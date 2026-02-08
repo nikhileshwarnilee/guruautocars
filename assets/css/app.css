@@ -1,0 +1,27 @@
+﻿:root {
+  --gac-primary: #0d6efd;
+  --gac-success: #198754;
+  --gac-warning: #ffc107;
+  --gac-danger: #dc3545;
+}
+
+.brand-link .brand-image {
+  float: none;
+  margin-left: 0;
+  margin-right: 0.5rem;
+}
+
+.table td,
+.table th {
+  vertical-align: middle;
+}
+
+.erp-stat-number {
+  font-size: 1.35rem;
+  font-weight: 700;
+}
+
+.form-hint {
+  color: #6c757d;
+  font-size: 0.85rem;
+}
