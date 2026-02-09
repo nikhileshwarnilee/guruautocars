@@ -179,6 +179,7 @@ $partsStmt = db()->prepare(
      FROM parts p
      LEFT JOIN garage_inventory gi ON gi.part_id = p.id AND gi.garage_id = :garage_id
      WHERE p.company_id = :company_id
+       AND p.status_code <> "DELETED"
      ORDER BY p.part_name ASC'
 );
 $partsStmt->execute([

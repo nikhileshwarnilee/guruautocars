@@ -19,7 +19,9 @@ if ($identifier === '' || $password === '') {
 
 $stmt = db()->prepare(
     'SELECT u.id, u.company_id, u.primary_garage_id, u.password_hash, u.is_active,
-            r.role_key
+            u.status_code,
+            r.role_key,
+            r.status_code AS role_status
      FROM users u
      INNER JOIN roles r ON r.id = u.role_id
      WHERE (u.email = :email OR u.username = :username)
@@ -37,6 +39,11 @@ if (!$user || !password_verify($password, (string) $user['password_hash'])) {
 }
 
 if ((int) $user['is_active'] !== 1) {
+    flash_set('login_error', 'Your account is inactive. Contact administrator.', 'danger');
+    redirect('login.php');
+}
+
+if ((string) ($user['status_code'] ?? 'ACTIVE') !== 'ACTIVE' || (string) ($user['role_status'] ?? 'ACTIVE') !== 'ACTIVE') {
     flash_set('login_error', 'Your account is inactive. Contact administrator.', 'danger');
     redirect('login.php');
 }

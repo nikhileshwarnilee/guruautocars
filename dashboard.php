@@ -11,11 +11,21 @@ $active_menu = 'dashboard';
 $companyId = active_company_id();
 $garageId = active_garage_id();
 
-$customersStmt = db()->prepare('SELECT COUNT(*) FROM customers WHERE company_id = :company_id');
+$customersStmt = db()->prepare(
+    'SELECT COUNT(*)
+     FROM customers
+     WHERE company_id = :company_id
+       AND status_code <> "DELETED"'
+);
 $customersStmt->execute(['company_id' => $companyId]);
 $totalCustomers = (int) $customersStmt->fetchColumn();
 
-$vehiclesStmt = db()->prepare('SELECT COUNT(*) FROM vehicles WHERE company_id = :company_id');
+$vehiclesStmt = db()->prepare(
+    'SELECT COUNT(*)
+     FROM vehicles
+     WHERE company_id = :company_id
+       AND status_code <> "DELETED"'
+);
 $vehiclesStmt->execute(['company_id' => $companyId]);
 $totalVehicles = (int) $vehiclesStmt->fetchColumn();
 

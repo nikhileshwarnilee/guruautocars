@@ -65,7 +65,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
              WHERE v.id = :vehicle_id
                AND c.id = :customer_id
                AND v.company_id = :company_id
-               AND c.company_id = :company_id'
+               AND c.company_id = :company_id
+               AND v.status_code = "ACTIVE"
+               AND c.status_code = "ACTIVE"'
         );
         $validationStmt->execute([
             'vehicle_id' => $vehicleId,
@@ -120,7 +122,7 @@ $customersStmt = db()->prepare(
     'SELECT id, full_name, phone
      FROM customers
      WHERE company_id = :company_id
-       AND is_active = 1
+       AND status_code = "ACTIVE"
      ORDER BY full_name ASC'
 );
 $customersStmt->execute(['company_id' => $companyId]);
@@ -130,7 +132,7 @@ $vehiclesStmt = db()->prepare(
     'SELECT id, customer_id, registration_no, brand, model
      FROM vehicles
      WHERE company_id = :company_id
-       AND is_active = 1
+       AND status_code = "ACTIVE"
      ORDER BY registration_no ASC'
 );
 $vehiclesStmt->execute(['company_id' => $companyId]);
@@ -143,7 +145,7 @@ $mechanicsStmt = db()->prepare(
      INNER JOIN user_garages ug ON ug.user_id = u.id
      WHERE u.company_id = :company_id
        AND ug.garage_id = :garage_id
-       AND u.is_active = 1
+       AND u.status_code = "ACTIVE"
        AND r.role_key IN ("mechanic", "manager")
      ORDER BY u.name ASC'
 );

@@ -62,6 +62,7 @@ function current_user(bool $refresh = false): ?array
 
     $stmt = db()->prepare(
         'SELECT u.id, u.company_id, u.primary_garage_id, u.name, u.email, u.username, u.phone, u.is_active,
+                u.status_code,
                 r.role_key, r.role_name,
                 g.name AS primary_garage_name,
                 c.name AS company_name
@@ -71,6 +72,9 @@ function current_user(bool $refresh = false): ?array
          LEFT JOIN garages g ON g.id = u.primary_garage_id
          WHERE u.id = :user_id
            AND u.is_active = 1
+           AND u.status_code = "ACTIVE"
+           AND (r.status_code IS NULL OR r.status_code = "ACTIVE")
+           AND (c.status_code IS NULL OR c.status_code = "ACTIVE")
          LIMIT 1'
     );
     $stmt->execute(['user_id' => (int) $_SESSION['user_id']]);
@@ -86,7 +90,8 @@ function current_user(bool $refresh = false): ?array
          FROM user_garages ug
          INNER JOIN garages g ON g.id = ug.garage_id
          WHERE ug.user_id = :user_id
-           AND g.status = "active"
+           AND (g.status = "active" OR g.status IS NULL)
+           AND (g.status_code IS NULL OR g.status_code = "ACTIVE")
          ORDER BY g.name ASC'
     );
     $garageStmt->execute(['user_id' => (int) $user['id']]);
@@ -125,8 +130,11 @@ function set_active_garage(int $garageId): bool
     $stmt = db()->prepare(
         'SELECT COUNT(*)
          FROM user_garages
+         INNER JOIN garages g ON g.id = user_garages.garage_id
          WHERE user_id = :user_id
-           AND garage_id = :garage_id'
+           AND garage_id = :garage_id
+           AND (g.status = "active" OR g.status IS NULL)
+           AND (g.status_code IS NULL OR g.status_code = "ACTIVE")'
     );
     $stmt->execute([
         'user_id' => (int) $_SESSION['user_id'],
@@ -166,9 +174,13 @@ function user_permissions(bool $refresh = false): array
     $stmt = db()->prepare(
         'SELECT p.perm_key
          FROM users u
+         INNER JOIN roles r ON r.id = u.role_id
          INNER JOIN role_permissions rp ON rp.role_id = u.role_id
          INNER JOIN permissions p ON p.id = rp.permission_id
-         WHERE u.id = :user_id'
+         WHERE u.id = :user_id
+           AND u.status_code = "ACTIVE"
+           AND r.status_code = "ACTIVE"
+           AND p.status_code = "ACTIVE"'
     );
     $stmt->execute(['user_id' => (int) $_SESSION['user_id']]);
 

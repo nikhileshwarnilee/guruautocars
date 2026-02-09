@@ -308,7 +308,7 @@ $inventoryPartsStmt = db()->prepare(
      INNER JOIN parts p ON p.id = gi.part_id
      WHERE gi.garage_id = :garage_id
        AND p.company_id = :company_id
-       AND p.is_active = 1
+       AND p.status_code = "ACTIVE"
        AND gi.quantity > 0
      ORDER BY p.part_name ASC'
 );
@@ -325,7 +325,7 @@ $mechanicsStmt = db()->prepare(
      INNER JOIN user_garages ug ON ug.user_id = u.id
      WHERE u.company_id = :company_id
        AND ug.garage_id = :garage_id
-       AND u.is_active = 1
+       AND u.status_code = "ACTIVE"
        AND r.role_key IN ("mechanic", "manager")
      ORDER BY u.name ASC'
 );

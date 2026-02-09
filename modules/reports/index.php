@@ -97,7 +97,7 @@ $staffPerformanceSql =
        ' . ($isSuperAdmin ? '' : ' AND jc.garage_id = :garage_id ') . '
        AND DATE(jc.created_at) BETWEEN :from_date AND :to_date
      WHERE u.company_id = :company_id
-       AND u.is_active = 1
+       AND u.status_code = "ACTIVE"
      GROUP BY u.id
      ORDER BY completed_jobs DESC, total_jobs DESC
      LIMIT 15';

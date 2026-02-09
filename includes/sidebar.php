@@ -2,8 +2,11 @@
 declare(strict_types=1);
 
 $activeMenu = $active_menu ?? '';
-$canViewOrganization = has_permission('company.manage') || has_permission('garage.manage') || has_permission('staff.manage');
-$isOrganizationOpen = is_menu_group_open('organization.', $activeMenu);
+
+$isOrganizationOpen = is_menu_group_open('organization.', $activeMenu) || is_menu_group_open('system.', $activeMenu);
+$isPeopleOpen = is_menu_group_open('people.', $activeMenu);
+$isServicePartsOpen = is_menu_group_open('services.', $activeMenu) || is_menu_group_open('inventory.', $activeMenu) || is_menu_group_open('vendors.', $activeMenu);
+$isVisOpen = is_menu_group_open('vis.', $activeMenu);
 ?>
 <aside class="app-sidebar bg-body-secondary shadow" data-bs-theme="dark">
   <div class="sidebar-brand">
@@ -22,12 +25,12 @@ $isOrganizationOpen = is_menu_group_open('organization.', $activeMenu);
           </a>
         </li>
 
-        <?php if ($canViewOrganization): ?>
+        <?php if (has_permission('company.manage') || has_permission('garage.manage') || has_permission('financial_year.view') || has_permission('settings.view')): ?>
           <li class="nav-item <?= $isOrganizationOpen ? 'menu-open' : ''; ?>">
             <a href="#" class="nav-link <?= $isOrganizationOpen ? 'active' : ''; ?>">
-              <i class="nav-icon bi bi-diagram-3"></i>
+              <i class="nav-icon bi bi-building"></i>
               <p>
-                Organization
+                Organization & System
                 <i class="nav-arrow bi bi-chevron-right"></i>
               </p>
             </a>
@@ -36,7 +39,7 @@ $isOrganizationOpen = is_menu_group_open('organization.', $activeMenu);
                 <li class="nav-item">
                   <a href="<?= e(url('modules/organization/companies.php')); ?>" class="nav-link <?= e(is_active_menu('organization.companies', $activeMenu)); ?>">
                     <i class="nav-icon bi bi-circle"></i>
-                    <p>Companies</p>
+                    <p>Company Master</p>
                   </a>
                 </li>
               <?php endif; ?>
@@ -44,15 +47,61 @@ $isOrganizationOpen = is_menu_group_open('organization.', $activeMenu);
                 <li class="nav-item">
                   <a href="<?= e(url('modules/organization/garages.php')); ?>" class="nav-link <?= e(is_active_menu('organization.garages', $activeMenu)); ?>">
                     <i class="nav-icon bi bi-circle"></i>
-                    <p>Garages</p>
+                    <p>Garage / Branch Master</p>
                   </a>
                 </li>
               <?php endif; ?>
-              <?php if (has_permission('staff.manage')): ?>
+              <?php if (has_permission('financial_year.view')): ?>
                 <li class="nav-item">
-                  <a href="<?= e(url('modules/organization/staff.php')); ?>" class="nav-link <?= e(is_active_menu('organization.staff', $activeMenu)); ?>">
+                  <a href="<?= e(url('modules/system/financial_years.php')); ?>" class="nav-link <?= e(is_active_menu('system.financial_years', $activeMenu)); ?>">
                     <i class="nav-icon bi bi-circle"></i>
-                    <p>Staff</p>
+                    <p>Financial Year</p>
+                  </a>
+                </li>
+              <?php endif; ?>
+              <?php if (has_permission('settings.view')): ?>
+                <li class="nav-item">
+                  <a href="<?= e(url('modules/system/settings.php')); ?>" class="nav-link <?= e(is_active_menu('system.settings', $activeMenu)); ?>">
+                    <i class="nav-icon bi bi-circle"></i>
+                    <p>System Settings</p>
+                  </a>
+                </li>
+              <?php endif; ?>
+            </ul>
+          </li>
+        <?php endif; ?>
+
+        <?php if (has_permission('role.view') || has_permission('permission.view') || has_permission('staff.view') || has_permission('staff.manage')): ?>
+          <li class="nav-item <?= $isPeopleOpen ? 'menu-open' : ''; ?>">
+            <a href="#" class="nav-link <?= $isPeopleOpen ? 'active' : ''; ?>">
+              <i class="nav-icon bi bi-people"></i>
+              <p>
+                People
+                <i class="nav-arrow bi bi-chevron-right"></i>
+              </p>
+            </a>
+            <ul class="nav nav-treeview">
+              <?php if (has_permission('role.view')): ?>
+                <li class="nav-item">
+                  <a href="<?= e(url('modules/people/roles.php')); ?>" class="nav-link <?= e(is_active_menu('people.roles', $activeMenu)); ?>">
+                    <i class="nav-icon bi bi-circle"></i>
+                    <p>Role Master</p>
+                  </a>
+                </li>
+              <?php endif; ?>
+              <?php if (has_permission('permission.view')): ?>
+                <li class="nav-item">
+                  <a href="<?= e(url('modules/people/permissions.php')); ?>" class="nav-link <?= e(is_active_menu('people.permissions', $activeMenu)); ?>">
+                    <i class="nav-icon bi bi-circle"></i>
+                    <p>Permission Management</p>
+                  </a>
+                </li>
+              <?php endif; ?>
+              <?php if (has_permission('staff.view') || has_permission('staff.manage')): ?>
+                <li class="nav-item">
+                  <a href="<?= e(url('modules/organization/staff.php')); ?>" class="nav-link <?= e(is_active_menu('people.staff', $activeMenu)); ?>">
+                    <i class="nav-icon bi bi-circle"></i>
+                    <p>Staff Master</p>
                   </a>
                 </li>
               <?php endif; ?>
@@ -63,8 +112,8 @@ $isOrganizationOpen = is_menu_group_open('organization.', $activeMenu);
         <?php if (has_permission('customer.view')): ?>
           <li class="nav-item">
             <a href="<?= e(url('modules/customers/index.php')); ?>" class="nav-link <?= e(is_active_menu('customers', $activeMenu)); ?>">
-              <i class="nav-icon bi bi-people"></i>
-              <p>Customers</p>
+              <i class="nav-icon bi bi-person-vcard"></i>
+              <p>Customer Master</p>
             </a>
           </li>
         <?php endif; ?>
@@ -73,8 +122,88 @@ $isOrganizationOpen = is_menu_group_open('organization.', $activeMenu);
           <li class="nav-item">
             <a href="<?= e(url('modules/vehicles/index.php')); ?>" class="nav-link <?= e(is_active_menu('vehicles', $activeMenu)); ?>">
               <i class="nav-icon bi bi-car-front"></i>
-              <p>Vehicles</p>
+              <p>Vehicle Master</p>
             </a>
+          </li>
+        <?php endif; ?>
+
+        <?php if (has_permission('service.view') || has_permission('part_category.view') || has_permission('part_master.view') || has_permission('vendor.view') || has_permission('inventory.view')): ?>
+          <li class="nav-item <?= $isServicePartsOpen ? 'menu-open' : ''; ?>">
+            <a href="#" class="nav-link <?= $isServicePartsOpen ? 'active' : ''; ?>">
+              <i class="nav-icon bi bi-tools"></i>
+              <p>
+                Service & Parts
+                <i class="nav-arrow bi bi-chevron-right"></i>
+              </p>
+            </a>
+            <ul class="nav nav-treeview">
+              <?php if (has_permission('service.view')): ?>
+                <li class="nav-item">
+                  <a href="<?= e(url('modules/services/index.php')); ?>" class="nav-link <?= e(is_active_menu('services.master', $activeMenu)); ?>">
+                    <i class="nav-icon bi bi-circle"></i>
+                    <p>Service / Labour Master</p>
+                  </a>
+                </li>
+              <?php endif; ?>
+              <?php if (has_permission('part_category.view')): ?>
+                <li class="nav-item">
+                  <a href="<?= e(url('modules/inventory/categories.php')); ?>" class="nav-link <?= e(is_active_menu('inventory.categories', $activeMenu)); ?>">
+                    <i class="nav-icon bi bi-circle"></i>
+                    <p>Part Category Master</p>
+                  </a>
+                </li>
+              <?php endif; ?>
+              <?php if (has_permission('part_master.view')): ?>
+                <li class="nav-item">
+                  <a href="<?= e(url('modules/inventory/parts_master.php')); ?>" class="nav-link <?= e(is_active_menu('inventory.parts_master', $activeMenu)); ?>">
+                    <i class="nav-icon bi bi-circle"></i>
+                    <p>Parts / Item Master</p>
+                  </a>
+                </li>
+              <?php endif; ?>
+              <?php if (has_permission('vendor.view')): ?>
+                <li class="nav-item">
+                  <a href="<?= e(url('modules/vendors/index.php')); ?>" class="nav-link <?= e(is_active_menu('vendors.master', $activeMenu)); ?>">
+                    <i class="nav-icon bi bi-circle"></i>
+                    <p>Vendor / Supplier Master</p>
+                  </a>
+                </li>
+              <?php endif; ?>
+              <?php if (has_permission('inventory.view')): ?>
+                <li class="nav-item">
+                  <a href="<?= e(url('modules/inventory/index.php')); ?>" class="nav-link <?= e(is_active_menu('inventory', $activeMenu)); ?>">
+                    <i class="nav-icon bi bi-circle"></i>
+                    <p>Stock Movements</p>
+                  </a>
+                </li>
+              <?php endif; ?>
+            </ul>
+          </li>
+        <?php endif; ?>
+
+        <?php if (has_permission('vis.view')): ?>
+          <li class="nav-item <?= $isVisOpen ? 'menu-open' : ''; ?>">
+            <a href="#" class="nav-link <?= $isVisOpen ? 'active' : ''; ?>">
+              <i class="nav-icon bi bi-cpu"></i>
+              <p>
+                VIS
+                <i class="nav-arrow bi bi-chevron-right"></i>
+              </p>
+            </a>
+            <ul class="nav nav-treeview">
+              <li class="nav-item">
+                <a href="<?= e(url('modules/vis/catalog.php')); ?>" class="nav-link <?= e(is_active_menu('vis.catalog', $activeMenu)); ?>">
+                  <i class="nav-icon bi bi-circle"></i>
+                  <p>Vehicle Catalog</p>
+                </a>
+              </li>
+              <li class="nav-item">
+                <a href="<?= e(url('modules/vis/compatibility.php')); ?>" class="nav-link <?= e(is_active_menu('vis.compatibility', $activeMenu)); ?>">
+                  <i class="nav-icon bi bi-circle"></i>
+                  <p>Compatibility Mapping</p>
+                </a>
+              </li>
+            </ul>
           </li>
         <?php endif; ?>
 
@@ -83,15 +212,6 @@ $isOrganizationOpen = is_menu_group_open('organization.', $activeMenu);
             <a href="<?= e(url('modules/jobs/index.php')); ?>" class="nav-link <?= e(is_active_menu('jobs', $activeMenu)); ?>">
               <i class="nav-icon bi bi-card-checklist"></i>
               <p>Job Cards</p>
-            </a>
-          </li>
-        <?php endif; ?>
-
-        <?php if (has_permission('inventory.view')): ?>
-          <li class="nav-item">
-            <a href="<?= e(url('modules/inventory/index.php')); ?>" class="nav-link <?= e(is_active_menu('inventory', $activeMenu)); ?>">
-              <i class="nav-icon bi bi-box-seam"></i>
-              <p>Inventory</p>
             </a>
           </li>
         <?php endif; ?>

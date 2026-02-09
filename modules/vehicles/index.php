@@ -5,16 +5,26 @@ require_once __DIR__ . '/../../includes/app.php';
 require_login();
 require_permission('vehicle.view');
 
-$page_title = 'Vehicles';
+$page_title = 'Vehicle Master';
 $active_menu = 'vehicles';
 $canManage = has_permission('vehicle.manage');
 $companyId = active_company_id();
 
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && $canManage) {
+$allowedVehicleTypes = ['2W', '4W', 'COMMERCIAL'];
+$allowedFuelTypes = ['PETROL', 'DIESEL', 'CNG', 'EV', 'HYBRID', 'OTHER'];
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     require_csrf();
+
+    if (!$canManage) {
+        flash_set('vehicle_error', 'You do not have permission to modify vehicle master.', 'danger');
+        redirect('modules/vehicles/index.php');
+    }
+
     $action = (string) ($_POST['_action'] ?? '');
 
-    if ($action === 'create') {
+    if ($action === 'create' || $action === 'update') {
+        $vehicleId = post_int('vehicle_id');
         $customerId = post_int('customer_id');
         $registrationNo = strtoupper(post_string('registration_no', 30));
         $vehicleType = (string) ($_POST['vehicle_type'] ?? '4W');
@@ -27,14 +37,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $canManage) {
         $chassisNo = post_string('chassis_no', 60);
         $engineNo = post_string('engine_no', 60);
         $odometer = post_int('odometer_km');
-        $notes = post_string('notes', 1000);
-
-        $allowedVehicleTypes = ['2W', '4W', 'COMMERCIAL'];
-        $allowedFuelTypes = ['PETROL', 'DIESEL', 'CNG', 'EV', 'HYBRID', 'OTHER'];
+        $notes = post_string('notes', 2000);
+        $statusCode = normalize_status_code((string) ($_POST['status_code'] ?? 'ACTIVE'));
+        $visVariantId = post_int('vis_variant_id');
 
         if (!in_array($vehicleType, $allowedVehicleTypes, true)) {
             $vehicleType = '4W';
         }
+
         if (!in_array($fuelType, $allowedFuelTypes, true)) {
             $fuelType = 'PETROL';
         }
@@ -44,63 +54,189 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $canManage) {
             redirect('modules/vehicles/index.php');
         }
 
-        $customerCheck = db()->prepare('SELECT id FROM customers WHERE id = :id AND company_id = :company_id LIMIT 1');
-        $customerCheck->execute([
+        $customerStmt = db()->prepare(
+            'SELECT id
+             FROM customers
+             WHERE id = :id
+               AND company_id = :company_id
+               AND status_code <> "DELETED"
+             LIMIT 1'
+        );
+        $customerStmt->execute([
             'id' => $customerId,
             'company_id' => $companyId,
         ]);
-        if (!$customerCheck->fetch()) {
+
+        if (!$customerStmt->fetch()) {
             flash_set('vehicle_error', 'Invalid customer selected.', 'danger');
             redirect('modules/vehicles/index.php');
         }
 
-        try {
-            $stmt = db()->prepare(
-                'INSERT INTO vehicles
-                  (company_id, customer_id, registration_no, vehicle_type, brand, model, variant, fuel_type, model_year, color, chassis_no, engine_no, odometer_km, notes, is_active)
-                 VALUES
-                  (:company_id, :customer_id, :registration_no, :vehicle_type, :brand, :model, :variant, :fuel_type, :model_year, :color, :chassis_no, :engine_no, :odometer_km, :notes, 1)'
-            );
-            $stmt->execute([
-                'company_id' => $companyId,
-                'customer_id' => $customerId,
-                'registration_no' => $registrationNo,
-                'vehicle_type' => $vehicleType,
-                'brand' => $brand,
-                'model' => $model,
-                'variant' => $variant !== '' ? $variant : null,
-                'fuel_type' => $fuelType,
-                'model_year' => $modelYear > 0 ? $modelYear : null,
-                'color' => $color !== '' ? $color : null,
-                'chassis_no' => $chassisNo !== '' ? $chassisNo : null,
-                'engine_no' => $engineNo !== '' ? $engineNo : null,
-                'odometer_km' => $odometer > 0 ? $odometer : 0,
-                'notes' => $notes !== '' ? $notes : null,
-            ]);
+        $visVariantName = null;
+        if ($visVariantId > 0) {
+            try {
+                $visStmt = db()->prepare(
+                    'SELECT vv.id, vv.variant_name, vv.fuel_type, vm.model_name, vb.brand_name
+                     FROM vis_variants vv
+                     INNER JOIN vis_models vm ON vm.id = vv.model_id
+                     INNER JOIN vis_brands vb ON vb.id = vm.brand_id
+                     WHERE vv.id = :id
+                       AND vv.status_code = "ACTIVE"
+                       AND vm.status_code = "ACTIVE"
+                       AND vb.status_code = "ACTIVE"
+                     LIMIT 1'
+                );
+                $visStmt->execute(['id' => $visVariantId]);
+                $visVariant = $visStmt->fetch();
 
-            flash_set('vehicle_success', 'Vehicle added successfully.', 'success');
-        } catch (Throwable $exception) {
-            flash_set('vehicle_error', 'Unable to add vehicle. Registration number must be unique.', 'danger');
+                if (!$visVariant) {
+                    $visVariantId = 0;
+                } else {
+                    $visVariantName = (string) $visVariant['brand_name'] . ' / ' . (string) $visVariant['model_name'] . ' / ' . (string) $visVariant['variant_name'];
+                }
+            } catch (Throwable $exception) {
+                $visVariantId = 0;
+            }
+        }
+
+        $isActive = $statusCode === 'ACTIVE' ? 1 : 0;
+
+        if ($action === 'create') {
+            try {
+                $insertStmt = db()->prepare(
+                    'INSERT INTO vehicles
+                      (company_id, customer_id, registration_no, vehicle_type, brand, model, variant, fuel_type, model_year, color, chassis_no, engine_no, odometer_km, notes, vis_variant_id, is_active, status_code, deleted_at)
+                     VALUES
+                      (:company_id, :customer_id, :registration_no, :vehicle_type, :brand, :model, :variant, :fuel_type, :model_year, :color, :chassis_no, :engine_no, :odometer_km, :notes, :vis_variant_id, :is_active, :status_code, :deleted_at)'
+                );
+                $insertStmt->execute([
+                    'company_id' => $companyId,
+                    'customer_id' => $customerId,
+                    'registration_no' => $registrationNo,
+                    'vehicle_type' => $vehicleType,
+                    'brand' => $brand,
+                    'model' => $model,
+                    'variant' => $variant !== '' ? $variant : null,
+                    'fuel_type' => $fuelType,
+                    'model_year' => $modelYear > 0 ? $modelYear : null,
+                    'color' => $color !== '' ? $color : null,
+                    'chassis_no' => $chassisNo !== '' ? $chassisNo : null,
+                    'engine_no' => $engineNo !== '' ? $engineNo : null,
+                    'odometer_km' => $odometer > 0 ? $odometer : 0,
+                    'notes' => $notes !== '' ? $notes : null,
+                    'vis_variant_id' => $visVariantId > 0 ? $visVariantId : null,
+                    'is_active' => $isActive,
+                    'status_code' => $statusCode,
+                    'deleted_at' => $statusCode === 'DELETED' ? date('Y-m-d H:i:s') : null,
+                ]);
+
+                $createdVehicleId = (int) db()->lastInsertId();
+                add_vehicle_history($createdVehicleId, 'CREATE', 'Vehicle created', [
+                    'registration_no' => $registrationNo,
+                    'status_code' => $statusCode,
+                    'vis_variant' => $visVariantName,
+                ]);
+                log_audit('vehicles', 'create', $createdVehicleId, 'Created vehicle ' . $registrationNo);
+
+                flash_set('vehicle_success', 'Vehicle created successfully.', 'success');
+            } catch (Throwable $exception) {
+                flash_set('vehicle_error', 'Unable to create vehicle. Registration number must be unique.', 'danger');
+            }
+        }
+
+        if ($action === 'update') {
+            if ($vehicleId <= 0) {
+                flash_set('vehicle_error', 'Invalid vehicle selected for update.', 'danger');
+                redirect('modules/vehicles/index.php');
+            }
+
+            try {
+                $updateStmt = db()->prepare(
+                    'UPDATE vehicles
+                     SET customer_id = :customer_id,
+                         registration_no = :registration_no,
+                         vehicle_type = :vehicle_type,
+                         brand = :brand,
+                         model = :model,
+                         variant = :variant,
+                         fuel_type = :fuel_type,
+                         model_year = :model_year,
+                         color = :color,
+                         chassis_no = :chassis_no,
+                         engine_no = :engine_no,
+                         odometer_km = :odometer_km,
+                         notes = :notes,
+                         vis_variant_id = :vis_variant_id,
+                         is_active = :is_active,
+                         status_code = :status_code,
+                         deleted_at = CASE WHEN :status_code = "DELETED" THEN NOW() ELSE NULL END
+                     WHERE id = :id
+                       AND company_id = :company_id'
+                );
+                $updateStmt->execute([
+                    'customer_id' => $customerId,
+                    'registration_no' => $registrationNo,
+                    'vehicle_type' => $vehicleType,
+                    'brand' => $brand,
+                    'model' => $model,
+                    'variant' => $variant !== '' ? $variant : null,
+                    'fuel_type' => $fuelType,
+                    'model_year' => $modelYear > 0 ? $modelYear : null,
+                    'color' => $color !== '' ? $color : null,
+                    'chassis_no' => $chassisNo !== '' ? $chassisNo : null,
+                    'engine_no' => $engineNo !== '' ? $engineNo : null,
+                    'odometer_km' => $odometer > 0 ? $odometer : 0,
+                    'notes' => $notes !== '' ? $notes : null,
+                    'vis_variant_id' => $visVariantId > 0 ? $visVariantId : null,
+                    'is_active' => $isActive,
+                    'status_code' => $statusCode,
+                    'id' => $vehicleId,
+                    'company_id' => $companyId,
+                ]);
+
+                add_vehicle_history($vehicleId, 'UPDATE', 'Vehicle details updated', [
+                    'registration_no' => $registrationNo,
+                    'status_code' => $statusCode,
+                    'vis_variant' => $visVariantName,
+                ]);
+                log_audit('vehicles', 'update', $vehicleId, 'Updated vehicle ' . $registrationNo);
+
+                flash_set('vehicle_success', 'Vehicle updated successfully.', 'success');
+            } catch (Throwable $exception) {
+                flash_set('vehicle_error', 'Unable to update vehicle. Registration number must be unique.', 'danger');
+            }
         }
 
         redirect('modules/vehicles/index.php');
     }
 
-    if ($action === 'toggle_status') {
+    if ($action === 'change_status') {
         $vehicleId = post_int('vehicle_id');
-        $nextActive = post_int('next_active', 0) === 1 ? 1 : 0;
+        $nextStatus = normalize_status_code((string) ($_POST['next_status'] ?? 'INACTIVE'));
 
+        if ($vehicleId <= 0) {
+            flash_set('vehicle_error', 'Invalid vehicle selected.', 'danger');
+            redirect('modules/vehicles/index.php');
+        }
+
+        $isActive = $nextStatus === 'ACTIVE' ? 1 : 0;
         $stmt = db()->prepare(
             'UPDATE vehicles
-             SET is_active = :is_active
+             SET is_active = :is_active,
+                 status_code = :status_code,
+                 deleted_at = CASE WHEN :status_code = "DELETED" THEN NOW() ELSE NULL END
              WHERE id = :id
                AND company_id = :company_id'
         );
         $stmt->execute([
-            'is_active' => $nextActive,
+            'is_active' => $isActive,
+            'status_code' => $nextStatus,
             'id' => $vehicleId,
             'company_id' => $companyId,
         ]);
+
+        add_vehicle_history($vehicleId, 'STATUS', 'Status changed to ' . $nextStatus, ['status_code' => $nextStatus]);
+        log_audit('vehicles', 'status', $vehicleId, 'Changed vehicle status to ' . $nextStatus);
 
         flash_set('vehicle_success', 'Vehicle status updated.', 'success');
         redirect('modules/vehicles/index.php');
@@ -111,39 +247,99 @@ $customersStmt = db()->prepare(
     'SELECT id, full_name, phone
      FROM customers
      WHERE company_id = :company_id
-       AND is_active = 1
+       AND status_code = "ACTIVE"
      ORDER BY full_name ASC'
 );
 $customersStmt->execute(['company_id' => $companyId]);
 $customers = $customersStmt->fetchAll();
 
+$visVariants = [];
+try {
+    $visStmt = db()->query(
+        'SELECT vv.id, vv.variant_name, vv.fuel_type, vm.model_name, vb.brand_name
+         FROM vis_variants vv
+         INNER JOIN vis_models vm ON vm.id = vv.model_id
+         INNER JOIN vis_brands vb ON vb.id = vm.brand_id
+         WHERE vv.status_code = "ACTIVE"
+           AND vm.status_code = "ACTIVE"
+           AND vb.status_code = "ACTIVE"
+         ORDER BY vb.brand_name ASC, vm.model_name ASC, vv.variant_name ASC
+         LIMIT 500'
+    );
+    $visVariants = $visStmt->fetchAll();
+} catch (Throwable $exception) {
+    $visVariants = [];
+}
+$hasVisData = !empty($visVariants);
+
+$editId = get_int('edit_id');
+$editVehicle = null;
+if ($editId > 0) {
+    $editStmt = db()->prepare('SELECT * FROM vehicles WHERE id = :id AND company_id = :company_id LIMIT 1');
+    $editStmt->execute([
+        'id' => $editId,
+        'company_id' => $companyId,
+    ]);
+    $editVehicle = $editStmt->fetch() ?: null;
+}
+
+$historyVehicleId = get_int('history_id');
+$vehicleHistory = [];
+if ($historyVehicleId > 0) {
+    $historyStmt = db()->prepare(
+        'SELECT vh.*, u.name AS created_by_name
+         FROM vehicle_history vh
+         LEFT JOIN vehicles v ON v.id = vh.vehicle_id
+         LEFT JOIN users u ON u.id = vh.created_by
+         WHERE vh.vehicle_id = :vehicle_id
+           AND v.company_id = :company_id
+         ORDER BY vh.id DESC
+         LIMIT 30'
+    );
+    $historyStmt->execute([
+        'vehicle_id' => $historyVehicleId,
+        'company_id' => $companyId,
+    ]);
+    $vehicleHistory = $historyStmt->fetchAll();
+}
+
 $search = trim((string) ($_GET['q'] ?? ''));
+$statusFilter = strtoupper(trim((string) ($_GET['status'] ?? '')));
+$allowedStatuses = ['ACTIVE', 'INACTIVE', 'DELETED', 'ALL'];
+if (!in_array($statusFilter, $allowedStatuses, true)) {
+    $statusFilter = '';
+}
+
+$whereParts = ['v.company_id = :company_id'];
+$params = ['company_id' => $companyId];
 
 if ($search !== '') {
-    $vehiclesStmt = db()->prepare(
-        'SELECT v.*, c.full_name AS customer_name, c.phone AS customer_phone,
-                (SELECT COUNT(*) FROM job_cards jc WHERE jc.vehicle_id = v.id) AS service_count
-         FROM vehicles v
-         INNER JOIN customers c ON c.id = v.customer_id
-         WHERE v.company_id = :company_id
-           AND (v.registration_no LIKE :query OR v.brand LIKE :query OR v.model LIKE :query OR c.full_name LIKE :query)
-         ORDER BY v.id DESC'
-    );
-    $vehiclesStmt->execute([
-        'company_id' => $companyId,
-        'query' => '%' . $search . '%',
-    ]);
-} else {
-    $vehiclesStmt = db()->prepare(
-        'SELECT v.*, c.full_name AS customer_name, c.phone AS customer_phone,
-                (SELECT COUNT(*) FROM job_cards jc WHERE jc.vehicle_id = v.id) AS service_count
-         FROM vehicles v
-         INNER JOIN customers c ON c.id = v.customer_id
-         WHERE v.company_id = :company_id
-         ORDER BY v.id DESC'
-    );
-    $vehiclesStmt->execute(['company_id' => $companyId]);
+    $whereParts[] = '(v.registration_no LIKE :query OR v.brand LIKE :query OR v.model LIKE :query OR v.variant LIKE :query OR c.full_name LIKE :query)';
+    $params['query'] = '%' . $search . '%';
 }
+
+if ($statusFilter === '') {
+    $whereParts[] = 'v.status_code <> "DELETED"';
+} elseif ($statusFilter !== 'ALL') {
+    $whereParts[] = 'v.status_code = :status_code';
+    $params['status_code'] = $statusFilter;
+}
+
+$vehicleSql =
+    'SELECT v.*, c.full_name AS customer_name, c.phone AS customer_phone,
+            (SELECT COUNT(*) FROM job_cards jc WHERE jc.vehicle_id = v.id) AS service_count,
+            (SELECT COUNT(*) FROM vehicle_history h WHERE h.vehicle_id = v.id) AS history_count,
+            vv.variant_name AS vis_variant_name, vm.model_name AS vis_model_name, vb.brand_name AS vis_brand_name
+     FROM vehicles v
+     INNER JOIN customers c ON c.id = v.customer_id
+     LEFT JOIN vis_variants vv ON vv.id = v.vis_variant_id
+     LEFT JOIN vis_models vm ON vm.id = vv.model_id
+     LEFT JOIN vis_brands vb ON vb.id = vm.brand_id
+     WHERE ' . implode(' AND ', $whereParts) . '
+     ORDER BY v.id DESC';
+
+$vehiclesStmt = db()->prepare($vehicleSql);
+$vehiclesStmt->execute($params);
 $vehicles = $vehiclesStmt->fetchAll();
 
 require_once __DIR__ . '/../../includes/header.php';
@@ -154,11 +350,11 @@ require_once __DIR__ . '/../../includes/sidebar.php';
   <div class="app-content-header">
     <div class="container-fluid">
       <div class="row">
-        <div class="col-sm-6"><h3 class="mb-0">Vehicle Management</h3></div>
+        <div class="col-sm-6"><h3 class="mb-0">Vehicle Master</h3></div>
         <div class="col-sm-6">
           <ol class="breadcrumb float-sm-end">
             <li class="breadcrumb-item"><a href="<?= e(url('dashboard.php')); ?>">Home</a></li>
-            <li class="breadcrumb-item active">Vehicles</li>
+            <li class="breadcrumb-item active">Vehicle Master</li>
           </ol>
         </div>
       </div>
@@ -169,88 +365,111 @@ require_once __DIR__ . '/../../includes/sidebar.php';
     <div class="container-fluid">
       <?php if ($canManage): ?>
         <div class="card card-primary">
-          <div class="card-header"><h3 class="card-title">Add Vehicle</h3></div>
+          <div class="card-header"><h3 class="card-title"><?= $editVehicle ? 'Edit Vehicle' : 'Add Vehicle'; ?></h3></div>
           <form method="post">
             <div class="card-body row g-3">
               <?= csrf_field(); ?>
-              <input type="hidden" name="_action" value="create" />
+              <input type="hidden" name="_action" value="<?= $editVehicle ? 'update' : 'create'; ?>" />
+              <input type="hidden" name="vehicle_id" value="<?= (int) ($editVehicle['id'] ?? 0); ?>" />
 
               <div class="col-md-4">
                 <label class="form-label">Customer</label>
                 <select name="customer_id" class="form-select" required>
                   <option value="">Select Customer</option>
                   <?php foreach ($customers as $customer): ?>
-                    <option value="<?= (int) $customer['id']; ?>">
+                    <option value="<?= (int) $customer['id']; ?>" <?= ((int) ($editVehicle['customer_id'] ?? 0) === (int) $customer['id']) ? 'selected' : ''; ?>>
                       <?= e((string) $customer['full_name']); ?> (<?= e((string) $customer['phone']); ?>)
                     </option>
                   <?php endforeach; ?>
                 </select>
               </div>
-              <div class="col-md-4">
-                <label class="form-label">Registration Number</label>
-                <input type="text" name="registration_no" class="form-control" required />
+              <div class="col-md-2">
+                <label class="form-label">Registration No</label>
+                <input type="text" name="registration_no" class="form-control" required value="<?= e((string) ($editVehicle['registration_no'] ?? '')); ?>" />
               </div>
-              <div class="col-md-4">
+              <div class="col-md-2">
                 <label class="form-label">Vehicle Type</label>
                 <select name="vehicle_type" class="form-select" required>
-                  <option value="2W">2W</option>
-                  <option value="4W" selected>4W</option>
-                  <option value="COMMERCIAL">Commercial</option>
+                  <?php foreach ($allowedVehicleTypes as $type): ?>
+                    <option value="<?= e($type); ?>" <?= ((string) ($editVehicle['vehicle_type'] ?? '4W') === $type) ? 'selected' : ''; ?>><?= e($type); ?></option>
+                  <?php endforeach; ?>
+                </select>
+              </div>
+              <div class="col-md-2">
+                <label class="form-label">Fuel Type</label>
+                <select name="fuel_type" class="form-select" required>
+                  <?php foreach ($allowedFuelTypes as $fuel): ?>
+                    <option value="<?= e($fuel); ?>" <?= ((string) ($editVehicle['fuel_type'] ?? 'PETROL') === $fuel) ? 'selected' : ''; ?>><?= e($fuel); ?></option>
+                  <?php endforeach; ?>
+                </select>
+              </div>
+              <div class="col-md-2">
+                <label class="form-label">Status</label>
+                <select name="status_code" class="form-select" required>
+                  <?php foreach (status_options((string) ($editVehicle['status_code'] ?? 'ACTIVE')) as $option): ?>
+                    <option value="<?= e($option['value']); ?>" <?= $option['selected'] ? 'selected' : ''; ?>><?= e($option['value']); ?></option>
+                  <?php endforeach; ?>
                 </select>
               </div>
 
               <div class="col-md-3">
                 <label class="form-label">Brand</label>
-                <input type="text" name="brand" class="form-control" required />
+                <input type="text" name="brand" class="form-control" required value="<?= e((string) ($editVehicle['brand'] ?? '')); ?>" />
               </div>
               <div class="col-md-3">
                 <label class="form-label">Model</label>
-                <input type="text" name="model" class="form-control" required />
+                <input type="text" name="model" class="form-control" required value="<?= e((string) ($editVehicle['model'] ?? '')); ?>" />
               </div>
               <div class="col-md-3">
                 <label class="form-label">Variant</label>
-                <input type="text" name="variant" class="form-control" />
+                <input type="text" name="variant" class="form-control" value="<?= e((string) ($editVehicle['variant'] ?? '')); ?>" />
               </div>
-              <div class="col-md-3">
-                <label class="form-label">Fuel Type</label>
-                <select name="fuel_type" class="form-select" required>
-                  <option value="PETROL">Petrol</option>
-                  <option value="DIESEL">Diesel</option>
-                  <option value="CNG">CNG</option>
-                  <option value="EV">EV</option>
-                  <option value="HYBRID">Hybrid</option>
-                  <option value="OTHER">Other</option>
-                </select>
-              </div>
-
               <div class="col-md-3">
                 <label class="form-label">Model Year</label>
-                <input type="number" name="model_year" class="form-control" min="1990" max="2099" />
-              </div>
-              <div class="col-md-3">
-                <label class="form-label">Color</label>
-                <input type="text" name="color" class="form-control" />
-              </div>
-              <div class="col-md-3">
-                <label class="form-label">Odometer (KM)</label>
-                <input type="number" name="odometer_km" class="form-control" min="0" step="1" />
-              </div>
-              <div class="col-md-3">
-                <label class="form-label">Engine No</label>
-                <input type="text" name="engine_no" class="form-control" />
+                <input type="number" name="model_year" class="form-control" min="1990" max="2099" value="<?= e((string) ($editVehicle['model_year'] ?? '')); ?>" />
               </div>
 
-              <div class="col-md-6">
-                <label class="form-label">Chassis No</label>
-                <input type="text" name="chassis_no" class="form-control" />
+              <div class="col-md-2">
+                <label class="form-label">Color</label>
+                <input type="text" name="color" class="form-control" value="<?= e((string) ($editVehicle['color'] ?? '')); ?>" />
               </div>
-              <div class="col-md-6">
+              <div class="col-md-2">
+                <label class="form-label">Odometer (KM)</label>
+                <input type="number" name="odometer_km" class="form-control" min="0" value="<?= e((string) ($editVehicle['odometer_km'] ?? '0')); ?>" />
+              </div>
+              <div class="col-md-4">
+                <label class="form-label">Chassis No</label>
+                <input type="text" name="chassis_no" class="form-control" value="<?= e((string) ($editVehicle['chassis_no'] ?? '')); ?>" />
+              </div>
+              <div class="col-md-4">
+                <label class="form-label">Engine No</label>
+                <input type="text" name="engine_no" class="form-control" value="<?= e((string) ($editVehicle['engine_no'] ?? '')); ?>" />
+              </div>
+
+              <div class="col-md-8">
+                <label class="form-label">VIS Variant (Optional)</label>
+                <select name="vis_variant_id" class="form-select">
+                  <option value="0">No VIS linkage</option>
+                  <?php foreach ($visVariants as $variant): ?>
+                    <option value="<?= (int) $variant['id']; ?>" <?= ((int) ($editVehicle['vis_variant_id'] ?? 0) === (int) $variant['id']) ? 'selected' : ''; ?>>
+                      <?= e((string) $variant['brand_name']); ?> / <?= e((string) $variant['model_name']); ?> / <?= e((string) $variant['variant_name']); ?> (<?= e((string) $variant['fuel_type']); ?>)
+                    </option>
+                  <?php endforeach; ?>
+                </select>
+                <div class="form-hint">
+                  <?= $hasVisData ? 'VIS data found: selecting a variant enables compatibility suggestions in downstream modules.' : 'No VIS catalog data available right now. Vehicle creation works normally without VIS.'; ?>
+                </div>
+              </div>
+              <div class="col-md-4">
                 <label class="form-label">Notes</label>
-                <input type="text" name="notes" class="form-control" />
+                <input type="text" name="notes" class="form-control" value="<?= e((string) ($editVehicle['notes'] ?? '')); ?>" />
               </div>
             </div>
-            <div class="card-footer">
-              <button type="submit" class="btn btn-primary">Save Vehicle</button>
+            <div class="card-footer d-flex gap-2">
+              <button type="submit" class="btn btn-primary"><?= $editVehicle ? 'Update Vehicle' : 'Create Vehicle'; ?></button>
+              <?php if ($editVehicle): ?>
+                <a href="<?= e(url('modules/vehicles/index.php')); ?>" class="btn btn-outline-secondary">Cancel Edit</a>
+              <?php endif; ?>
             </div>
           </form>
         </div>
@@ -258,11 +477,18 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 
       <div class="card">
         <div class="card-header">
-          <h3 class="card-title">Vehicles</h3>
+          <h3 class="card-title">Vehicle List</h3>
           <div class="card-tools">
             <form method="get" class="d-flex gap-2">
-              <input type="text" name="q" class="form-control form-control-sm" value="<?= e($search); ?>" placeholder="Search registration/brand/model/customer" />
-              <button type="submit" class="btn btn-sm btn-outline-primary">Search</button>
+              <input type="text" name="q" value="<?= e($search); ?>" class="form-control form-control-sm" placeholder="Search registration/brand/model/customer" />
+              <select name="status" class="form-select form-select-sm">
+                <option value="" <?= $statusFilter === '' ? 'selected' : ''; ?>>Active + Inactive</option>
+                <option value="ACTIVE" <?= $statusFilter === 'ACTIVE' ? 'selected' : ''; ?>>ACTIVE</option>
+                <option value="INACTIVE" <?= $statusFilter === 'INACTIVE' ? 'selected' : ''; ?>>INACTIVE</option>
+                <option value="DELETED" <?= $statusFilter === 'DELETED' ? 'selected' : ''; ?>>DELETED</option>
+                <option value="ALL" <?= $statusFilter === 'ALL' ? 'selected' : ''; ?>>ALL</option>
+              </select>
+              <button type="submit" class="btn btn-sm btn-outline-primary">Filter</button>
             </form>
           </div>
         </div>
@@ -274,46 +500,62 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                 <th>Registration</th>
                 <th>Vehicle</th>
                 <th>Customer</th>
-                <th>Service Count</th>
+                <th>VIS Match</th>
+                <th>Jobs</th>
+                <th>History</th>
                 <th>Status</th>
-                <?php if ($canManage): ?><th>Action</th><?php endif; ?>
+                <th>Actions</th>
               </tr>
             </thead>
             <tbody>
               <?php if (empty($vehicles)): ?>
-                <tr><td colspan="7" class="text-center text-muted py-4">No vehicles found.</td></tr>
+                <tr><td colspan="9" class="text-center text-muted py-4">No vehicles found.</td></tr>
               <?php else: ?>
                 <?php foreach ($vehicles as $vehicle): ?>
                   <tr>
                     <td><?= (int) $vehicle['id']; ?></td>
                     <td><?= e((string) $vehicle['registration_no']); ?></td>
                     <td>
-                      <?= e((string) $vehicle['brand']); ?> <?= e((string) $vehicle['model']); ?>
-                      <br><small class="text-muted"><?= e((string) $vehicle['vehicle_type']); ?> | <?= e((string) $vehicle['fuel_type']); ?></small>
+                      <?= e((string) $vehicle['brand']); ?> <?= e((string) $vehicle['model']); ?> <?= e((string) ($vehicle['variant'] ?? '')); ?><br>
+                      <small class="text-muted"><?= e((string) $vehicle['vehicle_type']); ?> | <?= e((string) $vehicle['fuel_type']); ?></small>
                     </td>
                     <td>
-                      <?= e((string) $vehicle['customer_name']); ?>
-                      <br><small class="text-muted"><?= e((string) $vehicle['customer_phone']); ?></small>
+                      <?= e((string) $vehicle['customer_name']); ?><br>
+                      <small class="text-muted"><?= e((string) ($vehicle['customer_phone'] ?? '-')); ?></small>
+                    </td>
+                    <td>
+                      <?php if ((int) ($vehicle['vis_variant_id'] ?? 0) > 0): ?>
+                        <span class="badge text-bg-info">Linked</span><br>
+                        <small class="text-muted"><?= e((string) (($vehicle['vis_brand_name'] ?? '-') . ' / ' . ($vehicle['vis_model_name'] ?? '-') . ' / ' . ($vehicle['vis_variant_name'] ?? '-'))); ?></small>
+                      <?php else: ?>
+                        <span class="badge text-bg-secondary">Not Linked</span>
+                      <?php endif; ?>
                     </td>
                     <td><?= (int) $vehicle['service_count']; ?></td>
-                    <td>
-                      <span class="badge text-bg-<?= ((int) $vehicle['is_active'] === 1) ? 'success' : 'secondary'; ?>">
-                        <?= ((int) $vehicle['is_active'] === 1) ? 'Active' : 'Inactive'; ?>
-                      </span>
+                    <td><?= (int) $vehicle['history_count']; ?></td>
+                    <td><span class="badge text-bg-<?= e(status_badge_class((string) $vehicle['status_code'])); ?>"><?= e(record_status_label((string) $vehicle['status_code'])); ?></span></td>
+                    <td class="d-flex gap-1">
+                      <a class="btn btn-sm btn-outline-info" href="<?= e(url('modules/vehicles/index.php?history_id=' . (int) $vehicle['id'])); ?>">History</a>
+                      <?php if ($canManage): ?>
+                        <a class="btn btn-sm btn-outline-primary" href="<?= e(url('modules/vehicles/index.php?edit_id=' . (int) $vehicle['id'])); ?>">Edit</a>
+                        <?php if ((string) $vehicle['status_code'] !== 'DELETED'): ?>
+                          <form method="post" class="d-inline" data-confirm="Change vehicle status?">
+                            <?= csrf_field(); ?>
+                            <input type="hidden" name="_action" value="change_status" />
+                            <input type="hidden" name="vehicle_id" value="<?= (int) $vehicle['id']; ?>" />
+                            <input type="hidden" name="next_status" value="<?= e(((string) $vehicle['status_code'] === 'ACTIVE') ? 'INACTIVE' : 'ACTIVE'); ?>" />
+                            <button type="submit" class="btn btn-sm btn-outline-secondary"><?= ((string) $vehicle['status_code'] === 'ACTIVE') ? 'Inactivate' : 'Activate'; ?></button>
+                          </form>
+                          <form method="post" class="d-inline" data-confirm="Soft delete this vehicle?">
+                            <?= csrf_field(); ?>
+                            <input type="hidden" name="_action" value="change_status" />
+                            <input type="hidden" name="vehicle_id" value="<?= (int) $vehicle['id']; ?>" />
+                            <input type="hidden" name="next_status" value="DELETED" />
+                            <button type="submit" class="btn btn-sm btn-outline-danger">Soft Delete</button>
+                          </form>
+                        <?php endif; ?>
+                      <?php endif; ?>
                     </td>
-                    <?php if ($canManage): ?>
-                      <td>
-                        <form method="post" class="d-inline" data-confirm="Change vehicle status?">
-                          <?= csrf_field(); ?>
-                          <input type="hidden" name="_action" value="toggle_status" />
-                          <input type="hidden" name="vehicle_id" value="<?= (int) $vehicle['id']; ?>" />
-                          <input type="hidden" name="next_active" value="<?= ((int) $vehicle['is_active'] === 1) ? '0' : '1'; ?>" />
-                          <button type="submit" class="btn btn-sm btn-outline-primary">
-                            <?= ((int) $vehicle['is_active'] === 1) ? 'Deactivate' : 'Activate'; ?>
-                          </button>
-                        </form>
-                      </td>
-                    <?php endif; ?>
                   </tr>
                 <?php endforeach; ?>
               <?php endif; ?>
@@ -321,6 +563,41 @@ require_once __DIR__ . '/../../includes/sidebar.php';
           </table>
         </div>
       </div>
+
+      <?php if ($historyVehicleId > 0): ?>
+        <div class="card mt-3">
+          <div class="card-header d-flex justify-content-between align-items-center">
+            <h3 class="card-title mb-0">Vehicle History #<?= (int) $historyVehicleId; ?></h3>
+            <a class="btn btn-sm btn-outline-secondary" href="<?= e(url('modules/vehicles/index.php')); ?>">Close</a>
+          </div>
+          <div class="card-body table-responsive p-0">
+            <table class="table table-sm table-striped mb-0">
+              <thead>
+                <tr>
+                  <th>When</th>
+                  <th>Action</th>
+                  <th>Note</th>
+                  <th>By</th>
+                </tr>
+              </thead>
+              <tbody>
+                <?php if (empty($vehicleHistory)): ?>
+                  <tr><td colspan="4" class="text-center text-muted py-4">No history found.</td></tr>
+                <?php else: ?>
+                  <?php foreach ($vehicleHistory as $history): ?>
+                    <tr>
+                      <td><?= e((string) $history['created_at']); ?></td>
+                      <td><span class="badge text-bg-secondary"><?= e((string) $history['action_type']); ?></span></td>
+                      <td><?= e((string) ($history['action_note'] ?? '-')); ?></td>
+                      <td><?= e((string) ($history['created_by_name'] ?? '-')); ?></td>
+                    </tr>
+                  <?php endforeach; ?>
+                <?php endif; ?>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      <?php endif; ?>
     </div>
   </div>
 </main>
