@@ -42,6 +42,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $action = (string) ($_POST['_action'] ?? '');
 
     if ($action === 'create_invoice' && $canManage) {
+        if (!has_permission('job.view')) {
+            flash_set('billing_error', 'You do not have permission to bill against job cards.', 'danger');
+            redirect('modules/billing/index.php');
+        }
+
         $jobCardId = post_int('job_card_id');
         $serviceGstRate = (float) ($_POST['service_gst_rate'] ?? 18);
         $isInterstate = post_int('is_interstate', 0) === 1 ? 1 : 0;
@@ -63,6 +68,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                  WHERE jc.id = :job_id
                    AND jc.company_id = :company_id
                    AND jc.garage_id = :garage_id
+                   AND jc.status_code <> "DELETED"
                  FOR UPDATE'
             );
             $jobStmt->execute([
@@ -74,6 +80,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
             if (!$job) {
                 throw new RuntimeException('Job card not found.');
+            }
+
+            $billableStatuses = ['READY_FOR_DELIVERY', 'COMPLETED', 'CLOSED'];
+            if (!in_array((string) $job['status'], $billableStatuses, true)) {
+                throw new RuntimeException('Only READY_FOR_DELIVERY, COMPLETED, or CLOSED jobs can be billed.');
             }
 
             $existingInvoiceStmt = $pdo->prepare('SELECT id FROM invoices WHERE job_card_id = :job_id LIMIT 1');
@@ -225,7 +236,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 ]);
             }
 
-            if ((string) $job['status'] !== 'COMPLETED') {
+            if (!in_array((string) $job['status'], ['COMPLETED', 'CLOSED'], true)) {
                 $jobUpdate = $pdo->prepare('UPDATE job_cards SET status = "COMPLETED", completed_at = NOW(), updated_by = :updated_by WHERE id = :job_id');
                 $jobUpdate->execute([
                     'updated_by' => (int) $_SESSION['user_id'],
@@ -351,7 +362,8 @@ $eligibleJobsStmt = db()->prepare(
      LEFT JOIN invoices i ON i.job_card_id = jc.id
      WHERE jc.company_id = :company_id
        AND jc.garage_id = :garage_id
-       AND jc.status IN ("READY_FOR_DELIVERY", "COMPLETED")
+       AND jc.status_code <> "DELETED"
+       AND jc.status IN ("READY_FOR_DELIVERY", "COMPLETED", "CLOSED")
        AND i.id IS NULL
      ORDER BY jc.id DESC'
 );
