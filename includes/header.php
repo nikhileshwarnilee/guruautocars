@@ -94,7 +94,7 @@ $globalVehicleSearchApiUrl = $globalVehicleSearchEnabled ? url('modules/vehicles
                     <?= csrf_field(); ?>
                     <input type="hidden" name="_action" value="switch_garage" />
                     <input type="hidden" name="_redirect" value="<?= e($requestPathForRedirect); ?>" />
-                    <select class="form-select form-select-sm" name="garage_id" onchange="this.form.submit()">
+                    <select class="form-select form-select-sm" name="garage_id" onchange="if (this.form && typeof this.form.requestSubmit === 'function') { this.form.requestSubmit(); } else if (this.form) { this.form.submit(); }">
                       <?php foreach ($garages as $garage): ?>
                         <option value="<?= (int) $garage['id']; ?>" <?= ((int) $garage['id'] === $currentGarageId) ? 'selected' : ''; ?>>
                           <?= e((string) $garage['name']); ?>
@@ -125,14 +125,12 @@ $globalVehicleSearchApiUrl = $globalVehicleSearchEnabled ? url('modules/vehicles
           </ul>
         </div>
       </nav>
-      <?php if (!empty($flashMessages)): ?>
-        <div class="container-fluid mt-3">
-          <?php foreach ($flashMessages as $flash): ?>
-            <?php $type = in_array(($flash['type'] ?? 'info'), ['success', 'danger', 'warning', 'info'], true) ? $flash['type'] : 'info'; ?>
-            <div class="alert alert-<?= e($type); ?> alert-dismissible fade show" role="alert">
-              <?= e((string) ($flash['message'] ?? '')); ?>
-              <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
-            </div>
-          <?php endforeach; ?>
-        </div>
-      <?php endif; ?>
+      <?php $normalizedFlashMessages = flash_messages_normalize($flashMessages); ?>
+      <div id="gac-flash-container" class="container-fluid mt-3 <?= empty($normalizedFlashMessages) ? 'd-none' : ''; ?>" aria-live="polite">
+        <?php foreach ($normalizedFlashMessages as $flash): ?>
+          <div class="alert alert-<?= e((string) $flash['type']); ?> alert-dismissible fade show" role="alert">
+            <?= e((string) ($flash['message'] ?? '')); ?>
+            <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+          </div>
+        <?php endforeach; ?>
+      </div>

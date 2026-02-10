@@ -17,9 +17,78 @@ function url(string $path = ''): string
     return (APP_BASE_URL !== '' ? APP_BASE_URL : '') . '/' . $cleanPath;
 }
 
+function is_ajax_request(): bool
+{
+    $xmlHttpRequest = strtolower(trim((string) ($_SERVER['HTTP_X_REQUESTED_WITH'] ?? '')));
+    if ($xmlHttpRequest === 'xmlhttprequest') {
+        return true;
+    }
+
+    $acceptHeader = strtolower((string) ($_SERVER['HTTP_ACCEPT'] ?? ''));
+    if ($acceptHeader !== '' && str_contains($acceptHeader, 'application/json')) {
+        return true;
+    }
+
+    return false;
+}
+
+function ajax_json(array $payload, int $statusCode = 200): never
+{
+    if (!headers_sent()) {
+        http_response_code($statusCode);
+        header('Content-Type: application/json; charset=utf-8');
+        header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+        header('Pragma: no-cache');
+    }
+
+    echo json_encode($payload, JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
+function flash_messages_normalize(array $messages): array
+{
+    $normalized = [];
+    foreach ($messages as $message) {
+        if (!is_array($message)) {
+            continue;
+        }
+
+        $type = strtolower(trim((string) ($message['type'] ?? 'info')));
+        if (!in_array($type, ['success', 'danger', 'warning', 'info'], true)) {
+            $type = 'info';
+        }
+
+        $normalized[] = [
+            'message' => (string) ($message['message'] ?? ''),
+            'type' => $type,
+        ];
+    }
+
+    return $normalized;
+}
+
 function redirect(string $path): never
 {
-    header('Location: ' . url($path));
+    $location = url($path);
+
+    if (is_ajax_request()) {
+        $flashMessages = flash_messages_normalize(flash_pull_all());
+        $hasDanger = false;
+        foreach ($flashMessages as $message) {
+            if (($message['type'] ?? 'info') === 'danger') {
+                $hasDanger = true;
+                break;
+            }
+        }
+
+        ajax_json([
+            'ok' => !$hasDanger,
+            'redirect' => $location,
+            'flash' => $flashMessages,
+        ], $hasDanger ? 422 : 200);
+    }
+
+    header('Location: ' . $location);
     exit;
 }
 
@@ -78,6 +147,14 @@ function require_csrf(): void
 {
     $token = $_POST['_csrf'] ?? null;
     if (!verify_csrf_token(is_string($token) ? $token : null)) {
+        if (is_ajax_request()) {
+            ajax_json([
+                'ok' => false,
+                'message' => 'Your session token expired. Refresh and try again.',
+                'code' => 'CSRF_INVALID',
+            ], 419);
+        }
+
         http_response_code(419);
         exit('Invalid CSRF token.');
     }

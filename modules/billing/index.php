@@ -1128,19 +1128,9 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 
 <script>
   (function () {
-    var confirmForms = document.querySelectorAll('form[data-confirm]');
-    for (var i = 0; i < confirmForms.length; i++) {
-      confirmForms[i].addEventListener('submit', function (event) {
-        var message = this.getAttribute('data-confirm') || 'Are you sure?';
-        if (!window.confirm(message)) {
-          event.preventDefault();
-        }
-      });
-    }
-
     var cancelForms = document.querySelectorAll('.js-cancel-invoice-form');
-    for (var j = 0; j < cancelForms.length; j++) {
-      cancelForms[j].addEventListener('submit', function (event) {
+    for (var i = 0; i < cancelForms.length; i++) {
+      cancelForms[i].addEventListener('submit', function (event) {
         var reason = window.prompt('Cancellation reason is required for audit trail. Enter reason:');
         if (!reason || !reason.trim()) {
           event.preventDefault();

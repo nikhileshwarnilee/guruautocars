@@ -262,7 +262,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             <div class="card-body">
               <form method="get" class="row g-2 mb-3">
                 <div class="col-md-8">
-                  <select name="role_id" class="form-select" onchange="this.form.submit()">
+                  <select name="role_id" class="form-select" onchange="if (this.form && typeof this.form.requestSubmit === 'function') { this.form.requestSubmit(); } else if (this.form) { this.form.submit(); }">
                     <?php foreach ($roles as $role): ?>
                       <option value="<?= (int) $role['id']; ?>" <?= ((int) $role['id'] === $selectedRoleId) ? 'selected' : ''; ?>>
                         <?= e((string) $role['role_name']); ?> (<?= e((string) $role['role_key']); ?>)

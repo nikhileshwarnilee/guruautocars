@@ -40,6 +40,27 @@
   margin-bottom: 0.75rem;
 }
 
+.gac-form-status {
+  margin-bottom: 0.85rem;
+}
+
+.gac-form-loading {
+  position: relative;
+}
+
+.gac-form-loading::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: rgba(255, 255, 255, 0.45);
+  border-radius: 0.25rem;
+  pointer-events: none;
+}
+
+.gac-btn-spinner {
+  vertical-align: text-bottom;
+}
+
 .gac-global-search {
   position: relative;
   max-width: 640px;

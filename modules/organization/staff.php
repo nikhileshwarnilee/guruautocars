@@ -534,7 +534,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             <form method="get" class="row g-2 align-items-end">
               <div class="col-md-4">
                 <label class="form-label">Company Scope</label>
-                <select name="company_id" class="form-select" onchange="this.form.submit()">
+                <select name="company_id" class="form-select" onchange="if (this.form && typeof this.form.requestSubmit === 'function') { this.form.requestSubmit(); } else if (this.form) { this.form.submit(); }">
                   <?php foreach ($companyOptions as $company): ?>
                     <option value="<?= (int) $company['id']; ?>" <?= ((int) $company['id'] === $selectedCompanyId) ? 'selected' : ''; ?>>
                       <?= e((string) $company['name']); ?>

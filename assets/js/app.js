@@ -1,10 +1,15 @@
 document.addEventListener('DOMContentLoaded', function () {
+  gacBoot();
+});
+
+function gacBoot() {
   bindConfirmForms();
+  initAjaxFormEngine();
   initGlobalVehicleSearch();
   initSearchableSelects();
   initVehicleAttributeSelectors();
   initMasterInsightsFilters();
-});
+}
 
 function bindConfirmForms() {
   var dangerousForms = document.querySelectorAll('form[data-confirm]');
@@ -20,6 +25,598 @@ function bindConfirmForms() {
       }
     });
   }
+}
+
+function initAjaxFormEngine() {
+  if (!document.body || document.body.getAttribute('data-gac-ajax-form-init') === '1') {
+    return;
+  }
+  document.body.setAttribute('data-gac-ajax-form-init', '1');
+
+  document.addEventListener('submit', function (event) {
+    var form = event.target;
+    if (!form || form.tagName !== 'FORM') {
+      return;
+    }
+    if (event.defaultPrevented || !shouldAjaxifyForm(form)) {
+      return;
+    }
+
+    event.preventDefault();
+    if (form.getAttribute('data-gac-submitting') === '1') {
+      return;
+    }
+
+    var method = resolveFormMethod(form);
+    clearFormStatus(form);
+    clearFormFieldErrors(form);
+
+    if (!form.noValidate && typeof form.checkValidity === 'function' && !form.checkValidity()) {
+      form.classList.add('was-validated');
+      showFormStatus(form, 'Please correct the highlighted fields and retry.', 'danger');
+      if (typeof form.reportValidity === 'function') {
+        form.reportValidity();
+      }
+      return;
+    }
+
+    var submitter = event.submitter || null;
+    form.setAttribute('data-gac-submitting', '1');
+    setFormSubmittingState(form, submitter, true);
+
+    if (method === 'GET') {
+      var navigationUrl = buildGetFormUrl(form, submitter);
+      navigateWithinApp(navigationUrl, [])
+        .catch(function () {
+          window.location.assign(navigationUrl);
+        })
+        .then(function () {
+          form.removeAttribute('data-gac-submitting');
+          setFormSubmittingState(form, submitter, false);
+        });
+      return;
+    }
+
+    var actionUrl = resolveFormAction(form);
+    var formData = new FormData(form);
+    if (submitter && submitter.name) {
+      formData.append(submitter.name, submitter.value || '');
+    }
+
+    fetch(actionUrl, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: {
+        'X-Requested-With': 'XMLHttpRequest',
+        'Accept': 'application/json'
+      },
+      body: formData
+    })
+      .then(function (response) {
+        return response.text().then(function (text) {
+          return {
+            response: response,
+            payload: safeParseJson(text),
+            rawText: text
+          };
+        });
+      })
+      .then(function (result) {
+        var payload = result.payload || null;
+        var flashMessages = payload ? normalizeFlashMessages(payload.flash || payload.flashes || payload.messages || []) : [];
+        var flashRendered = false;
+        if (flashMessages.length > 0) {
+          flashRendered = renderFlashMessages(flashMessages);
+          if (!flashRendered) {
+            showFormStatus(form, flashMessages[0].message, flashMessages[0].type || 'info');
+          }
+        }
+
+        if (payload && payload.errors && typeof payload.errors === 'object') {
+          applyFieldErrors(form, payload.errors);
+          if (typeof payload.message === 'string' && payload.message.trim() !== '') {
+            showFormStatus(form, payload.message, 'danger');
+          } else {
+            showFormStatus(form, 'Please review the highlighted fields.', 'danger');
+          }
+        } else if (payload && typeof payload.message === 'string' && payload.message.trim() !== '') {
+          showFormStatus(form, payload.message, payload.ok === false ? 'danger' : 'success');
+        }
+
+        if (payload && typeof payload.redirect === 'string' && payload.redirect.trim() !== '') {
+          var destination = payload.redirect;
+          var sameDestination = isSameDestinationUrl(destination, window.location.href);
+
+          if (payload.ok === false && sameDestination) {
+            if (flashMessages.length === 0 && (!payload.message || String(payload.message).trim() === '')) {
+              showFormStatus(form, 'Unable to process the request. Please review and retry.', 'danger');
+            }
+            return;
+          }
+
+          return navigateWithinApp(destination, flashMessages).catch(function () {
+            window.location.assign(destination);
+          });
+        }
+
+        if (!payload) {
+          if (result.response && result.response.redirected && result.response.url) {
+            return navigateWithinApp(result.response.url, []).catch(function () {
+              window.location.assign(result.response.url);
+            });
+          }
+          showFormStatus(form, 'Unexpected server response. Please refresh and retry.', 'danger');
+          return;
+        }
+
+        if (payload.ok === false && flashMessages.length === 0 && (!payload.message || String(payload.message).trim() === '')) {
+          showFormStatus(form, 'Request failed. Please retry.', 'danger');
+          return;
+        }
+
+        if (payload.ok !== false && flashMessages.length === 0 && (!payload.message || String(payload.message).trim() === '')) {
+          showFormStatus(form, 'Saved successfully.', 'success');
+        }
+      })
+      .catch(function () {
+        showFormStatus(form, 'Network error. Please retry.', 'danger');
+      })
+      .then(function () {
+        form.removeAttribute('data-gac-submitting');
+        setFormSubmittingState(form, submitter, false);
+      });
+  });
+}
+
+function shouldAjaxifyForm(form) {
+  if (!form) {
+    return false;
+  }
+  if (form.getAttribute('data-no-ajax') === '1') {
+    return false;
+  }
+  if (form.getAttribute('data-ajax') === 'off' || form.getAttribute('data-ajax-form') === 'off') {
+    return false;
+  }
+  if (form.getAttribute('data-master-filter-form') === '1') {
+    return false;
+  }
+  if (form.getAttribute('data-inline-customer-form') === '1') {
+    return false;
+  }
+
+  var inlineOnSubmit = String(form.getAttribute('onsubmit') || '').toLowerCase();
+  if (inlineOnSubmit.indexOf('return false') >= 0) {
+    return false;
+  }
+
+  var method = resolveFormMethod(form);
+  if (method !== 'POST' && method !== 'GET') {
+    return false;
+  }
+
+  var target = String(form.getAttribute('target') || '').trim().toLowerCase();
+  if (target !== '' && target !== '_self') {
+    return false;
+  }
+
+  var action = String(form.getAttribute('action') || '').trim().toLowerCase();
+  if (action.indexOf('print_') >= 0) {
+    return false;
+  }
+  if (method === 'GET' && action.indexOf('download=1') >= 0) {
+    return false;
+  }
+
+  return true;
+}
+
+function resolveFormMethod(form) {
+  if (!form) {
+    return 'GET';
+  }
+  return String(form.getAttribute('method') || 'get').trim().toUpperCase();
+}
+
+function resolveFormAction(form) {
+  if (!form) {
+    return window.location.href;
+  }
+
+  var action = String(form.getAttribute('action') || '').trim();
+  return action !== '' ? action : window.location.href;
+}
+
+function buildGetFormUrl(form, submitter) {
+  var baseUrl = new URL(resolveFormAction(form), window.location.href);
+  var formData = new FormData(form);
+  if (submitter && submitter.name) {
+    formData.append(submitter.name, submitter.value || '');
+  }
+
+  var params = new URLSearchParams();
+  formData.forEach(function (value, key) {
+    if (typeof value !== 'string') {
+      return;
+    }
+    params.append(key, value);
+  });
+
+  baseUrl.search = params.toString();
+  return baseUrl.toString();
+}
+
+function setFormSubmittingState(form, submitter, isSubmitting) {
+  if (!form) {
+    return;
+  }
+
+  var submitButtons = form.querySelectorAll('button[type="submit"], input[type="submit"]');
+  var targetButton = submitter;
+  if (!targetButton || targetButton.form !== form) {
+    targetButton = submitButtons.length > 0 ? submitButtons[0] : null;
+  }
+
+  if (isSubmitting) {
+    form.classList.add('gac-form-loading');
+    form.setAttribute('aria-busy', 'true');
+
+    for (var index = 0; index < submitButtons.length; index++) {
+      var button = submitButtons[index];
+      button.setAttribute('data-gac-disabled-before', button.disabled ? '1' : '0');
+      button.disabled = true;
+
+      if (button !== targetButton) {
+        continue;
+      }
+
+      if (button.tagName === 'BUTTON') {
+        button.setAttribute('data-gac-original-html', button.innerHTML);
+        var loadingLabel = (button.getAttribute('data-loading-label') || button.textContent || 'Processing').trim();
+        if (loadingLabel === '') {
+          loadingLabel = 'Processing';
+        }
+        button.innerHTML = '<span class="spinner-border spinner-border-sm me-1 gac-btn-spinner" role="status" aria-hidden="true"></span>' + escapeHtml(loadingLabel) + '...';
+        button.setAttribute('data-gac-spinner-active', '1');
+      } else if (button.tagName === 'INPUT') {
+        button.setAttribute('data-gac-original-value', button.value);
+        button.value = 'Processing...';
+        button.setAttribute('data-gac-spinner-active', '1');
+      }
+    }
+    return;
+  }
+
+  form.classList.remove('gac-form-loading');
+  form.removeAttribute('aria-busy');
+
+  for (var buttonIndex = 0; buttonIndex < submitButtons.length; buttonIndex++) {
+    var submitButton = submitButtons[buttonIndex];
+    if (submitButton.getAttribute('data-gac-spinner-active') === '1') {
+      if (submitButton.tagName === 'BUTTON') {
+        submitButton.innerHTML = submitButton.getAttribute('data-gac-original-html') || submitButton.innerHTML;
+        submitButton.removeAttribute('data-gac-original-html');
+      } else if (submitButton.tagName === 'INPUT') {
+        submitButton.value = submitButton.getAttribute('data-gac-original-value') || submitButton.value;
+        submitButton.removeAttribute('data-gac-original-value');
+      }
+      submitButton.removeAttribute('data-gac-spinner-active');
+    }
+
+    var wasDisabled = submitButton.getAttribute('data-gac-disabled-before') === '1';
+    submitButton.disabled = wasDisabled;
+    submitButton.removeAttribute('data-gac-disabled-before');
+  }
+}
+
+function clearFormStatus(form) {
+  if (!form) {
+    return;
+  }
+
+  var statusNodes = form.querySelectorAll('[data-gac-form-status="1"]');
+  for (var index = 0; index < statusNodes.length; index++) {
+    statusNodes[index].remove();
+  }
+}
+
+function showFormStatus(form, message, type) {
+  var statusMessage = String(message || '').trim();
+  if (!form || statusMessage === '') {
+    return;
+  }
+
+  if (form.classList.contains('d-inline') || form.classList.contains('d-inline-flex')) {
+    renderFlashMessages([{ message: statusMessage, type: type || 'info' }]);
+    return;
+  }
+
+  clearFormStatus(form);
+  var alertType = normalizeAlertType(type || 'info');
+  var statusNode = document.createElement('div');
+  statusNode.className = 'alert alert-' + alertType + ' alert-dismissible fade show gac-form-status';
+  statusNode.setAttribute('data-gac-form-status', '1');
+  statusNode.setAttribute('role', 'alert');
+  statusNode.innerHTML = escapeHtml(statusMessage) + '<button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>';
+
+  form.insertBefore(statusNode, form.firstChild);
+}
+
+function clearFormFieldErrors(form) {
+  if (!form) {
+    return;
+  }
+
+  var invalidFields = form.querySelectorAll('[data-gac-invalid="1"]');
+  for (var index = 0; index < invalidFields.length; index++) {
+    invalidFields[index].classList.remove('is-invalid');
+    invalidFields[index].removeAttribute('data-gac-invalid');
+  }
+
+  var feedbackNodes = form.querySelectorAll('[data-gac-field-feedback="1"]');
+  for (var feedbackIndex = 0; feedbackIndex < feedbackNodes.length; feedbackIndex++) {
+    feedbackNodes[feedbackIndex].remove();
+  }
+}
+
+function applyFieldErrors(form, errors) {
+  if (!form || !errors || typeof errors !== 'object') {
+    return;
+  }
+
+  var fieldNames = Object.keys(errors);
+  var firstInvalidField = null;
+  for (var index = 0; index < fieldNames.length; index++) {
+    var fieldName = fieldNames[index];
+    var selector = '[name="' + cssEscapeSelector(fieldName) + '"]';
+    var fields = form.querySelectorAll(selector);
+    if (!fields || fields.length === 0) {
+      continue;
+    }
+
+    var rawMessage = errors[fieldName];
+    var message = '';
+    if (Array.isArray(rawMessage)) {
+      message = String(rawMessage[0] || '').trim();
+    } else {
+      message = String(rawMessage || '').trim();
+    }
+    if (message === '') {
+      message = 'Invalid value.';
+    }
+
+    for (var fieldIndex = 0; fieldIndex < fields.length; fieldIndex++) {
+      var field = fields[fieldIndex];
+      field.classList.add('is-invalid');
+      field.setAttribute('data-gac-invalid', '1');
+      if (!firstInvalidField) {
+        firstInvalidField = field;
+      }
+
+      if (fieldIndex > 0) {
+        continue;
+      }
+
+      var feedback = document.createElement('div');
+      feedback.className = 'invalid-feedback';
+      feedback.setAttribute('data-gac-field-feedback', '1');
+      feedback.textContent = message;
+
+      if (field.nextSibling) {
+        field.parentNode.insertBefore(feedback, field.nextSibling);
+      } else {
+        field.parentNode.appendChild(feedback);
+      }
+    }
+  }
+
+  if (firstInvalidField && typeof firstInvalidField.focus === 'function') {
+    firstInvalidField.focus();
+  }
+}
+
+function normalizeFlashMessages(rawMessages) {
+  var items = [];
+  if (Array.isArray(rawMessages)) {
+    items = rawMessages;
+  } else if (rawMessages && typeof rawMessages === 'object') {
+    items = Object.keys(rawMessages).map(function (key) {
+      return rawMessages[key];
+    });
+  } else if (typeof rawMessages === 'string' && rawMessages.trim() !== '') {
+    items = [{ message: rawMessages.trim(), type: 'info' }];
+  }
+
+  var normalized = [];
+  for (var index = 0; index < items.length; index++) {
+    var item = items[index];
+    if (!item) {
+      continue;
+    }
+
+    if (typeof item === 'string') {
+      if (item.trim() !== '') {
+        normalized.push({ message: item.trim(), type: 'info' });
+      }
+      continue;
+    }
+
+    var message = String(item.message || '').trim();
+    if (message === '') {
+      continue;
+    }
+
+    normalized.push({
+      message: message,
+      type: normalizeAlertType(item.type || 'info')
+    });
+  }
+
+  return normalized;
+}
+
+function renderFlashMessages(messages) {
+  var container = document.getElementById('gac-flash-container');
+  if (!container) {
+    return false;
+  }
+
+  var normalizedMessages = normalizeFlashMessages(messages);
+  container.innerHTML = '';
+
+  if (normalizedMessages.length === 0) {
+    container.classList.add('d-none');
+    return true;
+  }
+
+  container.classList.remove('d-none');
+  for (var index = 0; index < normalizedMessages.length; index++) {
+    var message = normalizedMessages[index];
+    var alert = document.createElement('div');
+    alert.className = 'alert alert-' + normalizeAlertType(message.type) + ' alert-dismissible fade show';
+    alert.setAttribute('role', 'alert');
+    alert.innerHTML = escapeHtml(message.message) + '<button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>';
+    container.appendChild(alert);
+  }
+  return true;
+}
+
+function navigateWithinApp(url, flashMessages) {
+  var destination;
+  try {
+    destination = new URL(String(url || ''), window.location.href);
+  } catch (error) {
+    return Promise.reject(error);
+  }
+
+  if (destination.origin !== window.location.origin) {
+    return Promise.reject(new Error('Cross-origin navigation not supported for AJAX-first flow.'));
+  }
+
+  return fetch(destination.toString(), {
+    credentials: 'same-origin'
+  })
+    .then(function (response) {
+      return response.text().then(function (html) {
+        return {
+          response: response,
+          html: html
+        };
+      });
+    })
+    .then(function (result) {
+      if (!replaceAppWrapperFromHtml(result.html)) {
+        throw new Error('Unable to replace app wrapper.');
+      }
+
+      var finalUrl = result.response && result.response.url
+        ? String(result.response.url)
+        : destination.toString();
+
+      if (window.history && typeof window.history.replaceState === 'function') {
+        window.history.replaceState({}, '', finalUrl);
+      }
+
+      if (flashMessages && flashMessages.length > 0) {
+        renderFlashMessages(flashMessages);
+      }
+
+      gacBoot();
+      window.scrollTo(0, 0);
+      return true;
+    });
+}
+
+function replaceAppWrapperFromHtml(html) {
+  var markup = String(html || '');
+  if (markup.trim() === '') {
+    return false;
+  }
+
+  var parser = new DOMParser();
+  var parsedDocument = parser.parseFromString(markup, 'text/html');
+  var incomingWrapper = parsedDocument.querySelector('.app-wrapper');
+  var currentWrapper = document.querySelector('.app-wrapper');
+  if (!incomingWrapper || !currentWrapper) {
+    return false;
+  }
+
+  currentWrapper.innerHTML = incomingWrapper.innerHTML;
+  if (parsedDocument.title && parsedDocument.title.trim() !== '') {
+    document.title = parsedDocument.title.trim();
+  }
+
+  executeScriptsInContainer(currentWrapper);
+  return true;
+}
+
+function executeScriptsInContainer(container) {
+  if (!container) {
+    return;
+  }
+
+  var scripts = container.querySelectorAll('script');
+  for (var index = 0; index < scripts.length; index++) {
+    var script = scripts[index];
+    var scriptType = String(script.getAttribute('type') || '').trim().toLowerCase();
+    if (scriptType !== '' && scriptType !== 'text/javascript' && scriptType !== 'application/javascript' && scriptType !== 'module') {
+      continue;
+    }
+
+    var replacement = document.createElement('script');
+    for (var attrIndex = 0; attrIndex < script.attributes.length; attrIndex++) {
+      var attribute = script.attributes[attrIndex];
+      replacement.setAttribute(attribute.name, attribute.value);
+    }
+    replacement.text = script.text || '';
+    script.parentNode.replaceChild(replacement, script);
+  }
+}
+
+function safeParseJson(text) {
+  var payload = null;
+  try {
+    payload = JSON.parse(String(text || ''));
+  } catch (error) {
+    payload = null;
+  }
+  return payload;
+}
+
+function isSameDestinationUrl(left, right) {
+  try {
+    var leftUrl = new URL(String(left || ''), window.location.href);
+    var rightUrl = new URL(String(right || ''), window.location.href);
+    return leftUrl.origin === rightUrl.origin
+      && leftUrl.pathname === rightUrl.pathname
+      && leftUrl.search === rightUrl.search;
+  } catch (error) {
+    return false;
+  }
+}
+
+function normalizeAlertType(type) {
+  var value = String(type || '').trim().toLowerCase();
+  if (value === 'success' || value === 'danger' || value === 'warning' || value === 'info') {
+    return value;
+  }
+  return 'info';
+}
+
+function cssEscapeSelector(value) {
+  if (window.CSS && typeof window.CSS.escape === 'function') {
+    return window.CSS.escape(String(value || ''));
+  }
+  return String(value || '').replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+}
+
+function escapeHtml(value) {
+  return String(value || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 function initGlobalVehicleSearch() {
