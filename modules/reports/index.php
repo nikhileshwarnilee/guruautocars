@@ -191,6 +191,54 @@ $avgCompletionStmt = db()->prepare(
 $avgCompletionStmt->execute($avgCompletionParams);
 $avgCompletion = $avgCompletionStmt->fetch() ?: ['closed_jobs' => 0, 'avg_hours' => 0];
 
+$estimateConversion = [
+    'draft_count' => 0,
+    'approved_count' => 0,
+    'rejected_count' => 0,
+    'converted_count' => 0,
+    'total_count' => 0,
+    'approved_pool' => 0,
+    'conversion_ratio' => 0.0,
+];
+$estimateStatusRows = [];
+
+if (table_columns('estimates') !== []) {
+    $estimateParams = ['company_id' => $companyId, 'from_date' => $fromDate, 'to_date' => $toDate];
+    $estimateScopeSql = analytics_garage_scope_sql('e.garage_id', $selectedGarageId, $garageIds, $estimateParams, 'estimate_scope');
+    $estimateStmt = db()->prepare(
+        'SELECT
+            SUM(CASE WHEN e.estimate_status = "DRAFT" THEN 1 ELSE 0 END) AS draft_count,
+            SUM(CASE WHEN e.estimate_status = "APPROVED" THEN 1 ELSE 0 END) AS approved_count,
+            SUM(CASE WHEN e.estimate_status = "REJECTED" THEN 1 ELSE 0 END) AS rejected_count,
+            SUM(CASE WHEN e.estimate_status = "CONVERTED" THEN 1 ELSE 0 END) AS converted_count,
+            COUNT(*) AS total_count
+         FROM estimates e
+         WHERE e.company_id = :company_id
+           AND e.status_code = "ACTIVE"
+           ' . $estimateScopeSql . '
+           AND DATE(e.created_at) BETWEEN :from_date AND :to_date'
+    );
+    $estimateStmt->execute($estimateParams);
+    $estimateRow = $estimateStmt->fetch() ?: [];
+
+    $estimateConversion['draft_count'] = (int) ($estimateRow['draft_count'] ?? 0);
+    $estimateConversion['approved_count'] = (int) ($estimateRow['approved_count'] ?? 0);
+    $estimateConversion['rejected_count'] = (int) ($estimateRow['rejected_count'] ?? 0);
+    $estimateConversion['converted_count'] = (int) ($estimateRow['converted_count'] ?? 0);
+    $estimateConversion['total_count'] = (int) ($estimateRow['total_count'] ?? 0);
+    $estimateConversion['approved_pool'] = $estimateConversion['approved_count'] + $estimateConversion['converted_count'];
+    $estimateConversion['conversion_ratio'] = $estimateConversion['approved_pool'] > 0
+        ? round(($estimateConversion['converted_count'] * 100) / $estimateConversion['approved_pool'], 2)
+        : 0.0;
+
+    $estimateStatusRows = [
+        ['status' => 'DRAFT', 'total' => $estimateConversion['draft_count']],
+        ['status' => 'APPROVED', 'total' => $estimateConversion['approved_count']],
+        ['status' => 'REJECTED', 'total' => $estimateConversion['rejected_count']],
+        ['status' => 'CONVERTED', 'total' => $estimateConversion['converted_count']],
+    ];
+}
+
 $mechanicParams = ['company_id' => $companyId, 'from_date' => $fromDate, 'to_date' => $toDate];
 $mechanicScopeSql = analytics_garage_scope_sql('jc.garage_id', $selectedGarageId, $garageIds, $mechanicParams, 'mechanic_scope');
 $mechanicStmt = db()->prepare(
@@ -816,6 +864,9 @@ $avgCompletionHours = (float) ($avgCompletion['avg_hours'] ?? 0);
 $repeatCustomerCount = count($repeatCustomers);
 $totalStockValue = array_reduce($stockValuationRows, static fn (float $sum, array $row): float => $sum + (float) ($row['stock_value'] ?? 0), 0.0);
 $totalOutstanding = array_reduce($outstandingReceivables, static fn (float $sum, array $row): float => $sum + (float) ($row['outstanding_amount'] ?? 0), 0.0);
+$estimateTotalCount = (int) ($estimateConversion['total_count'] ?? 0);
+$estimateApprovedPool = (int) ($estimateConversion['approved_pool'] ?? 0);
+$estimateConversionRatio = (float) ($estimateConversion['conversion_ratio'] ?? 0);
 
 $exportKey = trim((string) ($_GET['export'] ?? ''));
 if ($exportKey !== '') {
@@ -833,6 +884,24 @@ if ($exportKey !== '') {
         case 'mechanic_productivity':
             $rows = array_map(static fn (array $row): array => [$row['mechanic_name'], (int) ($row['assigned_jobs'] ?? 0), (int) ($row['closed_jobs'] ?? 0), (float) ($row['avg_close_hours'] ?? 0)], $mechanicRows);
             reports_csv_download('mechanic_productivity_' . $timestamp . '.csv', ['Mechanic', 'Assigned Jobs', 'Closed Jobs', 'Avg Close Hours'], $rows);
+
+        case 'estimate_conversion':
+            $rows = [
+                [
+                    (int) ($estimateConversion['total_count'] ?? 0),
+                    (int) ($estimateConversion['draft_count'] ?? 0),
+                    (int) ($estimateConversion['approved_count'] ?? 0),
+                    (int) ($estimateConversion['rejected_count'] ?? 0),
+                    (int) ($estimateConversion['converted_count'] ?? 0),
+                    (int) ($estimateConversion['approved_pool'] ?? 0),
+                    (float) ($estimateConversion['conversion_ratio'] ?? 0),
+                ],
+            ];
+            reports_csv_download(
+                'estimate_conversion_' . $timestamp . '.csv',
+                ['Total Estimates', 'Draft', 'Approved', 'Rejected', 'Converted', 'Approved Pool', 'Conversion Ratio %'],
+                $rows
+            );
 
         case 'repeat_customers':
             $rows = array_map(static fn (array $row): array => [$row['full_name'], $row['phone'], (int) ($row['service_count'] ?? 0), $row['last_service_at']], $repeatCustomers);
@@ -1073,6 +1142,12 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       </div>
 
       <div class="row g-3 mb-3">
+        <div class="col-md-4"><div class="info-box"><span class="info-box-icon text-bg-secondary"><i class="bi bi-file-earmark-text"></i></span><div class="info-box-content"><span class="info-box-text">Estimates Created</span><span class="info-box-number"><?= number_format($estimateTotalCount); ?></span></div></div></div>
+        <div class="col-md-4"><div class="info-box"><span class="info-box-icon text-bg-success"><i class="bi bi-check2-square"></i></span><div class="info-box-content"><span class="info-box-text">Approved Pool</span><span class="info-box-number"><?= number_format($estimateApprovedPool); ?></span></div></div></div>
+        <div class="col-md-4"><div class="info-box"><span class="info-box-icon text-bg-primary"><i class="bi bi-arrow-left-right"></i></span><div class="info-box-content"><span class="info-box-text">Estimate Conversion %</span><span class="info-box-number"><?= e(number_format($estimateConversionRatio, 2)); ?>%</span></div></div></div>
+      </div>
+
+      <div class="row g-3 mb-3">
         <div class="col-md-4"><div class="info-box"><span class="info-box-icon text-bg-warning"><i class="bi bi-tools"></i></span><div class="info-box-content"><span class="info-box-text">Outsourced Lines</span><span class="info-box-number"><?= number_format((int) ($outsourcePayableTotals['line_count'] ?? 0)); ?></span></div></div></div>
         <div class="col-md-4"><div class="info-box"><span class="info-box-icon text-bg-danger"><i class="bi bi-cash-stack"></i></span><div class="info-box-content"><span class="info-box-text">Outsource Payable (Unpaid)</span><span class="info-box-number"><?= e(format_currency((float) ($outsourcePayableTotals['unpaid_total'] ?? 0))); ?></span></div></div></div>
         <div class="col-md-4"><div class="info-box"><span class="info-box-icon text-bg-success"><i class="bi bi-cash-coin"></i></span><div class="info-box-content"><span class="info-box-text">Outsource Paid</span><span class="info-box-number"><?= e(format_currency((float) ($outsourcePayableTotals['paid_total'] ?? 0))); ?></span></div></div></div>
@@ -1156,6 +1231,45 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                   <?php endforeach; endif; ?>
                 </tbody>
               </table>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card mb-3">
+        <div class="card-header d-flex justify-content-between align-items-center">
+          <h3 class="card-title mb-0">Estimate Conversion Reports</h3>
+          <a href="<?= e(reports_export_url($exportBaseParams, 'estimate_conversion')); ?>" class="btn btn-sm btn-outline-primary">CSV</a>
+        </div>
+        <div class="card-body row g-3">
+          <div class="col-lg-6">
+            <div class="table-responsive">
+              <table class="table table-striped mb-0">
+                <thead><tr><th>Status</th><th>Total</th></tr></thead>
+                <tbody>
+                  <?php if (empty($estimateStatusRows)): ?>
+                    <tr><td colspan="2" class="text-center text-muted py-4">Estimate module data not available.</td></tr>
+                  <?php else: ?>
+                    <?php foreach ($estimateStatusRows as $row): ?>
+                      <tr><td><?= e((string) $row['status']); ?></td><td><?= (int) ($row['total'] ?? 0); ?></td></tr>
+                    <?php endforeach; ?>
+                  <?php endif; ?>
+                </tbody>
+              </table>
+            </div>
+          </div>
+          <div class="col-lg-6">
+            <div class="card card-outline card-primary h-100 mb-0">
+              <div class="card-body">
+                <div class="mb-2"><strong>Total Estimates:</strong> <?= number_format($estimateTotalCount); ?></div>
+                <div class="mb-2"><strong>Approved Pool:</strong> <?= number_format($estimateApprovedPool); ?> (APPROVED + CONVERTED)</div>
+                <div class="mb-2"><strong>Converted:</strong> <?= number_format((int) ($estimateConversion['converted_count'] ?? 0)); ?></div>
+                <div class="mb-2"><strong>Conversion Ratio:</strong> <?= e(number_format($estimateConversionRatio, 2)); ?>%</div>
+                <div class="progress progress-sm mt-3">
+                  <div class="progress-bar bg-primary" style="width: <?= e((string) max(0, min(100, $estimateConversionRatio))); ?>%"></div>
+                </div>
+                <small class="text-muted">Ratio = Converted / (Approved + Converted)</small>
+              </div>
             </div>
           </div>
         </div>

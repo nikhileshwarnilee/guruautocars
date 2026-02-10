@@ -1280,6 +1280,11 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         </div>
         <div class="col-sm-4 text-sm-end">
           <a href="<?= e(url('modules/jobs/index.php')); ?>" class="btn btn-outline-secondary btn-sm">Back to Jobs</a>
+          <?php if ((int) ($job['estimate_id'] ?? 0) > 0): ?>
+            <a href="<?= e(url('modules/estimates/view.php?id=' . (int) $job['estimate_id'])); ?>" class="btn btn-info btn-sm">
+              Source Estimate
+            </a>
+          <?php endif; ?>
           <?php if ($invoice): ?>
             <a href="<?= e(url('modules/billing/print_invoice.php?id=' . (int) $invoice['id'])); ?>" class="btn btn-success btn-sm" target="_blank">
               Invoice <?= e((string) $invoice['invoice_number']); ?> (<?= e((string) ($invoice['invoice_status'] ?? '')); ?>)

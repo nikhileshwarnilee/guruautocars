@@ -254,6 +254,15 @@ $isVisOpen = is_menu_group_open('vis.', $activeMenu);
           </li>
         <?php endif; ?>
 
+        <?php if (has_permission('estimate.view')): ?>
+          <li class="nav-item">
+            <a href="<?= e(url('modules/estimates/index.php')); ?>" class="nav-link <?= e(is_active_menu('estimates', $activeMenu)); ?>">
+              <i class="nav-icon bi bi-file-earmark-text"></i>
+              <p>Estimates</p>
+            </a>
+          </li>
+        <?php endif; ?>
+
         <?php if (has_permission('billing.view') || has_permission('invoice.view')): ?>
           <li class="nav-item">
             <a href="<?= e(url('modules/billing/index.php')); ?>" class="nav-link <?= e(is_active_menu('billing', $activeMenu)); ?>">

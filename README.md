@@ -25,6 +25,7 @@ Core PHP + MySQL + AdminLTE based ERP for Indian multi-branch garage operations.
    - `mysql -u root guruautocars < database/job_card_advanced_flow_upgrade.sql`
    - `mysql -u root guruautocars < database/inventory_intelligence_upgrade.sql`
    - `mysql -u root guruautocars < database/purchase_module_upgrade.sql`
+   - `mysql -u root guruautocars < database/estimate_module_upgrade.sql`
    - `mysql -u root guruautocars < database/temporary_stock_management_upgrade.sql`
    - `mysql -u root guruautocars < database/billing_gst_intelligence_upgrade.sql`
    - `mysql -u root guruautocars < database/reports_dashboard_analytics_upgrade.sql`
@@ -37,6 +38,7 @@ Core PHP + MySQL + AdminLTE based ERP for Indian multi-branch garage operations.
 - Organization (Companies, Garages, Staff)
 - Customers
 - Vehicles
+- Estimates (Draft -> Approved/Rejected -> Converted)
 - Job Cards
 - Inventory
 - Purchases (Vendor + Unassigned Purchase flow)
