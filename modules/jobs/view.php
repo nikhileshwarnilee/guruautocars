@@ -852,12 +852,18 @@ $partsTotal = (float) ($totals['parts_total'] ?? 0);
 $estimatedTotal = round($laborTotal + $partsTotal, 2);
 
 $invoiceStmt = db()->prepare(
-    'SELECT id, invoice_number, grand_total, payment_status
+    'SELECT id, invoice_number, grand_total, payment_status, invoice_status
      FROM invoices
      WHERE job_card_id = :job_id
+       AND company_id = :company_id
+       AND garage_id = :garage_id
      LIMIT 1'
 );
-$invoiceStmt->execute(['job_id' => $jobId]);
+$invoiceStmt->execute([
+    'job_id' => $jobId,
+    'company_id' => $companyId,
+    'garage_id' => $garageId,
+]);
 $invoice = $invoiceStmt->fetch() ?: null;
 
 $nextStatuses = [];
@@ -905,7 +911,9 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         <div class="col-sm-4 text-sm-end">
           <a href="<?= e(url('modules/jobs/index.php')); ?>" class="btn btn-outline-secondary btn-sm">Back to Jobs</a>
           <?php if ($invoice): ?>
-            <a href="<?= e(url('modules/billing/print_invoice.php?id=' . (int) $invoice['id'])); ?>" class="btn btn-success btn-sm" target="_blank">Invoice <?= e((string) $invoice['invoice_number']); ?></a>
+            <a href="<?= e(url('modules/billing/print_invoice.php?id=' . (int) $invoice['id'])); ?>" class="btn btn-success btn-sm" target="_blank">
+              Invoice <?= e((string) $invoice['invoice_number']); ?> (<?= e((string) ($invoice['invoice_status'] ?? '')); ?>)
+            </a>
           <?php endif; ?>
         </div>
       </div>

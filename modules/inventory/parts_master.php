@@ -102,15 +102,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             if ($openingStock > 0) {
                 $movementStmt = $pdo->prepare(
                     'INSERT INTO inventory_movements
-                      (company_id, garage_id, part_id, movement_type, quantity, reference_type, notes, created_by)
+                      (company_id, garage_id, part_id, movement_type, quantity, reference_type, movement_uid, notes, created_by)
                      VALUES
-                      (:company_id, :garage_id, :part_id, "IN", :quantity, "OPENING", :notes, :created_by)'
+                      (:company_id, :garage_id, :part_id, "IN", :quantity, "OPENING", :movement_uid, :notes, :created_by)'
                 );
                 $movementStmt->execute([
                     'company_id' => $companyId,
                     'garage_id' => $garageId,
                     'part_id' => $partId,
                     'quantity' => $openingStock,
+                    'movement_uid' => sprintf('opening-%d-%d-%d', $companyId, $garageId, $partId),
                     'notes' => 'Opening stock from parts master',
                     'created_by' => (int) $_SESSION['user_id'],
                 ]);

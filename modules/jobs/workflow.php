@@ -239,7 +239,7 @@ function job_post_inventory_on_close(int $jobId, int $companyId, int $garageId, 
 
     try {
         $jobStmt = $pdo->prepare(
-            'SELECT id, stock_posted_at
+            'SELECT id, status, status_code, stock_posted_at
              FROM job_cards
              WHERE id = :id
                AND company_id = :company_id
@@ -255,6 +255,16 @@ function job_post_inventory_on_close(int $jobId, int $companyId, int $garageId, 
 
         if (!$job) {
             throw new RuntimeException('Job card not found for inventory posting.');
+        }
+
+        if ((string) ($job['status_code'] ?? 'ACTIVE') !== 'ACTIVE') {
+            $pdo->commit();
+            return ['warnings' => [], 'posted' => false];
+        }
+
+        if ((string) ($job['status'] ?? '') === 'CANCELLED') {
+            $pdo->commit();
+            return ['warnings' => [], 'posted' => false];
         }
 
         if (!empty($job['stock_posted_at'])) {
@@ -290,9 +300,9 @@ function job_post_inventory_on_close(int $jobId, int $companyId, int $garageId, 
         );
         $movementStmt = $pdo->prepare(
             'INSERT INTO inventory_movements
-              (company_id, garage_id, part_id, movement_type, quantity, reference_type, reference_id, notes, created_by)
+              (company_id, garage_id, part_id, movement_type, quantity, reference_type, reference_id, movement_uid, notes, created_by)
              VALUES
-              (:company_id, :garage_id, :part_id, "OUT", :quantity, "JOB_CARD", :reference_id, :notes, :created_by)'
+              (:company_id, :garage_id, :part_id, "OUT", :quantity, "JOB_CARD", :reference_id, :movement_uid, :notes, :created_by)'
         );
 
         foreach ($partLines as $line) {
@@ -341,6 +351,7 @@ function job_post_inventory_on_close(int $jobId, int $companyId, int $garageId, 
                 'part_id' => $partId,
                 'quantity' => $requiredQty,
                 'reference_id' => $jobId,
+                'movement_uid' => sprintf('jobclose-%d-%d', $jobId, $partId),
                 'notes' => 'Auto posted on CLOSE for Job Card #' . $jobId,
                 'created_by' => $actorUserId,
             ]);

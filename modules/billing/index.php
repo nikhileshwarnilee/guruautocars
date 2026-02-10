@@ -3,58 +3,64 @@ declare(strict_types=1);
 
 require_once __DIR__ . '/../../includes/app.php';
 require_login();
-require_permission('invoice.view');
+require_once __DIR__ . '/workflow.php';
 
+if (!billing_can_view()) {
+    flash_set('access_denied', 'You do not have permission to access billing.', 'danger');
+    redirect('dashboard.php');
+}
 $page_title = 'Billing & Invoices';
 $active_menu = 'billing';
 $companyId = active_company_id();
 $garageId = active_garage_id();
+$userId = (int) ($_SESSION['user_id'] ?? 0);
 
-$canManage = has_permission('invoice.manage');
-$canPay = has_permission('invoice.pay');
+$canCreate = billing_can_create();
+$canFinalize = billing_can_finalize();
+$canCancel = billing_can_cancel();
+$canPay = billing_can_pay();
 
-function generate_invoice_number(PDO $pdo, int $garageId): string
+function billing_parse_date(?string $date): ?string
 {
-    $counterStmt = $pdo->prepare('SELECT prefix, current_number FROM invoice_counters WHERE garage_id = :garage_id FOR UPDATE');
-    $counterStmt->execute(['garage_id' => $garageId]);
-    $counter = $counterStmt->fetch();
-
-    if (!$counter) {
-        $insertCounter = $pdo->prepare('INSERT INTO invoice_counters (garage_id, prefix, current_number) VALUES (:garage_id, "INV", 5000)');
-        $insertCounter->execute(['garage_id' => $garageId]);
-        $counter = ['prefix' => 'INV', 'current_number' => 5000];
+    $date = trim((string) $date);
+    if ($date === '') {
+        return null;
     }
 
-    $nextNumber = ((int) $counter['current_number']) + 1;
+    if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $date)) {
+        return null;
+    }
 
-    $updateStmt = $pdo->prepare('UPDATE invoice_counters SET current_number = :current_number WHERE garage_id = :garage_id');
-    $updateStmt->execute([
-        'current_number' => $nextNumber,
-        'garage_id' => $garageId,
-    ]);
+    [$year, $month, $day] = array_map('intval', explode('-', $date));
+    if (!checkdate($month, $day, $year)) {
+        return null;
+    }
 
-    $prefix = (string) $counter['prefix'];
-    return sprintf('%s-%s-%05d', $prefix, date('ym'), $nextNumber);
+    return $date;
+}
+
+function billing_snapshot_value(array $snapshot, string $section, string $key): string
+{
+    $value = $snapshot[$section][$key] ?? null;
+    return is_string($value) ? $value : '';
 }
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     require_csrf();
     $action = (string) ($_POST['_action'] ?? '');
 
-    if ($action === 'create_invoice' && $canManage) {
+    if ($action === 'create_invoice' && $canCreate) {
         if (!has_permission('job.view')) {
             flash_set('billing_error', 'You do not have permission to bill against job cards.', 'danger');
             redirect('modules/billing/index.php');
         }
 
         $jobCardId = post_int('job_card_id');
-        $serviceGstRate = (float) ($_POST['service_gst_rate'] ?? 18);
-        $isInterstate = post_int('is_interstate', 0) === 1 ? 1 : 0;
-        $dueDateInput = post_string('due_date', 10);
+        $dueDate = billing_parse_date((string) ($_POST['due_date'] ?? ''));
         $notes = post_string('notes', 1000);
 
         if ($jobCardId <= 0) {
-            flash_set('billing_error', 'Select a job card.', 'danger');
+            flash_set('billing_error', 'Select a closed job card.', 'danger');
             redirect('modules/billing/index.php');
         }
 
@@ -63,12 +69,30 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         try {
             $jobStmt = $pdo->prepare(
-                'SELECT jc.id, jc.customer_id, jc.vehicle_id, jc.status
+                'SELECT jc.id, jc.job_number, jc.customer_id, jc.vehicle_id, jc.status, jc.status_code, jc.closed_at,
+                        cu.full_name AS customer_name, cu.phone AS customer_phone, cu.gstin AS customer_gstin,
+                        cu.address_line1 AS customer_address_line1, cu.address_line2 AS customer_address_line2,
+                        cu.city AS customer_city, cu.state AS customer_state, cu.pincode AS customer_pincode,
+                        v.registration_no, v.brand, v.model, v.variant, v.fuel_type, v.model_year,
+                        g.name AS garage_name, g.code AS garage_code, g.gstin AS garage_gstin,
+                        g.address_line1 AS garage_address_line1, g.address_line2 AS garage_address_line2,
+                        g.city AS garage_city, g.state AS garage_state, g.pincode AS garage_pincode,
+                        c.name AS company_name, c.legal_name AS company_legal_name, c.gstin AS company_gstin,
+                        c.address_line1 AS company_address_line1, c.address_line2 AS company_address_line2,
+                        c.city AS company_city, c.state AS company_state, c.pincode AS company_pincode
                  FROM job_cards jc
+                 INNER JOIN customers cu ON cu.id = jc.customer_id
+                 INNER JOIN vehicles v ON v.id = jc.vehicle_id
+                 INNER JOIN garages g ON g.id = jc.garage_id
+                 INNER JOIN companies c ON c.id = jc.company_id
                  WHERE jc.id = :job_id
                    AND jc.company_id = :company_id
                    AND jc.garage_id = :garage_id
-                   AND jc.status_code <> "DELETED"
+                   AND jc.status = "CLOSED"
+                   AND jc.status_code = "ACTIVE"
+                   AND (cu.status_code IS NULL OR cu.status_code <> "DELETED")
+                   AND (v.status_code IS NULL OR v.status_code <> "DELETED")
+                 LIMIT 1
                  FOR UPDATE'
             );
             $jobStmt->execute([
@@ -79,173 +103,404 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $job = $jobStmt->fetch();
 
             if (!$job) {
-                throw new RuntimeException('Job card not found.');
+                throw new RuntimeException('Invoice can be generated only from active CLOSED job cards in this garage.');
             }
 
-            $billableStatuses = ['READY_FOR_DELIVERY', 'COMPLETED', 'CLOSED'];
-            if (!in_array((string) $job['status'], $billableStatuses, true)) {
-                throw new RuntimeException('Only READY_FOR_DELIVERY, COMPLETED, or CLOSED jobs can be billed.');
-            }
-
-            $existingInvoiceStmt = $pdo->prepare('SELECT id FROM invoices WHERE job_card_id = :job_id LIMIT 1');
+            $existingInvoiceStmt = $pdo->prepare('SELECT id, invoice_number, invoice_status FROM invoices WHERE job_card_id = :job_id LIMIT 1 FOR UPDATE');
             $existingInvoiceStmt->execute(['job_id' => $jobCardId]);
-            if ($existingInvoiceStmt->fetch()) {
-                throw new RuntimeException('Invoice already exists for this job card.');
+            $existingInvoice = $existingInvoiceStmt->fetch();
+            if ($existingInvoice) {
+                throw new RuntimeException('Invoice already exists for this job card (' . (string) $existingInvoice['invoice_number'] . ').');
             }
 
-            $laborLinesStmt = $pdo->prepare('SELECT description, quantity, unit_price, total_amount FROM job_labor WHERE job_card_id = :job_id');
-            $laborLinesStmt->execute(['job_id' => $jobCardId]);
-            $laborLines = $laborLinesStmt->fetchAll();
+            $laborStmt = $pdo->prepare(
+                'SELECT jl.id, jl.service_id, jl.description, jl.quantity, jl.unit_price, jl.gst_rate,
+                        s.service_code
+                 FROM job_labor jl
+                 LEFT JOIN services s ON s.id = jl.service_id
+                 WHERE jl.job_card_id = :job_id
+                 ORDER BY jl.id ASC'
+            );
+            $laborStmt->execute(['job_id' => $jobCardId]);
+            $laborLines = $laborStmt->fetchAll();
 
-            $partLinesStmt = $pdo->prepare(
-                'SELECT jp.part_id, p.part_name, jp.quantity, jp.unit_price, jp.gst_rate, jp.total_amount
+            $partsStmt = $pdo->prepare(
+                'SELECT jp.id, jp.part_id, jp.quantity, jp.unit_price, jp.gst_rate,
+                        p.part_name, p.hsn_code
                  FROM job_parts jp
                  INNER JOIN parts p ON p.id = jp.part_id
-                 WHERE jp.job_card_id = :job_id'
+                 WHERE jp.job_card_id = :job_id
+                 ORDER BY jp.id ASC'
             );
-            $partLinesStmt->execute(['job_id' => $jobCardId]);
-            $partLines = $partLinesStmt->fetchAll();
+            $partsStmt->execute(['job_id' => $jobCardId]);
+            $partLines = $partsStmt->fetchAll();
 
-            $serviceSubtotal = 0.0;
+            if (empty($laborLines) && empty($partLines)) {
+                throw new RuntimeException('No labor or parts found for this job card.');
+            }
+
+            $taxRegime = billing_tax_regime((string) ($job['garage_state'] ?? ''), (string) ($job['customer_state'] ?? ''));
+
+            $invoiceLines = [];
             foreach ($laborLines as $line) {
-                $serviceSubtotal += (float) $line['total_amount'];
+                $description = trim((string) ($line['description'] ?? ''));
+                if ($description === '') {
+                    $description = 'Labor Line #' . (int) $line['id'];
+                }
+                $invoiceLines[] = billing_calculate_line(
+                    'LABOR',
+                    $description,
+                    null,
+                    (isset($line['service_id']) && (int) $line['service_id'] > 0) ? (int) $line['service_id'] : null,
+                    isset($line['service_code']) ? (string) $line['service_code'] : null,
+                    (float) $line['quantity'],
+                    (float) $line['unit_price'],
+                    (float) $line['gst_rate'],
+                    $taxRegime
+                );
             }
 
-            $partsSubtotal = 0.0;
-            $partsTaxTotal = 0.0;
             foreach ($partLines as $line) {
-                $lineTotal = (float) $line['total_amount'];
-                $lineRate = (float) $line['gst_rate'];
-                $partsSubtotal += $lineTotal;
-                $partsTaxTotal += ($lineTotal * $lineRate / 100);
+                $invoiceLines[] = billing_calculate_line(
+                    'PART',
+                    (string) $line['part_name'],
+                    (int) $line['part_id'],
+                    null,
+                    isset($line['hsn_code']) ? (string) $line['hsn_code'] : null,
+                    (float) $line['quantity'],
+                    (float) $line['unit_price'],
+                    (float) $line['gst_rate'],
+                    $taxRegime
+                );
             }
 
-            if ($serviceSubtotal <= 0 && $partsSubtotal <= 0) {
-                throw new RuntimeException('No labor or parts found for billing.');
+            $totals = billing_calculate_totals($invoiceLines);
+            if (((float) $totals['grand_total']) <= 0.0) {
+                throw new RuntimeException('Invoice total must be greater than zero.');
             }
 
-            $serviceTaxTotal = $serviceSubtotal * $serviceGstRate / 100;
-            $totalTaxAmount = $serviceTaxTotal + $partsTaxTotal;
-            $taxableAmount = $serviceSubtotal + $partsSubtotal;
-
-            $cgstRate = 0.0;
-            $sgstRate = 0.0;
-            $igstRate = 0.0;
-            $cgstAmount = 0.0;
-            $sgstAmount = 0.0;
-            $igstAmount = 0.0;
-
-            if ($isInterstate === 1) {
-                $igstRate = $serviceGstRate;
-                $igstAmount = round($totalTaxAmount, 2);
-            } else {
-                $cgstRate = round($serviceGstRate / 2, 2);
-                $sgstRate = round($serviceGstRate / 2, 2);
-                $cgstAmount = round($totalTaxAmount / 2, 2);
-                $sgstAmount = round($totalTaxAmount - $cgstAmount, 2);
-            }
-
-            $grossTotal = $taxableAmount + $totalTaxAmount;
-            $roundedTotal = round($grossTotal, 0);
-            $roundOff = round($roundedTotal - $grossTotal, 2);
-            $grandTotal = round($grossTotal + $roundOff, 2);
-
-            $invoiceNumber = generate_invoice_number($pdo, $garageId);
             $invoiceDate = date('Y-m-d');
-            $dueDate = $dueDateInput !== '' ? $dueDateInput : null;
+            $numberMeta = billing_generate_invoice_number($pdo, $companyId, $garageId, $invoiceDate);
+            $invoiceNumber = (string) $numberMeta['invoice_number'];
+
+            $snapshot = [
+                'company' => [
+                    'name' => (string) ($job['company_name'] ?? ''),
+                    'legal_name' => (string) ($job['company_legal_name'] ?? ''),
+                    'gstin' => (string) ($job['company_gstin'] ?? ''),
+                    'address_line1' => (string) ($job['company_address_line1'] ?? ''),
+                    'address_line2' => (string) ($job['company_address_line2'] ?? ''),
+                    'city' => (string) ($job['company_city'] ?? ''),
+                    'state' => (string) ($job['company_state'] ?? ''),
+                    'pincode' => (string) ($job['company_pincode'] ?? ''),
+                ],
+                'garage' => [
+                    'name' => (string) ($job['garage_name'] ?? ''),
+                    'code' => (string) ($job['garage_code'] ?? ''),
+                    'gstin' => (string) ($job['garage_gstin'] ?? ''),
+                    'address_line1' => (string) ($job['garage_address_line1'] ?? ''),
+                    'address_line2' => (string) ($job['garage_address_line2'] ?? ''),
+                    'city' => (string) ($job['garage_city'] ?? ''),
+                    'state' => (string) ($job['garage_state'] ?? ''),
+                    'pincode' => (string) ($job['garage_pincode'] ?? ''),
+                ],
+                'customer' => [
+                    'full_name' => (string) ($job['customer_name'] ?? ''),
+                    'phone' => (string) ($job['customer_phone'] ?? ''),
+                    'gstin' => (string) ($job['customer_gstin'] ?? ''),
+                    'address_line1' => (string) ($job['customer_address_line1'] ?? ''),
+                    'address_line2' => (string) ($job['customer_address_line2'] ?? ''),
+                    'city' => (string) ($job['customer_city'] ?? ''),
+                    'state' => (string) ($job['customer_state'] ?? ''),
+                    'pincode' => (string) ($job['customer_pincode'] ?? ''),
+                ],
+                'vehicle' => [
+                    'registration_no' => (string) ($job['registration_no'] ?? ''),
+                    'brand' => (string) ($job['brand'] ?? ''),
+                    'model' => (string) ($job['model'] ?? ''),
+                    'variant' => (string) ($job['variant'] ?? ''),
+                    'fuel_type' => (string) ($job['fuel_type'] ?? ''),
+                    'model_year' => $job['model_year'] !== null ? (int) $job['model_year'] : null,
+                ],
+                'job' => [
+                    'id' => (int) $job['id'],
+                    'job_number' => (string) $job['job_number'],
+                    'closed_at' => (string) ($job['closed_at'] ?? ''),
+                ],
+                'tax_regime' => $taxRegime,
+                'generated_at' => date('c'),
+            ];
 
             $invoiceInsert = $pdo->prepare(
                 'INSERT INTO invoices
-                  (company_id, garage_id, invoice_number, job_card_id, customer_id, vehicle_id, invoice_date, due_date,
-                   subtotal_service, subtotal_parts, taxable_amount,
-                   cgst_rate, sgst_rate, igst_rate,
-                   cgst_amount, sgst_amount, igst_amount,
-                   round_off, grand_total, payment_status, notes, created_by)
+                  (company_id, garage_id, invoice_number, job_card_id, customer_id, vehicle_id, invoice_date, due_date, invoice_status,
+                   subtotal_service, subtotal_parts, taxable_amount, tax_regime,
+                   cgst_rate, sgst_rate, igst_rate, cgst_amount, sgst_amount, igst_amount,
+                   service_tax_amount, parts_tax_amount, total_tax_amount, gross_total, round_off, grand_total,
+                   payment_status, payment_mode, notes, created_by, financial_year_id, financial_year_label, sequence_number, snapshot_json)
                  VALUES
-                  (:company_id, :garage_id, :invoice_number, :job_card_id, :customer_id, :vehicle_id, :invoice_date, :due_date,
-                   :subtotal_service, :subtotal_parts, :taxable_amount,
-                   :cgst_rate, :sgst_rate, :igst_rate,
-                   :cgst_amount, :sgst_amount, :igst_amount,
-                   :round_off, :grand_total, "UNPAID", :notes, :created_by)'
+                  (:company_id, :garage_id, :invoice_number, :job_card_id, :customer_id, :vehicle_id, :invoice_date, :due_date, "DRAFT",
+                   :subtotal_service, :subtotal_parts, :taxable_amount, :tax_regime,
+                   :cgst_rate, :sgst_rate, :igst_rate, :cgst_amount, :sgst_amount, :igst_amount,
+                   :service_tax_amount, :parts_tax_amount, :total_tax_amount, :gross_total, :round_off, :grand_total,
+                   "UNPAID", NULL, :notes, :created_by, :financial_year_id, :financial_year_label, :sequence_number, :snapshot_json)'
             );
             $invoiceInsert->execute([
                 'company_id' => $companyId,
                 'garage_id' => $garageId,
                 'invoice_number' => $invoiceNumber,
-                'job_card_id' => $jobCardId,
+                'job_card_id' => (int) $job['id'],
                 'customer_id' => (int) $job['customer_id'],
                 'vehicle_id' => (int) $job['vehicle_id'],
                 'invoice_date' => $invoiceDate,
                 'due_date' => $dueDate,
-                'subtotal_service' => round($serviceSubtotal, 2),
-                'subtotal_parts' => round($partsSubtotal, 2),
-                'taxable_amount' => round($taxableAmount, 2),
-                'cgst_rate' => $cgstRate,
-                'sgst_rate' => $sgstRate,
-                'igst_rate' => $igstRate,
-                'cgst_amount' => $cgstAmount,
-                'sgst_amount' => $sgstAmount,
-                'igst_amount' => $igstAmount,
-                'round_off' => $roundOff,
-                'grand_total' => $grandTotal,
+                'subtotal_service' => $totals['subtotal_service'],
+                'subtotal_parts' => $totals['subtotal_parts'],
+                'taxable_amount' => $totals['taxable_amount'],
+                'tax_regime' => $taxRegime,
+                'cgst_rate' => $totals['cgst_rate'],
+                'sgst_rate' => $totals['sgst_rate'],
+                'igst_rate' => $totals['igst_rate'],
+                'cgst_amount' => $totals['cgst_amount'],
+                'sgst_amount' => $totals['sgst_amount'],
+                'igst_amount' => $totals['igst_amount'],
+                'service_tax_amount' => $totals['service_tax_amount'],
+                'parts_tax_amount' => $totals['parts_tax_amount'],
+                'total_tax_amount' => $totals['total_tax_amount'],
+                'gross_total' => $totals['gross_total'],
+                'round_off' => $totals['round_off'],
+                'grand_total' => $totals['grand_total'],
                 'notes' => $notes !== '' ? $notes : null,
-                'created_by' => (int) $_SESSION['user_id'],
+                'created_by' => $userId > 0 ? $userId : null,
+                'financial_year_id' => $numberMeta['financial_year_id'],
+                'financial_year_label' => (string) $numberMeta['financial_year_label'],
+                'sequence_number' => (int) $numberMeta['sequence_number'],
+                'snapshot_json' => json_encode($snapshot, JSON_UNESCAPED_UNICODE),
             ]);
 
             $invoiceId = (int) $pdo->lastInsertId();
 
             $itemInsert = $pdo->prepare(
                 'INSERT INTO invoice_items
-                  (invoice_id, item_type, description, part_id, quantity, unit_price, gst_rate, taxable_value, tax_amount, total_value)
+                  (invoice_id, item_type, description, part_id, service_id, hsn_sac_code, quantity, unit_price, gst_rate,
+                   cgst_rate, sgst_rate, igst_rate, taxable_value, cgst_amount, sgst_amount, igst_amount, tax_amount, total_value)
                  VALUES
-                  (:invoice_id, :item_type, :description, :part_id, :quantity, :unit_price, :gst_rate, :taxable_value, :tax_amount, :total_value)'
+                  (:invoice_id, :item_type, :description, :part_id, :service_id, :hsn_sac_code, :quantity, :unit_price, :gst_rate,
+                   :cgst_rate, :sgst_rate, :igst_rate, :taxable_value, :cgst_amount, :sgst_amount, :igst_amount, :tax_amount, :total_value)'
             );
 
-            foreach ($laborLines as $line) {
-                $taxable = (float) $line['total_amount'];
-                $taxAmount = round($taxable * $serviceGstRate / 100, 2);
+            foreach ($invoiceLines as $line) {
                 $itemInsert->execute([
                     'invoice_id' => $invoiceId,
-                    'item_type' => 'LABOR',
+                    'item_type' => (string) $line['item_type'],
                     'description' => (string) $line['description'],
-                    'part_id' => null,
-                    'quantity' => (float) $line['quantity'],
-                    'unit_price' => (float) $line['unit_price'],
-                    'gst_rate' => $serviceGstRate,
-                    'taxable_value' => round($taxable, 2),
-                    'tax_amount' => $taxAmount,
-                    'total_value' => round($taxable + $taxAmount, 2),
+                    'part_id' => $line['part_id'],
+                    'service_id' => $line['service_id'],
+                    'hsn_sac_code' => $line['hsn_sac_code'],
+                    'quantity' => $line['quantity'],
+                    'unit_price' => $line['unit_price'],
+                    'gst_rate' => $line['gst_rate'],
+                    'cgst_rate' => $line['cgst_rate'],
+                    'sgst_rate' => $line['sgst_rate'],
+                    'igst_rate' => $line['igst_rate'],
+                    'taxable_value' => $line['taxable_value'],
+                    'cgst_amount' => $line['cgst_amount'],
+                    'sgst_amount' => $line['sgst_amount'],
+                    'igst_amount' => $line['igst_amount'],
+                    'tax_amount' => $line['tax_amount'],
+                    'total_value' => $line['total_value'],
                 ]);
             }
 
-            foreach ($partLines as $line) {
-                $taxable = (float) $line['total_amount'];
-                $rate = (float) $line['gst_rate'];
-                $taxAmount = round($taxable * $rate / 100, 2);
-                $itemInsert->execute([
-                    'invoice_id' => $invoiceId,
-                    'item_type' => 'PART',
-                    'description' => (string) $line['part_name'],
-                    'part_id' => (int) $line['part_id'],
-                    'quantity' => (float) $line['quantity'],
-                    'unit_price' => (float) $line['unit_price'],
-                    'gst_rate' => $rate,
-                    'taxable_value' => round($taxable, 2),
-                    'tax_amount' => $taxAmount,
-                    'total_value' => round($taxable + $taxAmount, 2),
-                ]);
-            }
+            billing_record_status_history(
+                $pdo,
+                $invoiceId,
+                null,
+                'DRAFT',
+                'CREATE_DRAFT',
+                'Draft invoice created from closed job card.',
+                $userId > 0 ? $userId : null,
+                [
+                    'job_card_id' => (int) $job['id'],
+                    'invoice_number' => $invoiceNumber,
+                    'tax_regime' => $taxRegime,
+                ]
+            );
 
-            if (!in_array((string) $job['status'], ['COMPLETED', 'CLOSED'], true)) {
-                $jobUpdate = $pdo->prepare('UPDATE job_cards SET status = "COMPLETED", completed_at = NOW(), updated_by = :updated_by WHERE id = :job_id');
-                $jobUpdate->execute([
-                    'updated_by' => (int) $_SESSION['user_id'],
-                    'job_id' => $jobCardId,
-                ]);
-            }
+            log_audit('billing', 'create_draft', $invoiceId, 'Created draft invoice ' . $invoiceNumber . ' from Job ' . (string) $job['job_number']);
 
             $pdo->commit();
-            flash_set('billing_success', 'Invoice created: ' . $invoiceNumber, 'success');
+            flash_set('billing_success', 'Draft invoice created: ' . $invoiceNumber, 'success');
+        } catch (Throwable $exception) {
+            $pdo->rollBack();
+            flash_set('billing_error', $exception->getMessage(), 'danger');
+        }
+
+        redirect('modules/billing/index.php');
+    }
+
+    if ($action === 'finalize_invoice' && $canFinalize) {
+        $invoiceId = post_int('invoice_id');
+        if ($invoiceId <= 0) {
+            flash_set('billing_error', 'Invalid invoice selected for finalization.', 'danger');
+            redirect('modules/billing/index.php');
+        }
+
+        $pdo = db();
+        $pdo->beginTransaction();
+
+        try {
+            $invoiceStmt = $pdo->prepare(
+                'SELECT *
+                 FROM invoices
+                 WHERE id = :invoice_id
+                   AND company_id = :company_id
+                   AND garage_id = :garage_id
+                 LIMIT 1
+                 FOR UPDATE'
+            );
+            $invoiceStmt->execute([
+                'invoice_id' => $invoiceId,
+                'company_id' => $companyId,
+                'garage_id' => $garageId,
+            ]);
+            $invoice = $invoiceStmt->fetch();
+
+            if (!$invoice) {
+                throw new RuntimeException('Invoice not found for finalization.');
+            }
+
+            $currentStatus = strtoupper((string) ($invoice['invoice_status'] ?? ''));
+            if ($currentStatus === 'CANCELLED') {
+                throw new RuntimeException('Cancelled invoices cannot be finalized.');
+            }
+            if ($currentStatus === 'FINALIZED') {
+                throw new RuntimeException('Invoice is already finalized.');
+            }
+            if ($currentStatus !== 'DRAFT') {
+                throw new RuntimeException('Only draft invoices can be finalized.');
+            }
+
+            $itemStmt = $pdo->prepare('SELECT * FROM invoice_items WHERE invoice_id = :invoice_id ORDER BY id ASC');
+            $itemStmt->execute(['invoice_id' => $invoiceId]);
+            $items = $itemStmt->fetchAll();
+
+            $validation = billing_validate_invoice_totals($invoice, $items);
+            if (!($validation['valid'] ?? false)) {
+                $errors = $validation['errors'] ?? [];
+                throw new RuntimeException('GST mismatch found: ' . implode(' ', array_slice($errors, 0, 3)));
+            }
+
+            $finalizeStmt = $pdo->prepare(
+                'UPDATE invoices
+                 SET invoice_status = "FINALIZED",
+                     finalized_at = NOW(),
+                     finalized_by = :finalized_by
+                 WHERE id = :invoice_id'
+            );
+            $finalizeStmt->execute([
+                'finalized_by' => $userId > 0 ? $userId : null,
+                'invoice_id' => $invoiceId,
+            ]);
+
+            billing_record_status_history(
+                $pdo,
+                $invoiceId,
+                'DRAFT',
+                'FINALIZED',
+                'FINALIZE',
+                'Invoice finalized after GST integrity validation.',
+                $userId > 0 ? $userId : null,
+                null
+            );
+
+            log_audit('billing', 'finalize', $invoiceId, 'Finalized invoice ' . (string) $invoice['invoice_number']);
+
+            $pdo->commit();
+            flash_set('billing_success', 'Invoice finalized successfully.', 'success');
+        } catch (Throwable $exception) {
+            $pdo->rollBack();
+            flash_set('billing_error', $exception->getMessage(), 'danger');
+        }
+
+        redirect('modules/billing/index.php');
+    }
+
+    if ($action === 'cancel_invoice' && $canCancel) {
+        $invoiceId = post_int('invoice_id');
+        $cancelReason = post_string('cancel_reason', 255);
+
+        if ($invoiceId <= 0 || $cancelReason === '') {
+            flash_set('billing_error', 'Invoice and cancellation reason are required.', 'danger');
+            redirect('modules/billing/index.php');
+        }
+
+        $pdo = db();
+        $pdo->beginTransaction();
+
+        try {
+            $invoiceStmt = $pdo->prepare(
+                'SELECT id, invoice_number, invoice_status
+                 FROM invoices
+                 WHERE id = :invoice_id
+                   AND company_id = :company_id
+                   AND garage_id = :garage_id
+                 LIMIT 1
+                 FOR UPDATE'
+            );
+            $invoiceStmt->execute([
+                'invoice_id' => $invoiceId,
+                'company_id' => $companyId,
+                'garage_id' => $garageId,
+            ]);
+            $invoice = $invoiceStmt->fetch();
+
+            if (!$invoice) {
+                throw new RuntimeException('Invoice not found for cancellation.');
+            }
+
+            $currentStatus = strtoupper((string) ($invoice['invoice_status'] ?? ''));
+            if ($currentStatus === 'CANCELLED') {
+                throw new RuntimeException('Invoice is already cancelled.');
+            }
+
+            $paidStmt = $pdo->prepare('SELECT COALESCE(SUM(amount), 0) FROM payments WHERE invoice_id = :invoice_id');
+            $paidStmt->execute(['invoice_id' => $invoiceId]);
+            $paidAmount = (float) $paidStmt->fetchColumn();
+            if ($paidAmount > 0.01) {
+                throw new RuntimeException('Invoice with payments cannot be cancelled. Reverse payments first.');
+            }
+
+            $cancelStmt = $pdo->prepare(
+                'UPDATE invoices
+                 SET invoice_status = "CANCELLED",
+                     payment_status = "CANCELLED",
+                     cancelled_at = NOW(),
+                     cancelled_by = :cancelled_by,
+                     cancel_reason = :cancel_reason
+                 WHERE id = :invoice_id'
+            );
+            $cancelStmt->execute([
+                'cancelled_by' => $userId > 0 ? $userId : null,
+                'cancel_reason' => $cancelReason,
+                'invoice_id' => $invoiceId,
+            ]);
+
+            billing_record_status_history(
+                $pdo,
+                $invoiceId,
+                $currentStatus,
+                'CANCELLED',
+                'CANCEL',
+                $cancelReason,
+                $userId > 0 ? $userId : null,
+                ['paid_amount' => $paidAmount]
+            );
+
+            log_audit('billing', 'cancel', $invoiceId, 'Cancelled invoice ' . (string) $invoice['invoice_number']);
+
+            $pdo->commit();
+            flash_set('billing_success', 'Invoice cancelled successfully.', 'success');
         } catch (Throwable $exception) {
             $pdo->rollBack();
             flash_set('billing_error', $exception->getMessage(), 'danger');
@@ -257,18 +512,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if ($action === 'add_payment' && $canPay) {
         $invoiceId = post_int('invoice_id');
         $amount = (float) ($_POST['amount'] ?? 0);
-        $paidOn = post_string('paid_on', 10);
-        $paymentMode = (string) ($_POST['payment_mode'] ?? 'CASH');
+        $paidOn = billing_parse_date((string) ($_POST['paid_on'] ?? ''));
+        $paymentMode = billing_normalize_payment_mode((string) ($_POST['payment_mode'] ?? 'CASH'));
         $referenceNo = post_string('reference_no', 100);
         $notes = post_string('notes', 255);
 
-        $allowedModes = ['CASH', 'UPI', 'CARD', 'BANK_TRANSFER', 'CHEQUE'];
-        if (!in_array($paymentMode, $allowedModes, true)) {
+        if ($paymentMode === 'MIXED') {
             $paymentMode = 'CASH';
         }
 
-        if ($invoiceId <= 0 || $amount <= 0 || $paidOn === '') {
-            flash_set('billing_error', 'Invoice, payment amount and paid date are required.', 'danger');
+        if ($invoiceId <= 0 || $amount <= 0 || $paidOn === null) {
+            flash_set('billing_error', 'Invoice, amount, payment date and mode are required.', 'danger');
             redirect('modules/billing/index.php');
         }
 
@@ -277,11 +531,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         try {
             $invoiceStmt = $pdo->prepare(
-                'SELECT id, grand_total
+                'SELECT id, invoice_number, grand_total, invoice_status
                  FROM invoices
                  WHERE id = :invoice_id
                    AND company_id = :company_id
                    AND garage_id = :garage_id
+                 LIMIT 1
                  FOR UPDATE'
             );
             $invoiceStmt->execute([
@@ -295,6 +550,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 throw new RuntimeException('Invoice not found.');
             }
 
+            if ((string) ($invoice['invoice_status'] ?? '') !== 'FINALIZED') {
+                throw new RuntimeException('Payments are allowed only for finalized invoices.');
+            }
+
             $paidSumStmt = $pdo->prepare('SELECT COALESCE(SUM(amount), 0) FROM payments WHERE invoice_id = :invoice_id');
             $paidSumStmt->execute(['invoice_id' => $invoiceId]);
             $alreadyPaid = (float) $paidSumStmt->fetchColumn();
@@ -302,7 +561,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $remaining = $grandTotal - $alreadyPaid;
 
             if ($amount > $remaining + 0.01) {
-                throw new RuntimeException('Payment exceeds outstanding amount. Outstanding: ' . number_format($remaining, 2));
+                throw new RuntimeException('Payment exceeds outstanding amount. Outstanding: ' . number_format(max(0.0, $remaining), 2));
             }
 
             $paymentInsert = $pdo->prepare(
@@ -313,21 +572,24 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             );
             $paymentInsert->execute([
                 'invoice_id' => $invoiceId,
-                'amount' => round($amount, 2),
+                'amount' => billing_round($amount),
                 'paid_on' => $paidOn,
                 'payment_mode' => $paymentMode,
                 'reference_no' => $referenceNo !== '' ? $referenceNo : null,
                 'notes' => $notes !== '' ? $notes : null,
-                'received_by' => (int) $_SESSION['user_id'],
+                'received_by' => $userId > 0 ? $userId : null,
             ]);
+            $paymentId = (int) $pdo->lastInsertId();
 
-            $newPaid = $alreadyPaid + $amount;
-            $status = 'PARTIAL';
+            $newPaid = billing_round($alreadyPaid + $amount);
+            $paymentStatus = 'PARTIAL';
             if ($newPaid <= 0.001) {
-                $status = 'UNPAID';
+                $paymentStatus = 'UNPAID';
             } elseif ($newPaid >= $grandTotal - 0.01) {
-                $status = 'PAID';
+                $paymentStatus = 'PAID';
             }
+
+            $summaryMode = billing_payment_mode_summary($pdo, $invoiceId);
 
             $invoiceUpdate = $pdo->prepare(
                 'UPDATE invoices
@@ -336,10 +598,27 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                  WHERE id = :invoice_id'
             );
             $invoiceUpdate->execute([
-                'payment_status' => $status,
-                'payment_mode' => $paymentMode,
+                'payment_status' => $paymentStatus,
+                'payment_mode' => $summaryMode,
                 'invoice_id' => $invoiceId,
             ]);
+
+            billing_record_payment_history(
+                $pdo,
+                $invoiceId,
+                $paymentId,
+                'PAYMENT_RECORDED',
+                $notes !== '' ? $notes : 'Payment received.',
+                $userId > 0 ? $userId : null,
+                [
+                    'amount' => billing_round($amount),
+                    'mode' => $paymentMode,
+                    'paid_on' => $paidOn,
+                    'reference_no' => $referenceNo !== '' ? $referenceNo : null,
+                ]
+            );
+
+            log_audit('billing', 'payment', $invoiceId, 'Recorded payment of ' . number_format($amount, 2) . ' for invoice ' . (string) $invoice['invoice_number']);
 
             $pdo->commit();
             flash_set('billing_success', 'Payment recorded successfully.', 'success');
@@ -353,7 +632,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 }
 
 $eligibleJobsStmt = db()->prepare(
-    'SELECT jc.id, jc.job_number, jc.status, c.full_name AS customer_name, v.registration_no,
+    'SELECT jc.id, jc.job_number, jc.closed_at,
+            c.full_name AS customer_name, v.registration_no,
             COALESCE((SELECT SUM(total_amount) FROM job_labor jl WHERE jl.job_card_id = jc.id), 0) AS labor_total,
             COALESCE((SELECT SUM(total_amount) FROM job_parts jp WHERE jp.job_card_id = jc.id), 0) AS parts_total
      FROM job_cards jc
@@ -362,10 +642,12 @@ $eligibleJobsStmt = db()->prepare(
      LEFT JOIN invoices i ON i.job_card_id = jc.id
      WHERE jc.company_id = :company_id
        AND jc.garage_id = :garage_id
-       AND jc.status_code <> "DELETED"
-       AND jc.status IN ("READY_FOR_DELIVERY", "COMPLETED", "CLOSED")
+       AND jc.status = "CLOSED"
+       AND jc.status_code = "ACTIVE"
+       AND (c.status_code IS NULL OR c.status_code <> "DELETED")
+       AND (v.status_code IS NULL OR v.status_code <> "DELETED")
        AND i.id IS NULL
-     ORDER BY jc.id DESC'
+     ORDER BY jc.closed_at DESC, jc.id DESC'
 );
 $eligibleJobsStmt->execute([
     'company_id' => $companyId,
@@ -374,12 +656,14 @@ $eligibleJobsStmt->execute([
 $eligibleJobs = $eligibleJobsStmt->fetchAll();
 
 $invoicesStmt = db()->prepare(
-    'SELECT i.id, i.invoice_number, i.invoice_date, i.grand_total, i.payment_status, i.payment_mode,
-            c.full_name AS customer_name, v.registration_no,
+    'SELECT i.id, i.invoice_number, i.invoice_date, i.financial_year_label, i.invoice_status, i.tax_regime,
+            i.taxable_amount, i.total_tax_amount, i.grand_total, i.payment_status, i.payment_mode, i.cancel_reason,
+            i.snapshot_json,
+            c.full_name AS live_customer_name, v.registration_no AS live_registration_no,
             COALESCE((SELECT SUM(p.amount) FROM payments p WHERE p.invoice_id = i.id), 0) AS paid_amount
      FROM invoices i
-     INNER JOIN customers c ON c.id = i.customer_id
-     INNER JOIN vehicles v ON v.id = i.vehicle_id
+     LEFT JOIN customers c ON c.id = i.customer_id
+     LEFT JOIN vehicles v ON v.id = i.vehicle_id
      WHERE i.company_id = :company_id
        AND i.garage_id = :garage_id
      ORDER BY i.id DESC'
@@ -389,6 +673,19 @@ $invoicesStmt->execute([
     'garage_id' => $garageId,
 ]);
 $invoices = $invoicesStmt->fetchAll();
+
+foreach ($invoices as &$invoice) {
+    $snapshot = json_decode((string) ($invoice['snapshot_json'] ?? ''), true);
+    if (!is_array($snapshot)) {
+        $snapshot = [];
+    }
+    $invoice['snapshot'] = $snapshot;
+    $snapCustomer = billing_snapshot_value($snapshot, 'customer', 'full_name');
+    $snapVehicle = billing_snapshot_value($snapshot, 'vehicle', 'registration_no');
+    $invoice['display_customer_name'] = $snapCustomer !== '' ? $snapCustomer : (string) ($invoice['live_customer_name'] ?? '-');
+    $invoice['display_registration_no'] = $snapVehicle !== '' ? $snapVehicle : (string) ($invoice['live_registration_no'] ?? '-');
+}
+unset($invoice);
 
 $paymentsStmt = db()->prepare(
     'SELECT p.*, i.invoice_number, u.name AS received_by_name
@@ -405,6 +702,39 @@ $paymentsStmt->execute([
     'garage_id' => $garageId,
 ]);
 $payments = $paymentsStmt->fetchAll();
+
+$statusHistoryStmt = db()->prepare(
+    'SELECT h.*, i.invoice_number, u.name AS actor_name
+     FROM invoice_status_history h
+     INNER JOIN invoices i ON i.id = h.invoice_id
+     LEFT JOIN users u ON u.id = h.created_by
+     WHERE i.company_id = :company_id
+       AND i.garage_id = :garage_id
+     ORDER BY h.id DESC
+     LIMIT 40'
+);
+$statusHistoryStmt->execute([
+    'company_id' => $companyId,
+    'garage_id' => $garageId,
+]);
+$statusHistory = $statusHistoryStmt->fetchAll();
+
+$paymentHistoryStmt = db()->prepare(
+    'SELECT ph.*, i.invoice_number, p.amount AS payment_amount, p.payment_mode, p.paid_on, u.name AS actor_name
+     FROM invoice_payment_history ph
+     INNER JOIN invoices i ON i.id = ph.invoice_id
+     LEFT JOIN payments p ON p.id = ph.payment_id
+     LEFT JOIN users u ON u.id = ph.created_by
+     WHERE i.company_id = :company_id
+       AND i.garage_id = :garage_id
+     ORDER BY ph.id DESC
+     LIMIT 40'
+);
+$paymentHistoryStmt->execute([
+    'company_id' => $companyId,
+    'garage_id' => $garageId,
+]);
+$paymentHistory = $paymentHistoryStmt->fetchAll();
 
 require_once __DIR__ . '/../../includes/header.php';
 require_once __DIR__ . '/../../includes/sidebar.php';
@@ -427,45 +757,40 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 
   <div class="app-content">
     <div class="container-fluid">
-      <?php if ($canManage): ?>
+      <?php if ($canCreate): ?>
         <div class="card card-primary">
-          <div class="card-header"><h3 class="card-title">Generate Invoice from Job Card</h3></div>
+          <div class="card-header"><h3 class="card-title">Generate Draft Invoice from Closed Job Card</h3></div>
           <form method="post">
             <div class="card-body row g-3">
               <?= csrf_field(); ?>
               <input type="hidden" name="_action" value="create_invoice" />
-              <div class="col-md-6">
-                <label class="form-label">Eligible Job Card</label>
+              <div class="col-md-8">
+                <label class="form-label">Eligible Closed Job Card</label>
                 <select name="job_card_id" class="form-select" required>
-                  <option value="">Select Job Card</option>
+                  <option value="">Select CLOSED Job Card</option>
                   <?php foreach ($eligibleJobs as $job): ?>
                     <option value="<?= (int) $job['id']; ?>">
                       <?= e((string) $job['job_number']); ?> | <?= e((string) $job['customer_name']); ?> | <?= e((string) $job['registration_no']); ?> | Labor <?= e(number_format((float) $job['labor_total'], 2)); ?> + Parts <?= e(number_format((float) $job['parts_total'], 2)); ?>
                     </option>
                   <?php endforeach; ?>
                 </select>
-              </div>
-              <div class="col-md-2">
-                <label class="form-label">Service GST %</label>
-                <input type="number" step="0.01" name="service_gst_rate" class="form-control" value="18" required />
+                <small class="text-muted">Only active CLOSED jobs in this garage are billable.</small>
               </div>
               <div class="col-md-2">
                 <label class="form-label">Due Date</label>
                 <input type="date" name="due_date" class="form-control" />
               </div>
-              <div class="col-md-2 d-flex align-items-center mt-4">
-                <div class="form-check mt-2">
-                  <input class="form-check-input" type="checkbox" value="1" id="is_interstate" name="is_interstate" />
-                  <label class="form-check-label" for="is_interstate">Interstate (IGST)</label>
-                </div>
+              <div class="col-md-2">
+                <label class="form-label">Invoice Date</label>
+                <input type="text" class="form-control" value="<?= e(date('Y-m-d')); ?>" readonly />
               </div>
               <div class="col-md-12">
-                <label class="form-label">Invoice Notes</label>
-                <input type="text" name="notes" class="form-control" placeholder="Optional notes" />
+                <label class="form-label">Notes</label>
+                <input type="text" name="notes" class="form-control" placeholder="Optional internal note" />
               </div>
             </div>
             <div class="card-footer">
-              <button type="submit" class="btn btn-primary">Create Invoice</button>
+              <button type="submit" class="btn btn-primary">Create Draft Invoice</button>
             </div>
           </form>
         </div>
@@ -473,7 +798,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 
       <?php if ($canPay): ?>
         <div class="card card-info">
-          <div class="card-header"><h3 class="card-title">Record Payment</h3></div>
+          <div class="card-header"><h3 class="card-title">Record Payment (Finalized Invoices)</h3></div>
           <form method="post">
             <div class="card-body row g-3">
               <?= csrf_field(); ?>
@@ -483,8 +808,11 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                 <select name="invoice_id" class="form-select" required>
                   <option value="">Select Invoice</option>
                   <?php foreach ($invoices as $invoice): ?>
-                    <?php $outstanding = (float) $invoice['grand_total'] - (float) $invoice['paid_amount']; ?>
-                    <?php if ($outstanding > 0.01): ?>
+                    <?php
+                      $invoiceStatus = (string) ($invoice['invoice_status'] ?? '');
+                      $outstanding = (float) $invoice['grand_total'] - (float) $invoice['paid_amount'];
+                    ?>
+                    <?php if ($invoiceStatus === 'FINALIZED' && $outstanding > 0.01): ?>
                       <option value="<?= (int) $invoice['id']; ?>">
                         <?= e((string) $invoice['invoice_number']); ?> | Outstanding: <?= e(number_format($outstanding, 2)); ?>
                       </option>
@@ -534,22 +862,31 @@ require_once __DIR__ . '/../../includes/sidebar.php';
               <tr>
                 <th>Invoice No</th>
                 <th>Date</th>
+                <th>FY</th>
                 <th>Customer</th>
                 <th>Vehicle</th>
+                <th>Regime</th>
+                <th>Taxable</th>
+                <th>Tax</th>
                 <th>Total</th>
                 <th>Paid</th>
                 <th>Outstanding</th>
-                <th>Status</th>
+                <th>Invoice Status</th>
+                <th>Payment</th>
+                <th>Actions</th>
               </tr>
             </thead>
             <tbody>
               <?php if (empty($invoices)): ?>
-                <tr><td colspan="8" class="text-center text-muted py-4">No invoices generated.</td></tr>
+                <tr><td colspan="14" class="text-center text-muted py-4">No invoices generated.</td></tr>
               <?php else: ?>
                 <?php foreach ($invoices as $invoice): ?>
-                  <?php $paid = (float) $invoice['paid_amount']; ?>
-                  <?php $total = (float) $invoice['grand_total']; ?>
-                  <?php $outstanding = $total - $paid; ?>
+                  <?php
+                    $paid = (float) $invoice['paid_amount'];
+                    $total = (float) $invoice['grand_total'];
+                    $outstanding = max(0.0, $total - $paid);
+                    $invoiceStatus = (string) ($invoice['invoice_status'] ?? 'DRAFT');
+                  ?>
                   <tr>
                     <td>
                       <a href="<?= e(url('modules/billing/print_invoice.php?id=' . (int) $invoice['id'])); ?>" target="_blank">
@@ -557,12 +894,50 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                       </a>
                     </td>
                     <td><?= e((string) $invoice['invoice_date']); ?></td>
-                    <td><?= e((string) $invoice['customer_name']); ?></td>
-                    <td><?= e((string) $invoice['registration_no']); ?></td>
+                    <td><?= e((string) ($invoice['financial_year_label'] ?? '-')); ?></td>
+                    <td><?= e((string) $invoice['display_customer_name']); ?></td>
+                    <td><?= e((string) $invoice['display_registration_no']); ?></td>
+                    <td><?= e((string) ($invoice['tax_regime'] ?? '-')); ?></td>
+                    <td><?= e(format_currency((float) $invoice['taxable_amount'])); ?></td>
+                    <td><?= e(format_currency((float) $invoice['total_tax_amount'])); ?></td>
                     <td><?= e(format_currency($total)); ?></td>
                     <td><?= e(format_currency($paid)); ?></td>
                     <td><?= e(format_currency($outstanding)); ?></td>
-                    <td><span class="badge text-bg-secondary"><?= e((string) $invoice['payment_status']); ?></span></td>
+                    <td>
+                      <span class="badge text-bg-<?= e(billing_status_badge_class($invoiceStatus)); ?>">
+                        <?= e($invoiceStatus); ?>
+                      </span>
+                      <?php if ($invoiceStatus === 'CANCELLED' && !empty($invoice['cancel_reason'])): ?>
+                        <div><small class="text-muted"><?= e((string) $invoice['cancel_reason']); ?></small></div>
+                      <?php endif; ?>
+                    </td>
+                    <td>
+                      <span class="badge text-bg-<?= e(billing_payment_badge_class((string) ($invoice['payment_status'] ?? 'UNPAID'))); ?>">
+                        <?= e((string) ($invoice['payment_status'] ?? 'UNPAID')); ?>
+                      </span>
+                      <?php if (!empty($invoice['payment_mode'])): ?>
+                        <div><small class="text-muted"><?= e((string) $invoice['payment_mode']); ?></small></div>
+                      <?php endif; ?>
+                    </td>
+                    <td class="d-flex gap-1">
+                      <?php if ($canFinalize && $invoiceStatus === 'DRAFT'): ?>
+                        <form method="post" class="d-inline" data-confirm="Finalize this invoice? GST values will be locked.">
+                          <?= csrf_field(); ?>
+                          <input type="hidden" name="_action" value="finalize_invoice" />
+                          <input type="hidden" name="invoice_id" value="<?= (int) $invoice['id']; ?>" />
+                          <button type="submit" class="btn btn-sm btn-success">Finalize</button>
+                        </form>
+                      <?php endif; ?>
+                      <?php if ($canCancel && $invoiceStatus !== 'CANCELLED'): ?>
+                        <form method="post" class="d-inline js-cancel-invoice-form">
+                          <?= csrf_field(); ?>
+                          <input type="hidden" name="_action" value="cancel_invoice" />
+                          <input type="hidden" name="invoice_id" value="<?= (int) $invoice['id']; ?>" />
+                          <input type="hidden" name="cancel_reason" value="" />
+                          <button type="submit" class="btn btn-sm btn-outline-danger">Cancel</button>
+                        </form>
+                      <?php endif; ?>
+                    </td>
                   </tr>
                 <?php endforeach; ?>
               <?php endif; ?>
@@ -571,8 +946,82 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         </div>
       </div>
 
+      <div class="row mt-3 g-3">
+        <div class="col-lg-6">
+          <div class="card">
+            <div class="card-header"><h3 class="card-title">Invoice Status History</h3></div>
+            <div class="card-body table-responsive p-0">
+              <table class="table table-sm table-striped mb-0">
+                <thead>
+                  <tr>
+                    <th>Date</th>
+                    <th>Invoice</th>
+                    <th>Transition</th>
+                    <th>Action</th>
+                    <th>Note</th>
+                    <th>By</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <?php if (empty($statusHistory)): ?>
+                    <tr><td colspan="6" class="text-center text-muted py-4">No status events found.</td></tr>
+                  <?php else: ?>
+                    <?php foreach ($statusHistory as $entry): ?>
+                      <tr>
+                        <td><?= e((string) $entry['created_at']); ?></td>
+                        <td><?= e((string) $entry['invoice_number']); ?></td>
+                        <td><?= e((string) (($entry['from_status'] ?? '-') . ' -> ' . ($entry['to_status'] ?? '-'))); ?></td>
+                        <td><?= e((string) $entry['action_type']); ?></td>
+                        <td><?= e((string) ($entry['action_note'] ?? '-')); ?></td>
+                        <td><?= e((string) ($entry['actor_name'] ?? 'System')); ?></td>
+                      </tr>
+                    <?php endforeach; ?>
+                  <?php endif; ?>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <div class="col-lg-6">
+          <div class="card">
+            <div class="card-header"><h3 class="card-title">Payment History</h3></div>
+            <div class="card-body table-responsive p-0">
+              <table class="table table-sm table-striped mb-0">
+                <thead>
+                  <tr>
+                    <th>Date</th>
+                    <th>Invoice</th>
+                    <th>Paid On</th>
+                    <th>Mode</th>
+                    <th>Amount</th>
+                    <th>By</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <?php if (empty($paymentHistory)): ?>
+                    <tr><td colspan="6" class="text-center text-muted py-4">No payment history found.</td></tr>
+                  <?php else: ?>
+                    <?php foreach ($paymentHistory as $entry): ?>
+                      <tr>
+                        <td><?= e((string) $entry['created_at']); ?></td>
+                        <td><?= e((string) $entry['invoice_number']); ?></td>
+                        <td><?= e((string) ($entry['paid_on'] ?? '-')); ?></td>
+                        <td><?= e((string) ($entry['payment_mode'] ?? '-')); ?></td>
+                        <td><?= e(format_currency((float) ($entry['payment_amount'] ?? 0))); ?></td>
+                        <td><?= e((string) ($entry['actor_name'] ?? 'System')); ?></td>
+                      </tr>
+                    <?php endforeach; ?>
+                  <?php endif; ?>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <div class="card mt-3">
-        <div class="card-header"><h3 class="card-title">Recent Payments</h3></div>
+        <div class="card-header"><h3 class="card-title">Recent Payment Entries</h3></div>
         <div class="card-body table-responsive p-0">
           <table class="table table-sm table-striped mb-0">
             <thead>
@@ -607,5 +1056,34 @@ require_once __DIR__ . '/../../includes/sidebar.php';
     </div>
   </div>
 </main>
+
+<script>
+  (function () {
+    var confirmForms = document.querySelectorAll('form[data-confirm]');
+    for (var i = 0; i < confirmForms.length; i++) {
+      confirmForms[i].addEventListener('submit', function (event) {
+        var message = this.getAttribute('data-confirm') || 'Are you sure?';
+        if (!window.confirm(message)) {
+          event.preventDefault();
+        }
+      });
+    }
+
+    var cancelForms = document.querySelectorAll('.js-cancel-invoice-form');
+    for (var j = 0; j < cancelForms.length; j++) {
+      cancelForms[j].addEventListener('submit', function (event) {
+        var reason = window.prompt('Cancellation reason is required for audit trail. Enter reason:');
+        if (!reason || !reason.trim()) {
+          event.preventDefault();
+          return;
+        }
+        var input = this.querySelector('input[name="cancel_reason"]');
+        if (input) {
+          input.value = reason.trim();
+        }
+      });
+    }
+  })();
+</script>
 
 <?php require_once __DIR__ . '/../../includes/footer.php'; ?>

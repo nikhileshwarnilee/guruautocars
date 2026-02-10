@@ -216,7 +216,7 @@ $isVisOpen = is_menu_group_open('vis.', $activeMenu);
           </li>
         <?php endif; ?>
 
-        <?php if (has_permission('invoice.view')): ?>
+        <?php if (has_permission('billing.view') || has_permission('invoice.view')): ?>
           <li class="nav-item">
             <a href="<?= e(url('modules/billing/index.php')); ?>" class="nav-link <?= e(is_active_menu('billing', $activeMenu)); ?>">
               <i class="nav-icon bi bi-receipt"></i>
