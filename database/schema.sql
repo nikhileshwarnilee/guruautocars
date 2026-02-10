@@ -230,6 +230,7 @@ CREATE TABLE job_cards (
   job_number VARCHAR(30) NOT NULL,
   customer_id INT UNSIGNED NOT NULL,
   vehicle_id INT UNSIGNED NOT NULL,
+  odometer_km INT UNSIGNED NOT NULL DEFAULT 0,
   assigned_to INT UNSIGNED NULL,
   service_advisor_id INT UNSIGNED NULL,
   complaint TEXT NOT NULL,

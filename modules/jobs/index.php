@@ -15,6 +15,9 @@ $userId = (int) ($_SESSION['user_id'] ?? 0);
 $canCreate = has_permission('job.create') || has_permission('job.manage');
 $canEdit = has_permission('job.edit') || has_permission('job.update') || has_permission('job.manage');
 $canAssign = has_permission('job.assign') || has_permission('job.manage');
+$jobCardColumns = table_columns('job_cards');
+$jobOdometerEnabled = in_array('odometer_km', $jobCardColumns, true);
+$odometerEditableStatuses = ['OPEN', 'IN_PROGRESS'];
 
 function parse_ids(mixed $value): array
 {
@@ -57,11 +60,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $vehicleId = post_int('vehicle_id');
         $complaint = post_string('complaint', 3000);
         $diagnosis = post_string('diagnosis', 3000);
+        $odometerRaw = trim((string) ($_POST['odometer_km'] ?? ''));
+        $odometerKm = null;
         $priority = strtoupper(post_string('priority', 10));
         $promisedAt = post_string('promised_at', 25);
         $assignedUserIds = $canAssign ? parse_ids($_POST['assigned_user_ids'] ?? []) : [];
         if (!in_array($priority, ['LOW', 'MEDIUM', 'HIGH', 'URGENT'], true)) {
             $priority = 'MEDIUM';
+        }
+        if ($jobOdometerEnabled) {
+            $parsedOdometer = filter_var($odometerRaw, FILTER_VALIDATE_INT);
+            if ($odometerRaw === '' || $parsedOdometer === false || (int) $parsedOdometer < 0) {
+                flash_set('job_error', 'Odometer reading is required and must be a valid non-negative number.', 'danger');
+                redirect('modules/jobs/index.php');
+            }
+            $odometerKm = (int) $parsedOdometer;
         }
         if ($customerId <= 0 || $vehicleId <= 0 || $complaint === '') {
             flash_set('job_error', 'Customer, vehicle and complaint are required.', 'danger');
@@ -83,13 +96,23 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $pdo->beginTransaction();
         try {
             $jobNumber = job_generate_number($pdo, $garageId);
-            $stmt = $pdo->prepare(
-                'INSERT INTO job_cards
-                  (company_id, garage_id, job_number, customer_id, vehicle_id, assigned_to, service_advisor_id, complaint, diagnosis, status, priority, promised_at, status_code, created_by, updated_by)
-                 VALUES
-                  (:company_id, :garage_id, :job_number, :customer_id, :vehicle_id, NULL, :service_advisor_id, :complaint, :diagnosis, "OPEN", :priority, :promised_at, "ACTIVE", :created_by, :updated_by)'
-            );
-            $stmt->execute([
+            if ($jobOdometerEnabled) {
+                $stmt = $pdo->prepare(
+                    'INSERT INTO job_cards
+                      (company_id, garage_id, job_number, customer_id, vehicle_id, odometer_km, assigned_to, service_advisor_id, complaint, diagnosis, status, priority, promised_at, status_code, created_by, updated_by)
+                     VALUES
+                      (:company_id, :garage_id, :job_number, :customer_id, :vehicle_id, :odometer_km, NULL, :service_advisor_id, :complaint, :diagnosis, "OPEN", :priority, :promised_at, "ACTIVE", :created_by, :updated_by)'
+                );
+            } else {
+                $stmt = $pdo->prepare(
+                    'INSERT INTO job_cards
+                      (company_id, garage_id, job_number, customer_id, vehicle_id, assigned_to, service_advisor_id, complaint, diagnosis, status, priority, promised_at, status_code, created_by, updated_by)
+                     VALUES
+                      (:company_id, :garage_id, :job_number, :customer_id, :vehicle_id, NULL, :service_advisor_id, :complaint, :diagnosis, "OPEN", :priority, :promised_at, "ACTIVE", :created_by, :updated_by)'
+                );
+            }
+
+            $insertParams = [
                 'company_id' => $companyId,
                 'garage_id' => $garageId,
                 'job_number' => $jobNumber,
@@ -102,7 +125,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'promised_at' => $promisedAt !== '' ? str_replace('T', ' ', $promisedAt) : null,
                 'created_by' => $userId,
                 'updated_by' => $userId,
-            ]);
+            ];
+            if ($jobOdometerEnabled) {
+                $insertParams['odometer_km'] = $odometerKm !== null ? $odometerKm : 0;
+            }
+            $stmt->execute($insertParams);
             $jobId = (int) $pdo->lastInsertId();
             if ($canAssign) {
                 $assigned = job_sync_assignments($jobId, $companyId, $garageId, $assignedUserIds, $userId);
@@ -110,7 +137,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     job_append_history($jobId, 'ASSIGN_CREATE', null, null, 'Assigned users', ['user_ids' => $assigned]);
                 }
             }
-            job_append_history($jobId, 'CREATE', null, 'OPEN', 'Job created', ['job_number' => $jobNumber]);
+            $createHistoryPayload = ['job_number' => $jobNumber];
+            if ($jobOdometerEnabled && $odometerKm !== null) {
+                $createHistoryPayload['odometer_km'] = $odometerKm;
+            }
+            job_append_history($jobId, 'CREATE', null, 'OPEN', 'Job created', $createHistoryPayload);
             log_audit('job_cards', 'create', $jobId, 'Created job card ' . $jobNumber, [
                 'entity' => 'job_card',
                 'source' => 'UI',
@@ -123,6 +154,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'priority' => $priority,
                     'customer_id' => $customerId,
                     'vehicle_id' => $vehicleId,
+                    'odometer_km' => $jobOdometerEnabled && $odometerKm !== null ? $odometerKm : null,
                 ],
                 'metadata' => [
                     'assigned_count' => isset($assigned) && is_array($assigned) ? count($assigned) : 0,
@@ -152,9 +184,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         $complaint = post_string('complaint', 3000);
         $diagnosis = post_string('diagnosis', 3000);
+        $odometerRaw = trim((string) ($_POST['odometer_km'] ?? ''));
+        $odometerKm = null;
         $priority = strtoupper(post_string('priority', 10));
         $promisedAt = post_string('promised_at', 25);
         $assignedUserIds = $canAssign ? parse_ids($_POST['assigned_user_ids'] ?? []) : [];
+        $currentStatus = job_normalize_status((string) ($job['status'] ?? 'OPEN'));
+        $odometerEditable = $jobOdometerEnabled && in_array($currentStatus, $odometerEditableStatuses, true);
         if (!in_array($priority, ['LOW', 'MEDIUM', 'HIGH', 'URGENT'], true)) {
             $priority = 'MEDIUM';
         }
@@ -162,12 +198,32 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             flash_set('job_error', 'Complaint is required.', 'danger');
             redirect('modules/jobs/index.php?edit_id=' . $jobId);
         }
+        if ($jobOdometerEnabled) {
+            if ($odometerEditable) {
+                $parsedOdometer = filter_var($odometerRaw, FILTER_VALIDATE_INT);
+                if ($odometerRaw === '' || $parsedOdometer === false || (int) $parsedOdometer < 0) {
+                    flash_set('job_error', 'Odometer reading is required and must be a valid non-negative number.', 'danger');
+                    redirect('modules/jobs/index.php?edit_id=' . $jobId);
+                }
+                $odometerKm = (int) $parsedOdometer;
+            } else {
+                $postedValue = filter_var($odometerRaw, FILTER_VALIDATE_INT);
+                $currentOdometer = (int) ($job['odometer_km'] ?? 0);
+                if ($odometerRaw !== '' && $postedValue !== false && (int) $postedValue !== $currentOdometer) {
+                    flash_set('job_error', 'Odometer can only be edited while job status is OPEN or IN_PROGRESS.', 'danger');
+                    redirect('modules/jobs/index.php?edit_id=' . $jobId);
+                }
+            }
+        }
 
-        $stmt = db()->prepare(
-            'UPDATE job_cards SET complaint = :complaint, diagnosis = :diagnosis, priority = :priority, promised_at = :promised_at, updated_by = :updated_by
-             WHERE id = :id AND company_id = :company_id AND garage_id = :garage_id'
-        );
-        $stmt->execute([
+        $updateSql =
+            'UPDATE job_cards
+             SET complaint = :complaint,
+                 diagnosis = :diagnosis,
+                 priority = :priority,
+                 promised_at = :promised_at,
+                 updated_by = :updated_by';
+        $updateParams = [
             'complaint' => $complaint,
             'diagnosis' => $diagnosis !== '' ? $diagnosis : null,
             'priority' => $priority,
@@ -176,13 +232,37 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'id' => $jobId,
             'company_id' => $companyId,
             'garage_id' => $garageId,
-        ]);
+        ];
+        if ($jobOdometerEnabled && $odometerEditable && $odometerKm !== null) {
+            $updateSql .= ',
+                 odometer_km = :odometer_km';
+            $updateParams['odometer_km'] = $odometerKm;
+        }
+        $updateSql .= '
+             WHERE id = :id
+               AND company_id = :company_id
+               AND garage_id = :garage_id';
+
+        $stmt = db()->prepare($updateSql);
+        $stmt->execute($updateParams);
 
         if ($canAssign) {
             $assigned = job_sync_assignments($jobId, $companyId, $garageId, $assignedUserIds, $userId);
             job_append_history($jobId, 'ASSIGN_UPDATE', null, null, 'Updated assignments', ['user_ids' => $assigned]);
         }
-        job_append_history($jobId, 'UPDATE_META', (string) $job['status'], (string) $job['status'], 'Job metadata updated');
+        $historyPayload = null;
+        if ($jobOdometerEnabled && $odometerEditable && $odometerKm !== null) {
+            $previousOdometer = (int) ($job['odometer_km'] ?? 0);
+            if ($previousOdometer !== $odometerKm) {
+                $historyPayload = [
+                    'odometer_km' => [
+                        'from' => $previousOdometer,
+                        'to' => $odometerKm,
+                    ],
+                ];
+            }
+        }
+        job_append_history($jobId, 'UPDATE_META', (string) $job['status'], (string) $job['status'], 'Job metadata updated', $historyPayload);
         log_audit('job_cards', 'update', $jobId, 'Updated job metadata', [
             'entity' => 'job_card',
             'source' => 'UI',
@@ -191,15 +271,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'diagnosis' => (string) ($job['diagnosis'] ?? ''),
                 'priority' => (string) ($job['priority'] ?? ''),
                 'promised_at' => (string) ($job['promised_at'] ?? ''),
+                'odometer_km' => $jobOdometerEnabled ? (int) ($job['odometer_km'] ?? 0) : null,
             ],
             'after' => [
                 'complaint' => $complaint,
                 'diagnosis' => $diagnosis,
                 'priority' => $priority,
                 'promised_at' => $promisedAt !== '' ? str_replace('T', ' ', $promisedAt) : null,
+                'odometer_km' => $jobOdometerEnabled
+                    ? ($odometerEditable && $odometerKm !== null ? $odometerKm : (int) ($job['odometer_km'] ?? 0))
+                    : null,
             ],
             'metadata' => [
                 'assigned_count' => isset($assigned) && is_array($assigned) ? count($assigned) : 0,
+                'odometer_editable' => $odometerEditable,
             ],
         ]);
         flash_set('job_success', 'Job card updated.', 'success');
@@ -211,7 +296,43 @@ $customers = db()->prepare('SELECT id, full_name, phone FROM customers WHERE com
 $customers->execute(['company_id' => $companyId]);
 $customers = $customers->fetchAll();
 
-$vehicles = db()->prepare('SELECT id, customer_id, registration_no, brand, model FROM vehicles WHERE company_id = :company_id AND status_code = "ACTIVE" ORDER BY registration_no ASC');
+if ($jobOdometerEnabled) {
+    $vehicles = db()->prepare(
+        'SELECT v.id, v.customer_id, v.registration_no, v.brand, v.model, v.odometer_km,
+                (
+                    SELECT jc.odometer_km
+                    FROM job_cards jc
+                    WHERE jc.company_id = :company_id
+                      AND jc.vehicle_id = v.id
+                      AND jc.status_code <> "DELETED"
+                    ORDER BY COALESCE(jc.opened_at, jc.created_at, jc.updated_at) DESC, jc.id DESC
+                    LIMIT 1
+                ) AS last_job_odometer_km,
+                (
+                    SELECT jc.job_number
+                    FROM job_cards jc
+                    WHERE jc.company_id = :company_id
+                      AND jc.vehicle_id = v.id
+                      AND jc.status_code <> "DELETED"
+                    ORDER BY COALESCE(jc.opened_at, jc.created_at, jc.updated_at) DESC, jc.id DESC
+                    LIMIT 1
+                ) AS last_odometer_job_number
+         FROM vehicles v
+         WHERE v.company_id = :company_id
+           AND v.status_code = "ACTIVE"
+         ORDER BY v.registration_no ASC'
+    );
+} else {
+    $vehicles = db()->prepare(
+        'SELECT id, customer_id, registration_no, brand, model, odometer_km,
+                NULL AS last_job_odometer_km,
+                NULL AS last_odometer_job_number
+         FROM vehicles
+         WHERE company_id = :company_id
+           AND status_code = "ACTIVE"
+         ORDER BY registration_no ASC'
+    );
+}
 $vehicles->execute(['company_id' => $companyId]);
 $vehicles = $vehicles->fetchAll();
 $vehicleAttributesEnabled = vehicle_masters_enabled() && vehicle_master_link_columns_supported();
@@ -225,6 +346,9 @@ $editAssignments = [];
 if ($editJob) {
     $editAssignments = array_map(static fn (array $row): int => (int) $row['user_id'], job_current_assignments((int) $editJob['id']));
 }
+$editJobOdometerEditable = $editJob !== null
+    && $jobOdometerEnabled
+    && in_array(job_normalize_status((string) ($editJob['status'] ?? 'OPEN')), $odometerEditableStatuses, true);
 
 $statusFilter = strtoupper(trim((string) ($_GET['status'] ?? '')));
 $query = trim((string) ($_GET['q'] ?? ''));
@@ -266,6 +390,13 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       <div class="card-header"><h3 class="card-title"><?= $editJob ? 'Edit Job Card' : 'Create Job Card'; ?></h3></div>
       <form method="post"><div class="card-body row g-3">
         <?= csrf_field(); ?><input type="hidden" name="_action" value="<?= $editJob ? 'update' : 'create'; ?>"><input type="hidden" name="job_id" value="<?= (int) ($editJob['id'] ?? 0); ?>">
+        <?php if (!$jobOdometerEnabled): ?>
+          <div class="col-12">
+            <div class="alert alert-warning mb-0">
+              Job-card odometer tracking is disabled in this database. Run <code>database/odometer_flow_upgrade.sql</code> to enable mandatory per-job odometer flow.
+            </div>
+          </div>
+        <?php endif; ?>
         <div class="col-md-3">
           <label class="form-label">Customer</label>
           <select id="job-customer-select" name="customer_id" class="form-select" required <?= $editJob ? 'disabled' : ''; ?>>
@@ -319,12 +450,43 @@ require_once __DIR__ . '/../../includes/sidebar.php';
           <select id="job-vehicle-select" name="vehicle_id" class="form-select" required <?= $editJob ? 'disabled' : ''; ?>>
             <option value="">Select Vehicle</option>
             <?php foreach ($vehicles as $vehicle): ?>
-              <option value="<?= (int) $vehicle['id']; ?>" data-customer-id="<?= (int) $vehicle['customer_id']; ?>" <?= ((int) ($editJob['vehicle_id'] ?? 0) === (int) $vehicle['id']) ? 'selected' : ''; ?>>
+              <?php
+                $lastJobOdometer = array_key_exists('last_job_odometer_km', $vehicle) && $vehicle['last_job_odometer_km'] !== null
+                    ? (int) $vehicle['last_job_odometer_km']
+                    : null;
+                $legacyVehicleOdometer = (int) ($vehicle['odometer_km'] ?? 0);
+                $suggestedOdometer = $lastJobOdometer;
+                $suggestedSource = '';
+                if ($lastJobOdometer !== null) {
+                    $jobNumber = trim((string) ($vehicle['last_odometer_job_number'] ?? ''));
+                    $suggestedSource = $jobNumber !== '' ? ('Last Job Card ' . $jobNumber) : 'Last Job Card';
+                } elseif ($legacyVehicleOdometer > 0) {
+                    $suggestedOdometer = $legacyVehicleOdometer;
+                    $suggestedSource = 'Legacy Vehicle Master';
+                }
+              ?>
+              <option value="<?= (int) $vehicle['id']; ?>" data-customer-id="<?= (int) $vehicle['customer_id']; ?>" data-last-odometer="<?= e($suggestedOdometer !== null ? (string) $suggestedOdometer : ''); ?>" data-last-odometer-source="<?= e($suggestedSource); ?>" <?= ((int) ($editJob['vehicle_id'] ?? 0) === (int) $vehicle['id']) ? 'selected' : ''; ?>>
                 <?= e((string) $vehicle['registration_no']); ?> - <?= e((string) $vehicle['brand']); ?> <?= e((string) $vehicle['model']); ?>
               </option>
             <?php endforeach; ?>
           </select>
           <?php if ($editJob): ?><input type="hidden" name="vehicle_id" value="<?= (int) $editJob['vehicle_id']; ?>"><?php endif; ?>
+        </div>
+        <div class="col-md-2">
+          <label class="form-label">Odometer (KM)</label>
+          <input id="job-odometer-input" type="number" name="odometer_km" class="form-control" min="0"
+                 value="<?= e($jobOdometerEnabled && $editJob ? (string) ((int) ($editJob['odometer_km'] ?? 0)) : ''); ?>"
+                 <?= !$jobOdometerEnabled || ($editJob && !$editJobOdometerEditable) ? 'disabled' : ''; ?>
+                 <?= $jobOdometerEnabled && (!$editJob || $editJobOdometerEditable) ? 'required' : ''; ?>>
+          <div id="job-odometer-hint" class="form-hint text-muted mt-1">
+            <?php if (!$jobOdometerEnabled): ?>
+              Odometer tracking inactive until DB upgrade is applied.
+            <?php elseif ($editJob && !$editJobOdometerEditable): ?>
+              Odometer can be edited only in OPEN or IN_PROGRESS status.
+            <?php else: ?>
+              Select vehicle to auto-fill the last recorded odometer.
+            <?php endif; ?>
+          </div>
         </div>
         <div class="col-md-2"><label class="form-label">Priority</label><select name="priority" class="form-select"><?php $priority = (string) ($editJob['priority'] ?? 'MEDIUM'); ?><option value="LOW" <?= $priority === 'LOW' ? 'selected' : ''; ?>>Low</option><option value="MEDIUM" <?= $priority === 'MEDIUM' ? 'selected' : ''; ?>>Medium</option><option value="HIGH" <?= $priority === 'HIGH' ? 'selected' : ''; ?>>High</option><option value="URGENT" <?= $priority === 'URGENT' ? 'selected' : ''; ?>>Urgent</option></select></div>
         <div class="col-md-2"><label class="form-label">Promised</label><input type="datetime-local" name="promised_at" class="form-control" value="<?= e((string) (!empty($editJob['promised_at']) ? str_replace(' ', 'T', substr((string) $editJob['promised_at'], 0, 16)) : '')); ?>"></div>
@@ -359,18 +521,48 @@ require_once __DIR__ . '/../../includes/sidebar.php';
     var vehicleSelect = document.getElementById('job-vehicle-select');
     var customerSelect = document.getElementById('job-customer-select');
     var ownerHint = document.getElementById('job-owner-lock-hint');
+    var odometerInput = document.getElementById('job-odometer-input');
+    var odometerHint = document.getElementById('job-odometer-hint');
     var target = document.getElementById('vis-suggestions-content');
+    var isEditMode = <?= $editJob ? 'true' : 'false'; ?>;
+    var odometerEnabled = <?= $jobOdometerEnabled ? 'true' : 'false'; ?>;
     if (!vehicleSelect || !target) return;
 
-    function selectedVehicleCustomerId() {
+    function selectedVehicleOption() {
       if (!vehicleSelect) {
-        return '';
+        return null;
       }
-      var selected = vehicleSelect.options[vehicleSelect.selectedIndex];
+      if (vehicleSelect.selectedIndex < 0) {
+        return null;
+      }
+      return vehicleSelect.options[vehicleSelect.selectedIndex] || null;
+    }
+
+    function selectedVehicleCustomerId() {
+      var selected = selectedVehicleOption();
       if (!selected) {
         return '';
       }
       return (selected.getAttribute('data-customer-id') || '').trim();
+    }
+
+    function selectedVehicleOdometerMeta() {
+      var selected = selectedVehicleOption();
+      if (!selected) {
+        return { value: '', source: '' };
+      }
+      return {
+        value: (selected.getAttribute('data-last-odometer') || '').trim(),
+        source: (selected.getAttribute('data-last-odometer-source') || '').trim()
+      };
+    }
+
+    function formatKm(value) {
+      var parsed = Number(value);
+      if (!Number.isFinite(parsed)) {
+        return value;
+      }
+      return parsed.toLocaleString();
     }
 
     function renderOwnerHint(message) {
@@ -378,6 +570,13 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         return;
       }
       ownerHint.textContent = message || '';
+    }
+
+    function renderOdometerHint(message) {
+      if (!odometerHint) {
+        return;
+      }
+      odometerHint.textContent = message || '';
     }
 
     function syncOwnerFromVehicle() {
@@ -399,6 +598,40 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         customerSelect.dispatchEvent(new Event('change', { bubbles: true }));
       }
       renderOwnerHint('Owner auto-filled from selected vehicle to prevent mismatches.');
+    }
+
+    function syncOdometerFromVehicle(forceOverwrite) {
+      if (!odometerEnabled || !odometerInput || odometerInput.disabled) {
+        return;
+      }
+      if (vehicleSelect.disabled) {
+        return;
+      }
+
+      var selectedVehicleId = (vehicleSelect.value || '').trim();
+      if (selectedVehicleId === '') {
+        if (forceOverwrite) {
+          odometerInput.value = '';
+        }
+        renderOdometerHint('Select vehicle to auto-fill the last recorded odometer.');
+        return;
+      }
+
+      var odometerMeta = selectedVehicleOdometerMeta();
+      if (odometerMeta.value === '') {
+        if (forceOverwrite) {
+          odometerInput.value = '';
+        }
+        renderOdometerHint('No previous odometer found for this vehicle. Enter current reading.');
+        return;
+      }
+
+      if (forceOverwrite || (odometerInput.value || '').trim() === '') {
+        odometerInput.value = odometerMeta.value;
+      }
+
+      var sourceText = odometerMeta.source !== '' ? ' (' + odometerMeta.source + ')' : '';
+      renderOdometerHint('Last recorded odometer: ' + formatKm(odometerMeta.value) + ' KM' + sourceText + '.');
     }
 
     function enforceVehicleOwnerMatch() {
@@ -423,6 +656,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         gacRefreshSearchableSelect(vehicleSelect);
       }
       renderOwnerHint('Vehicle selection was cleared because it does not belong to the selected customer.');
+      syncOdometerFromVehicle(true);
       load('');
     }
 
@@ -442,6 +676,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
     }
     vehicleSelect.addEventListener('change', function () {
       syncOwnerFromVehicle();
+      syncOdometerFromVehicle(true);
       load(vehicleSelect.value);
     });
     if (customerSelect) {
@@ -449,7 +684,10 @@ require_once __DIR__ . '/../../includes/sidebar.php';
     }
     if (vehicleSelect.value) {
       syncOwnerFromVehicle();
+      syncOdometerFromVehicle(!isEditMode);
       load(vehicleSelect.value);
+    } else {
+      syncOdometerFromVehicle(false);
     }
   })();
 </script>

@@ -479,13 +479,19 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                 <?php foreach ($customers as $customer): ?>
                   <tr>
                     <td><?= (int) $customer['id']; ?></td>
-                    <td><?= e((string) $customer['full_name']); ?><br><small class="text-muted"><?= e((string) (($customer['city'] ?? '-') . ', ' . ($customer['state'] ?? '-'))); ?></small></td>
+                    <td>
+                      <a href="<?= e(url('modules/customers/view.php?id=' . (int) $customer['id'])); ?>" class="fw-semibold text-decoration-none">
+                        <?= e((string) $customer['full_name']); ?>
+                      </a><br>
+                      <small class="text-muted"><?= e((string) (($customer['city'] ?? '-') . ', ' . ($customer['state'] ?? '-'))); ?></small>
+                    </td>
                     <td><?= e((string) $customer['phone']); ?><br><small class="text-muted"><?= e((string) ($customer['email'] ?? '-')); ?></small></td>
                     <td><?= e((string) ($customer['gstin'] ?? '-')); ?></td>
                     <td><?= (int) $customer['vehicle_count']; ?></td>
                     <td><?= (int) $customer['history_count']; ?></td>
                     <td><span class="badge text-bg-<?= e(status_badge_class((string) $customer['status_code'])); ?>"><?= e(record_status_label((string) $customer['status_code'])); ?></span></td>
                     <td class="d-flex gap-1">
+                      <a class="btn btn-sm btn-outline-success" href="<?= e(url('modules/customers/view.php?id=' . (int) $customer['id'])); ?>">View</a>
                       <a class="btn btn-sm btn-outline-info" href="<?= e(url('modules/customers/index.php?history_id=' . (int) $customer['id'])); ?>">History</a>
                       <?php if ($canManage): ?>
                         <a class="btn btn-sm btn-outline-primary" href="<?= e(url('modules/customers/index.php?edit_id=' . (int) $customer['id'])); ?>">Edit</a>

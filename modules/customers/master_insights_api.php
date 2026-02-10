@@ -41,7 +41,9 @@ function customer_master_render_rows(array $customers, bool $canManage): string
         <tr>
           <td><?= (int) ($customer['id'] ?? 0); ?></td>
           <td>
-            <?= e((string) ($customer['full_name'] ?? '')); ?>
+            <a href="<?= e(url('modules/customers/view.php?id=' . (int) ($customer['id'] ?? 0))); ?>" class="fw-semibold text-decoration-none">
+              <?= e((string) ($customer['full_name'] ?? '')); ?>
+            </a>
             <span class="badge text-bg-<?= e(customer_master_badge_class($customerType)); ?> ms-1"><?= e($customerType); ?></span><br>
             <small class="text-muted"><?= e((string) (($customer['city'] ?? '-') . ', ' . ($customer['state'] ?? '-'))); ?></small>
           </td>
@@ -59,6 +61,7 @@ function customer_master_render_rows(array $customers, bool $canManage): string
           </td>
           <td><span class="badge text-bg-<?= e(status_badge_class($statusCode)); ?>"><?= e(record_status_label($statusCode)); ?></span></td>
           <td class="d-flex gap-1">
+            <a class="btn btn-sm btn-outline-success" href="<?= e(url('modules/customers/view.php?id=' . (int) ($customer['id'] ?? 0))); ?>">View</a>
             <a class="btn btn-sm btn-outline-info" href="<?= e(url('modules/customers/index.php?history_id=' . (int) ($customer['id'] ?? 0))); ?>">History</a>
             <?php if ($canManage): ?>
               <a class="btn btn-sm btn-outline-primary" href="<?= e(url('modules/customers/index.php?edit_id=' . (int) ($customer['id'] ?? 0))); ?>">Edit</a>

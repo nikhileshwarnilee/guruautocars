@@ -135,6 +135,8 @@ $reportVehicleFilters = [
     'color_id' => $reportColorId,
 ];
 $vehicleAttributesApiUrl = url('modules/vehicles/attributes_api.php');
+$jobCardColumns = table_columns('job_cards');
+$jobOdometerEnabled = in_array('odometer_km', $jobCardColumns, true);
 
 $exportBaseParams = [
     'garage_id' => $selectedGarageId,

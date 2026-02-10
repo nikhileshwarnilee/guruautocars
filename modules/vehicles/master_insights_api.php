@@ -100,6 +100,8 @@ function vehicle_master_render_rows(array $vehicles, bool $canManage): string
 $companyId = active_company_id();
 $canManage = has_permission('vehicle.manage');
 $vehicleAttributeEnabled = vehicle_masters_enabled() && vehicle_master_link_columns_supported();
+$jobCardColumns = table_columns('job_cards');
+$jobOdometerEnabled = in_array('odometer_km', $jobCardColumns, true);
 
 $search = trim((string) ($_GET['q'] ?? ''));
 $statusFilter = strtoupper(trim((string) ($_GET['status'] ?? '')));
@@ -206,6 +208,22 @@ if ($lastServiceTo !== '') {
 }
 
 try {
+    $historyCountExpr = '(SELECT COUNT(*) FROM vehicle_history h WHERE h.vehicle_id = v.id)';
+    if ($jobOdometerEnabled) {
+        $historyCountExpr =
+            '(SELECT COUNT(*) FROM (
+                SELECT vh.id AS entry_id
+                FROM vehicle_history vh
+                WHERE vh.vehicle_id = v.id
+                UNION ALL
+                SELECT jc.id AS entry_id
+                FROM job_cards jc
+                WHERE jc.vehicle_id = v.id
+                  AND jc.company_id = v.company_id
+                  AND jc.status_code <> "DELETED"
+            ) hx)';
+    }
+
     $statsSql =
         'SELECT COUNT(*) AS total_vehicles,
                 SUM(CASE WHEN COALESCE(js.open_jobs, 0) > 0 THEN 1 ELSE 0 END) AS vehicles_with_active_jobs,
@@ -224,7 +242,7 @@ try {
                 COALESCE(js.total_jobs, 0) AS service_count,
                 COALESCE(js.open_jobs, 0) AS active_job_count,
                 js.last_service_at,
-                (SELECT COUNT(*) FROM vehicle_history h WHERE h.vehicle_id = v.id) AS history_count,
+                ' . $historyCountExpr . ' AS history_count,
                 vv.variant_name AS vis_variant_name, vm.model_name AS vis_model_name, vb.brand_name AS vis_brand_name
          FROM vehicles v
          INNER JOIN customers c ON c.id = v.customer_id

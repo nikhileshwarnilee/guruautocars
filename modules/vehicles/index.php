@@ -13,6 +13,8 @@ $companyId = active_company_id();
 $allowedVehicleTypes = ['2W', '4W', 'COMMERCIAL'];
 $allowedFuelTypes = ['PETROL', 'DIESEL', 'CNG', 'EV', 'HYBRID', 'OTHER'];
 $vehicleAttributeEnabled = vehicle_masters_enabled() && vehicle_master_link_columns_supported();
+$jobCardColumns = table_columns('job_cards');
+$jobOdometerEnabled = in_array('odometer_km', $jobCardColumns, true);
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     require_csrf();
@@ -37,7 +39,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $colorId = post_int('color_id');
         $chassisNo = post_string('chassis_no', 60);
         $engineNo = post_string('engine_no', 60);
-        $odometer = post_int('odometer_km');
         $notes = post_string('notes', 2000);
         $statusCode = normalize_status_code((string) ($_POST['status_code'] ?? 'ACTIVE'));
         $visVariantId = post_int('vis_variant_id');
@@ -241,9 +242,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if ($vehicleAttributeEnabled) {
                     $insertStmt = db()->prepare(
                         'INSERT INTO vehicles
-                          (company_id, customer_id, registration_no, vehicle_type, brand, brand_id, model, model_id, variant, variant_id, fuel_type, model_year, model_year_id, color, color_id, chassis_no, engine_no, odometer_km, notes, vis_variant_id, is_active, status_code, deleted_at)
+                          (company_id, customer_id, registration_no, vehicle_type, brand, brand_id, model, model_id, variant, variant_id, fuel_type, model_year, model_year_id, color, color_id, chassis_no, engine_no, notes, vis_variant_id, is_active, status_code, deleted_at)
                          VALUES
-                          (:company_id, :customer_id, :registration_no, :vehicle_type, :brand, :brand_id, :model, :model_id, :variant, :variant_id, :fuel_type, :model_year, :model_year_id, :color, :color_id, :chassis_no, :engine_no, :odometer_km, :notes, :vis_variant_id, :is_active, :status_code, :deleted_at)'
+                          (:company_id, :customer_id, :registration_no, :vehicle_type, :brand, :brand_id, :model, :model_id, :variant, :variant_id, :fuel_type, :model_year, :model_year_id, :color, :color_id, :chassis_no, :engine_no, :notes, :vis_variant_id, :is_active, :status_code, :deleted_at)'
                     );
                     $insertStmt->execute([
                         'company_id' => $companyId,
@@ -263,7 +264,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         'color_id' => $resolvedColorId !== null && $resolvedColorId > 0 ? $resolvedColorId : null,
                         'chassis_no' => $chassisNo !== '' ? $chassisNo : null,
                         'engine_no' => $engineNo !== '' ? $engineNo : null,
-                        'odometer_km' => $odometer > 0 ? $odometer : 0,
                         'notes' => $notes !== '' ? $notes : null,
                         'vis_variant_id' => $visVariantId > 0 ? $visVariantId : null,
                         'is_active' => $isActive,
@@ -273,9 +273,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 } else {
                     $insertStmt = db()->prepare(
                         'INSERT INTO vehicles
-                          (company_id, customer_id, registration_no, vehicle_type, brand, model, variant, fuel_type, model_year, color, chassis_no, engine_no, odometer_km, notes, vis_variant_id, is_active, status_code, deleted_at)
+                          (company_id, customer_id, registration_no, vehicle_type, brand, model, variant, fuel_type, model_year, color, chassis_no, engine_no, notes, vis_variant_id, is_active, status_code, deleted_at)
                          VALUES
-                          (:company_id, :customer_id, :registration_no, :vehicle_type, :brand, :model, :variant, :fuel_type, :model_year, :color, :chassis_no, :engine_no, :odometer_km, :notes, :vis_variant_id, :is_active, :status_code, :deleted_at)'
+                          (:company_id, :customer_id, :registration_no, :vehicle_type, :brand, :model, :variant, :fuel_type, :model_year, :color, :chassis_no, :engine_no, :notes, :vis_variant_id, :is_active, :status_code, :deleted_at)'
                     );
                     $insertStmt->execute([
                         'company_id' => $companyId,
@@ -290,7 +290,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         'color' => $color !== '' ? $color : null,
                         'chassis_no' => $chassisNo !== '' ? $chassisNo : null,
                         'engine_no' => $engineNo !== '' ? $engineNo : null,
-                        'odometer_km' => $odometer > 0 ? $odometer : 0,
                         'notes' => $notes !== '' ? $notes : null,
                         'vis_variant_id' => $visVariantId > 0 ? $visVariantId : null,
                         'is_active' => $isActive,
@@ -302,7 +301,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $createdVehicleId = (int) db()->lastInsertId();
                 add_vehicle_history($createdVehicleId, 'CREATE', 'Vehicle created', [
                     'registration_no' => $registrationNo,
-                    'odometer_km' => $odometer > 0 ? $odometer : 0,
                     'status_code' => $statusCode,
                     'vis_variant' => $visVariantName,
                 ]);
@@ -340,7 +338,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                              color_id = :color_id,
                              chassis_no = :chassis_no,
                              engine_no = :engine_no,
-                             odometer_km = :odometer_km,
                              notes = :notes,
                              vis_variant_id = :vis_variant_id,
                              is_active = :is_active,
@@ -366,7 +363,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         'color_id' => $resolvedColorId !== null && $resolvedColorId > 0 ? $resolvedColorId : null,
                         'chassis_no' => $chassisNo !== '' ? $chassisNo : null,
                         'engine_no' => $engineNo !== '' ? $engineNo : null,
-                        'odometer_km' => $odometer > 0 ? $odometer : 0,
                         'notes' => $notes !== '' ? $notes : null,
                         'vis_variant_id' => $visVariantId > 0 ? $visVariantId : null,
                         'is_active' => $isActive,
@@ -388,7 +384,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                              color = :color,
                              chassis_no = :chassis_no,
                              engine_no = :engine_no,
-                             odometer_km = :odometer_km,
                              notes = :notes,
                              vis_variant_id = :vis_variant_id,
                              is_active = :is_active,
@@ -409,7 +404,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         'color' => $color !== '' ? $color : null,
                         'chassis_no' => $chassisNo !== '' ? $chassisNo : null,
                         'engine_no' => $engineNo !== '' ? $engineNo : null,
-                        'odometer_km' => $odometer > 0 ? $odometer : 0,
                         'notes' => $notes !== '' ? $notes : null,
                         'vis_variant_id' => $visVariantId > 0 ? $visVariantId : null,
                         'is_active' => $isActive,
@@ -421,7 +415,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
                 add_vehicle_history($vehicleId, 'UPDATE', 'Vehicle details updated', [
                     'registration_no' => $registrationNo,
-                    'odometer_km' => $odometer > 0 ? $odometer : 0,
                     'status_code' => $statusCode,
                     'vis_variant' => $visVariantName,
                 ]);
@@ -445,19 +438,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             redirect('modules/vehicles/index.php');
         }
 
-        $currentOdometerStmt = db()->prepare(
-            'SELECT odometer_km
-             FROM vehicles
-             WHERE id = :id
-               AND company_id = :company_id
-             LIMIT 1'
-        );
-        $currentOdometerStmt->execute([
-            'id' => $vehicleId,
-            'company_id' => $companyId,
-        ]);
-        $currentOdometer = (int) ($currentOdometerStmt->fetchColumn() ?: 0);
-
         $isActive = $nextStatus === 'ACTIVE' ? 1 : 0;
         $stmt = db()->prepare(
             'UPDATE vehicles
@@ -476,7 +456,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         add_vehicle_history($vehicleId, 'STATUS', 'Status changed to ' . $nextStatus, [
             'status_code' => $nextStatus,
-            'odometer_km' => $currentOdometer,
         ]);
         log_audit('vehicles', 'status', $vehicleId, 'Changed vehicle status to ' . $nextStatus);
 
@@ -570,16 +549,54 @@ if ($vehicleAttributeEnabled && $editVehicle) {
 $historyVehicleId = get_int('history_id');
 $vehicleHistory = [];
 if ($historyVehicleId > 0) {
-    $historyStmt = db()->prepare(
-        'SELECT vh.*, u.name AS created_by_name
-         FROM vehicle_history vh
-         LEFT JOIN vehicles v ON v.id = vh.vehicle_id
-         LEFT JOIN users u ON u.id = vh.created_by
-         WHERE vh.vehicle_id = :vehicle_id
-           AND v.company_id = :company_id
-         ORDER BY vh.id DESC
-         LIMIT 30'
-    );
+    if ($jobOdometerEnabled) {
+        $historyStmt = db()->prepare(
+            'SELECT h.event_at AS created_at, h.action_type, h.action_note, h.created_by_name, h.odometer_km, h.source_label
+             FROM (
+                SELECT vh.created_at AS event_at,
+                       vh.action_type,
+                       vh.action_note,
+                       u.name AS created_by_name,
+                       NULL AS odometer_km,
+                       "VEHICLE_MASTER" AS source_label
+                FROM vehicle_history vh
+                LEFT JOIN vehicles v ON v.id = vh.vehicle_id
+                LEFT JOIN users u ON u.id = vh.created_by
+                WHERE vh.vehicle_id = :vehicle_id
+                  AND v.company_id = :company_id
+
+                UNION ALL
+
+                SELECT COALESCE(jc.opened_at, jc.created_at, jc.updated_at) AS event_at,
+                       "JOB_ODOMETER" AS action_type,
+                       CONCAT("Job ", jc.job_number, " (", jc.status, ")") AS action_note,
+                       u2.name AS created_by_name,
+                       jc.odometer_km AS odometer_km,
+                       "JOB_CARD" AS source_label
+                FROM job_cards jc
+                INNER JOIN vehicles v2 ON v2.id = jc.vehicle_id
+                LEFT JOIN users u2 ON u2.id = jc.created_by
+                WHERE jc.vehicle_id = :vehicle_id
+                  AND jc.company_id = :company_id
+                  AND jc.status_code <> "DELETED"
+                  AND v2.company_id = :company_id
+             ) h
+             ORDER BY h.event_at DESC
+             LIMIT 50'
+        );
+    } else {
+        $historyStmt = db()->prepare(
+            'SELECT vh.created_at, vh.action_type, vh.action_note, u.name AS created_by_name,
+                    NULL AS odometer_km, "VEHICLE_MASTER" AS source_label
+             FROM vehicle_history vh
+             LEFT JOIN vehicles v ON v.id = vh.vehicle_id
+             LEFT JOIN users u ON u.id = vh.created_by
+             WHERE vh.vehicle_id = :vehicle_id
+               AND v.company_id = :company_id
+             ORDER BY vh.id DESC
+             LIMIT 30'
+        );
+    }
     $historyStmt->execute([
         'vehicle_id' => $historyVehicleId,
         'company_id' => $companyId,
@@ -650,10 +667,26 @@ if ($vehicleAttributeEnabled) {
     }
 }
 
+$historyCountExpr = '(SELECT COUNT(*) FROM vehicle_history h WHERE h.vehicle_id = v.id)';
+if ($jobOdometerEnabled) {
+    $historyCountExpr =
+        '(SELECT COUNT(*) FROM (
+            SELECT vh.id AS entry_id
+            FROM vehicle_history vh
+            WHERE vh.vehicle_id = v.id
+            UNION ALL
+            SELECT jc.id AS entry_id
+            FROM job_cards jc
+            WHERE jc.vehicle_id = v.id
+              AND jc.company_id = v.company_id
+              AND jc.status_code <> "DELETED"
+        ) hx)';
+}
+
 $vehicleSql =
     'SELECT v.*, c.full_name AS customer_name, c.phone AS customer_phone,
             (SELECT COUNT(*) FROM job_cards jc WHERE jc.vehicle_id = v.id) AS service_count,
-            (SELECT COUNT(*) FROM vehicle_history h WHERE h.vehicle_id = v.id) AS history_count,
+            ' . $historyCountExpr . ' AS history_count,
             vv.variant_name AS vis_variant_name, vm.model_name AS vis_model_name, vb.brand_name AS vis_brand_name
      FROM vehicles v
      INNER JOIN customers c ON c.id = v.customer_id
@@ -827,15 +860,11 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                 </div>
               <?php endif; ?>
 
-              <div class="col-md-2">
-                <label class="form-label">Odometer (KM)</label>
-                <input type="number" name="odometer_km" class="form-control" min="0" value="<?= e((string) ($editVehicle['odometer_km'] ?? '0')); ?>" />
-              </div>
-              <div class="col-md-4">
+              <div class="col-md-6">
                 <label class="form-label">Chassis No</label>
                 <input type="text" name="chassis_no" class="form-control" value="<?= e((string) ($editVehicle['chassis_no'] ?? '')); ?>" />
               </div>
-              <div class="col-md-4">
+              <div class="col-md-6">
                 <label class="form-label">Engine No</label>
                 <input type="text" name="engine_no" class="form-control" value="<?= e((string) ($editVehicle['engine_no'] ?? '')); ?>" />
               </div>
@@ -1078,18 +1107,28 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                 <tr>
                   <th>When</th>
                   <th>Action</th>
+                  <th>Source</th>
+                  <th>Odometer (KM)</th>
                   <th>Note</th>
                   <th>By</th>
                 </tr>
               </thead>
               <tbody>
                 <?php if (empty($vehicleHistory)): ?>
-                  <tr><td colspan="4" class="text-center text-muted py-4">No history found.</td></tr>
+                  <tr><td colspan="6" class="text-center text-muted py-4">No history found.</td></tr>
                 <?php else: ?>
                   <?php foreach ($vehicleHistory as $history): ?>
                     <tr>
                       <td><?= e((string) $history['created_at']); ?></td>
                       <td><span class="badge text-bg-secondary"><?= e((string) $history['action_type']); ?></span></td>
+                      <td><?= e((string) ($history['source_label'] ?? '-')); ?></td>
+                      <td>
+                        <?php if ($history['odometer_km'] !== null && $history['odometer_km'] !== ''): ?>
+                          <?= e(number_format((float) $history['odometer_km'], 0)); ?>
+                        <?php else: ?>
+                          -
+                        <?php endif; ?>
+                      </td>
                       <td><?= e((string) ($history['action_note'] ?? '-')); ?></td>
                       <td><?= e((string) ($history['created_by_name'] ?? '-')); ?></td>
                     </tr>

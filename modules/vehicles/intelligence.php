@@ -76,6 +76,8 @@ function intelligence_short_text(string $value, int $limit = 100): string
 $customerColumns = table_columns('customers');
 $hasCustomerAltPhone = in_array('alt_phone', $customerColumns, true);
 $hasCustomerType = in_array('customer_type', $customerColumns, true);
+$jobCardColumns = table_columns('job_cards');
+$jobOdometerEnabled = in_array('odometer_km', $jobCardColumns, true);
 
 $vehicleStmt = db()->prepare(
     'SELECT v.*,
@@ -138,6 +140,7 @@ try {
     $jobHistoryStmt = db()->prepare(
         'SELECT jc.id, jc.job_number, jc.status, jc.status_code, jc.priority, jc.opened_at, jc.completed_at, jc.closed_at,
                 jc.complaint, jc.diagnosis, jc.estimated_cost, jc.updated_at,
+                ' . ($jobOdometerEnabled ? 'jc.odometer_km' : 'NULL') . ' AS odometer_km,
                 g.name AS garage_name,
                 inv.invoice_number, inv.grand_total AS invoice_grand_total, inv.payment_status,
                 (SELECT COUNT(*) FROM job_labor jl WHERE jl.job_card_id = jc.id) AS service_lines_count,
@@ -347,65 +350,83 @@ try {
     $repeatedIssues = [];
 }
 
-try {
-    $odometerStmt = db()->prepare(
-        'SELECT vh.action_type, vh.snapshot_json, vh.created_at
-         FROM vehicle_history vh
-         WHERE vh.vehicle_id = :vehicle_id
-         ORDER BY vh.id ASC'
-    );
-    $odometerStmt->execute(['vehicle_id' => $vehicleId]);
-    $historyRows = $odometerStmt->fetchAll();
+$latestOdometerReading = null;
+$latestOdometerSource = '';
+$timeline = [];
 
-    $timeline = [];
-    foreach ($historyRows as $historyRow) {
-        $snapshotRaw = (string) ($historyRow['snapshot_json'] ?? '');
-        if ($snapshotRaw === '') {
+if ($jobOdometerEnabled) {
+    foreach ($jobHistory as $jobRow) {
+        if (!isset($jobRow['odometer_km']) || !is_numeric($jobRow['odometer_km'])) {
             continue;
         }
 
-        $snapshot = json_decode($snapshotRaw, true);
-        if (!is_array($snapshot) || !isset($snapshot['odometer_km']) || !is_numeric($snapshot['odometer_km'])) {
+        $readingKm = (int) round((float) $jobRow['odometer_km']);
+        if ($readingKm < 0) {
             continue;
+        }
+
+        $capturedAt = trim((string) ($jobRow['opened_at'] ?? ''));
+        if ($capturedAt === '') {
+            $capturedAt = trim((string) ($jobRow['updated_at'] ?? ''));
+        }
+        if ($capturedAt === '') {
+            $capturedAt = trim((string) ($jobRow['closed_at'] ?? ''));
+        }
+        if ($capturedAt === '') {
+            $capturedAt = trim((string) ($jobRow['completed_at'] ?? ''));
+        }
+
+        $jobNumber = trim((string) ($jobRow['job_number'] ?? ''));
+        if ($jobNumber === '') {
+            $jobNumber = '#' . (string) ($jobRow['id'] ?? '');
         }
 
         $timeline[] = [
-            'captured_at' => (string) ($historyRow['created_at'] ?? ''),
-            'reading_km' => (int) round((float) $snapshot['odometer_km']),
-            'source' => 'History: ' . (string) ($historyRow['action_type'] ?? 'UPDATE'),
+            'captured_at' => $capturedAt,
+            'reading_km' => $readingKm,
+            'source' => 'Job ' . $jobNumber . ' (' . (string) ($jobRow['status'] ?? 'OPEN') . ')',
         ];
     }
+}
 
-    $timeline[] = [
-        'captured_at' => (string) ($vehicle['updated_at'] ?? $vehicle['created_at'] ?? ''),
-        'reading_km' => (int) ($vehicle['odometer_km'] ?? 0),
-        'source' => 'Current Vehicle Master',
-    ];
+if (empty($timeline)) {
+    $legacyReading = (int) ($vehicle['odometer_km'] ?? 0);
+    if ($legacyReading > 0) {
+        $timeline[] = [
+            'captured_at' => (string) ($vehicle['updated_at'] ?? $vehicle['created_at'] ?? ''),
+            'reading_km' => $legacyReading,
+            'source' => 'Legacy Vehicle Master',
+        ];
+    }
+}
 
-    usort($timeline, static function (array $left, array $right): int {
-        return strcmp((string) ($left['captured_at'] ?? ''), (string) ($right['captured_at'] ?? ''));
-    });
-
-    $deduped = [];
-    foreach ($timeline as $entry) {
-        $key = (string) ($entry['captured_at'] ?? '') . '|' . (string) ($entry['reading_km'] ?? '');
-        $deduped[$key] = $entry;
+usort($timeline, static function (array $left, array $right): int {
+    $compare = strcmp((string) ($left['captured_at'] ?? ''), (string) ($right['captured_at'] ?? ''));
+    if ($compare !== 0) {
+        return $compare;
     }
 
-    $odometerTimeline = array_values($deduped);
-    $previousReading = null;
-    foreach ($odometerTimeline as $index => $entry) {
-        $currentReading = (int) ($entry['reading_km'] ?? 0);
-        $odometerTimeline[$index]['delta_km'] = $previousReading === null ? null : $currentReading - $previousReading;
-        $previousReading = $currentReading;
-    }
-} catch (Throwable $exception) {
-    $odometerTimeline = [[
-        'captured_at' => (string) ($vehicle['updated_at'] ?? $vehicle['created_at'] ?? ''),
-        'reading_km' => (int) ($vehicle['odometer_km'] ?? 0),
-        'source' => 'Current Vehicle Master',
-        'delta_km' => null,
-    ]];
+    return strcmp((string) ($left['source'] ?? ''), (string) ($right['source'] ?? ''));
+});
+
+$deduped = [];
+foreach ($timeline as $entry) {
+    $key = (string) ($entry['captured_at'] ?? '') . '|' . (string) ($entry['reading_km'] ?? '') . '|' . (string) ($entry['source'] ?? '');
+    $deduped[$key] = $entry;
+}
+
+$odometerTimeline = array_values($deduped);
+$previousReading = null;
+foreach ($odometerTimeline as $index => $entry) {
+    $currentReading = (int) ($entry['reading_km'] ?? 0);
+    $odometerTimeline[$index]['delta_km'] = $previousReading === null ? null : $currentReading - $previousReading;
+    $previousReading = $currentReading;
+}
+
+if (!empty($odometerTimeline)) {
+    $lastEntry = $odometerTimeline[count($odometerTimeline) - 1];
+    $latestOdometerReading = (int) ($lastEntry['reading_km'] ?? 0);
+    $latestOdometerSource = (string) ($lastEntry['source'] ?? '');
 }
 
 $visSuggestions = job_fetch_vis_suggestions($companyId, $garageId, $vehicleId);
@@ -551,8 +572,13 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                   <div><span class="badge text-bg-<?= e(status_badge_class((string) ($vehicle['status_code'] ?? 'ACTIVE'))); ?>"><?= e(record_status_label((string) ($vehicle['status_code'] ?? 'ACTIVE'))); ?></span></div>
                 </div>
                 <div class="col-md-4">
-                  <div class="text-muted small">Current Odometer</div>
-                  <div class="fw-semibold"><?= e(number_format((float) ($vehicle['odometer_km'] ?? 0), 0)); ?> KM</div>
+                  <div class="text-muted small">Latest Odometer</div>
+                  <?php if ($latestOdometerReading !== null): ?>
+                    <div class="fw-semibold"><?= e(number_format((float) $latestOdometerReading, 0)); ?> KM</div>
+                    <div class="small text-muted"><?= e($latestOdometerSource !== '' ? $latestOdometerSource : 'Job Card'); ?></div>
+                  <?php else: ?>
+                    <div class="text-muted">No odometer reading captured yet.</div>
+                  <?php endif; ?>
                 </div>
                 <div class="col-md-4">
                   <div class="text-muted small">Chassis No</div>
@@ -666,6 +692,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                 <th>Job #</th>
                 <th>Garage</th>
                 <th>Opened</th>
+                <th>Odometer</th>
                 <th>Status</th>
                 <th>Priority</th>
                 <th>Complaint</th>
@@ -677,7 +704,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             </thead>
             <tbody>
               <?php if (empty($jobHistory)): ?>
-                <tr><td colspan="10" class="text-center text-muted py-4">No jobs found for this vehicle.</td></tr>
+                <tr><td colspan="11" class="text-center text-muted py-4">No jobs found for this vehicle.</td></tr>
               <?php else: ?>
                 <?php foreach ($jobHistory as $job): ?>
                   <tr>
@@ -686,6 +713,13 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                     <td>
                       <?= e(intelligence_format_datetime((string) ($job['opened_at'] ?? ''))); ?><br>
                       <small class="text-muted">Updated: <?= e(intelligence_format_datetime((string) ($job['updated_at'] ?? ''))); ?></small>
+                    </td>
+                    <td>
+                      <?php if (isset($job['odometer_km']) && $job['odometer_km'] !== null && $job['odometer_km'] !== ''): ?>
+                        <?= e(number_format((float) $job['odometer_km'], 0)); ?> KM
+                      <?php else: ?>
+                        -
+                      <?php endif; ?>
                     </td>
                     <td>
                       <span class="badge text-bg-<?= e(intelligence_job_status_badge((string) ($job['status'] ?? 'OPEN'))); ?>"><?= e((string) ($job['status'] ?? 'OPEN')); ?></span>
