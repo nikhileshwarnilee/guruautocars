@@ -111,7 +111,23 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
             }
             job_append_history($jobId, 'CREATE', null, 'OPEN', 'Job created', ['job_number' => $jobNumber]);
-            log_audit('job_cards', 'create', $jobId, 'Created job card ' . $jobNumber);
+            log_audit('job_cards', 'create', $jobId, 'Created job card ' . $jobNumber, [
+                'entity' => 'job_card',
+                'source' => 'UI',
+                'before' => ['exists' => false],
+                'after' => [
+                    'id' => $jobId,
+                    'job_number' => $jobNumber,
+                    'status' => 'OPEN',
+                    'status_code' => 'ACTIVE',
+                    'priority' => $priority,
+                    'customer_id' => $customerId,
+                    'vehicle_id' => $vehicleId,
+                ],
+                'metadata' => [
+                    'assigned_count' => isset($assigned) && is_array($assigned) ? count($assigned) : 0,
+                ],
+            ]);
             $pdo->commit();
             flash_set('job_success', 'Job card created successfully.', 'success');
             redirect('modules/jobs/view.php?id=' . $jobId);
@@ -167,7 +183,25 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             job_append_history($jobId, 'ASSIGN_UPDATE', null, null, 'Updated assignments', ['user_ids' => $assigned]);
         }
         job_append_history($jobId, 'UPDATE_META', (string) $job['status'], (string) $job['status'], 'Job metadata updated');
-        log_audit('job_cards', 'update', $jobId, 'Updated job metadata');
+        log_audit('job_cards', 'update', $jobId, 'Updated job metadata', [
+            'entity' => 'job_card',
+            'source' => 'UI',
+            'before' => [
+                'complaint' => (string) ($job['complaint'] ?? ''),
+                'diagnosis' => (string) ($job['diagnosis'] ?? ''),
+                'priority' => (string) ($job['priority'] ?? ''),
+                'promised_at' => (string) ($job['promised_at'] ?? ''),
+            ],
+            'after' => [
+                'complaint' => $complaint,
+                'diagnosis' => $diagnosis,
+                'priority' => $priority,
+                'promised_at' => $promisedAt !== '' ? str_replace('T', ' ', $promisedAt) : null,
+            ],
+            'metadata' => [
+                'assigned_count' => isset($assigned) && is_array($assigned) ? count($assigned) : 0,
+            ],
+        ]);
         flash_set('job_success', 'Job card updated.', 'success');
         redirect('modules/jobs/index.php');
     }

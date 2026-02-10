@@ -1,0 +1,1 @@
+user_id|i:1;company_id|i:1;role_key|s:11:"super_admin";active_garage_id|i:1;_csrf_token|s:64:"3d9158e7f4a7792808874cd46c743d8192e9be525780950c72a8d46db228a0df";_audit_request_id|s:32:"baa682157cc2c79c70a70394551fd21b";_flash|a:1:{s:11:"job_success";a:2:{s:7:"message";s:29:"Job status updated to CLOSED.";s:4:"type";s:7:"success";}}

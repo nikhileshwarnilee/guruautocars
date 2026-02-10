@@ -16,6 +16,22 @@ function reports_can_view_financial(): bool
 
 function reports_csv_download(string $filename, array $headers, array $rows): never
 {
+    $moduleKey = strtolower((string) strtok($filename, '_'));
+    $rowCount = count($rows);
+    log_data_export('reports_' . $moduleKey, 'CSV', $rowCount, [
+        'company_id' => active_company_id(),
+        'garage_id' => active_garage_id() > 0 ? active_garage_id() : null,
+        'filter_summary' => 'Report export: ' . $filename,
+        'scope' => ['filename' => $filename],
+        'requested_by' => isset($_SESSION['user_id']) ? (int) $_SESSION['user_id'] : null,
+    ]);
+    log_audit('exports', 'download', null, 'Exported report CSV: ' . $filename, [
+        'entity' => 'data_export',
+        'source' => 'UI',
+        'before' => ['requested' => true],
+        'after' => ['module' => 'reports_' . $moduleKey, 'format' => 'CSV', 'row_count' => $rowCount],
+    ]);
+
     header('Content-Type: text/csv; charset=utf-8');
     header('Content-Disposition: attachment; filename="' . $filename . '"');
 
@@ -58,6 +74,7 @@ $currentUser = current_user();
 $roleKey = (string) ($currentUser['role_key'] ?? ($_SESSION['role_key'] ?? ''));
 $isOwnerScope = analytics_is_owner_role($roleKey);
 $canViewFinancial = reports_can_view_financial();
+$canExportData = has_permission('export.data');
 
 $garageOptions = analytics_accessible_garages($companyId, $isOwnerScope);
 if (empty($garageOptions) && $activeGarageId > 0) {
@@ -669,6 +686,10 @@ $totalOutstanding = array_reduce($outstandingReceivables, static fn (float $sum,
 
 $exportKey = trim((string) ($_GET['export'] ?? ''));
 if ($exportKey !== '') {
+    if (!$canExportData) {
+        http_response_code(403);
+        exit('Export access denied.');
+    }
     $timestamp = date('Ymd_His');
 
     switch ($exportKey) {

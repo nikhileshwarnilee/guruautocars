@@ -1,0 +1,1 @@
+user_id|i:1;company_id|i:1;role_key|s:11:"super_admin";active_garage_id|i:1;_csrf_token|s:64:"066412c6d7086d0a6ff9e00f1cf49f393cf87de7a0b535e80153c2da592b1a1c";_flash|a:1:{s:9:"job_error";a:2:{s:7:"message";s:55:"Invalid workflow transition from IN_PROGRESS to CLOSED.";s:4:"type";s:6:"danger";}}

@@ -324,7 +324,37 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $statusNote !== '' ? $statusNote : null,
             ['inventory_warnings' => count($inventoryWarnings)]
         );
-        log_audit('job_cards', 'status', $jobId, 'Status changed from ' . $currentStatus . ' to ' . $targetStatus);
+        $jobAfterWrite = fetch_job_row($jobId, $companyId, $garageId);
+        $auditAction = 'status_change';
+        $auditSource = 'UI';
+        if ($targetStatus === 'CLOSED') {
+            $auditAction = 'close';
+            $auditSource = 'JOB-CLOSE';
+        } elseif ($targetStatus === 'CANCELLED') {
+            $auditAction = 'cancel';
+        }
+        log_audit('job_cards', $auditAction, $jobId, 'Status changed from ' . $currentStatus . ' to ' . $targetStatus, [
+            'entity' => 'job_card',
+            'source' => $auditSource,
+            'before' => [
+                'status' => (string) ($jobForWrite['status'] ?? ''),
+                'status_code' => (string) ($jobForWrite['status_code'] ?? ''),
+                'closed_at' => (string) ($jobForWrite['closed_at'] ?? ''),
+                'completed_at' => (string) ($jobForWrite['completed_at'] ?? ''),
+                'cancel_note' => (string) ($jobForWrite['cancel_note'] ?? ''),
+            ],
+            'after' => [
+                'status' => (string) ($jobAfterWrite['status'] ?? $targetStatus),
+                'status_code' => (string) ($jobAfterWrite['status_code'] ?? ($targetStatus === 'CANCELLED' ? 'INACTIVE' : (string) ($jobForWrite['status_code'] ?? 'ACTIVE'))),
+                'closed_at' => (string) ($jobAfterWrite['closed_at'] ?? ''),
+                'completed_at' => (string) ($jobAfterWrite['completed_at'] ?? ''),
+                'cancel_note' => (string) ($jobAfterWrite['cancel_note'] ?? ''),
+            ],
+            'metadata' => [
+                'workflow_note' => $statusNote !== '' ? $statusNote : null,
+                'inventory_warning_count' => count($inventoryWarnings),
+            ],
+        ]);
 
         flash_set('job_success', 'Job status updated to ' . $targetStatus . '.', 'success');
         if (!empty($inventoryWarnings)) {

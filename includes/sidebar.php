@@ -25,7 +25,7 @@ $isVisOpen = is_menu_group_open('vis.', $activeMenu);
           </a>
         </li>
 
-        <?php if (has_permission('company.manage') || has_permission('garage.manage') || has_permission('financial_year.view') || has_permission('settings.view')): ?>
+<?php if (has_permission('company.manage') || has_permission('garage.manage') || has_permission('financial_year.view') || has_permission('settings.view') || has_permission('audit.view') || has_permission('export.data') || has_permission('backup.manage')): ?>
           <li class="nav-item <?= $isOrganizationOpen ? 'menu-open' : ''; ?>">
             <a href="#" class="nav-link <?= $isOrganizationOpen ? 'active' : ''; ?>">
               <i class="nav-icon bi bi-building"></i>
@@ -64,6 +64,30 @@ $isVisOpen = is_menu_group_open('vis.', $activeMenu);
                   <a href="<?= e(url('modules/system/settings.php')); ?>" class="nav-link <?= e(is_active_menu('system.settings', $activeMenu)); ?>">
                     <i class="nav-icon bi bi-circle"></i>
                     <p>System Settings</p>
+                  </a>
+                </li>
+              <?php endif; ?>
+              <?php if (has_permission('audit.view')): ?>
+                <li class="nav-item">
+                  <a href="<?= e(url('modules/system/audit_logs.php')); ?>" class="nav-link <?= e(is_active_menu('system.audit', $activeMenu)); ?>">
+                    <i class="nav-icon bi bi-circle"></i>
+                    <p>Audit Logs</p>
+                  </a>
+                </li>
+              <?php endif; ?>
+              <?php if (has_permission('export.data')): ?>
+                <li class="nav-item">
+                  <a href="<?= e(url('modules/system/exports.php')); ?>" class="nav-link <?= e(is_active_menu('system.exports', $activeMenu)); ?>">
+                    <i class="nav-icon bi bi-circle"></i>
+                    <p>Data Exports</p>
+                  </a>
+                </li>
+              <?php endif; ?>
+              <?php if (has_permission('backup.manage')): ?>
+                <li class="nav-item">
+                  <a href="<?= e(url('modules/system/backup_recovery.php')); ?>" class="nav-link <?= e(is_active_menu('system.backup', $activeMenu)); ?>">
+                    <i class="nav-icon bi bi-circle"></i>
+                    <p>Backup & Recovery</p>
                   </a>
                 </li>
               <?php endif; ?>

@@ -91,7 +91,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $invoiceCounterStmt->execute(['garage_id' => $garageId]);
 
             $pdo->commit();
-            log_audit('garages', 'create', $garageId, 'Created garage ' . $code);
+            log_audit('garages', 'create', $garageId, 'Created garage ' . $code, [
+                'entity' => 'garage',
+                'source' => 'UI',
+                'company_id' => $companyId,
+                'garage_id' => $garageId,
+                'before' => ['exists' => false],
+                'after' => [
+                    'id' => $garageId,
+                    'code' => $code,
+                    'name' => $name,
+                    'status_code' => $statusCode,
+                ],
+            ]);
             flash_set('garage_success', 'Garage created successfully.', 'success');
         } catch (Throwable $exception) {
             $pdo->rollBack();
@@ -131,6 +143,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
 
         $legacyStatus = $statusCode === 'ACTIVE' ? 'active' : 'inactive';
+        $beforeStmt = db()->prepare(
+            'SELECT id, name, code, status, status_code
+             FROM garages
+             WHERE id = :id
+               AND company_id = :company_id
+             LIMIT 1'
+        );
+        $beforeStmt->execute([
+            'id' => $garageId,
+            'company_id' => $companyId,
+        ]);
+        $beforeGarage = $beforeStmt->fetch() ?: null;
 
         try {
             $stmt = db()->prepare(
@@ -168,7 +192,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'company_id' => $companyId,
             ]);
 
-            log_audit('garages', 'update', $garageId, 'Updated garage ' . $code);
+            log_audit('garages', 'update', $garageId, 'Updated garage ' . $code, [
+                'entity' => 'garage',
+                'source' => 'UI',
+                'company_id' => $companyId,
+                'garage_id' => $garageId,
+                'before' => is_array($beforeGarage) ? [
+                    'name' => (string) ($beforeGarage['name'] ?? ''),
+                    'code' => (string) ($beforeGarage['code'] ?? ''),
+                    'status_code' => (string) ($beforeGarage['status_code'] ?? ''),
+                ] : null,
+                'after' => [
+                    'name' => $name,
+                    'code' => $code,
+                    'status_code' => $statusCode,
+                ],
+            ]);
             flash_set('garage_success', 'Garage updated successfully.', 'success');
         } catch (Throwable $exception) {
             flash_set('garage_error', 'Unable to update garage. Code must be unique per company.', 'danger');
@@ -197,6 +236,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
 
         $legacyStatus = $nextStatus === 'ACTIVE' ? 'active' : 'inactive';
+        $beforeStatusStmt = db()->prepare(
+            'SELECT status, status_code
+             FROM garages
+             WHERE id = :id
+               AND company_id = :company_id
+             LIMIT 1'
+        );
+        $beforeStatusStmt->execute([
+            'id' => $garageId,
+            'company_id' => $companyId,
+        ]);
+        $beforeStatus = $beforeStatusStmt->fetch() ?: null;
 
         $stmt = db()->prepare(
             'UPDATE garages
@@ -213,7 +264,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'company_id' => $companyId,
         ]);
 
-        log_audit('garages', 'status', $garageId, 'Changed status to ' . $nextStatus);
+        log_audit('garages', 'status', $garageId, 'Changed status to ' . $nextStatus, [
+            'entity' => 'garage',
+            'source' => 'UI',
+            'company_id' => $companyId,
+            'garage_id' => $garageId,
+            'before' => is_array($beforeStatus) ? [
+                'status' => (string) ($beforeStatus['status'] ?? ''),
+                'status_code' => (string) ($beforeStatus['status_code'] ?? ''),
+            ] : null,
+            'after' => [
+                'status' => $legacyStatus,
+                'status_code' => $nextStatus,
+            ],
+        ]);
         flash_set('garage_success', 'Garage status updated.', 'success');
         redirect('modules/organization/garages.php?company_id=' . $companyId);
     }

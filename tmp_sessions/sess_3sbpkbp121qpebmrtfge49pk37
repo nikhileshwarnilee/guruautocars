@@ -1,0 +1,1 @@
+user_id|i:1;company_id|i:1;role_key|s:11:"super_admin";active_garage_id|i:1;_csrf_token|s:64:"69318e40fe296ee94804a3920c310d6bfb3bf57acdf5dc4ca242e8e62d5f79cb";_audit_request_id|s:32:"8aed5d7364b3c431a61d1bdeb9c17d6a";_flash|a:1:{s:15:"billing_success";a:2:{s:7:"message";s:31:"Invoice finalized successfully.";s:4:"type";s:7:"success";}}

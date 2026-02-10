@@ -155,7 +155,23 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
 
             $pdo->commit();
-            log_audit('staff', 'create', $userId, 'Created staff user ' . $username);
+            log_audit('staff', 'create', $userId, 'Created staff user ' . $username, [
+                'entity' => 'staff',
+                'source' => 'UI',
+                'company_id' => $companyId,
+                'garage_id' => $primaryGarageId,
+                'before' => ['exists' => false],
+                'after' => [
+                    'user_id' => $userId,
+                    'username' => $username,
+                    'role_id' => $roleId,
+                    'primary_garage_id' => $primaryGarageId,
+                    'status_code' => $statusCode,
+                ],
+                'metadata' => [
+                    'assigned_garages' => $validGarageIds,
+                ],
+            ]);
             flash_set('staff_success', 'Staff user created successfully.', 'success');
         } catch (Throwable $exception) {
             $pdo->rollBack();
@@ -253,6 +269,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             redirect('modules/organization/staff.php?company_id=' . $companyId . '&edit_id=' . $userId);
         }
 
+        $beforeUserStmt = db()->prepare(
+            'SELECT role_id, primary_garage_id, name, email, username, phone, status_code, is_active
+             FROM users
+             WHERE id = :id
+               AND company_id = :company_id
+             LIMIT 1'
+        );
+        $beforeUserStmt->execute([
+            'id' => $userId,
+            'company_id' => $companyId,
+        ]);
+        $beforeUser = $beforeUserStmt->fetch() ?: null;
+
         $isActive = $statusCode === 'ACTIVE' ? 1 : 0;
 
         $pdo = db();
@@ -309,7 +338,32 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
 
             $pdo->commit();
-            log_audit('staff', 'update', $userId, 'Updated staff user ' . $username);
+            log_audit('staff', 'update', $userId, 'Updated staff user ' . $username, [
+                'entity' => 'staff',
+                'source' => 'UI',
+                'company_id' => $companyId,
+                'garage_id' => $primaryGarageId,
+                'before' => is_array($beforeUser) ? [
+                    'role_id' => (int) ($beforeUser['role_id'] ?? 0),
+                    'primary_garage_id' => (int) ($beforeUser['primary_garage_id'] ?? 0),
+                    'name' => (string) ($beforeUser['name'] ?? ''),
+                    'email' => (string) ($beforeUser['email'] ?? ''),
+                    'username' => (string) ($beforeUser['username'] ?? ''),
+                    'status_code' => (string) ($beforeUser['status_code'] ?? ''),
+                ] : null,
+                'after' => [
+                    'role_id' => $roleId,
+                    'primary_garage_id' => $primaryGarageId,
+                    'name' => $name,
+                    'email' => $email,
+                    'username' => $username,
+                    'status_code' => $statusCode,
+                ],
+                'metadata' => [
+                    'assigned_garages' => $validGarageIds,
+                    'password_changed' => $password !== '',
+                ],
+            ]);
             flash_set('staff_success', 'Staff user updated successfully.', 'success');
         } catch (Throwable $exception) {
             $pdo->rollBack();
@@ -328,7 +382,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             redirect('modules/organization/staff.php?company_id=' . $selectedCompanyId);
         }
 
-        $userStmt = db()->prepare('SELECT id, company_id, username FROM users WHERE id = :id LIMIT 1');
+        $userStmt = db()->prepare(
+            'SELECT id, company_id, username, status_code, is_active, primary_garage_id
+             FROM users
+             WHERE id = :id
+             LIMIT 1'
+        );
         $userStmt->execute(['id' => $userId]);
         $user = $userStmt->fetch();
 
@@ -363,7 +422,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'company_id' => $companyId,
         ]);
 
-        log_audit('staff', 'status', $userId, 'Changed status to ' . $nextStatus);
+        log_audit('staff', 'status', $userId, 'Changed status to ' . $nextStatus, [
+            'entity' => 'staff',
+            'source' => 'UI',
+            'company_id' => $companyId,
+            'garage_id' => (int) ($user['primary_garage_id'] ?? 0),
+            'before' => [
+                'status_code' => (string) ($user['status_code'] ?? ''),
+                'is_active' => (int) ($user['is_active'] ?? 0),
+            ],
+            'after' => [
+                'status_code' => $nextStatus,
+                'is_active' => $isActive,
+            ],
+        ]);
         flash_set('staff_success', 'Staff status updated.', 'success');
         redirect('modules/organization/staff.php?company_id=' . $companyId);
     }

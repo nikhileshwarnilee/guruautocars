@@ -118,7 +118,40 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
 
             $pdo->commit();
-            log_audit('parts_master', 'create', $partId, 'Created part ' . $partSku);
+            log_audit('parts_master', 'create', $partId, 'Created part ' . $partSku, [
+                'entity' => 'part',
+                'source' => 'UI',
+                'garage_id' => $garageId,
+                'before' => ['exists' => false],
+                'after' => [
+                    'part_id' => $partId,
+                    'part_sku' => $partSku,
+                    'part_name' => $partName,
+                    'status_code' => $statusCode,
+                    'selling_price' => (float) $sellingPrice,
+                ],
+                'metadata' => [
+                    'opening_stock' => max(0, (float) $openingStock),
+                ],
+            ]);
+            if ($openingStock > 0) {
+                log_audit('inventory', 'stock_in', $partId, 'Opening stock posted from part creation.', [
+                    'entity' => 'inventory_movement',
+                    'source' => 'UI',
+                    'garage_id' => $garageId,
+                    'before' => [
+                        'part_id' => $partId,
+                        'stock_qty' => 0,
+                    ],
+                    'after' => [
+                        'part_id' => $partId,
+                        'stock_qty' => (float) $openingStock,
+                        'movement_type' => 'IN',
+                        'movement_qty' => (float) $openingStock,
+                        'reference_type' => 'OPENING',
+                    ],
+                ]);
+            }
             flash_set('parts_success', 'Part created successfully.', 'success');
         } catch (Throwable $exception) {
             $pdo->rollBack();
@@ -140,6 +173,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $gstRate = (float) ($_POST['gst_rate'] ?? 18);
         $minStock = (float) ($_POST['min_stock'] ?? 0);
         $statusCode = normalize_status_code((string) ($_POST['status_code'] ?? 'ACTIVE'));
+        $beforeStmt = db()->prepare(
+            'SELECT part_name, part_sku, status_code, selling_price, gst_rate, min_stock
+             FROM parts
+             WHERE id = :id
+               AND company_id = :company_id
+             LIMIT 1'
+        );
+        $beforeStmt->execute([
+            'id' => $partId,
+            'company_id' => $companyId,
+        ]);
+        $beforePart = $beforeStmt->fetch() ?: null;
 
         $stmt = db()->prepare(
             'UPDATE parts
@@ -174,7 +219,25 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'company_id' => $companyId,
         ]);
 
-        log_audit('parts_master', 'update', $partId, 'Updated part');
+        log_audit('parts_master', 'update', $partId, 'Updated part', [
+            'entity' => 'part',
+            'source' => 'UI',
+            'before' => is_array($beforePart) ? [
+                'part_name' => (string) ($beforePart['part_name'] ?? ''),
+                'part_sku' => (string) ($beforePart['part_sku'] ?? ''),
+                'status_code' => (string) ($beforePart['status_code'] ?? ''),
+                'selling_price' => (float) ($beforePart['selling_price'] ?? 0),
+                'gst_rate' => (float) ($beforePart['gst_rate'] ?? 0),
+                'min_stock' => (float) ($beforePart['min_stock'] ?? 0),
+            ] : null,
+            'after' => [
+                'part_name' => $partName,
+                'status_code' => $statusCode,
+                'selling_price' => (float) $sellingPrice,
+                'gst_rate' => (float) $gstRate,
+                'min_stock' => (float) $minStock,
+            ],
+        ]);
         flash_set('parts_success', 'Part updated successfully.', 'success');
         redirect('modules/inventory/parts_master.php');
     }
@@ -182,6 +245,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if ($action === 'change_status') {
         $partId = post_int('part_id');
         $nextStatus = normalize_status_code((string) ($_POST['next_status'] ?? 'INACTIVE'));
+        $beforeStatusStmt = db()->prepare(
+            'SELECT status_code, is_active
+             FROM parts
+             WHERE id = :id
+               AND company_id = :company_id
+             LIMIT 1'
+        );
+        $beforeStatusStmt->execute([
+            'id' => $partId,
+            'company_id' => $companyId,
+        ]);
+        $beforeStatus = $beforeStatusStmt->fetch() ?: null;
 
         $stmt = db()->prepare(
             'UPDATE parts
@@ -198,7 +273,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'company_id' => $companyId,
         ]);
 
-        log_audit('parts_master', 'status', $partId, 'Changed part status to ' . $nextStatus);
+        log_audit('parts_master', 'status', $partId, 'Changed part status to ' . $nextStatus, [
+            'entity' => 'part',
+            'source' => 'UI',
+            'before' => is_array($beforeStatus) ? [
+                'status_code' => (string) ($beforeStatus['status_code'] ?? ''),
+                'is_active' => (int) ($beforeStatus['is_active'] ?? 0),
+            ] : null,
+            'after' => [
+                'status_code' => $nextStatus,
+                'is_active' => $nextStatus === 'ACTIVE' ? 1 : 0,
+            ],
+        ]);
         flash_set('parts_success', 'Part status updated.', 'success');
         redirect('modules/inventory/parts_master.php');
     }

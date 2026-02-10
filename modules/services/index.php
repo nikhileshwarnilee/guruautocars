@@ -55,7 +55,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             ]);
 
             $serviceId = (int) db()->lastInsertId();
-            log_audit('services', 'create', $serviceId, 'Created service ' . $serviceCode);
+            log_audit('services', 'create', $serviceId, 'Created service ' . $serviceCode, [
+                'entity' => 'service',
+                'source' => 'UI',
+                'before' => ['exists' => false],
+                'after' => [
+                    'service_id' => $serviceId,
+                    'service_code' => $serviceCode,
+                    'service_name' => $serviceName,
+                    'status_code' => $statusCode,
+                    'default_rate' => (float) $defaultRate,
+                    'gst_rate' => (float) $gstRate,
+                ],
+            ]);
             flash_set('service_success', 'Service created successfully.', 'success');
         } catch (Throwable $exception) {
             flash_set('service_error', 'Unable to create service. Service code must be unique.', 'danger');
@@ -72,6 +84,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $defaultRate = (float) ($_POST['default_rate'] ?? 0);
         $gstRate = (float) ($_POST['gst_rate'] ?? 18);
         $statusCode = normalize_status_code((string) ($_POST['status_code'] ?? 'ACTIVE'));
+        $beforeStmt = db()->prepare(
+            'SELECT service_name, status_code, default_rate, gst_rate
+             FROM services
+             WHERE id = :id
+               AND company_id = :company_id
+             LIMIT 1'
+        );
+        $beforeStmt->execute([
+            'id' => $serviceId,
+            'company_id' => $companyId,
+        ]);
+        $beforeService = $beforeStmt->fetch() ?: null;
 
         $stmt = db()->prepare(
             'UPDATE services
@@ -96,7 +120,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'company_id' => $companyId,
         ]);
 
-        log_audit('services', 'update', $serviceId, 'Updated service');
+        log_audit('services', 'update', $serviceId, 'Updated service', [
+            'entity' => 'service',
+            'source' => 'UI',
+            'before' => is_array($beforeService) ? [
+                'service_name' => (string) ($beforeService['service_name'] ?? ''),
+                'status_code' => (string) ($beforeService['status_code'] ?? ''),
+                'default_rate' => (float) ($beforeService['default_rate'] ?? 0),
+                'gst_rate' => (float) ($beforeService['gst_rate'] ?? 0),
+            ] : null,
+            'after' => [
+                'service_name' => $serviceName,
+                'status_code' => $statusCode,
+                'default_rate' => (float) $defaultRate,
+                'gst_rate' => (float) $gstRate,
+            ],
+        ]);
         flash_set('service_success', 'Service updated successfully.', 'success');
         redirect('modules/services/index.php');
     }
@@ -104,6 +143,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if ($action === 'change_status') {
         $serviceId = post_int('service_id');
         $nextStatus = normalize_status_code((string) ($_POST['next_status'] ?? 'INACTIVE'));
+        $beforeStatusStmt = db()->prepare(
+            'SELECT status_code
+             FROM services
+             WHERE id = :id
+               AND company_id = :company_id
+             LIMIT 1'
+        );
+        $beforeStatusStmt->execute([
+            'id' => $serviceId,
+            'company_id' => $companyId,
+        ]);
+        $beforeStatus = $beforeStatusStmt->fetch() ?: null;
 
         $stmt = db()->prepare(
             'UPDATE services
@@ -118,7 +169,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'company_id' => $companyId,
         ]);
 
-        log_audit('services', 'status', $serviceId, 'Changed status to ' . $nextStatus);
+        log_audit('services', 'status', $serviceId, 'Changed status to ' . $nextStatus, [
+            'entity' => 'service',
+            'source' => 'UI',
+            'before' => is_array($beforeStatus) ? [
+                'status_code' => (string) ($beforeStatus['status_code'] ?? ''),
+            ] : null,
+            'after' => [
+                'status_code' => $nextStatus,
+            ],
+        ]);
         flash_set('service_success', 'Service status updated.', 'success');
         redirect('modules/services/index.php');
     }

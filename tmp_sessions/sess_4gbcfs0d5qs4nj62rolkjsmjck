@@ -1,0 +1,1 @@
+user_id|i:1;company_id|i:1;role_key|s:11:"super_admin";active_garage_id|i:1;_csrf_token|s:64:"16eef8967e04d4f1e8bf1c0b7eded3e4409bb8052fe3f89973d1df49f49b5ebf";_audit_request_id|s:32:"2cf95a2a8fb916105aa6cce561332671";_flash|a:1:{s:11:"job_success";a:2:{s:7:"message";s:32:"Job status updated to COMPLETED.";s:4:"type";s:7:"success";}}

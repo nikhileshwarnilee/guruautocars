@@ -75,7 +75,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             ]);
 
             $companyId = (int) db()->lastInsertId();
-            log_audit('companies', 'create', $companyId, 'Created company ' . $name);
+            log_audit('companies', 'create', $companyId, 'Created company ' . $name, [
+                'entity' => 'company',
+                'source' => 'UI',
+                'before' => ['exists' => false],
+                'after' => [
+                    'id' => $companyId,
+                    'name' => $name,
+                    'gstin' => $gstin !== '' ? $gstin : null,
+                    'status_code' => $statusCode,
+                ],
+            ]);
             flash_set('company_success', 'Company created successfully.', 'success');
         } catch (Throwable $exception) {
             flash_set('company_error', 'Unable to create company. GSTIN might already exist.', 'danger');
@@ -115,6 +125,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
 
         $legacyStatus = $statusCode === 'ACTIVE' ? 'active' : 'inactive';
+        $beforeStmt = db()->prepare(
+            'SELECT id, name, gstin, city, state, status, status_code
+             FROM companies
+             WHERE id = :id
+             LIMIT 1'
+        );
+        $beforeStmt->execute(['id' => $companyId]);
+        $beforeCompany = $beforeStmt->fetch() ?: null;
 
         try {
             $stmt = db()->prepare(
@@ -152,7 +170,24 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'id' => $companyId,
             ]);
 
-            log_audit('companies', 'update', $companyId, 'Updated company ' . $name);
+            log_audit('companies', 'update', $companyId, 'Updated company ' . $name, [
+                'entity' => 'company',
+                'source' => 'UI',
+                'before' => is_array($beforeCompany) ? [
+                    'name' => (string) ($beforeCompany['name'] ?? ''),
+                    'gstin' => (string) ($beforeCompany['gstin'] ?? ''),
+                    'city' => (string) ($beforeCompany['city'] ?? ''),
+                    'state' => (string) ($beforeCompany['state'] ?? ''),
+                    'status_code' => (string) ($beforeCompany['status_code'] ?? ''),
+                ] : null,
+                'after' => [
+                    'name' => $name,
+                    'gstin' => $gstin !== '' ? $gstin : null,
+                    'city' => $city !== '' ? $city : null,
+                    'state' => $state !== '' ? $state : null,
+                    'status_code' => $statusCode,
+                ],
+            ]);
             flash_set('company_success', 'Company updated successfully.', 'success');
         } catch (Throwable $exception) {
             flash_set('company_error', 'Unable to update company. GSTIN might already exist.', 'danger');
@@ -181,6 +216,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
 
         $legacyStatus = $nextStatus === 'ACTIVE' ? 'active' : 'inactive';
+        $beforeStatusStmt = db()->prepare(
+            'SELECT status, status_code
+             FROM companies
+             WHERE id = :id
+             LIMIT 1'
+        );
+        $beforeStatusStmt->execute(['id' => $companyId]);
+        $beforeStatus = $beforeStatusStmt->fetch() ?: null;
 
         $stmt = db()->prepare(
             'UPDATE companies
@@ -195,7 +238,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'id' => $companyId,
         ]);
 
-        log_audit('companies', 'status', $companyId, 'Changed status to ' . $nextStatus);
+        log_audit('companies', 'status', $companyId, 'Changed status to ' . $nextStatus, [
+            'entity' => 'company',
+            'source' => 'UI',
+            'before' => is_array($beforeStatus) ? [
+                'status' => (string) ($beforeStatus['status'] ?? ''),
+                'status_code' => (string) ($beforeStatus['status_code'] ?? ''),
+            ] : null,
+            'after' => [
+                'status' => $legacyStatus,
+                'status_code' => $nextStatus,
+            ],
+        ]);
         flash_set('company_success', 'Company status updated.', 'success');
         redirect('modules/organization/companies.php');
     }

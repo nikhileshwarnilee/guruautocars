@@ -287,11 +287,35 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             ]);
 
             $pdo->commit();
+            $auditAction = $movementType === 'IN'
+                ? 'stock_in'
+                : ($movementType === 'OUT' ? 'stock_out' : 'adjustment');
             log_audit(
                 'inventory',
-                'adjust',
+                $auditAction,
                 $partId,
-                sprintf('Stock %s posted for %s (%s), delta %.2f at garage %d', $movementType, (string) $part['part_name'], (string) $part['part_sku'], $delta, $activeGarageId)
+                sprintf('Stock %s posted for %s (%s), delta %.2f at garage %d', $movementType, (string) $part['part_name'], (string) $part['part_sku'], $delta, $activeGarageId),
+                [
+                    'entity' => 'inventory_movement',
+                    'source' => 'UI',
+                    'before' => [
+                        'garage_id' => $activeGarageId,
+                        'part_id' => $partId,
+                        'stock_qty' => round($currentQty, 2),
+                    ],
+                    'after' => [
+                        'garage_id' => $activeGarageId,
+                        'part_id' => $partId,
+                        'stock_qty' => round($newQty, 2),
+                        'movement_type' => $movementType,
+                        'movement_qty' => round($movementQuantity, 2),
+                        'reference_type' => $sourceType,
+                    ],
+                    'metadata' => [
+                        'allow_negative' => $allowNegativeRequested,
+                        'delta' => round($delta, 2),
+                    ],
+                ]
             );
             flash_set('inventory_success', 'Stock movement posted successfully.', 'success');
         } catch (Throwable $exception) {
@@ -499,7 +523,31 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     (string) $part['part_sku'],
                     $activeGarageId,
                     $toGarageId
-                )
+                ),
+                [
+                    'entity' => 'inventory_transfer',
+                    'source' => 'UI',
+                    'before' => [
+                        'part_id' => $partId,
+                        'from_garage_id' => $activeGarageId,
+                        'to_garage_id' => $toGarageId,
+                        'from_stock_qty' => round($sourceQty, 2),
+                        'to_stock_qty' => round($targetQty, 2),
+                    ],
+                    'after' => [
+                        'part_id' => $partId,
+                        'from_garage_id' => $activeGarageId,
+                        'to_garage_id' => $toGarageId,
+                        'from_stock_qty' => round($newSourceQty, 2),
+                        'to_stock_qty' => round($newTargetQty, 2),
+                        'transfer_ref' => $transferRef,
+                        'quantity' => round($quantity, 2),
+                        'status_code' => 'POSTED',
+                    ],
+                    'metadata' => [
+                        'allow_negative' => $allowNegativeRequested,
+                    ],
+                ]
             );
             flash_set('inventory_success', 'Transfer posted successfully. Ref: ' . $transferRef, 'success');
         } catch (Throwable $exception) {

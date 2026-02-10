@@ -24,6 +24,7 @@ Core PHP + MySQL + AdminLTE based ERP for Indian multi-branch garage operations.
    - `mysql -u root guruautocars < database/inventory_intelligence_upgrade.sql`
    - `mysql -u root guruautocars < database/billing_gst_intelligence_upgrade.sql`
    - `mysql -u root guruautocars < database/reports_dashboard_analytics_upgrade.sql`
+   - `mysql -u root guruautocars < database/compliance_hardening_upgrade.sql`
 4. Start Apache + MySQL in XAMPP.
 5. Open: `http://localhost/guruautocars/login.php`
 
@@ -36,6 +37,10 @@ Core PHP + MySQL + AdminLTE based ERP for Indian multi-branch garage operations.
 - Inventory
 - Billing (GST-ready)
 - Reports & Analytics
+- Compliance hardening:
+  - Immutable audit logs
+  - Scoped data exports
+  - Backup metadata + recovery integrity checks
 
 ## Security Baseline
 - Password hashing (`password_hash`, `password_verify`)
@@ -47,3 +52,6 @@ Core PHP + MySQL + AdminLTE based ERP for Indian multi-branch garage operations.
 ## Notes
 - `template/` is treated as read-only UI reference only.
 - Runtime assets are loaded only from `/assets`.
+- Backup scope is database data/structure only. Cache folders/files are not part of DB backups.
+- Recommended backup command:
+  - `mysqldump -u root --single-transaction --routines --triggers --events --set-gtid-purged=OFF guruautocars > backups\\guruautocars_YYYYMMDD_HHMMSS.sql`

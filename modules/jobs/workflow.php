@@ -234,6 +234,7 @@ function job_current_assignments(int $jobId): array
 function job_post_inventory_on_close(int $jobId, int $companyId, int $garageId, int $actorUserId): array
 {
     $warnings = [];
+    $auditMovements = [];
     $pdo = db();
     $pdo->beginTransaction();
 
@@ -355,6 +356,15 @@ function job_post_inventory_on_close(int $jobId, int $companyId, int $garageId, 
                 'notes' => 'Auto posted on CLOSE for Job Card #' . $jobId,
                 'created_by' => $actorUserId,
             ]);
+
+            $auditMovements[] = [
+                'part_id' => $partId,
+                'part_name' => (string) ($line['part_name'] ?? ''),
+                'part_sku' => (string) ($line['part_sku'] ?? ''),
+                'available_qty' => round($availableQty, 2),
+                'required_qty' => round($requiredQty, 2),
+                'new_qty' => round($newQty, 2),
+            ];
         }
 
         $postStmt = $pdo->prepare(
@@ -365,6 +375,38 @@ function job_post_inventory_on_close(int $jobId, int $companyId, int $garageId, 
         $postStmt->execute(['id' => $jobId]);
 
         $pdo->commit();
+
+        foreach ($auditMovements as $movement) {
+            log_audit(
+                'inventory',
+                'stock_out',
+                (int) $movement['part_id'],
+                'Auto stock OUT posted from job close #' . $jobId,
+                [
+                    'entity' => 'inventory_movement',
+                    'source' => 'JOB-CLOSE',
+                    'company_id' => $companyId,
+                    'garage_id' => $garageId,
+                    'user_id' => $actorUserId,
+                    'before' => [
+                        'part_id' => (int) $movement['part_id'],
+                        'stock_qty' => (float) $movement['available_qty'],
+                    ],
+                    'after' => [
+                        'part_id' => (int) $movement['part_id'],
+                        'stock_qty' => (float) $movement['new_qty'],
+                        'movement_type' => 'OUT',
+                        'movement_qty' => (float) $movement['required_qty'],
+                    ],
+                    'metadata' => [
+                        'job_card_id' => $jobId,
+                        'part_name' => (string) $movement['part_name'],
+                        'part_sku' => (string) $movement['part_sku'],
+                    ],
+                ]
+            );
+        }
+
         return ['warnings' => $warnings, 'posted' => true];
     } catch (Throwable $exception) {
         $pdo->rollBack();

@@ -1,0 +1,1 @@
+user_id|i:1;company_id|i:1;role_key|s:11:"super_admin";active_garage_id|i:1;_csrf_token|s:64:"fd204c2dde28fdda358d264a030c12315e5f04e10ac0be2826ab91921e1a4209";_flash|a:1:{s:13:"billing_error";a:2:{s:7:"message";s:74:"Invoice can be generated only from active CLOSED job cards in this garage.";s:4:"type";s:6:"danger";}}

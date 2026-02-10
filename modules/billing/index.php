@@ -327,7 +327,24 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 ]
             );
 
-            log_audit('billing', 'create_draft', $invoiceId, 'Created draft invoice ' . $invoiceNumber . ' from Job ' . (string) $job['job_number']);
+            log_audit('billing', 'create', $invoiceId, 'Created draft invoice ' . $invoiceNumber . ' from Job ' . (string) $job['job_number'], [
+                'entity' => 'invoice',
+                'source' => 'UI',
+                'before' => ['exists' => false],
+                'after' => [
+                    'invoice_number' => $invoiceNumber,
+                    'invoice_status' => 'DRAFT',
+                    'payment_status' => 'UNPAID',
+                    'grand_total' => (float) ($totals['grand_total'] ?? 0),
+                    'taxable_amount' => (float) ($totals['taxable_amount'] ?? 0),
+                    'total_tax_amount' => (float) ($totals['total_tax_amount'] ?? 0),
+                    'job_card_id' => (int) $job['id'],
+                ],
+                'metadata' => [
+                    'financial_year_label' => (string) ($numberMeta['financial_year_label'] ?? ''),
+                    'line_count' => count($invoiceLines),
+                ],
+            ]);
 
             $pdo->commit();
             flash_set('billing_success', 'Draft invoice created: ' . $invoiceNumber, 'success');
@@ -414,7 +431,23 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 null
             );
 
-            log_audit('billing', 'finalize', $invoiceId, 'Finalized invoice ' . (string) $invoice['invoice_number']);
+            log_audit('billing', 'finalize', $invoiceId, 'Finalized invoice ' . (string) $invoice['invoice_number'], [
+                'entity' => 'invoice',
+                'source' => 'UI',
+                'before' => [
+                    'invoice_status' => (string) ($invoice['invoice_status'] ?? 'DRAFT'),
+                    'payment_status' => (string) ($invoice['payment_status'] ?? 'UNPAID'),
+                    'grand_total' => (float) ($invoice['grand_total'] ?? 0),
+                ],
+                'after' => [
+                    'invoice_status' => 'FINALIZED',
+                    'payment_status' => (string) ($invoice['payment_status'] ?? 'UNPAID'),
+                    'grand_total' => (float) ($invoice['grand_total'] ?? 0),
+                ],
+                'metadata' => [
+                    'invoice_number' => (string) ($invoice['invoice_number'] ?? ''),
+                ],
+            ]);
 
             $pdo->commit();
             flash_set('billing_success', 'Invoice finalized successfully.', 'success');
@@ -440,7 +473,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         try {
             $invoiceStmt = $pdo->prepare(
-                'SELECT id, invoice_number, invoice_status
+                'SELECT id, invoice_number, invoice_status, payment_status
                  FROM invoices
                  WHERE id = :invoice_id
                    AND company_id = :company_id
@@ -497,7 +530,23 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 ['paid_amount' => $paidAmount]
             );
 
-            log_audit('billing', 'cancel', $invoiceId, 'Cancelled invoice ' . (string) $invoice['invoice_number']);
+            log_audit('billing', 'cancel', $invoiceId, 'Cancelled invoice ' . (string) $invoice['invoice_number'], [
+                'entity' => 'invoice',
+                'source' => 'UI',
+                'before' => [
+                    'invoice_status' => $currentStatus,
+                    'payment_status' => (string) ($invoice['payment_status'] ?? 'UNPAID'),
+                    'paid_amount' => (float) $paidAmount,
+                ],
+                'after' => [
+                    'invoice_status' => 'CANCELLED',
+                    'payment_status' => 'CANCELLED',
+                    'cancel_reason' => $cancelReason,
+                ],
+                'metadata' => [
+                    'invoice_number' => (string) ($invoice['invoice_number'] ?? ''),
+                ],
+            ]);
 
             $pdo->commit();
             flash_set('billing_success', 'Invoice cancelled successfully.', 'success');
@@ -618,7 +667,27 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 ]
             );
 
-            log_audit('billing', 'payment', $invoiceId, 'Recorded payment of ' . number_format($amount, 2) . ' for invoice ' . (string) $invoice['invoice_number']);
+            log_audit('billing', 'payment', $invoiceId, 'Recorded payment of ' . number_format($amount, 2) . ' for invoice ' . (string) $invoice['invoice_number'], [
+                'entity' => 'invoice_payment',
+                'source' => 'UI',
+                'before' => [
+                    'invoice_status' => (string) ($invoice['invoice_status'] ?? ''),
+                    'payment_status' => (string) ($invoice['payment_status'] ?? 'UNPAID'),
+                    'paid_amount' => (float) $alreadyPaid,
+                ],
+                'after' => [
+                    'invoice_status' => (string) ($invoice['invoice_status'] ?? ''),
+                    'payment_status' => $paymentStatus,
+                    'payment_mode' => (string) ($summaryMode ?? $paymentMode),
+                    'paid_amount' => (float) $newPaid,
+                    'payment_entry_amount' => (float) billing_round($amount),
+                ],
+                'metadata' => [
+                    'invoice_number' => (string) ($invoice['invoice_number'] ?? ''),
+                    'payment_id' => $paymentId,
+                    'reference_no' => $referenceNo !== '' ? $referenceNo : null,
+                ],
+            ]);
 
             $pdo->commit();
             flash_set('billing_success', 'Payment recorded successfully.', 'success');
