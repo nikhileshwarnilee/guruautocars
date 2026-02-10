@@ -25,3 +25,17 @@
   color: #6c757d;
   font-size: 0.85rem;
 }
+
+.gac-searchable-select .gac-search-input {
+  margin-bottom: 0.35rem;
+}
+
+.gac-searchable-select .gac-search-hint {
+  color: #6c757d;
+  font-size: 0.78rem;
+  margin-top: 0.25rem;
+}
+
+.gac-inline-form-alert {
+  margin-bottom: 0.75rem;
+}

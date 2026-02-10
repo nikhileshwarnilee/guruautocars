@@ -51,6 +51,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'status_code' => $statusCode,
                     'id' => $id,
                 ]);
+                if ($statusCode === 'ACTIVE') {
+                    vehicle_master_ensure_brand($brandName, $id);
+                }
                 log_audit('vis_catalog', 'update_brand', $id, 'Updated brand ' . $brandName);
                 flash_set('vis_success', 'Brand updated.', 'success');
             } else {
@@ -63,7 +66,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'status_code' => $statusCode,
                     'deleted_at' => $statusCode === 'DELETED' ? date('Y-m-d H:i:s') : null,
                 ]);
-                log_audit('vis_catalog', 'create_brand', (int) db()->lastInsertId(), 'Created brand ' . $brandName);
+                $createdBrandId = (int) db()->lastInsertId();
+                if ($statusCode === 'ACTIVE') {
+                    vehicle_master_ensure_brand($brandName, $createdBrandId);
+                }
+                log_audit('vis_catalog', 'create_brand', $createdBrandId, 'Created brand ' . $brandName);
                 flash_set('vis_success', 'Brand created.', 'success');
             }
         } catch (Throwable $exception) {
@@ -103,6 +110,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'status_code' => $statusCode,
                     'id' => $id,
                 ]);
+                if ($statusCode === 'ACTIVE') {
+                    $visBrandStmt = db()->prepare('SELECT brand_name FROM vis_brands WHERE id = :id LIMIT 1');
+                    $visBrandStmt->execute(['id' => $brandId]);
+                    $visBrandName = (string) ($visBrandStmt->fetchColumn() ?: '');
+                    if ($visBrandName !== '') {
+                        $masterBrand = vehicle_master_ensure_brand($visBrandName, $brandId);
+                        if ($masterBrand !== null) {
+                            vehicle_master_ensure_model((int) $masterBrand['id'], $modelName, $vehicleType, $id);
+                        }
+                    }
+                }
                 log_audit('vis_catalog', 'update_model', $id, 'Updated model ' . $modelName);
                 flash_set('vis_success', 'Model updated.', 'success');
             } else {
@@ -117,7 +135,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'status_code' => $statusCode,
                     'deleted_at' => $statusCode === 'DELETED' ? date('Y-m-d H:i:s') : null,
                 ]);
-                log_audit('vis_catalog', 'create_model', (int) db()->lastInsertId(), 'Created model ' . $modelName);
+                $createdModelId = (int) db()->lastInsertId();
+                if ($statusCode === 'ACTIVE') {
+                    $visBrandStmt = db()->prepare('SELECT brand_name FROM vis_brands WHERE id = :id LIMIT 1');
+                    $visBrandStmt->execute(['id' => $brandId]);
+                    $visBrandName = (string) ($visBrandStmt->fetchColumn() ?: '');
+                    if ($visBrandName !== '') {
+                        $masterBrand = vehicle_master_ensure_brand($visBrandName, $brandId);
+                        if ($masterBrand !== null) {
+                            vehicle_master_ensure_model((int) $masterBrand['id'], $modelName, $vehicleType, $createdModelId);
+                        }
+                    }
+                }
+                log_audit('vis_catalog', 'create_model', $createdModelId, 'Created model ' . $modelName);
                 flash_set('vis_success', 'Model created.', 'success');
             }
         } catch (Throwable $exception) {
@@ -160,6 +190,37 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'status_code' => $statusCode,
                     'id' => $id,
                 ]);
+                if ($statusCode === 'ACTIVE') {
+                    $visModelStmt = db()->prepare(
+                        'SELECT vm.id AS vis_model_id, vm.model_name, vm.vehicle_type, vb.id AS vis_brand_id, vb.brand_name
+                         FROM vis_models vm
+                         INNER JOIN vis_brands vb ON vb.id = vm.brand_id
+                         WHERE vm.id = :id
+                         LIMIT 1'
+                    );
+                    $visModelStmt->execute(['id' => $modelId]);
+                    $visModel = $visModelStmt->fetch();
+                    if ($visModel) {
+                        $masterBrand = vehicle_master_ensure_brand((string) $visModel['brand_name'], (int) $visModel['vis_brand_id']);
+                        if ($masterBrand !== null) {
+                            $masterModel = vehicle_master_ensure_model(
+                                (int) $masterBrand['id'],
+                                (string) $visModel['model_name'],
+                                (string) $visModel['vehicle_type'],
+                                (int) $visModel['vis_model_id']
+                            );
+                            if ($masterModel !== null) {
+                                vehicle_master_ensure_variant(
+                                    (int) $masterModel['id'],
+                                    $variantName,
+                                    $fuelType,
+                                    $engineCc !== '' ? $engineCc : null,
+                                    $id
+                                );
+                            }
+                        }
+                    }
+                }
                 log_audit('vis_catalog', 'update_variant', $id, 'Updated variant ' . $variantName);
                 flash_set('vis_success', 'Variant updated.', 'success');
             } else {
@@ -175,7 +236,39 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'status_code' => $statusCode,
                     'deleted_at' => $statusCode === 'DELETED' ? date('Y-m-d H:i:s') : null,
                 ]);
-                log_audit('vis_catalog', 'create_variant', (int) db()->lastInsertId(), 'Created variant ' . $variantName);
+                $createdVariantId = (int) db()->lastInsertId();
+                if ($statusCode === 'ACTIVE') {
+                    $visModelStmt = db()->prepare(
+                        'SELECT vm.id AS vis_model_id, vm.model_name, vm.vehicle_type, vb.id AS vis_brand_id, vb.brand_name
+                         FROM vis_models vm
+                         INNER JOIN vis_brands vb ON vb.id = vm.brand_id
+                         WHERE vm.id = :id
+                         LIMIT 1'
+                    );
+                    $visModelStmt->execute(['id' => $modelId]);
+                    $visModel = $visModelStmt->fetch();
+                    if ($visModel) {
+                        $masterBrand = vehicle_master_ensure_brand((string) $visModel['brand_name'], (int) $visModel['vis_brand_id']);
+                        if ($masterBrand !== null) {
+                            $masterModel = vehicle_master_ensure_model(
+                                (int) $masterBrand['id'],
+                                (string) $visModel['model_name'],
+                                (string) $visModel['vehicle_type'],
+                                (int) $visModel['vis_model_id']
+                            );
+                            if ($masterModel !== null) {
+                                vehicle_master_ensure_variant(
+                                    (int) $masterModel['id'],
+                                    $variantName,
+                                    $fuelType,
+                                    $engineCc !== '' ? $engineCc : null,
+                                    $createdVariantId
+                                );
+                            }
+                        }
+                    }
+                }
+                log_audit('vis_catalog', 'create_variant', $createdVariantId, 'Created variant ' . $variantName);
                 flash_set('vis_success', 'Variant created.', 'success');
             }
         } catch (Throwable $exception) {

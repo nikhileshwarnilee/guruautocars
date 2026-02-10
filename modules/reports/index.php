@@ -120,12 +120,32 @@ if ($toDate < $fromDate) {
 
 $fromDateTime = $fromDate . ' 00:00:00';
 $toDateTime = $toDate . ' 23:59:59';
+$vehicleAttributeEnabled = vehicle_masters_enabled() && vehicle_master_link_columns_supported();
+
+$reportBrandId = $vehicleAttributeEnabled ? get_int('report_brand_id') : 0;
+$reportModelId = $vehicleAttributeEnabled ? get_int('report_model_id') : 0;
+$reportVariantId = $vehicleAttributeEnabled ? get_int('report_variant_id') : 0;
+$reportModelYearId = $vehicleAttributeEnabled ? get_int('report_model_year_id') : 0;
+$reportColorId = $vehicleAttributeEnabled ? get_int('report_color_id') : 0;
+$reportVehicleFilters = [
+    'brand_id' => $reportBrandId,
+    'model_id' => $reportModelId,
+    'variant_id' => $reportVariantId,
+    'model_year_id' => $reportModelYearId,
+    'color_id' => $reportColorId,
+];
+$vehicleAttributesApiUrl = url('modules/vehicles/attributes_api.php');
 
 $exportBaseParams = [
     'garage_id' => $selectedGarageId,
     'fy_id' => $selectedFyId,
     'from' => $fromDate,
     'to' => $toDate,
+    'report_brand_id' => $reportBrandId > 0 ? $reportBrandId : null,
+    'report_model_id' => $reportModelId > 0 ? $reportModelId : null,
+    'report_variant_id' => $reportVariantId > 0 ? $reportVariantId : null,
+    'report_model_year_id' => $reportModelYearId > 0 ? $reportModelYearId : null,
+    'report_color_id' => $reportColorId > 0 ? $reportColorId : null,
 ];
 
 $jobStatusParams = ['company_id' => $companyId, 'from_date' => $fromDate, 'to_date' => $toDate];
@@ -244,6 +264,7 @@ $topCustomers = $topCustomerStmt->fetchAll();
 
 $modelParams = ['company_id' => $companyId, 'from_date' => $fromDate, 'to_date' => $toDate];
 $modelScopeSql = analytics_garage_scope_sql('jc.garage_id', $selectedGarageId, $garageIds, $modelParams, 'model_scope');
+$modelVehicleScopeSql = vehicle_master_scope_sql('v', $reportVehicleFilters, $modelParams, 'report_model_scope');
 $modelStmt = db()->prepare(
     'SELECT v.brand, v.model, COUNT(DISTINCT jc.id) AS service_count
      FROM job_cards jc
@@ -253,6 +274,7 @@ $modelStmt = db()->prepare(
        AND jc.status_code = "ACTIVE"
        AND v.company_id = :company_id
        AND v.status_code = "ACTIVE"
+       ' . $modelVehicleScopeSql . '
        ' . $modelScopeSql . '
        AND DATE(jc.closed_at) BETWEEN :from_date AND :to_date
      GROUP BY v.brand, v.model
@@ -264,6 +286,7 @@ $servicedModels = $modelStmt->fetchAll();
 
 $frequencyParams = ['company_id' => $companyId, 'from_date' => $fromDate, 'to_date' => $toDate];
 $frequencyScopeSql = analytics_garage_scope_sql('jc.garage_id', $selectedGarageId, $garageIds, $frequencyParams, 'frequency_scope');
+$frequencyVehicleScopeSql = vehicle_master_scope_sql('v', $reportVehicleFilters, $frequencyParams, 'report_frequency_scope');
 $frequencyStmt = db()->prepare(
     'SELECT v.registration_no, v.brand, v.model,
             COUNT(jc.id) AS service_count,
@@ -275,6 +298,7 @@ $frequencyStmt = db()->prepare(
        AND jc.status_code = "ACTIVE"
        AND v.company_id = :company_id
        AND v.status_code = "ACTIVE"
+       ' . $frequencyVehicleScopeSql . '
        ' . $frequencyScopeSql . '
        AND DATE(jc.closed_at) BETWEEN :from_date AND :to_date
      GROUP BY v.id, v.registration_no, v.brand, v.model
@@ -608,6 +632,7 @@ try {
 
         $visModelParams = ['company_id' => $companyId, 'from_date' => $fromDate, 'to_date' => $toDate];
         $visModelScopeSql = analytics_garage_scope_sql('jc.garage_id', $selectedGarageId, $garageIds, $visModelParams, 'vis_model_scope');
+        $visModelVehicleScopeSql = vehicle_master_scope_sql('v', $reportVehicleFilters, $visModelParams, 'report_vis_model_scope');
         $visModelStmt = db()->prepare(
             'SELECT vb.brand_name, vm.model_name, COUNT(DISTINCT jc.id) AS service_count
              FROM job_cards jc
@@ -623,6 +648,7 @@ try {
                AND i.invoice_status = "FINALIZED"
                AND v.company_id = :company_id
                AND v.status_code = "ACTIVE"
+               ' . $visModelVehicleScopeSql . '
                AND vv.status_code = "ACTIVE"
                AND vm.status_code = "ACTIVE"
                AND vb.status_code = "ACTIVE"
@@ -637,6 +663,7 @@ try {
 
         $visPartsParams = ['company_id' => $companyId, 'from_date' => $fromDate, 'to_date' => $toDate];
         $visPartsScopeSql = analytics_garage_scope_sql('jc.garage_id', $selectedGarageId, $garageIds, $visPartsParams, 'vis_parts_scope');
+        $visPartsVehicleScopeSql = vehicle_master_scope_sql('v', $reportVehicleFilters, $visPartsParams, 'report_vis_parts_scope');
         $visPartsStmt = db()->prepare(
             'SELECT vm.vehicle_type, p.part_name, p.part_sku, COALESCE(SUM(jp.quantity), 0) AS total_qty
              FROM job_parts jp
@@ -653,6 +680,7 @@ try {
                AND i.invoice_status = "FINALIZED"
                AND v.company_id = :company_id
                AND v.status_code = "ACTIVE"
+               ' . $visPartsVehicleScopeSql . '
                AND vv.status_code = "ACTIVE"
                AND vm.status_code = "ACTIVE"
                AND p.company_id = :company_id
@@ -860,6 +888,43 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             </div>
             <div class="col-md-2"><label class="form-label">From</label><input type="date" name="from" class="form-control" value="<?= e($fromDate); ?>" required /></div>
             <div class="col-md-2"><label class="form-label">To</label><input type="date" name="to" class="form-control" value="<?= e($toDate); ?>" required /></div>
+            <?php if ($vehicleAttributeEnabled): ?>
+              <div class="col-12" data-vehicle-attributes-root="1" data-vehicle-attributes-mode="filter" data-vehicle-attributes-endpoint="<?= e($vehicleAttributesApiUrl); ?>">
+                <div class="row g-2">
+                  <div class="col-md-2">
+                    <label class="form-label">Brand</label>
+                    <select name="report_brand_id" data-vehicle-attr="brand" data-selected-id="<?= e((string) $reportBrandId); ?>" class="form-select">
+                      <option value="">All Brands</option>
+                    </select>
+                  </div>
+                  <div class="col-md-2">
+                    <label class="form-label">Model</label>
+                    <select name="report_model_id" data-vehicle-attr="model" data-selected-id="<?= e((string) $reportModelId); ?>" class="form-select">
+                      <option value="">All Models</option>
+                    </select>
+                  </div>
+                  <div class="col-md-2">
+                    <label class="form-label">Variant</label>
+                    <select name="report_variant_id" data-vehicle-attr="variant" data-selected-id="<?= e((string) $reportVariantId); ?>" class="form-select">
+                      <option value="">All Variants</option>
+                    </select>
+                  </div>
+                  <div class="col-md-2">
+                    <label class="form-label">Year</label>
+                    <select name="report_model_year_id" data-vehicle-attr="model_year" data-selected-id="<?= e((string) $reportModelYearId); ?>" class="form-select">
+                      <option value="">All Years</option>
+                    </select>
+                  </div>
+                  <div class="col-md-2">
+                    <label class="form-label">Color</label>
+                    <select name="report_color_id" data-vehicle-attr="color" data-selected-id="<?= e((string) $reportColorId); ?>" class="form-select">
+                      <option value="">All Colors</option>
+                    </select>
+                  </div>
+                </div>
+                <div class="form-hint mt-1">Vehicle filters apply to vehicle-focused report sections and VIS insights.</div>
+              </div>
+            <?php endif; ?>
             <div class="col-md-2 d-flex gap-2"><button type="submit" class="btn btn-primary">Apply</button><a href="<?= e(url('modules/reports/index.php')); ?>" class="btn btn-outline-secondary">Reset</a></div>
           </form>
           <div class="mt-3">

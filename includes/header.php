@@ -30,7 +30,10 @@ $flashMessages = flash_pull_all();
     <link rel="stylesheet" href="<?= e(url('assets/css/adminlte.min.css')); ?>" />
     <link rel="stylesheet" href="<?= e(url('assets/css/app.css')); ?>" />
   </head>
-  <body class="layout-fixed sidebar-expand-lg bg-body-tertiary">
+  <body
+    class="layout-fixed sidebar-expand-lg bg-body-tertiary"
+    data-inline-customer-form-url="<?= e(url('modules/customers/inline_form.php')); ?>"
+  >
     <div class="app-wrapper">
       <nav class="app-header navbar navbar-expand bg-body">
         <div class="container-fluid">

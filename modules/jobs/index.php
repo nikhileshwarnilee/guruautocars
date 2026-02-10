@@ -214,6 +214,8 @@ $customers = $customers->fetchAll();
 $vehicles = db()->prepare('SELECT id, customer_id, registration_no, brand, model FROM vehicles WHERE company_id = :company_id AND status_code = "ACTIVE" ORDER BY registration_no ASC');
 $vehicles->execute(['company_id' => $companyId]);
 $vehicles = $vehicles->fetchAll();
+$vehicleAttributesEnabled = vehicle_masters_enabled() && vehicle_master_link_columns_supported();
+$vehicleAttributesApiUrl = url('modules/vehicles/attributes_api.php');
 
 $staffCandidates = job_assignment_candidates($companyId, $garageId);
 
@@ -264,8 +266,65 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       <div class="card-header"><h3 class="card-title"><?= $editJob ? 'Edit Job Card' : 'Create Job Card'; ?></h3></div>
       <form method="post"><div class="card-body row g-3">
         <?= csrf_field(); ?><input type="hidden" name="_action" value="<?= $editJob ? 'update' : 'create'; ?>"><input type="hidden" name="job_id" value="<?= (int) ($editJob['id'] ?? 0); ?>">
-        <div class="col-md-3"><label class="form-label">Customer</label><select name="customer_id" class="form-select" required <?= $editJob ? 'disabled' : ''; ?>><option value="">Select Customer</option><?php foreach ($customers as $customer): ?><option value="<?= (int) $customer['id']; ?>" <?= ((int) ($editJob['customer_id'] ?? 0) === (int) $customer['id']) ? 'selected' : ''; ?>><?= e((string) $customer['full_name']); ?> (<?= e((string) $customer['phone']); ?>)</option><?php endforeach; ?></select><?php if ($editJob): ?><input type="hidden" name="customer_id" value="<?= (int) $editJob['customer_id']; ?>"><?php endif; ?></div>
-        <div class="col-md-3"><label class="form-label">Vehicle</label><select id="job-vehicle-select" name="vehicle_id" class="form-select" required <?= $editJob ? 'disabled' : ''; ?>><option value="">Select Vehicle</option><?php foreach ($vehicles as $vehicle): ?><option value="<?= (int) $vehicle['id']; ?>" <?= ((int) ($editJob['vehicle_id'] ?? 0) === (int) $vehicle['id']) ? 'selected' : ''; ?>><?= e((string) $vehicle['registration_no']); ?> - <?= e((string) $vehicle['brand']); ?> <?= e((string) $vehicle['model']); ?></option><?php endforeach; ?></select><?php if ($editJob): ?><input type="hidden" name="vehicle_id" value="<?= (int) $editJob['vehicle_id']; ?>"><?php endif; ?></div>
+        <div class="col-md-3">
+          <label class="form-label">Customer</label>
+          <select id="job-customer-select" name="customer_id" class="form-select" required <?= $editJob ? 'disabled' : ''; ?>>
+            <option value="">Select Customer</option>
+            <?php foreach ($customers as $customer): ?>
+              <option value="<?= (int) $customer['id']; ?>" <?= ((int) ($editJob['customer_id'] ?? 0) === (int) $customer['id']) ? 'selected' : ''; ?>>
+                <?= e((string) $customer['full_name']); ?> (<?= e((string) $customer['phone']); ?>)
+              </option>
+            <?php endforeach; ?>
+          </select>
+          <?php if ($editJob): ?><input type="hidden" name="customer_id" value="<?= (int) $editJob['customer_id']; ?>"><?php endif; ?>
+        </div>
+
+        <?php if (!$editJob && $vehicleAttributesEnabled): ?>
+          <div class="col-md-6" data-vehicle-attributes-root="1" data-vehicle-attributes-mode="filter" data-vehicle-attributes-endpoint="<?= e($vehicleAttributesApiUrl); ?>" data-vehicle-picker-target="#job-vehicle-select" data-vehicle-customer-select="#job-customer-select">
+            <label class="form-label">Vehicle Filters</label>
+            <div class="row g-2">
+              <div class="col-md-4">
+                <select name="job_vehicle_brand_id" data-vehicle-attr="brand" class="form-select">
+                  <option value="">All Brands</option>
+                </select>
+              </div>
+              <div class="col-md-4">
+                <select name="job_vehicle_model_id" data-vehicle-attr="model" class="form-select">
+                  <option value="">All Models</option>
+                </select>
+              </div>
+              <div class="col-md-4">
+                <select name="job_vehicle_variant_id" data-vehicle-attr="variant" class="form-select">
+                  <option value="">All Variants</option>
+                </select>
+              </div>
+              <div class="col-md-6">
+                <select name="job_vehicle_model_year_id" data-vehicle-attr="model_year" class="form-select">
+                  <option value="">All Years</option>
+                </select>
+              </div>
+              <div class="col-md-6">
+                <select name="job_vehicle_color_id" data-vehicle-attr="color" class="form-select">
+                  <option value="">All Colors</option>
+                </select>
+              </div>
+            </div>
+            <div class="form-hint">Filter vehicle dropdown using standardized attributes.</div>
+          </div>
+        <?php endif; ?>
+
+        <div class="col-md-3">
+          <label class="form-label">Vehicle</label>
+          <select id="job-vehicle-select" name="vehicle_id" class="form-select" required <?= $editJob ? 'disabled' : ''; ?>>
+            <option value="">Select Vehicle</option>
+            <?php foreach ($vehicles as $vehicle): ?>
+              <option value="<?= (int) $vehicle['id']; ?>" <?= ((int) ($editJob['vehicle_id'] ?? 0) === (int) $vehicle['id']) ? 'selected' : ''; ?>>
+                <?= e((string) $vehicle['registration_no']); ?> - <?= e((string) $vehicle['brand']); ?> <?= e((string) $vehicle['model']); ?>
+              </option>
+            <?php endforeach; ?>
+          </select>
+          <?php if ($editJob): ?><input type="hidden" name="vehicle_id" value="<?= (int) $editJob['vehicle_id']; ?>"><?php endif; ?>
+        </div>
         <div class="col-md-2"><label class="form-label">Priority</label><select name="priority" class="form-select"><?php $priority = (string) ($editJob['priority'] ?? 'MEDIUM'); ?><option value="LOW" <?= $priority === 'LOW' ? 'selected' : ''; ?>>Low</option><option value="MEDIUM" <?= $priority === 'MEDIUM' ? 'selected' : ''; ?>>Medium</option><option value="HIGH" <?= $priority === 'HIGH' ? 'selected' : ''; ?>>High</option><option value="URGENT" <?= $priority === 'URGENT' ? 'selected' : ''; ?>>Urgent</option></select></div>
         <div class="col-md-2"><label class="form-label">Promised</label><input type="datetime-local" name="promised_at" class="form-control" value="<?= e((string) (!empty($editJob['promised_at']) ? str_replace(' ', 'T', substr((string) $editJob['promised_at'], 0, 16)) : '')); ?>"></div>
         <div class="col-md-12"><label class="form-label">Complaint</label><textarea name="complaint" class="form-control" rows="2" required><?= e((string) ($editJob['complaint'] ?? '')); ?></textarea></div>

@@ -12,6 +12,7 @@ $companyId = active_company_id();
 
 $allowedVehicleTypes = ['2W', '4W', 'COMMERCIAL'];
 $allowedFuelTypes = ['PETROL', 'DIESEL', 'CNG', 'EV', 'HYBRID', 'OTHER'];
+$vehicleAttributeEnabled = vehicle_masters_enabled() && vehicle_master_link_columns_supported();
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     require_csrf();
@@ -28,12 +29,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $customerId = post_int('customer_id');
         $registrationNo = strtoupper(post_string('registration_no', 30));
         $vehicleType = (string) ($_POST['vehicle_type'] ?? '4W');
-        $brand = post_string('brand', 80);
-        $model = post_string('model', 100);
-        $variant = post_string('variant', 100);
+        $brandId = post_int('brand_id');
+        $modelId = post_int('model_id');
+        $variantId = post_int('variant_id');
         $fuelType = (string) ($_POST['fuel_type'] ?? 'PETROL');
-        $modelYear = post_int('model_year');
-        $color = post_string('color', 40);
+        $modelYearId = post_int('model_year_id');
+        $colorId = post_int('color_id');
         $chassisNo = post_string('chassis_no', 60);
         $engineNo = post_string('engine_no', 60);
         $odometer = post_int('odometer_km');
@@ -41,12 +42,146 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $statusCode = normalize_status_code((string) ($_POST['status_code'] ?? 'ACTIVE'));
         $visVariantId = post_int('vis_variant_id');
 
+        $brandText = vehicle_master_normalize_text(post_string('brand_text', 100), 100);
+        $modelText = vehicle_master_normalize_text(post_string('model_text', 120), 120);
+        $variantText = vehicle_master_normalize_text(post_string('variant_text', 150), 150);
+        $modelYearText = vehicle_master_normalize_text(post_string('model_year_text', 4), 4);
+        $colorText = vehicle_master_normalize_text(post_string('color_text', 60), 60);
+
+        if ($brandText === '') {
+            $brandText = vehicle_master_normalize_text(post_string('brand', 100), 100);
+        }
+        if ($modelText === '') {
+            $modelText = vehicle_master_normalize_text(post_string('model', 120), 120);
+        }
+        if ($variantText === '') {
+            $variantText = vehicle_master_normalize_text(post_string('variant', 150), 150);
+        }
+        if ($modelYearText === '') {
+            $legacyYear = post_int('model_year');
+            if ($legacyYear > 0) {
+                $modelYearText = (string) $legacyYear;
+            }
+        }
+        if ($colorText === '') {
+            $colorText = vehicle_master_normalize_text(post_string('color', 60), 60);
+        }
+
         if (!in_array($vehicleType, $allowedVehicleTypes, true)) {
             $vehicleType = '4W';
         }
 
         if (!in_array($fuelType, $allowedFuelTypes, true)) {
             $fuelType = 'PETROL';
+        }
+
+        $resolvedBrandId = null;
+        $resolvedModelId = null;
+        $resolvedVariantId = null;
+        $resolvedModelYearId = null;
+        $resolvedColorId = null;
+
+        $brand = '';
+        $model = '';
+        $variant = '';
+        $modelYear = 0;
+        $color = '';
+
+        if ($vehicleAttributeEnabled) {
+            $brandRow = vehicle_master_get_brand($brandId);
+            if ($brandRow !== null) {
+                $resolvedBrandId = (int) $brandRow['id'];
+                $brand = (string) $brandRow['brand_name'];
+            } elseif ($brandText !== '') {
+                $brandRow = vehicle_master_ensure_brand($brandText);
+                if ($brandRow !== null) {
+                    $resolvedBrandId = (int) $brandRow['id'];
+                    $brand = (string) $brandRow['brand_name'];
+                } else {
+                    $brand = mb_substr($brandText, 0, 80);
+                }
+            }
+
+            if ($resolvedBrandId !== null && $resolvedBrandId > 0) {
+                $modelRow = vehicle_master_get_model($modelId, $resolvedBrandId);
+                if ($modelRow !== null) {
+                    $resolvedModelId = (int) $modelRow['id'];
+                    $model = (string) $modelRow['model_name'];
+                } elseif ($modelText !== '') {
+                    $modelRow = vehicle_master_ensure_model($resolvedBrandId, $modelText, $vehicleType);
+                    if ($modelRow !== null) {
+                        $resolvedModelId = (int) $modelRow['id'];
+                        $model = (string) $modelRow['model_name'];
+                    } else {
+                        $model = mb_substr($modelText, 0, 100);
+                    }
+                }
+            } else {
+                $model = mb_substr($modelText, 0, 100);
+            }
+
+            if ($resolvedModelId !== null && $resolvedModelId > 0) {
+                $variantRow = vehicle_master_get_variant($variantId, $resolvedModelId);
+                if ($variantRow !== null) {
+                    $resolvedVariantId = (int) $variantRow['id'];
+                    $variant = (string) $variantRow['variant_name'];
+                    if ($visVariantId <= 0 && !empty($variantRow['vis_variant_id'])) {
+                        $visVariantId = (int) $variantRow['vis_variant_id'];
+                    }
+                } elseif ($variantText !== '') {
+                    $variantRow = vehicle_master_ensure_variant($resolvedModelId, $variantText, $fuelType, null, $visVariantId > 0 ? $visVariantId : null);
+                    if ($variantRow !== null) {
+                        $resolvedVariantId = (int) $variantRow['id'];
+                        $variant = (string) $variantRow['variant_name'];
+                        if ($visVariantId <= 0 && !empty($variantRow['vis_variant_id'])) {
+                            $visVariantId = (int) $variantRow['vis_variant_id'];
+                        }
+                    } else {
+                        $variant = mb_substr($variantText, 0, 100);
+                    }
+                }
+            } else {
+                $variant = mb_substr($variantText, 0, 100);
+            }
+
+            $yearRow = vehicle_master_get_year($modelYearId);
+            if ($yearRow !== null) {
+                $resolvedModelYearId = (int) $yearRow['id'];
+                $modelYear = (int) $yearRow['year_value'];
+            } elseif ($modelYearText !== '' && ctype_digit($modelYearText)) {
+                $yearValue = (int) $modelYearText;
+                if ($yearValue >= 1900 && $yearValue <= 2100) {
+                    $yearRow = vehicle_master_ensure_year($yearValue);
+                    if ($yearRow !== null) {
+                        $resolvedModelYearId = (int) $yearRow['id'];
+                        $modelYear = (int) $yearRow['year_value'];
+                    } else {
+                        $modelYear = $yearValue;
+                    }
+                }
+            }
+
+            $colorRow = vehicle_master_get_color($colorId);
+            if ($colorRow !== null) {
+                $resolvedColorId = (int) $colorRow['id'];
+                $color = (string) $colorRow['color_name'];
+            } elseif ($colorText !== '') {
+                $colorRow = vehicle_master_ensure_color($colorText);
+                if ($colorRow !== null) {
+                    $resolvedColorId = (int) $colorRow['id'];
+                    $color = (string) $colorRow['color_name'];
+                } else {
+                    $color = mb_substr($colorText, 0, 40);
+                }
+            }
+        } else {
+            $brand = mb_substr($brandText, 0, 80);
+            $model = mb_substr($modelText, 0, 100);
+            $variant = mb_substr($variantText, 0, 100);
+            if ($modelYearText !== '' && ctype_digit($modelYearText)) {
+                $modelYear = (int) $modelYearText;
+            }
+            $color = mb_substr($colorText, 0, 40);
         }
 
         if ($customerId <= 0 || $registrationNo === '' || $brand === '' || $model === '') {
@@ -103,32 +238,66 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         if ($action === 'create') {
             try {
-                $insertStmt = db()->prepare(
-                    'INSERT INTO vehicles
-                      (company_id, customer_id, registration_no, vehicle_type, brand, model, variant, fuel_type, model_year, color, chassis_no, engine_no, odometer_km, notes, vis_variant_id, is_active, status_code, deleted_at)
-                     VALUES
-                      (:company_id, :customer_id, :registration_no, :vehicle_type, :brand, :model, :variant, :fuel_type, :model_year, :color, :chassis_no, :engine_no, :odometer_km, :notes, :vis_variant_id, :is_active, :status_code, :deleted_at)'
-                );
-                $insertStmt->execute([
-                    'company_id' => $companyId,
-                    'customer_id' => $customerId,
-                    'registration_no' => $registrationNo,
-                    'vehicle_type' => $vehicleType,
-                    'brand' => $brand,
-                    'model' => $model,
-                    'variant' => $variant !== '' ? $variant : null,
-                    'fuel_type' => $fuelType,
-                    'model_year' => $modelYear > 0 ? $modelYear : null,
-                    'color' => $color !== '' ? $color : null,
-                    'chassis_no' => $chassisNo !== '' ? $chassisNo : null,
-                    'engine_no' => $engineNo !== '' ? $engineNo : null,
-                    'odometer_km' => $odometer > 0 ? $odometer : 0,
-                    'notes' => $notes !== '' ? $notes : null,
-                    'vis_variant_id' => $visVariantId > 0 ? $visVariantId : null,
-                    'is_active' => $isActive,
-                    'status_code' => $statusCode,
-                    'deleted_at' => $statusCode === 'DELETED' ? date('Y-m-d H:i:s') : null,
-                ]);
+                if ($vehicleAttributeEnabled) {
+                    $insertStmt = db()->prepare(
+                        'INSERT INTO vehicles
+                          (company_id, customer_id, registration_no, vehicle_type, brand, brand_id, model, model_id, variant, variant_id, fuel_type, model_year, model_year_id, color, color_id, chassis_no, engine_no, odometer_km, notes, vis_variant_id, is_active, status_code, deleted_at)
+                         VALUES
+                          (:company_id, :customer_id, :registration_no, :vehicle_type, :brand, :brand_id, :model, :model_id, :variant, :variant_id, :fuel_type, :model_year, :model_year_id, :color, :color_id, :chassis_no, :engine_no, :odometer_km, :notes, :vis_variant_id, :is_active, :status_code, :deleted_at)'
+                    );
+                    $insertStmt->execute([
+                        'company_id' => $companyId,
+                        'customer_id' => $customerId,
+                        'registration_no' => $registrationNo,
+                        'vehicle_type' => $vehicleType,
+                        'brand' => $brand,
+                        'brand_id' => $resolvedBrandId !== null && $resolvedBrandId > 0 ? $resolvedBrandId : null,
+                        'model' => $model,
+                        'model_id' => $resolvedModelId !== null && $resolvedModelId > 0 ? $resolvedModelId : null,
+                        'variant' => $variant !== '' ? $variant : null,
+                        'variant_id' => $resolvedVariantId !== null && $resolvedVariantId > 0 ? $resolvedVariantId : null,
+                        'fuel_type' => $fuelType,
+                        'model_year' => $modelYear > 0 ? $modelYear : null,
+                        'model_year_id' => $resolvedModelYearId !== null && $resolvedModelYearId > 0 ? $resolvedModelYearId : null,
+                        'color' => $color !== '' ? $color : null,
+                        'color_id' => $resolvedColorId !== null && $resolvedColorId > 0 ? $resolvedColorId : null,
+                        'chassis_no' => $chassisNo !== '' ? $chassisNo : null,
+                        'engine_no' => $engineNo !== '' ? $engineNo : null,
+                        'odometer_km' => $odometer > 0 ? $odometer : 0,
+                        'notes' => $notes !== '' ? $notes : null,
+                        'vis_variant_id' => $visVariantId > 0 ? $visVariantId : null,
+                        'is_active' => $isActive,
+                        'status_code' => $statusCode,
+                        'deleted_at' => $statusCode === 'DELETED' ? date('Y-m-d H:i:s') : null,
+                    ]);
+                } else {
+                    $insertStmt = db()->prepare(
+                        'INSERT INTO vehicles
+                          (company_id, customer_id, registration_no, vehicle_type, brand, model, variant, fuel_type, model_year, color, chassis_no, engine_no, odometer_km, notes, vis_variant_id, is_active, status_code, deleted_at)
+                         VALUES
+                          (:company_id, :customer_id, :registration_no, :vehicle_type, :brand, :model, :variant, :fuel_type, :model_year, :color, :chassis_no, :engine_no, :odometer_km, :notes, :vis_variant_id, :is_active, :status_code, :deleted_at)'
+                    );
+                    $insertStmt->execute([
+                        'company_id' => $companyId,
+                        'customer_id' => $customerId,
+                        'registration_no' => $registrationNo,
+                        'vehicle_type' => $vehicleType,
+                        'brand' => $brand,
+                        'model' => $model,
+                        'variant' => $variant !== '' ? $variant : null,
+                        'fuel_type' => $fuelType,
+                        'model_year' => $modelYear > 0 ? $modelYear : null,
+                        'color' => $color !== '' ? $color : null,
+                        'chassis_no' => $chassisNo !== '' ? $chassisNo : null,
+                        'engine_no' => $engineNo !== '' ? $engineNo : null,
+                        'odometer_km' => $odometer > 0 ? $odometer : 0,
+                        'notes' => $notes !== '' ? $notes : null,
+                        'vis_variant_id' => $visVariantId > 0 ? $visVariantId : null,
+                        'is_active' => $isActive,
+                        'status_code' => $statusCode,
+                        'deleted_at' => $statusCode === 'DELETED' ? date('Y-m-d H:i:s') : null,
+                    ]);
+                }
 
                 $createdVehicleId = (int) db()->lastInsertId();
                 add_vehicle_history($createdVehicleId, 'CREATE', 'Vehicle created', [
@@ -151,48 +320,103 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
 
             try {
-                $updateStmt = db()->prepare(
-                    'UPDATE vehicles
-                     SET customer_id = :customer_id,
-                         registration_no = :registration_no,
-                         vehicle_type = :vehicle_type,
-                         brand = :brand,
-                         model = :model,
-                         variant = :variant,
-                         fuel_type = :fuel_type,
-                         model_year = :model_year,
-                         color = :color,
-                         chassis_no = :chassis_no,
-                         engine_no = :engine_no,
-                         odometer_km = :odometer_km,
-                         notes = :notes,
-                         vis_variant_id = :vis_variant_id,
-                         is_active = :is_active,
-                         status_code = :status_code,
-                         deleted_at = CASE WHEN :status_code = "DELETED" THEN NOW() ELSE NULL END
-                     WHERE id = :id
-                       AND company_id = :company_id'
-                );
-                $updateStmt->execute([
-                    'customer_id' => $customerId,
-                    'registration_no' => $registrationNo,
-                    'vehicle_type' => $vehicleType,
-                    'brand' => $brand,
-                    'model' => $model,
-                    'variant' => $variant !== '' ? $variant : null,
-                    'fuel_type' => $fuelType,
-                    'model_year' => $modelYear > 0 ? $modelYear : null,
-                    'color' => $color !== '' ? $color : null,
-                    'chassis_no' => $chassisNo !== '' ? $chassisNo : null,
-                    'engine_no' => $engineNo !== '' ? $engineNo : null,
-                    'odometer_km' => $odometer > 0 ? $odometer : 0,
-                    'notes' => $notes !== '' ? $notes : null,
-                    'vis_variant_id' => $visVariantId > 0 ? $visVariantId : null,
-                    'is_active' => $isActive,
-                    'status_code' => $statusCode,
-                    'id' => $vehicleId,
-                    'company_id' => $companyId,
-                ]);
+                if ($vehicleAttributeEnabled) {
+                    $updateStmt = db()->prepare(
+                        'UPDATE vehicles
+                         SET customer_id = :customer_id,
+                             registration_no = :registration_no,
+                             vehicle_type = :vehicle_type,
+                             brand = :brand,
+                             brand_id = :brand_id,
+                             model = :model,
+                             model_id = :model_id,
+                             variant = :variant,
+                             variant_id = :variant_id,
+                             fuel_type = :fuel_type,
+                             model_year = :model_year,
+                             model_year_id = :model_year_id,
+                             color = :color,
+                             color_id = :color_id,
+                             chassis_no = :chassis_no,
+                             engine_no = :engine_no,
+                             odometer_km = :odometer_km,
+                             notes = :notes,
+                             vis_variant_id = :vis_variant_id,
+                             is_active = :is_active,
+                             status_code = :status_code,
+                             deleted_at = CASE WHEN :status_code = "DELETED" THEN NOW() ELSE NULL END
+                         WHERE id = :id
+                           AND company_id = :company_id'
+                    );
+                    $updateStmt->execute([
+                        'customer_id' => $customerId,
+                        'registration_no' => $registrationNo,
+                        'vehicle_type' => $vehicleType,
+                        'brand' => $brand,
+                        'brand_id' => $resolvedBrandId !== null && $resolvedBrandId > 0 ? $resolvedBrandId : null,
+                        'model' => $model,
+                        'model_id' => $resolvedModelId !== null && $resolvedModelId > 0 ? $resolvedModelId : null,
+                        'variant' => $variant !== '' ? $variant : null,
+                        'variant_id' => $resolvedVariantId !== null && $resolvedVariantId > 0 ? $resolvedVariantId : null,
+                        'fuel_type' => $fuelType,
+                        'model_year' => $modelYear > 0 ? $modelYear : null,
+                        'model_year_id' => $resolvedModelYearId !== null && $resolvedModelYearId > 0 ? $resolvedModelYearId : null,
+                        'color' => $color !== '' ? $color : null,
+                        'color_id' => $resolvedColorId !== null && $resolvedColorId > 0 ? $resolvedColorId : null,
+                        'chassis_no' => $chassisNo !== '' ? $chassisNo : null,
+                        'engine_no' => $engineNo !== '' ? $engineNo : null,
+                        'odometer_km' => $odometer > 0 ? $odometer : 0,
+                        'notes' => $notes !== '' ? $notes : null,
+                        'vis_variant_id' => $visVariantId > 0 ? $visVariantId : null,
+                        'is_active' => $isActive,
+                        'status_code' => $statusCode,
+                        'id' => $vehicleId,
+                        'company_id' => $companyId,
+                    ]);
+                } else {
+                    $updateStmt = db()->prepare(
+                        'UPDATE vehicles
+                         SET customer_id = :customer_id,
+                             registration_no = :registration_no,
+                             vehicle_type = :vehicle_type,
+                             brand = :brand,
+                             model = :model,
+                             variant = :variant,
+                             fuel_type = :fuel_type,
+                             model_year = :model_year,
+                             color = :color,
+                             chassis_no = :chassis_no,
+                             engine_no = :engine_no,
+                             odometer_km = :odometer_km,
+                             notes = :notes,
+                             vis_variant_id = :vis_variant_id,
+                             is_active = :is_active,
+                             status_code = :status_code,
+                             deleted_at = CASE WHEN :status_code = "DELETED" THEN NOW() ELSE NULL END
+                         WHERE id = :id
+                           AND company_id = :company_id'
+                    );
+                    $updateStmt->execute([
+                        'customer_id' => $customerId,
+                        'registration_no' => $registrationNo,
+                        'vehicle_type' => $vehicleType,
+                        'brand' => $brand,
+                        'model' => $model,
+                        'variant' => $variant !== '' ? $variant : null,
+                        'fuel_type' => $fuelType,
+                        'model_year' => $modelYear > 0 ? $modelYear : null,
+                        'color' => $color !== '' ? $color : null,
+                        'chassis_no' => $chassisNo !== '' ? $chassisNo : null,
+                        'engine_no' => $engineNo !== '' ? $engineNo : null,
+                        'odometer_km' => $odometer > 0 ? $odometer : 0,
+                        'notes' => $notes !== '' ? $notes : null,
+                        'vis_variant_id' => $visVariantId > 0 ? $visVariantId : null,
+                        'is_active' => $isActive,
+                        'status_code' => $statusCode,
+                        'id' => $vehicleId,
+                        'company_id' => $companyId,
+                    ]);
+                }
 
                 add_vehicle_history($vehicleId, 'UPDATE', 'Vehicle details updated', [
                     'registration_no' => $registrationNo,
@@ -283,6 +507,48 @@ if ($editId > 0) {
     $editVehicle = $editStmt->fetch() ?: null;
 }
 
+$editAttrIds = [
+    'brand_id' => 0,
+    'model_id' => 0,
+    'variant_id' => 0,
+    'model_year_id' => 0,
+    'color_id' => 0,
+];
+if ($vehicleAttributeEnabled && $editVehicle) {
+    $editAttrIds['brand_id'] = (int) ($editVehicle['brand_id'] ?? 0);
+    $editAttrIds['model_id'] = (int) ($editVehicle['model_id'] ?? 0);
+    $editAttrIds['variant_id'] = (int) ($editVehicle['variant_id'] ?? 0);
+    $editAttrIds['model_year_id'] = (int) ($editVehicle['model_year_id'] ?? 0);
+    $editAttrIds['color_id'] = (int) ($editVehicle['color_id'] ?? 0);
+
+    if ($editAttrIds['brand_id'] <= 0 && trim((string) ($editVehicle['brand'] ?? '')) !== '') {
+        $brandRow = vehicle_master_ensure_brand((string) $editVehicle['brand']);
+        $editAttrIds['brand_id'] = (int) ($brandRow['id'] ?? 0);
+    }
+    if ($editAttrIds['model_id'] <= 0 && $editAttrIds['brand_id'] > 0 && trim((string) ($editVehicle['model'] ?? '')) !== '') {
+        $modelRow = vehicle_master_ensure_model($editAttrIds['brand_id'], (string) $editVehicle['model'], (string) ($editVehicle['vehicle_type'] ?? '4W'));
+        $editAttrIds['model_id'] = (int) ($modelRow['id'] ?? 0);
+    }
+    if ($editAttrIds['variant_id'] <= 0 && $editAttrIds['model_id'] > 0 && trim((string) ($editVehicle['variant'] ?? '')) !== '') {
+        $variantRow = vehicle_master_ensure_variant(
+            $editAttrIds['model_id'],
+            (string) $editVehicle['variant'],
+            (string) ($editVehicle['fuel_type'] ?? 'PETROL'),
+            null,
+            isset($editVehicle['vis_variant_id']) ? (int) $editVehicle['vis_variant_id'] : null
+        );
+        $editAttrIds['variant_id'] = (int) ($variantRow['id'] ?? 0);
+    }
+    if ($editAttrIds['model_year_id'] <= 0 && !empty($editVehicle['model_year'])) {
+        $yearRow = vehicle_master_ensure_year((int) $editVehicle['model_year']);
+        $editAttrIds['model_year_id'] = (int) ($yearRow['id'] ?? 0);
+    }
+    if ($editAttrIds['color_id'] <= 0 && trim((string) ($editVehicle['color'] ?? '')) !== '') {
+        $colorRow = vehicle_master_ensure_color((string) $editVehicle['color']);
+        $editAttrIds['color_id'] = (int) ($colorRow['id'] ?? 0);
+    }
+}
+
 $historyVehicleId = get_int('history_id');
 $vehicleHistory = [];
 if ($historyVehicleId > 0) {
@@ -305,6 +571,11 @@ if ($historyVehicleId > 0) {
 
 $search = trim((string) ($_GET['q'] ?? ''));
 $statusFilter = strtoupper(trim((string) ($_GET['status'] ?? '')));
+$brandFilterId = get_int('vehicle_filter_brand_id');
+$modelFilterId = get_int('vehicle_filter_model_id');
+$variantFilterId = get_int('vehicle_filter_variant_id');
+$modelYearFilterId = get_int('vehicle_filter_model_year_id');
+$colorFilterId = get_int('vehicle_filter_color_id');
 $allowedStatuses = ['ACTIVE', 'INACTIVE', 'DELETED', 'ALL'];
 if (!in_array($statusFilter, $allowedStatuses, true)) {
     $statusFilter = '';
@@ -325,6 +596,29 @@ if ($statusFilter === '') {
     $params['status_code'] = $statusFilter;
 }
 
+if ($vehicleAttributeEnabled) {
+    if ($brandFilterId > 0) {
+        $whereParts[] = 'v.brand_id = :brand_filter_id';
+        $params['brand_filter_id'] = $brandFilterId;
+    }
+    if ($modelFilterId > 0) {
+        $whereParts[] = 'v.model_id = :model_filter_id';
+        $params['model_filter_id'] = $modelFilterId;
+    }
+    if ($variantFilterId > 0) {
+        $whereParts[] = 'v.variant_id = :variant_filter_id';
+        $params['variant_filter_id'] = $variantFilterId;
+    }
+    if ($modelYearFilterId > 0) {
+        $whereParts[] = 'v.model_year_id = :model_year_filter_id';
+        $params['model_year_filter_id'] = $modelYearFilterId;
+    }
+    if ($colorFilterId > 0) {
+        $whereParts[] = 'v.color_id = :color_filter_id';
+        $params['color_filter_id'] = $colorFilterId;
+    }
+}
+
 $vehicleSql =
     'SELECT v.*, c.full_name AS customer_name, c.phone AS customer_phone,
             (SELECT COUNT(*) FROM job_cards jc WHERE jc.vehicle_id = v.id) AS service_count,
@@ -341,6 +635,7 @@ $vehicleSql =
 $vehiclesStmt = db()->prepare($vehicleSql);
 $vehiclesStmt->execute($params);
 $vehicles = $vehiclesStmt->fetchAll();
+$attributeApiUrl = url('modules/vehicles/attributes_api.php');
 
 require_once __DIR__ . '/../../includes/header.php';
 require_once __DIR__ . '/../../includes/sidebar.php';
@@ -364,6 +659,11 @@ require_once __DIR__ . '/../../includes/sidebar.php';
   <div class="app-content">
     <div class="container-fluid">
       <?php if ($canManage): ?>
+        <?php if (!$vehicleAttributeEnabled): ?>
+          <div class="alert alert-warning">
+            Vehicle Attribute Masters are not enabled in the database yet. Run `database/vehicle_attribute_masters_upgrade.sql` to activate cascading dropdowns.
+          </div>
+        <?php endif; ?>
         <div class="card card-primary">
           <div class="card-header"><h3 class="card-title"><?= $editVehicle ? 'Edit Vehicle' : 'Add Vehicle'; ?></h3></div>
           <form method="post">
@@ -412,27 +712,89 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                 </select>
               </div>
 
-              <div class="col-md-3">
-                <label class="form-label">Brand</label>
-                <input type="text" name="brand" class="form-control" required value="<?= e((string) ($editVehicle['brand'] ?? '')); ?>" />
-              </div>
-              <div class="col-md-3">
-                <label class="form-label">Model</label>
-                <input type="text" name="model" class="form-control" required value="<?= e((string) ($editVehicle['model'] ?? '')); ?>" />
-              </div>
-              <div class="col-md-3">
-                <label class="form-label">Variant</label>
-                <input type="text" name="variant" class="form-control" value="<?= e((string) ($editVehicle['variant'] ?? '')); ?>" />
-              </div>
-              <div class="col-md-3">
-                <label class="form-label">Model Year</label>
-                <input type="number" name="model_year" class="form-control" min="1990" max="2099" value="<?= e((string) ($editVehicle['model_year'] ?? '')); ?>" />
-              </div>
+              <?php if ($vehicleAttributeEnabled): ?>
+                <div class="col-12" data-vehicle-attributes-root="1" data-vehicle-attributes-mode="entry" data-vehicle-attributes-endpoint="<?= e($attributeApiUrl); ?>">
+                  <div class="row g-3">
+                    <div class="col-md-4">
+                      <label class="form-label">Brand</label>
+                      <select name="brand_id" data-vehicle-attr="brand" class="form-select" required data-selected-id="<?= e($editAttrIds['brand_id'] > 0 ? (string) $editAttrIds['brand_id'] : ((trim((string) ($editVehicle['brand'] ?? '')) !== '') ? '__custom__' : '')); ?>">
+                        <option value="">Loading Brands...</option>
+                      </select>
+                    </div>
+                    <div class="col-md-4">
+                      <label class="form-label">Model</label>
+                      <select name="model_id" data-vehicle-attr="model" class="form-select" required data-selected-id="<?= e($editAttrIds['model_id'] > 0 ? (string) $editAttrIds['model_id'] : ((trim((string) ($editVehicle['model'] ?? '')) !== '') ? '__custom__' : '')); ?>">
+                        <option value="">Select Model</option>
+                      </select>
+                    </div>
+                    <div class="col-md-4">
+                      <label class="form-label">Variant</label>
+                      <select name="variant_id" data-vehicle-attr="variant" class="form-select" data-selected-id="<?= e($editAttrIds['variant_id'] > 0 ? (string) $editAttrIds['variant_id'] : ((trim((string) ($editVehicle['variant'] ?? '')) !== '') ? '__custom__' : '')); ?>">
+                        <option value="">Select Variant</option>
+                      </select>
+                    </div>
 
-              <div class="col-md-2">
-                <label class="form-label">Color</label>
-                <input type="text" name="color" class="form-control" value="<?= e((string) ($editVehicle['color'] ?? '')); ?>" />
-              </div>
+                    <div class="col-md-2">
+                      <label class="form-label">Model Year</label>
+                      <select name="model_year_id" data-vehicle-attr="model_year" class="form-select" data-selected-id="<?= e($editAttrIds['model_year_id'] > 0 ? (string) $editAttrIds['model_year_id'] : ((!empty($editVehicle['model_year'])) ? '__custom__' : '')); ?>">
+                        <option value="">Loading Years...</option>
+                      </select>
+                    </div>
+                    <div class="col-md-2">
+                      <label class="form-label">Color</label>
+                      <select name="color_id" data-vehicle-attr="color" class="form-select" data-selected-id="<?= e($editAttrIds['color_id'] > 0 ? (string) $editAttrIds['color_id'] : ((trim((string) ($editVehicle['color'] ?? '')) !== '') ? '__custom__' : '')); ?>">
+                        <option value="">Loading Colors...</option>
+                      </select>
+                    </div>
+
+                    <div class="col-md-4" data-vehicle-fallback-wrap="brand" style="display:none;">
+                      <label class="form-label">Brand (Manual)</label>
+                      <input type="text" name="brand_text" data-vehicle-fallback="brand" class="form-control" maxlength="100" value="<?= e((string) ($editVehicle['brand'] ?? '')); ?>" />
+                    </div>
+                    <div class="col-md-4" data-vehicle-fallback-wrap="model" style="display:none;">
+                      <label class="form-label">Model (Manual)</label>
+                      <input type="text" name="model_text" data-vehicle-fallback="model" class="form-control" maxlength="120" value="<?= e((string) ($editVehicle['model'] ?? '')); ?>" />
+                    </div>
+                    <div class="col-md-4" data-vehicle-fallback-wrap="variant" style="display:none;">
+                      <label class="form-label">Variant (Manual)</label>
+                      <input type="text" name="variant_text" data-vehicle-fallback="variant" class="form-control" maxlength="150" value="<?= e((string) ($editVehicle['variant'] ?? '')); ?>" />
+                    </div>
+                    <div class="col-md-2" data-vehicle-fallback-wrap="model_year" style="display:none;">
+                      <label class="form-label">Model Year (Manual)</label>
+                      <input type="number" name="model_year_text" data-vehicle-fallback="model_year" class="form-control" min="1900" max="2100" value="<?= e((string) ($editVehicle['model_year'] ?? '')); ?>" />
+                    </div>
+                    <div class="col-md-2" data-vehicle-fallback-wrap="color" style="display:none;">
+                      <label class="form-label">Color (Manual)</label>
+                      <input type="text" name="color_text" data-vehicle-fallback="color" class="form-control" maxlength="60" value="<?= e((string) ($editVehicle['color'] ?? '')); ?>" />
+                    </div>
+                  </div>
+                  <div class="form-hint mt-2">
+                    Use master dropdowns for speed and consistency. If value is missing, choose "Not listed" and enter manual text.
+                  </div>
+                </div>
+              <?php else: ?>
+                <div class="col-md-3">
+                  <label class="form-label">Brand</label>
+                  <input type="text" name="brand" class="form-control" required value="<?= e((string) ($editVehicle['brand'] ?? '')); ?>" />
+                </div>
+                <div class="col-md-3">
+                  <label class="form-label">Model</label>
+                  <input type="text" name="model" class="form-control" required value="<?= e((string) ($editVehicle['model'] ?? '')); ?>" />
+                </div>
+                <div class="col-md-3">
+                  <label class="form-label">Variant</label>
+                  <input type="text" name="variant" class="form-control" value="<?= e((string) ($editVehicle['variant'] ?? '')); ?>" />
+                </div>
+                <div class="col-md-3">
+                  <label class="form-label">Model Year</label>
+                  <input type="number" name="model_year" class="form-control" min="1990" max="2099" value="<?= e((string) ($editVehicle['model_year'] ?? '')); ?>" />
+                </div>
+                <div class="col-md-2">
+                  <label class="form-label">Color</label>
+                  <input type="text" name="color" class="form-control" value="<?= e((string) ($editVehicle['color'] ?? '')); ?>" />
+                </div>
+              <?php endif; ?>
+
               <div class="col-md-2">
                 <label class="form-label">Odometer (KM)</label>
                 <input type="number" name="odometer_km" class="form-control" min="0" value="<?= e((string) ($editVehicle['odometer_km'] ?? '0')); ?>" />
@@ -478,19 +840,66 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       <div class="card">
         <div class="card-header">
           <h3 class="card-title">Vehicle List</h3>
-          <div class="card-tools">
-            <form method="get" class="d-flex gap-2">
-              <input type="text" name="q" value="<?= e($search); ?>" class="form-control form-control-sm" placeholder="Search registration/brand/model/customer" />
-              <select name="status" class="form-select form-select-sm">
-                <option value="" <?= $statusFilter === '' ? 'selected' : ''; ?>>Active + Inactive</option>
-                <option value="ACTIVE" <?= $statusFilter === 'ACTIVE' ? 'selected' : ''; ?>>ACTIVE</option>
-                <option value="INACTIVE" <?= $statusFilter === 'INACTIVE' ? 'selected' : ''; ?>>INACTIVE</option>
-                <option value="DELETED" <?= $statusFilter === 'DELETED' ? 'selected' : ''; ?>>DELETED</option>
-                <option value="ALL" <?= $statusFilter === 'ALL' ? 'selected' : ''; ?>>ALL</option>
-              </select>
-              <button type="submit" class="btn btn-sm btn-outline-primary">Filter</button>
-            </form>
-          </div>
+        </div>
+        <div class="card-body border-bottom">
+          <form method="get" class="row g-2 align-items-end">
+              <div class="col-md-4">
+                <label class="form-label form-label-sm mb-1">Search</label>
+                <input type="text" name="q" value="<?= e($search); ?>" class="form-control form-control-sm" placeholder="Registration / brand / model / customer" />
+              </div>
+              <div class="col-md-2">
+                <label class="form-label form-label-sm mb-1">Status</label>
+                <select name="status" class="form-select form-select-sm">
+                  <option value="" <?= $statusFilter === '' ? 'selected' : ''; ?>>Active + Inactive</option>
+                  <option value="ACTIVE" <?= $statusFilter === 'ACTIVE' ? 'selected' : ''; ?>>ACTIVE</option>
+                  <option value="INACTIVE" <?= $statusFilter === 'INACTIVE' ? 'selected' : ''; ?>>INACTIVE</option>
+                  <option value="DELETED" <?= $statusFilter === 'DELETED' ? 'selected' : ''; ?>>DELETED</option>
+                  <option value="ALL" <?= $statusFilter === 'ALL' ? 'selected' : ''; ?>>ALL</option>
+                </select>
+              </div>
+
+              <?php if ($vehicleAttributeEnabled): ?>
+                <div class="col-12" data-vehicle-attributes-root="1" data-vehicle-attributes-mode="filter" data-vehicle-attributes-endpoint="<?= e($attributeApiUrl); ?>">
+                  <div class="row g-2">
+                    <div class="col-md-2">
+                      <label class="form-label form-label-sm mb-1">Brand</label>
+                      <select name="vehicle_filter_brand_id" data-vehicle-attr="brand" data-selected-id="<?= e((string) $brandFilterId); ?>" class="form-select form-select-sm">
+                        <option value="">All Brands</option>
+                      </select>
+                    </div>
+                    <div class="col-md-2">
+                      <label class="form-label form-label-sm mb-1">Model</label>
+                      <select name="vehicle_filter_model_id" data-vehicle-attr="model" data-selected-id="<?= e((string) $modelFilterId); ?>" class="form-select form-select-sm">
+                        <option value="">All Models</option>
+                      </select>
+                    </div>
+                    <div class="col-md-2">
+                      <label class="form-label form-label-sm mb-1">Variant</label>
+                      <select name="vehicle_filter_variant_id" data-vehicle-attr="variant" data-selected-id="<?= e((string) $variantFilterId); ?>" class="form-select form-select-sm">
+                        <option value="">All Variants</option>
+                      </select>
+                    </div>
+                    <div class="col-md-2">
+                      <label class="form-label form-label-sm mb-1">Year</label>
+                      <select name="vehicle_filter_model_year_id" data-vehicle-attr="model_year" data-selected-id="<?= e((string) $modelYearFilterId); ?>" class="form-select form-select-sm">
+                        <option value="">All Years</option>
+                      </select>
+                    </div>
+                    <div class="col-md-2">
+                      <label class="form-label form-label-sm mb-1">Color</label>
+                      <select name="vehicle_filter_color_id" data-vehicle-attr="color" data-selected-id="<?= e((string) $colorFilterId); ?>" class="form-select form-select-sm">
+                        <option value="">All Colors</option>
+                      </select>
+                    </div>
+                  </div>
+                </div>
+              <?php endif; ?>
+
+              <div class="col-md-2 d-flex gap-2">
+                <button type="submit" class="btn btn-sm btn-outline-primary">Filter</button>
+                <a href="<?= e(url('modules/vehicles/index.php')); ?>" class="btn btn-sm btn-outline-secondary">Reset</a>
+              </div>
+          </form>
         </div>
         <div class="card-body table-responsive p-0">
           <table class="table table-striped mb-0">

@@ -451,6 +451,746 @@ function log_backup_integrity_check(array $context): void
     }
 }
 
+function vehicle_master_normalize_text(string $value, int $maxLength): string
+{
+    $normalized = preg_replace('/\s+/u', ' ', trim($value));
+    if ($normalized === null) {
+        $normalized = trim($value);
+    }
+
+    return mb_substr($normalized, 0, $maxLength);
+}
+
+function vehicle_masters_enabled(): bool
+{
+    return table_columns('vehicle_brands') !== []
+        && table_columns('vehicle_models') !== []
+        && table_columns('vehicle_variants') !== []
+        && table_columns('vehicle_model_years') !== []
+        && table_columns('vehicle_colors') !== [];
+}
+
+function vehicle_master_link_columns_supported(): bool
+{
+    $columns = table_columns('vehicles');
+    $required = ['brand_id', 'model_id', 'variant_id', 'model_year_id', 'color_id'];
+    foreach ($required as $column) {
+        if (!in_array($column, $columns, true)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+function vehicle_master_get_brand(int $brandId): ?array
+{
+    if ($brandId <= 0 || !vehicle_masters_enabled()) {
+        return null;
+    }
+
+    try {
+        $stmt = db()->prepare(
+            'SELECT id, brand_name, vis_brand_id
+             FROM vehicle_brands
+             WHERE id = :id
+               AND status_code = "ACTIVE"
+             LIMIT 1'
+        );
+        $stmt->execute(['id' => $brandId]);
+        $row = $stmt->fetch();
+        return $row ?: null;
+    } catch (Throwable $exception) {
+        return null;
+    }
+}
+
+function vehicle_master_get_model(int $modelId, ?int $brandId = null): ?array
+{
+    if ($modelId <= 0 || !vehicle_masters_enabled()) {
+        return null;
+    }
+
+    try {
+        $where = ['vm.id = :id', 'vm.status_code = "ACTIVE"', 'vb.status_code = "ACTIVE"'];
+        $params = ['id' => $modelId];
+        if ($brandId !== null && $brandId > 0) {
+            $where[] = 'vm.brand_id = :brand_id';
+            $params['brand_id'] = $brandId;
+        }
+
+        $stmt = db()->prepare(
+            'SELECT vm.id, vm.brand_id, vm.model_name, vm.vehicle_type, vm.vis_model_id, vb.brand_name
+             FROM vehicle_models vm
+             INNER JOIN vehicle_brands vb ON vb.id = vm.brand_id
+             WHERE ' . implode(' AND ', $where) . '
+             LIMIT 1'
+        );
+        $stmt->execute($params);
+        $row = $stmt->fetch();
+        return $row ?: null;
+    } catch (Throwable $exception) {
+        return null;
+    }
+}
+
+function vehicle_master_get_variant(int $variantId, ?int $modelId = null): ?array
+{
+    if ($variantId <= 0 || !vehicle_masters_enabled()) {
+        return null;
+    }
+
+    try {
+        $where = ['vv.id = :id', 'vv.status_code = "ACTIVE"', 'vm.status_code = "ACTIVE"', 'vb.status_code = "ACTIVE"'];
+        $params = ['id' => $variantId];
+        if ($modelId !== null && $modelId > 0) {
+            $where[] = 'vv.model_id = :model_id';
+            $params['model_id'] = $modelId;
+        }
+
+        $stmt = db()->prepare(
+            'SELECT vv.id, vv.model_id, vv.variant_name, vv.fuel_type, vv.engine_cc, vv.vis_variant_id,
+                    vm.model_name, vm.brand_id, vb.brand_name
+             FROM vehicle_variants vv
+             INNER JOIN vehicle_models vm ON vm.id = vv.model_id
+             INNER JOIN vehicle_brands vb ON vb.id = vm.brand_id
+             WHERE ' . implode(' AND ', $where) . '
+             LIMIT 1'
+        );
+        $stmt->execute($params);
+        $row = $stmt->fetch();
+        return $row ?: null;
+    } catch (Throwable $exception) {
+        return null;
+    }
+}
+
+function vehicle_master_get_year(int $yearId): ?array
+{
+    if ($yearId <= 0 || !vehicle_masters_enabled()) {
+        return null;
+    }
+
+    try {
+        $stmt = db()->prepare(
+            'SELECT id, year_value
+             FROM vehicle_model_years
+             WHERE id = :id
+               AND status_code = "ACTIVE"
+             LIMIT 1'
+        );
+        $stmt->execute(['id' => $yearId]);
+        $row = $stmt->fetch();
+        return $row ?: null;
+    } catch (Throwable $exception) {
+        return null;
+    }
+}
+
+function vehicle_master_get_color(int $colorId): ?array
+{
+    if ($colorId <= 0 || !vehicle_masters_enabled()) {
+        return null;
+    }
+
+    try {
+        $stmt = db()->prepare(
+            'SELECT id, color_name
+             FROM vehicle_colors
+             WHERE id = :id
+               AND status_code = "ACTIVE"
+             LIMIT 1'
+        );
+        $stmt->execute(['id' => $colorId]);
+        $row = $stmt->fetch();
+        return $row ?: null;
+    } catch (Throwable $exception) {
+        return null;
+    }
+}
+
+function vehicle_master_ensure_brand(string $brandName, ?int $visBrandId = null): ?array
+{
+    if (!vehicle_masters_enabled()) {
+        return null;
+    }
+
+    $brandName = vehicle_master_normalize_text($brandName, 100);
+    if ($brandName === '') {
+        return null;
+    }
+
+    try {
+        $selectStmt = db()->prepare('SELECT id FROM vehicle_brands WHERE brand_name = :brand_name LIMIT 1');
+        $selectStmt->execute(['brand_name' => $brandName]);
+        $existingId = (int) ($selectStmt->fetchColumn() ?: 0);
+
+        if ($existingId > 0) {
+            $updateStmt = db()->prepare(
+                'UPDATE vehicle_brands
+                 SET status_code = "ACTIVE",
+                     deleted_at = NULL,
+                     vis_brand_id = CASE
+                         WHEN vis_brand_id IS NULL AND :vis_brand_id > 0 THEN :vis_brand_id
+                         ELSE vis_brand_id
+                     END
+                 WHERE id = :id'
+            );
+            $updateStmt->execute([
+                'id' => $existingId,
+                'vis_brand_id' => $visBrandId !== null ? (int) $visBrandId : 0,
+            ]);
+
+            return vehicle_master_get_brand($existingId);
+        }
+
+        $insertStmt = db()->prepare(
+            'INSERT INTO vehicle_brands (brand_name, vis_brand_id, source_code, status_code, deleted_at)
+             VALUES (:brand_name, :vis_brand_id, :source_code, "ACTIVE", NULL)'
+        );
+        $insertStmt->execute([
+            'brand_name' => $brandName,
+            'vis_brand_id' => $visBrandId !== null && $visBrandId > 0 ? $visBrandId : null,
+            'source_code' => $visBrandId !== null && $visBrandId > 0 ? 'VIS' : 'MANUAL',
+        ]);
+
+        return vehicle_master_get_brand((int) db()->lastInsertId());
+    } catch (Throwable $exception) {
+        return null;
+    }
+}
+
+function vehicle_master_ensure_model(
+    int $brandId,
+    string $modelName,
+    ?string $vehicleType = null,
+    ?int $visModelId = null
+): ?array {
+    if (!vehicle_masters_enabled() || $brandId <= 0) {
+        return null;
+    }
+
+    $modelName = vehicle_master_normalize_text($modelName, 120);
+    if ($modelName === '') {
+        return null;
+    }
+
+    $vehicleType = strtoupper(trim((string) $vehicleType));
+    if (!in_array($vehicleType, ['2W', '4W', 'COMMERCIAL'], true)) {
+        $vehicleType = null;
+    }
+
+    try {
+        $selectStmt = db()->prepare(
+            'SELECT id
+             FROM vehicle_models
+             WHERE brand_id = :brand_id
+               AND model_name = :model_name
+             LIMIT 1'
+        );
+        $selectStmt->execute([
+            'brand_id' => $brandId,
+            'model_name' => $modelName,
+        ]);
+        $existingId = (int) ($selectStmt->fetchColumn() ?: 0);
+
+        if ($existingId > 0) {
+            $updateStmt = db()->prepare(
+                'UPDATE vehicle_models
+                 SET status_code = "ACTIVE",
+                     deleted_at = NULL,
+                     vehicle_type = COALESCE(vehicle_type, :vehicle_type),
+                     vis_model_id = CASE
+                         WHEN vis_model_id IS NULL AND :vis_model_id > 0 THEN :vis_model_id
+                         ELSE vis_model_id
+                     END
+                 WHERE id = :id'
+            );
+            $updateStmt->execute([
+                'id' => $existingId,
+                'vehicle_type' => $vehicleType,
+                'vis_model_id' => $visModelId !== null ? (int) $visModelId : 0,
+            ]);
+
+            return vehicle_master_get_model($existingId, $brandId);
+        }
+
+        $insertStmt = db()->prepare(
+            'INSERT INTO vehicle_models
+              (brand_id, model_name, vehicle_type, vis_model_id, source_code, status_code, deleted_at)
+             VALUES
+              (:brand_id, :model_name, :vehicle_type, :vis_model_id, :source_code, "ACTIVE", NULL)'
+        );
+        $insertStmt->execute([
+            'brand_id' => $brandId,
+            'model_name' => $modelName,
+            'vehicle_type' => $vehicleType,
+            'vis_model_id' => $visModelId !== null && $visModelId > 0 ? $visModelId : null,
+            'source_code' => $visModelId !== null && $visModelId > 0 ? 'VIS' : 'MANUAL',
+        ]);
+
+        return vehicle_master_get_model((int) db()->lastInsertId(), $brandId);
+    } catch (Throwable $exception) {
+        return null;
+    }
+}
+
+function vehicle_master_ensure_variant(
+    int $modelId,
+    string $variantName,
+    ?string $fuelType = null,
+    ?string $engineCc = null,
+    ?int $visVariantId = null
+): ?array {
+    if (!vehicle_masters_enabled() || $modelId <= 0) {
+        return null;
+    }
+
+    $variantName = vehicle_master_normalize_text($variantName, 150);
+    if ($variantName === '') {
+        return null;
+    }
+
+    $fuelType = strtoupper(trim((string) $fuelType));
+    if (!in_array($fuelType, ['PETROL', 'DIESEL', 'CNG', 'EV', 'HYBRID', 'OTHER'], true)) {
+        $fuelType = null;
+    }
+    $engineCc = vehicle_master_normalize_text((string) $engineCc, 30);
+
+    try {
+        $selectStmt = db()->prepare(
+            'SELECT id
+             FROM vehicle_variants
+             WHERE model_id = :model_id
+               AND variant_name = :variant_name
+             LIMIT 1'
+        );
+        $selectStmt->execute([
+            'model_id' => $modelId,
+            'variant_name' => $variantName,
+        ]);
+        $existingId = (int) ($selectStmt->fetchColumn() ?: 0);
+
+        if ($existingId > 0) {
+            $updateStmt = db()->prepare(
+                'UPDATE vehicle_variants
+                 SET status_code = "ACTIVE",
+                     deleted_at = NULL,
+                     fuel_type = COALESCE(fuel_type, :fuel_type),
+                     engine_cc = CASE
+                         WHEN (engine_cc IS NULL OR engine_cc = "") AND :engine_cc <> "" THEN :engine_cc
+                         ELSE engine_cc
+                     END,
+                     vis_variant_id = CASE
+                         WHEN vis_variant_id IS NULL AND :vis_variant_id > 0 THEN :vis_variant_id
+                         ELSE vis_variant_id
+                     END
+                 WHERE id = :id'
+            );
+            $updateStmt->execute([
+                'id' => $existingId,
+                'fuel_type' => $fuelType,
+                'engine_cc' => $engineCc,
+                'vis_variant_id' => $visVariantId !== null ? (int) $visVariantId : 0,
+            ]);
+
+            return vehicle_master_get_variant($existingId, $modelId);
+        }
+
+        $insertStmt = db()->prepare(
+            'INSERT INTO vehicle_variants
+              (model_id, variant_name, fuel_type, engine_cc, vis_variant_id, source_code, status_code, deleted_at)
+             VALUES
+              (:model_id, :variant_name, :fuel_type, :engine_cc, :vis_variant_id, :source_code, "ACTIVE", NULL)'
+        );
+        $insertStmt->execute([
+            'model_id' => $modelId,
+            'variant_name' => $variantName,
+            'fuel_type' => $fuelType,
+            'engine_cc' => $engineCc !== '' ? $engineCc : null,
+            'vis_variant_id' => $visVariantId !== null && $visVariantId > 0 ? $visVariantId : null,
+            'source_code' => $visVariantId !== null && $visVariantId > 0 ? 'VIS' : 'MANUAL',
+        ]);
+
+        return vehicle_master_get_variant((int) db()->lastInsertId(), $modelId);
+    } catch (Throwable $exception) {
+        return null;
+    }
+}
+
+function vehicle_master_ensure_year(int $yearValue): ?array
+{
+    if (!vehicle_masters_enabled()) {
+        return null;
+    }
+
+    if ($yearValue < 1900 || $yearValue > 2100) {
+        return null;
+    }
+
+    try {
+        $selectStmt = db()->prepare('SELECT id FROM vehicle_model_years WHERE year_value = :year_value LIMIT 1');
+        $selectStmt->execute(['year_value' => $yearValue]);
+        $existingId = (int) ($selectStmt->fetchColumn() ?: 0);
+
+        if ($existingId > 0) {
+            $updateStmt = db()->prepare(
+                'UPDATE vehicle_model_years
+                 SET status_code = "ACTIVE",
+                     deleted_at = NULL
+                 WHERE id = :id'
+            );
+            $updateStmt->execute(['id' => $existingId]);
+
+            return vehicle_master_get_year($existingId);
+        }
+
+        $insertStmt = db()->prepare(
+            'INSERT INTO vehicle_model_years (year_value, source_code, status_code, deleted_at)
+             VALUES (:year_value, "MANUAL", "ACTIVE", NULL)'
+        );
+        $insertStmt->execute(['year_value' => $yearValue]);
+
+        return vehicle_master_get_year((int) db()->lastInsertId());
+    } catch (Throwable $exception) {
+        return null;
+    }
+}
+
+function vehicle_master_ensure_color(string $colorName): ?array
+{
+    if (!vehicle_masters_enabled()) {
+        return null;
+    }
+
+    $colorName = vehicle_master_normalize_text($colorName, 60);
+    if ($colorName === '') {
+        return null;
+    }
+
+    try {
+        $selectStmt = db()->prepare('SELECT id FROM vehicle_colors WHERE color_name = :color_name LIMIT 1');
+        $selectStmt->execute(['color_name' => $colorName]);
+        $existingId = (int) ($selectStmt->fetchColumn() ?: 0);
+
+        if ($existingId > 0) {
+            $updateStmt = db()->prepare(
+                'UPDATE vehicle_colors
+                 SET status_code = "ACTIVE",
+                     deleted_at = NULL
+                 WHERE id = :id'
+            );
+            $updateStmt->execute(['id' => $existingId]);
+
+            return vehicle_master_get_color($existingId);
+        }
+
+        $insertStmt = db()->prepare(
+            'INSERT INTO vehicle_colors (color_name, source_code, status_code, deleted_at)
+             VALUES (:color_name, "MANUAL", "ACTIVE", NULL)'
+        );
+        $insertStmt->execute(['color_name' => $colorName]);
+
+        return vehicle_master_get_color((int) db()->lastInsertId());
+    } catch (Throwable $exception) {
+        return null;
+    }
+}
+
+function vehicle_master_search_brands(string $query = '', int $limit = 50): array
+{
+    if (!vehicle_masters_enabled()) {
+        return [];
+    }
+
+    $query = vehicle_master_normalize_text($query, 100);
+    $limit = max(1, min(200, $limit));
+
+    try {
+        $sql =
+            'SELECT id, brand_name, vis_brand_id
+             FROM vehicle_brands
+             WHERE status_code = "ACTIVE"';
+        $params = [];
+        if ($query !== '') {
+            $sql .= ' AND brand_name LIKE :query';
+            $params['query'] = '%' . $query . '%';
+        }
+        $sql .= ' ORDER BY brand_name ASC LIMIT ' . $limit;
+
+        $stmt = db()->prepare($sql);
+        $stmt->execute($params);
+        return $stmt->fetchAll();
+    } catch (Throwable $exception) {
+        return [];
+    }
+}
+
+function vehicle_master_search_models(int $brandId, string $query = '', int $limit = 80): array
+{
+    if (!vehicle_masters_enabled() || $brandId <= 0) {
+        return [];
+    }
+
+    $query = vehicle_master_normalize_text($query, 120);
+    $limit = max(1, min(300, $limit));
+
+    try {
+        $sql =
+            'SELECT vm.id, vm.brand_id, vm.model_name, vm.vehicle_type, vm.vis_model_id, vb.brand_name
+             FROM vehicle_models vm
+             INNER JOIN vehicle_brands vb ON vb.id = vm.brand_id
+             WHERE vm.brand_id = :brand_id
+               AND vm.status_code = "ACTIVE"
+               AND vb.status_code = "ACTIVE"';
+        $params = ['brand_id' => $brandId];
+        if ($query !== '') {
+            $sql .= ' AND vm.model_name LIKE :query';
+            $params['query'] = '%' . $query . '%';
+        }
+        $sql .= ' ORDER BY vm.model_name ASC LIMIT ' . $limit;
+
+        $stmt = db()->prepare($sql);
+        $stmt->execute($params);
+        return $stmt->fetchAll();
+    } catch (Throwable $exception) {
+        return [];
+    }
+}
+
+function vehicle_master_search_variants(int $modelId, string $query = '', int $limit = 120): array
+{
+    if (!vehicle_masters_enabled() || $modelId <= 0) {
+        return [];
+    }
+
+    $query = vehicle_master_normalize_text($query, 150);
+    $limit = max(1, min(400, $limit));
+
+    try {
+        $sql =
+            'SELECT vv.id, vv.model_id, vv.variant_name, vv.fuel_type, vv.engine_cc, vv.vis_variant_id,
+                    vm.brand_id, vm.model_name
+             FROM vehicle_variants vv
+             INNER JOIN vehicle_models vm ON vm.id = vv.model_id
+             WHERE vv.model_id = :model_id
+               AND vv.status_code = "ACTIVE"
+               AND vm.status_code = "ACTIVE"';
+        $params = ['model_id' => $modelId];
+        if ($query !== '') {
+            $sql .= ' AND vv.variant_name LIKE :query';
+            $params['query'] = '%' . $query . '%';
+        }
+        $sql .= ' ORDER BY vv.variant_name ASC LIMIT ' . $limit;
+
+        $stmt = db()->prepare($sql);
+        $stmt->execute($params);
+        return $stmt->fetchAll();
+    } catch (Throwable $exception) {
+        return [];
+    }
+}
+
+function vehicle_master_search_years(string $query = '', int $limit = 120): array
+{
+    if (!vehicle_masters_enabled()) {
+        return [];
+    }
+
+    $query = vehicle_master_normalize_text($query, 10);
+    $limit = max(1, min(300, $limit));
+
+    try {
+        $sql =
+            'SELECT id, year_value
+             FROM vehicle_model_years
+             WHERE status_code = "ACTIVE"';
+        $params = [];
+        if ($query !== '') {
+            $sql .= ' AND CAST(year_value AS CHAR) LIKE :query';
+            $params['query'] = '%' . $query . '%';
+        }
+        $sql .= ' ORDER BY year_value DESC LIMIT ' . $limit;
+
+        $stmt = db()->prepare($sql);
+        $stmt->execute($params);
+        return $stmt->fetchAll();
+    } catch (Throwable $exception) {
+        return [];
+    }
+}
+
+function vehicle_master_search_colors(string $query = '', int $limit = 120): array
+{
+    if (!vehicle_masters_enabled()) {
+        return [];
+    }
+
+    $query = vehicle_master_normalize_text($query, 60);
+    $limit = max(1, min(300, $limit));
+
+    try {
+        $sql =
+            'SELECT id, color_name
+             FROM vehicle_colors
+             WHERE status_code = "ACTIVE"';
+        $params = [];
+        if ($query !== '') {
+            $sql .= ' AND color_name LIKE :query';
+            $params['query'] = '%' . $query . '%';
+        }
+        $sql .= ' ORDER BY color_name ASC LIMIT ' . $limit;
+
+        $stmt = db()->prepare($sql);
+        $stmt->execute($params);
+        return $stmt->fetchAll();
+    } catch (Throwable $exception) {
+        return [];
+    }
+}
+
+function vehicle_master_scope_sql(string $vehicleAlias, array $filters, array &$params, string $prefix = 'vehicle'): string
+{
+    if (!vehicle_master_link_columns_supported()) {
+        return '';
+    }
+
+    $clauses = [];
+    $brandId = (int) ($filters['brand_id'] ?? 0);
+    $modelId = (int) ($filters['model_id'] ?? 0);
+    $variantId = (int) ($filters['variant_id'] ?? 0);
+    $modelYearId = (int) ($filters['model_year_id'] ?? 0);
+    $colorId = (int) ($filters['color_id'] ?? 0);
+
+    if ($brandId > 0) {
+        $key = $prefix . '_brand_id';
+        $params[$key] = $brandId;
+        $clauses[] = $vehicleAlias . '.brand_id = :' . $key;
+    }
+    if ($modelId > 0) {
+        $key = $prefix . '_model_id';
+        $params[$key] = $modelId;
+        $clauses[] = $vehicleAlias . '.model_id = :' . $key;
+    }
+    if ($variantId > 0) {
+        $key = $prefix . '_variant_id';
+        $params[$key] = $variantId;
+        $clauses[] = $vehicleAlias . '.variant_id = :' . $key;
+    }
+    if ($modelYearId > 0) {
+        $key = $prefix . '_model_year_id';
+        $params[$key] = $modelYearId;
+        $clauses[] = $vehicleAlias . '.model_year_id = :' . $key;
+    }
+    if ($colorId > 0) {
+        $key = $prefix . '_color_id';
+        $params[$key] = $colorId;
+        $clauses[] = $vehicleAlias . '.color_id = :' . $key;
+    }
+
+    return $clauses === [] ? '' : (' AND ' . implode(' AND ', $clauses));
+}
+
+function vehicle_master_search_vehicles(int $companyId, array $filters = [], int $limit = 200): array
+{
+    if ($companyId <= 0) {
+        return [];
+    }
+
+    $limit = max(1, min(500, $limit));
+    $columns = table_columns('vehicles');
+    $hasBrandId = in_array('brand_id', $columns, true);
+    $hasModelId = in_array('model_id', $columns, true);
+    $hasVariantId = in_array('variant_id', $columns, true);
+    $hasModelYearId = in_array('model_year_id', $columns, true);
+    $hasColorId = in_array('color_id', $columns, true);
+
+    $where = ['v.company_id = :company_id', 'v.status_code = "ACTIVE"'];
+    $params = ['company_id' => $companyId];
+
+    $customerId = (int) ($filters['customer_id'] ?? 0);
+    if ($customerId > 0) {
+        $where[] = 'v.customer_id = :customer_id';
+        $params['customer_id'] = $customerId;
+    }
+
+    $query = vehicle_master_normalize_text((string) ($filters['q'] ?? ''), 120);
+    if ($query !== '') {
+        $where[] = '(v.registration_no LIKE :query OR v.brand LIKE :query OR v.model LIKE :query OR v.variant LIKE :query)';
+        $params['query'] = '%' . $query . '%';
+    }
+
+    if ($hasBrandId) {
+        $brandId = (int) ($filters['brand_id'] ?? 0);
+        if ($brandId > 0) {
+            $where[] = 'v.brand_id = :brand_id';
+            $params['brand_id'] = $brandId;
+        }
+    }
+
+    if ($hasModelId) {
+        $modelId = (int) ($filters['model_id'] ?? 0);
+        if ($modelId > 0) {
+            $where[] = 'v.model_id = :model_id';
+            $params['model_id'] = $modelId;
+        }
+    }
+
+    if ($hasVariantId) {
+        $variantId = (int) ($filters['variant_id'] ?? 0);
+        if ($variantId > 0) {
+            $where[] = 'v.variant_id = :variant_id';
+            $params['variant_id'] = $variantId;
+        }
+    }
+
+    if ($hasModelYearId) {
+        $modelYearId = (int) ($filters['model_year_id'] ?? 0);
+        if ($modelYearId > 0) {
+            $where[] = 'v.model_year_id = :model_year_id';
+            $params['model_year_id'] = $modelYearId;
+        }
+    }
+
+    if ($hasColorId) {
+        $colorId = (int) ($filters['color_id'] ?? 0);
+        if ($colorId > 0) {
+            $where[] = 'v.color_id = :color_id';
+            $params['color_id'] = $colorId;
+        }
+    }
+
+    $selectFields = [
+        'v.id',
+        'v.customer_id',
+        'v.registration_no',
+        'v.brand',
+        'v.model',
+        'v.variant',
+        'v.model_year',
+        'v.color',
+    ];
+    $selectFields[] = $hasBrandId ? 'v.brand_id' : 'NULL AS brand_id';
+    $selectFields[] = $hasModelId ? 'v.model_id' : 'NULL AS model_id';
+    $selectFields[] = $hasVariantId ? 'v.variant_id' : 'NULL AS variant_id';
+    $selectFields[] = $hasModelYearId ? 'v.model_year_id' : 'NULL AS model_year_id';
+    $selectFields[] = $hasColorId ? 'v.color_id' : 'NULL AS color_id';
+
+    try {
+        $stmt = db()->prepare(
+            'SELECT ' . implode(', ', $selectFields) . '
+             FROM vehicles v
+             WHERE ' . implode(' AND ', $where) . '
+             ORDER BY v.registration_no ASC
+             LIMIT ' . $limit
+        );
+        $stmt->execute($params);
+        return $stmt->fetchAll();
+    } catch (Throwable $exception) {
+        return [];
+    }
+}
+
 function add_customer_history(int $customerId, string $actionType, ?string $actionNote = null, ?array $snapshot = null): void
 {
     try {
