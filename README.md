@@ -23,6 +23,7 @@ Core PHP + MySQL + AdminLTE based ERP for Indian multi-branch garage operations.
    - `mysql -u root guruautocars < database/job_workflow_hardening.sql`
    - `mysql -u root guruautocars < database/inventory_intelligence_upgrade.sql`
    - `mysql -u root guruautocars < database/billing_gst_intelligence_upgrade.sql`
+   - `mysql -u root guruautocars < database/reports_dashboard_analytics_upgrade.sql`
 4. Start Apache + MySQL in XAMPP.
 5. Open: `http://localhost/guruautocars/login.php`
 

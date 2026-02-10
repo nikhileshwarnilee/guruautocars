@@ -65,10 +65,7 @@ if ($mtdStart < $fyStart) {
     $mtdStart = $fyStart;
 }
 
-$canViewFinancial = has_permission('reports.financial')
-    || has_permission('report.view')
-    || has_permission('billing.view')
-    || has_permission('invoice.view');
+$canViewFinancial = has_permission('reports.financial');
 
 $revenueSummary = [
     'revenue_today' => 0,

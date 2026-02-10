@@ -225,7 +225,7 @@ $isVisOpen = is_menu_group_open('vis.', $activeMenu);
           </li>
         <?php endif; ?>
 
-        <?php if (has_permission('report.view')): ?>
+        <?php if (has_permission('reports.view') || has_permission('report.view')): ?>
           <li class="nav-item">
             <a href="<?= e(url('modules/reports/index.php')); ?>" class="nav-link <?= e(is_active_menu('reports', $activeMenu)); ?>">
               <i class="nav-icon bi bi-bar-chart"></i>
