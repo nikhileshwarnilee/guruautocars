@@ -17,6 +17,7 @@ $isSuperAdmin = (($currentUser['role_key'] ?? '') === 'super_admin');
 $canAdjust = has_permission('inventory.adjust') || has_permission('inventory.manage');
 $canTransfer = has_permission('inventory.transfer') || has_permission('inventory.manage');
 $canNegative = has_permission('inventory.negative') || has_permission('inventory.manage');
+$purchaseTablesReady = table_columns('purchases') !== [] && table_columns('purchase_items') !== [];
 
 function inv_decimal(string $key, float $default = 0.0): float
 {
@@ -190,24 +191,23 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         $partId = post_int('part_id');
         $movementType = strtoupper(trim((string) ($_POST['movement_type'] ?? 'IN')));
-        $sourceType = strtoupper(trim((string) ($_POST['source_type'] ?? 'ADJUSTMENT')));
         $quantityInput = inv_decimal('quantity');
         $notes = post_string('notes', 255);
         $allowNegativeRequested = post_int('allow_negative') === 1;
 
         $allowedMovementTypes = ['IN', 'OUT', 'ADJUST'];
-        $allowedSourceTypes = ['PURCHASE', 'OPENING', 'ADJUSTMENT'];
 
         if (!in_array($movementType, $allowedMovementTypes, true)) {
             flash_set('inventory_error', 'Invalid movement type.', 'danger');
             redirect('modules/inventory/index.php');
         }
-        if (!in_array($sourceType, $allowedSourceTypes, true)) {
-            flash_set('inventory_error', 'Invalid movement source.', 'danger');
-            redirect('modules/inventory/index.php');
-        }
         if ($partId <= 0) {
             flash_set('inventory_error', 'Part selection is required.', 'danger');
+            redirect('modules/inventory/index.php');
+        }
+
+        if ($movementType === 'IN' && !$purchaseTablesReady) {
+            flash_set('inventory_error', 'Purchase module tables are missing. Run database/purchase_module_upgrade.sql before posting stock-in entries.', 'danger');
             redirect('modules/inventory/index.php');
         }
 
@@ -233,7 +233,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
 
         $partStmt = db()->prepare(
-            'SELECT id, part_name, part_sku
+            'SELECT id, part_name, part_sku, purchase_price, gst_rate
              FROM parts
              WHERE id = :id
                AND company_id = :company_id
@@ -273,6 +273,59 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'part_id' => $partId,
             ]);
 
+            $sourceType = $movementType === 'IN' ? 'PURCHASE' : 'ADJUSTMENT';
+            $referenceId = null;
+
+            if ($movementType === 'IN') {
+                $unitCost = round((float) ($part['purchase_price'] ?? 0), 2);
+                $gstRate = round((float) ($part['gst_rate'] ?? 0), 2);
+                if ($gstRate < 0) {
+                    $gstRate = 0.0;
+                }
+                if ($gstRate > 100) {
+                    $gstRate = 100.0;
+                }
+
+                $taxableAmount = round($movementQuantity * $unitCost, 2);
+                $gstAmount = round(($taxableAmount * $gstRate) / 100, 2);
+                $lineTotal = round($taxableAmount + $gstAmount, 2);
+
+                $purchaseInsert = $pdo->prepare(
+                    'INSERT INTO purchases
+                      (company_id, garage_id, vendor_id, invoice_number, purchase_date, purchase_source, assignment_status, purchase_status, payment_status, taxable_amount, gst_amount, grand_total, notes, created_by)
+                     VALUES
+                      (:company_id, :garage_id, NULL, NULL, :purchase_date, "MANUAL_ADJUSTMENT", "UNASSIGNED", "DRAFT", "UNPAID", :taxable_amount, :gst_amount, :grand_total, :notes, :created_by)'
+                );
+                $purchaseInsert->execute([
+                    'company_id' => $companyId,
+                    'garage_id' => $activeGarageId,
+                    'purchase_date' => date('Y-m-d'),
+                    'taxable_amount' => $taxableAmount,
+                    'gst_amount' => $gstAmount,
+                    'grand_total' => $lineTotal,
+                    'notes' => $notes !== '' ? $notes : 'Created from manual stock adjustment',
+                    'created_by' => $userId,
+                ]);
+                $referenceId = (int) $pdo->lastInsertId();
+
+                $purchaseItemInsert = $pdo->prepare(
+                    'INSERT INTO purchase_items
+                      (purchase_id, part_id, quantity, unit_cost, gst_rate, taxable_amount, gst_amount, total_amount)
+                     VALUES
+                      (:purchase_id, :part_id, :quantity, :unit_cost, :gst_rate, :taxable_amount, :gst_amount, :total_amount)'
+                );
+                $purchaseItemInsert->execute([
+                    'purchase_id' => $referenceId,
+                    'part_id' => $partId,
+                    'quantity' => round($movementQuantity, 2),
+                    'unit_cost' => $unitCost,
+                    'gst_rate' => $gstRate,
+                    'taxable_amount' => $taxableAmount,
+                    'gst_amount' => $gstAmount,
+                    'total_amount' => $lineTotal,
+                ]);
+            }
+
             inv_insert_movement($pdo, [
                 'company_id' => $companyId,
                 'garage_id' => $activeGarageId,
@@ -280,7 +333,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'movement_type' => $movementType,
                 'quantity' => round($movementQuantity, 2),
                 'reference_type' => $sourceType,
-                'reference_id' => null,
+                'reference_id' => $referenceId,
                 'movement_uid' => 'adj-' . hash('sha256', $actionToken . '|' . $companyId . '|' . $activeGarageId . '|' . $partId . '|' . microtime(true)),
                 'notes' => $notes !== '' ? $notes : null,
                 'created_by' => $userId,
@@ -310,6 +363,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         'movement_type' => $movementType,
                         'movement_qty' => round($movementQuantity, 2),
                         'reference_type' => $sourceType,
+                        'reference_id' => $referenceId,
                     ],
                     'metadata' => [
                         'allow_negative' => $allowNegativeRequested,
@@ -317,7 +371,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     ],
                 ]
             );
-            flash_set('inventory_success', 'Stock movement posted successfully.', 'success');
+            if ($movementType === 'IN' && $referenceId !== null) {
+                flash_set('inventory_success', 'Stock added and logged as unassigned purchase #' . $referenceId . '.', 'success');
+            } else {
+                flash_set('inventory_success', 'Stock movement posted successfully.', 'success');
+            }
         } catch (Throwable $exception) {
             $pdo->rollBack();
             flash_set('inventory_error', $exception->getMessage(), 'danger');
@@ -900,7 +958,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
           <?php if ($canAdjust): ?>
             <div class="col-lg-6">
               <div class="card card-info">
-                <div class="card-header"><h3 class="card-title">Manual Stock Adjustment</h3></div>
+                <div class="card-header"><h3 class="card-title">Manual Stock Adjustment (Shortcut)</h3></div>
                 <form method="post">
                   <div class="card-body row g-2">
                     <?= csrf_field(); ?>
@@ -918,25 +976,20 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                         <?php endforeach; ?>
                       </select>
                     </div>
-                    <div class="col-md-4">
+                    <div class="col-md-6">
                       <label class="form-label">Movement</label>
                       <select name="movement_type" class="form-select" required>
-                        <option value="IN">Stock In (+)</option>
+                        <option value="IN">Stock In (+) -> Unassigned Purchase</option>
                         <option value="OUT">Stock Out (-)</option>
                         <option value="ADJUST">Adjustment (+/-)</option>
                       </select>
                     </div>
-                    <div class="col-md-4">
-                      <label class="form-label">Source</label>
-                      <select name="source_type" class="form-select" required>
-                        <option value="PURCHASE">Purchase</option>
-                        <option value="OPENING">Opening</option>
-                        <option value="ADJUSTMENT">Adjustment</option>
-                      </select>
-                    </div>
-                    <div class="col-md-4">
+                    <div class="col-md-6">
                       <label class="form-label">Quantity</label>
                       <input type="number" step="0.01" name="quantity" class="form-control" required>
+                    </div>
+                    <div class="col-md-12">
+                      <small class="text-muted">Stock In entries are auto-logged as unassigned purchases for later vendor and invoice assignment in Purchase Module.</small>
                     </div>
                     <?php if ($canNegative): ?>
                       <div class="col-md-12">

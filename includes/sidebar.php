@@ -5,7 +5,7 @@ $activeMenu = $active_menu ?? '';
 
 $isOrganizationOpen = is_menu_group_open('organization.', $activeMenu) || is_menu_group_open('system.', $activeMenu);
 $isPeopleOpen = is_menu_group_open('people.', $activeMenu);
-$isServicePartsOpen = is_menu_group_open('services.', $activeMenu) || is_menu_group_open('inventory.', $activeMenu) || is_menu_group_open('vendors.', $activeMenu);
+$isServicePartsOpen = is_menu_group_open('services.', $activeMenu) || is_menu_group_open('inventory.', $activeMenu) || is_menu_group_open('vendors.', $activeMenu) || is_menu_group_open('purchases.', $activeMenu);
 $isVisOpen = is_menu_group_open('vis.', $activeMenu);
 ?>
 <aside class="app-sidebar bg-body-secondary shadow" data-bs-theme="dark">
@@ -151,7 +151,7 @@ $isVisOpen = is_menu_group_open('vis.', $activeMenu);
           </li>
         <?php endif; ?>
 
-        <?php if (has_permission('service.view') || has_permission('part_category.view') || has_permission('part_master.view') || has_permission('vendor.view') || has_permission('inventory.view')): ?>
+        <?php if (has_permission('service.view') || has_permission('part_category.view') || has_permission('part_master.view') || has_permission('vendor.view') || has_permission('inventory.view') || has_permission('purchase.view')): ?>
           <li class="nav-item <?= $isServicePartsOpen ? 'menu-open' : ''; ?>">
             <a href="#" class="nav-link <?= $isServicePartsOpen ? 'active' : ''; ?>">
               <i class="nav-icon bi bi-tools"></i>
@@ -204,6 +204,14 @@ $isVisOpen = is_menu_group_open('vis.', $activeMenu);
                   <a href="<?= e(url('modules/inventory/index.php')); ?>" class="nav-link <?= e(is_active_menu('inventory', $activeMenu)); ?>">
                     <i class="nav-icon bi bi-circle"></i>
                     <p>Stock Movements</p>
+                  </a>
+                </li>
+              <?php endif; ?>
+              <?php if (has_permission('purchase.view')): ?>
+                <li class="nav-item">
+                  <a href="<?= e(url('modules/purchases/index.php')); ?>" class="nav-link <?= e(is_active_menu('purchases.index', $activeMenu)); ?>">
+                    <i class="nav-icon bi bi-circle"></i>
+                    <p>Purchases</p>
                   </a>
                 </li>
               <?php endif; ?>
