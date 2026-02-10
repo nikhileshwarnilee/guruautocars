@@ -18,6 +18,8 @@ if ($requestPathForRedirect === '') {
 }
 
 $flashMessages = flash_pull_all();
+$globalVehicleSearchEnabled = $user !== null && has_permission('vehicle.view');
+$globalVehicleSearchApiUrl = $globalVehicleSearchEnabled ? url('modules/vehicles/search_api.php') : '';
 ?>
 <!doctype html>
 <html lang="en">
@@ -44,6 +46,41 @@ $flashMessages = flash_pull_all();
               </a>
             </li>
           </ul>
+          <?php if ($globalVehicleSearchEnabled): ?>
+            <form
+              class="gac-global-search flex-grow-1 mx-2"
+              data-global-vehicle-search-root="1"
+              data-global-vehicle-search-endpoint="<?= e($globalVehicleSearchApiUrl); ?>"
+              role="search"
+              autocomplete="off"
+              onsubmit="return false;"
+            >
+              <div class="input-group input-group-sm">
+                <span class="input-group-text"><i class="bi bi-search"></i></span>
+                <input
+                  type="search"
+                  class="form-control"
+                  data-global-vehicle-search-input="1"
+                  placeholder="Search vehicle number or customer mobile"
+                  aria-label="Search vehicles by registration or customer mobile"
+                />
+                <button
+                  type="button"
+                  class="btn btn-outline-secondary d-none"
+                  data-global-vehicle-search-clear="1"
+                  aria-label="Clear vehicle search"
+                >
+                  <i class="bi bi-x-lg"></i>
+                </button>
+              </div>
+              <div
+                class="list-group d-none gac-global-search-results"
+                data-global-vehicle-search-results="1"
+                role="listbox"
+                aria-label="Vehicle search results"
+              ></div>
+            </form>
+          <?php endif; ?>
           <ul class="navbar-nav ms-auto align-items-center">
             <?php if ($user !== null): ?>
               <li class="nav-item me-2 d-none d-md-block">

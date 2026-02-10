@@ -302,6 +302,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $createdVehicleId = (int) db()->lastInsertId();
                 add_vehicle_history($createdVehicleId, 'CREATE', 'Vehicle created', [
                     'registration_no' => $registrationNo,
+                    'odometer_km' => $odometer > 0 ? $odometer : 0,
                     'status_code' => $statusCode,
                     'vis_variant' => $visVariantName,
                 ]);
@@ -420,6 +421,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
                 add_vehicle_history($vehicleId, 'UPDATE', 'Vehicle details updated', [
                     'registration_no' => $registrationNo,
+                    'odometer_km' => $odometer > 0 ? $odometer : 0,
                     'status_code' => $statusCode,
                     'vis_variant' => $visVariantName,
                 ]);
@@ -443,6 +445,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             redirect('modules/vehicles/index.php');
         }
 
+        $currentOdometerStmt = db()->prepare(
+            'SELECT odometer_km
+             FROM vehicles
+             WHERE id = :id
+               AND company_id = :company_id
+             LIMIT 1'
+        );
+        $currentOdometerStmt->execute([
+            'id' => $vehicleId,
+            'company_id' => $companyId,
+        ]);
+        $currentOdometer = (int) ($currentOdometerStmt->fetchColumn() ?: 0);
+
         $isActive = $nextStatus === 'ACTIVE' ? 1 : 0;
         $stmt = db()->prepare(
             'UPDATE vehicles
@@ -459,7 +474,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'company_id' => $companyId,
         ]);
 
-        add_vehicle_history($vehicleId, 'STATUS', 'Status changed to ' . $nextStatus, ['status_code' => $nextStatus]);
+        add_vehicle_history($vehicleId, 'STATUS', 'Status changed to ' . $nextStatus, [
+            'status_code' => $nextStatus,
+            'odometer_km' => $currentOdometer,
+        ]);
         log_audit('vehicles', 'status', $vehicleId, 'Changed vehicle status to ' . $nextStatus);
 
         flash_set('vehicle_success', 'Vehicle status updated.', 'success');
@@ -1018,6 +1036,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                     <td><?= (int) $vehicle['history_count']; ?></td>
                     <td><span class="badge text-bg-<?= e(status_badge_class((string) $vehicle['status_code'])); ?>"><?= e(record_status_label((string) $vehicle['status_code'])); ?></span></td>
                     <td class="d-flex gap-1">
+                      <a class="btn btn-sm btn-outline-dark" href="<?= e(url('modules/vehicles/intelligence.php?id=' . (int) $vehicle['id'])); ?>">Intel</a>
                       <a class="btn btn-sm btn-outline-info" href="<?= e(url('modules/vehicles/index.php?history_id=' . (int) $vehicle['id'])); ?>">History</a>
                       <?php if ($canManage): ?>
                         <a class="btn btn-sm btn-outline-primary" href="<?= e(url('modules/vehicles/index.php?edit_id=' . (int) $vehicle['id'])); ?>">Edit</a>

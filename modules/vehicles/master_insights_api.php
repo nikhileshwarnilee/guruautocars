@@ -68,6 +68,7 @@ function vehicle_master_render_rows(array $vehicles, bool $canManage): string
           </td>
           <td><span class="badge text-bg-<?= e(status_badge_class($statusCode)); ?>"><?= e(record_status_label($statusCode)); ?></span></td>
           <td class="d-flex gap-1">
+            <a class="btn btn-sm btn-outline-dark" href="<?= e(url('modules/vehicles/intelligence.php?id=' . (int) ($vehicle['id'] ?? 0))); ?>">Intel</a>
             <a class="btn btn-sm btn-outline-info" href="<?= e(url('modules/vehicles/index.php?history_id=' . (int) ($vehicle['id'] ?? 0))); ?>">History</a>
             <?php if ($canManage): ?>
               <a class="btn btn-sm btn-outline-primary" href="<?= e(url('modules/vehicles/index.php?edit_id=' . (int) ($vehicle['id'] ?? 0))); ?>">Edit</a>

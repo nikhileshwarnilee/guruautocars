@@ -1,5 +1,6 @@
 document.addEventListener('DOMContentLoaded', function () {
   bindConfirmForms();
+  initGlobalVehicleSearch();
   initSearchableSelects();
   initVehicleAttributeSelectors();
   initMasterInsightsFilters();
@@ -18,6 +19,355 @@ function bindConfirmForms() {
         event.preventDefault();
       }
     });
+  }
+}
+
+function initGlobalVehicleSearch() {
+  var roots = document.querySelectorAll('[data-global-vehicle-search-root="1"]');
+  if (!roots || roots.length === 0) {
+    return;
+  }
+
+  for (var i = 0; i < roots.length; i++) {
+    initGlobalSearchRoot(roots[i]);
+  }
+
+  function initGlobalSearchRoot(root) {
+    if (!root || root.getAttribute('data-global-vehicle-search-init') === '1') {
+      return;
+    }
+
+    var endpoint = (root.getAttribute('data-global-vehicle-search-endpoint') || '').trim();
+    var input = root.querySelector('[data-global-vehicle-search-input="1"]');
+    var resultsBox = root.querySelector('[data-global-vehicle-search-results="1"]');
+    var clearButton = root.querySelector('[data-global-vehicle-search-clear="1"]');
+    if (endpoint === '' || !input || !resultsBox) {
+      return;
+    }
+
+    root.setAttribute('data-global-vehicle-search-init', '1');
+
+    var state = {
+      requestSequence: 0,
+      activeIndex: -1,
+      items: [],
+      opened: false,
+      lastQuery: ''
+    };
+
+    var debouncedRequest = debounce(function () {
+      requestAndRender(false);
+    }, 180);
+
+    input.addEventListener('input', function () {
+      toggleClearButton();
+      var query = compactValue(input.value);
+      if (query.length < 2) {
+        state.requestSequence++;
+        state.items = [];
+        state.activeIndex = -1;
+        state.lastQuery = '';
+        closeResults();
+        return;
+      }
+      debouncedRequest();
+    });
+
+    input.addEventListener('focus', function () {
+      var query = compactValue(input.value);
+      if (query.length >= 2) {
+        requestAndRender(true);
+      }
+    });
+
+    input.addEventListener('keydown', function (event) {
+      if (event.key === 'Escape') {
+        if (state.opened) {
+          event.preventDefault();
+          closeResults();
+        }
+        return;
+      }
+
+      if (event.key === 'Tab') {
+        closeResults();
+        return;
+      }
+
+      if (!state.opened && (event.key === 'ArrowDown' || event.key === 'ArrowUp')) {
+        var query = compactValue(input.value);
+        if (query.length >= 2) {
+          event.preventDefault();
+          requestAndRender(true);
+        }
+        return;
+      }
+
+      if (state.items.length === 0) {
+        return;
+      }
+
+      if (event.key === 'ArrowDown') {
+        event.preventDefault();
+        setActiveIndex(state.activeIndex + 1);
+        return;
+      }
+
+      if (event.key === 'ArrowUp') {
+        event.preventDefault();
+        setActiveIndex(state.activeIndex - 1);
+        return;
+      }
+
+      if (event.key !== 'Enter') {
+        return;
+      }
+
+      event.preventDefault();
+      if (state.activeIndex < 0) {
+        setActiveIndex(0);
+      }
+
+      var selected = state.items[state.activeIndex];
+      if (!selected) {
+        return;
+      }
+
+      navigateToIntelligence(selected.intelligence_url || '');
+    });
+
+    if (clearButton) {
+      clearButton.addEventListener('click', function () {
+        state.requestSequence++;
+        input.value = '';
+        state.items = [];
+        state.activeIndex = -1;
+        state.lastQuery = '';
+        closeResults();
+        toggleClearButton();
+        input.focus();
+      });
+    }
+
+    document.addEventListener('click', function (event) {
+      if (!root.contains(event.target)) {
+        closeResults();
+      }
+    });
+
+    function compactValue(value) {
+      return String(value || '').replace(/\s+/g, ' ').trim();
+    }
+
+    function toggleClearButton() {
+      if (!clearButton) {
+        return;
+      }
+      if (compactValue(input.value) === '') {
+        clearButton.classList.add('d-none');
+      } else {
+        clearButton.classList.remove('d-none');
+      }
+    }
+
+    function requestAndRender(forceRefresh) {
+      var query = compactValue(input.value);
+      if (query.length < 2) {
+        closeResults();
+        return;
+      }
+
+      if (!forceRefresh && query === state.lastQuery && state.items.length > 0) {
+        openResults();
+        return;
+      }
+
+      var requestSequence = ++state.requestSequence;
+      renderMessage('Searching vehicles...');
+
+      var requestUrl = endpoint + (endpoint.indexOf('?') >= 0 ? '&' : '?') + 'q=' + encodeURIComponent(query);
+      fetch(requestUrl, {
+        credentials: 'same-origin',
+        headers: { 'X-Requested-With': 'XMLHttpRequest' }
+      })
+        .then(function (response) {
+          return response.text().then(function (text) {
+            var payload = null;
+            try {
+              payload = JSON.parse(text);
+            } catch (error) {
+              payload = null;
+            }
+            return {
+              ok: response.ok,
+              payload: payload
+            };
+          });
+        })
+        .then(function (result) {
+          if (requestSequence !== state.requestSequence) {
+            return;
+          }
+
+          if (!result.ok || !result.payload || !result.payload.ok) {
+            state.items = [];
+            renderMessage('Unable to search right now.');
+            return;
+          }
+
+          state.lastQuery = query;
+          state.items = Array.isArray(result.payload.items) ? result.payload.items : [];
+          state.activeIndex = -1;
+          renderItems();
+        })
+        .catch(function () {
+          if (requestSequence !== state.requestSequence) {
+            return;
+          }
+          state.items = [];
+          renderMessage('Unable to search right now.');
+        });
+    }
+
+    function renderMessage(message) {
+      resultsBox.innerHTML = '';
+      var row = document.createElement('div');
+      row.className = 'list-group-item text-muted small';
+      row.textContent = message || 'No results';
+      resultsBox.appendChild(row);
+      openResults();
+    }
+
+    function renderItems() {
+      resultsBox.innerHTML = '';
+      if (state.items.length === 0) {
+        renderMessage('No vehicles found.');
+        return;
+      }
+
+      for (var index = 0; index < state.items.length; index++) {
+        var item = state.items[index] || {};
+        var rowButton = document.createElement('button');
+        rowButton.type = 'button';
+        rowButton.className = 'list-group-item list-group-item-action gac-global-search-item';
+        rowButton.setAttribute('data-global-search-item', '1');
+        rowButton.setAttribute('data-index', String(index));
+        rowButton.setAttribute('role', 'option');
+        rowButton.setAttribute('aria-selected', 'false');
+
+        var topRow = document.createElement('div');
+        topRow.className = 'd-flex justify-content-between align-items-center gap-2';
+        var registration = document.createElement('div');
+        registration.className = 'fw-semibold';
+        registration.textContent = String(item.registration_no || '');
+        var status = document.createElement('span');
+        status.className = 'badge text-bg-' + statusBadgeClass(item.status_code || 'ACTIVE');
+        status.textContent = String(item.status_code || 'ACTIVE');
+        topRow.appendChild(registration);
+        topRow.appendChild(status);
+        rowButton.appendChild(topRow);
+
+        var vehicleLabel = document.createElement('div');
+        vehicleLabel.className = 'small text-muted';
+        vehicleLabel.textContent = String(item.vehicle_label || '');
+        rowButton.appendChild(vehicleLabel);
+
+        var ownerLine = document.createElement('div');
+        ownerLine.className = 'small';
+        var ownerPhone = String(item.customer_phone || '').trim();
+        ownerLine.textContent = String(item.customer_name || '-') + (ownerPhone !== '' ? ' | ' + ownerPhone : '');
+        rowButton.appendChild(ownerLine);
+
+        var statsLine = document.createElement('div');
+        statsLine.className = 'small text-muted';
+        statsLine.textContent =
+          'Jobs: ' + String(item.total_jobs || 0) +
+          ' | Open: ' + String(item.open_jobs || 0) +
+          (String(item.last_visit_at || '').trim() !== '' ? ' | Last: ' + String(item.last_visit_at) : '');
+        rowButton.appendChild(statsLine);
+
+        rowButton.addEventListener('mouseenter', function () {
+          var hoverIndex = parseInt(this.getAttribute('data-index') || '-1', 10);
+          if (isNaN(hoverIndex) || hoverIndex < 0) {
+            return;
+          }
+          setActiveIndex(hoverIndex);
+        });
+
+        rowButton.addEventListener('click', function () {
+          var clickIndex = parseInt(this.getAttribute('data-index') || '-1', 10);
+          if (isNaN(clickIndex) || clickIndex < 0 || !state.items[clickIndex]) {
+            return;
+          }
+          navigateToIntelligence(state.items[clickIndex].intelligence_url || '');
+        });
+
+        resultsBox.appendChild(rowButton);
+      }
+
+      openResults();
+    }
+
+    function setActiveIndex(index) {
+      var nodes = resultsBox.querySelectorAll('[data-global-search-item="1"]');
+      if (!nodes || nodes.length === 0) {
+        state.activeIndex = -1;
+        return;
+      }
+
+      if (index >= nodes.length) {
+        index = 0;
+      } else if (index < 0) {
+        index = nodes.length - 1;
+      }
+      state.activeIndex = index;
+
+      for (var i = 0; i < nodes.length; i++) {
+        if (i === state.activeIndex) {
+          nodes[i].classList.add('active');
+          nodes[i].setAttribute('aria-selected', 'true');
+          if (typeof nodes[i].scrollIntoView === 'function') {
+            nodes[i].scrollIntoView({ block: 'nearest' });
+          }
+        } else {
+          nodes[i].classList.remove('active');
+          nodes[i].setAttribute('aria-selected', 'false');
+        }
+      }
+    }
+
+    function statusBadgeClass(status) {
+      var normalized = String(status || '').toUpperCase();
+      if (normalized === 'ACTIVE') {
+        return 'success';
+      }
+      if (normalized === 'INACTIVE') {
+        return 'warning';
+      }
+      if (normalized === 'DELETED') {
+        return 'danger';
+      }
+      return 'secondary';
+    }
+
+    function navigateToIntelligence(url) {
+      var destination = String(url || '').trim();
+      if (destination === '') {
+        return;
+      }
+      window.location.assign(destination);
+    }
+
+    function openResults() {
+      resultsBox.classList.remove('d-none');
+      state.opened = true;
+    }
+
+    function closeResults() {
+      resultsBox.classList.add('d-none');
+      state.opened = false;
+      state.activeIndex = -1;
+    }
   }
 }
 

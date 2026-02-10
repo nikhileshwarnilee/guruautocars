@@ -39,3 +39,40 @@
 .gac-inline-form-alert {
   margin-bottom: 0.75rem;
 }
+
+.gac-global-search {
+  position: relative;
+  max-width: 640px;
+}
+
+.gac-global-search-results {
+  position: absolute;
+  top: calc(100% + 0.2rem);
+  left: 0;
+  right: 0;
+  z-index: 1065;
+  max-height: 22rem;
+  overflow-y: auto;
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  border-radius: 0.35rem;
+  background: #fff;
+  box-shadow: 0 0.5rem 1rem rgba(0, 0, 0, 0.14);
+}
+
+.gac-global-search-item {
+  text-align: left;
+}
+
+@media (max-width: 991.98px) {
+  .app-header .container-fluid {
+    flex-wrap: wrap;
+    row-gap: 0.4rem;
+  }
+
+  .gac-global-search {
+    order: 3;
+    flex: 1 0 100%;
+    max-width: none;
+    margin: 0.1rem 0 0;
+  }
+}
