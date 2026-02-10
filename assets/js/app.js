@@ -849,6 +849,7 @@ function initVehicleAttributeSelectors() {
           var option = document.createElement('option');
           option.value = String(item.id);
           option.textContent = String(item.label || item.registration_no || item.id);
+          option.setAttribute('data-customer-id', String(item.customer_id || ''));
           vehiclePicker.appendChild(option);
         }
 

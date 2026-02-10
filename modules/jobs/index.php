@@ -276,6 +276,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
               </option>
             <?php endforeach; ?>
           </select>
+          <div id="job-owner-lock-hint" class="form-hint text-muted mt-1"></div>
           <?php if ($editJob): ?><input type="hidden" name="customer_id" value="<?= (int) $editJob['customer_id']; ?>"><?php endif; ?>
         </div>
 
@@ -318,7 +319,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
           <select id="job-vehicle-select" name="vehicle_id" class="form-select" required <?= $editJob ? 'disabled' : ''; ?>>
             <option value="">Select Vehicle</option>
             <?php foreach ($vehicles as $vehicle): ?>
-              <option value="<?= (int) $vehicle['id']; ?>" <?= ((int) ($editJob['vehicle_id'] ?? 0) === (int) $vehicle['id']) ? 'selected' : ''; ?>>
+              <option value="<?= (int) $vehicle['id']; ?>" data-customer-id="<?= (int) $vehicle['customer_id']; ?>" <?= ((int) ($editJob['vehicle_id'] ?? 0) === (int) $vehicle['id']) ? 'selected' : ''; ?>>
                 <?= e((string) $vehicle['registration_no']); ?> - <?= e((string) $vehicle['brand']); ?> <?= e((string) $vehicle['model']); ?>
               </option>
             <?php endforeach; ?>
@@ -356,8 +357,75 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 <script>
   (function () {
     var vehicleSelect = document.getElementById('job-vehicle-select');
+    var customerSelect = document.getElementById('job-customer-select');
+    var ownerHint = document.getElementById('job-owner-lock-hint');
     var target = document.getElementById('vis-suggestions-content');
     if (!vehicleSelect || !target) return;
+
+    function selectedVehicleCustomerId() {
+      if (!vehicleSelect) {
+        return '';
+      }
+      var selected = vehicleSelect.options[vehicleSelect.selectedIndex];
+      if (!selected) {
+        return '';
+      }
+      return (selected.getAttribute('data-customer-id') || '').trim();
+    }
+
+    function renderOwnerHint(message) {
+      if (!ownerHint) {
+        return;
+      }
+      ownerHint.textContent = message || '';
+    }
+
+    function syncOwnerFromVehicle() {
+      if (!customerSelect || customerSelect.disabled || vehicleSelect.disabled) {
+        return;
+      }
+
+      var ownerCustomerId = selectedVehicleCustomerId();
+      if (ownerCustomerId === '') {
+        renderOwnerHint('');
+        return;
+      }
+
+      if ((customerSelect.value || '') !== ownerCustomerId) {
+        customerSelect.value = ownerCustomerId;
+        if (typeof gacRefreshSearchableSelect === 'function') {
+          gacRefreshSearchableSelect(customerSelect);
+        }
+        customerSelect.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+      renderOwnerHint('Owner auto-filled from selected vehicle to prevent mismatches.');
+    }
+
+    function enforceVehicleOwnerMatch() {
+      if (!customerSelect || customerSelect.disabled || vehicleSelect.disabled) {
+        return;
+      }
+
+      var selectedVehicleId = (vehicleSelect.value || '').trim();
+      if (selectedVehicleId === '') {
+        renderOwnerHint('');
+        return;
+      }
+
+      var ownerCustomerId = selectedVehicleCustomerId();
+      if (ownerCustomerId === '' || (customerSelect.value || '') === ownerCustomerId) {
+        renderOwnerHint('Owner auto-filled from selected vehicle to prevent mismatches.');
+        return;
+      }
+
+      vehicleSelect.value = '';
+      if (typeof gacRefreshSearchableSelect === 'function') {
+        gacRefreshSearchableSelect(vehicleSelect);
+      }
+      renderOwnerHint('Vehicle selection was cleared because it does not belong to the selected customer.');
+      load('');
+    }
+
     function render(data) {
       var services = data.service_suggestions || [], parts = data.part_suggestions || [], variant = data.variant;
       if (!variant && services.length === 0 && parts.length === 0) { target.innerHTML = 'No VIS data for this vehicle. Continue manually.'; return; }
@@ -372,8 +440,17 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         .then(render)
         .catch(function () { target.innerHTML = 'VIS suggestions unavailable. Continue manually.'; });
     }
-    vehicleSelect.addEventListener('change', function () { load(vehicleSelect.value); });
-    if (vehicleSelect.value) load(vehicleSelect.value);
+    vehicleSelect.addEventListener('change', function () {
+      syncOwnerFromVehicle();
+      load(vehicleSelect.value);
+    });
+    if (customerSelect) {
+      customerSelect.addEventListener('change', enforceVehicleOwnerMatch);
+    }
+    if (vehicleSelect.value) {
+      syncOwnerFromVehicle();
+      load(vehicleSelect.value);
+    }
   })();
 </script>
 <?php endif; ?>

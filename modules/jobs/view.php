@@ -72,6 +72,40 @@ function job_priority_badge_class(string $priority): string
     };
 }
 
+function normalize_labor_execution_type(?string $value): string
+{
+    $normalized = strtoupper(trim((string) $value));
+    return $normalized === 'OUTSOURCED' ? 'OUTSOURCED' : 'IN_HOUSE';
+}
+
+function normalize_outsource_payable_status(?string $value): string
+{
+    $normalized = strtoupper(trim((string) $value));
+    return $normalized === 'PAID' ? 'PAID' : 'UNPAID';
+}
+
+function fetch_outsource_vendor(int $companyId, int $vendorId): ?array
+{
+    if ($companyId <= 0 || $vendorId <= 0) {
+        return null;
+    }
+
+    $stmt = db()->prepare(
+        'SELECT id, vendor_name, vendor_code
+         FROM vendors
+         WHERE id = :id
+           AND company_id = :company_id
+           AND status_code = "ACTIVE"
+         LIMIT 1'
+    );
+    $stmt->execute([
+        'id' => $vendorId,
+        'company_id' => $companyId,
+    ]);
+    $row = $stmt->fetch();
+    return $row ?: null;
+}
+
 function fetch_job_row(int $jobId, int $companyId, int $garageId): ?array
 {
     $stmt = db()->prepare(
@@ -129,10 +163,14 @@ function fetch_job_labor(int $jobId): array
 {
     $stmt = db()->prepare(
         'SELECT jl.*, s.service_name, s.service_code, s.category_id AS service_category_id,
-                sc.category_name AS service_category_name
+                sc.category_name AS service_category_name,
+                v.vendor_name AS outsource_vendor_name,
+                up.name AS outsource_paid_by_name
          FROM job_labor jl
          LEFT JOIN services s ON s.id = jl.service_id
          LEFT JOIN service_categories sc ON sc.id = s.category_id AND sc.company_id = s.company_id
+         LEFT JOIN vendors v ON v.id = jl.outsource_vendor_id
+         LEFT JOIN users up ON up.id = jl.outsource_paid_by
          WHERE jl.job_card_id = :job_id
          ORDER BY jl.id DESC'
     );
@@ -208,6 +246,19 @@ function fetch_parts_master(int $companyId, int $garageId): array
         'company_id' => $companyId,
         'garage_id' => $garageId,
     ]);
+    return $stmt->fetchAll();
+}
+
+function fetch_outsource_vendors(int $companyId): array
+{
+    $stmt = db()->prepare(
+        'SELECT id, vendor_name, vendor_code
+         FROM vendors
+         WHERE company_id = :company_id
+           AND status_code = "ACTIVE"
+         ORDER BY vendor_name ASC'
+    );
+    $stmt->execute(['company_id' => $companyId]);
     return $stmt->fetchAll();
 }
 
@@ -445,6 +496,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         'add_labor',
         'update_labor',
         'delete_labor',
+        'toggle_outsource_payable',
         'add_part',
         'update_part',
         'delete_part',
@@ -469,6 +521,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $quantity = post_decimal('quantity', 1.0);
         $unitPrice = post_decimal('unit_price', 0.0);
         $gstRate = post_decimal('gst_rate', 18.0);
+        $executionType = normalize_labor_execution_type($_POST['execution_type'] ?? 'IN_HOUSE');
+        $outsourceVendorId = post_int('outsource_vendor_id');
+        $outsourcePartnerName = post_string('outsource_partner_name', 150);
+        $outsourceCost = post_decimal('outsource_cost', 0.0);
+        $outsourceVendorName = null;
         $serviceName = null;
         $serviceCategoryName = null;
 
@@ -528,18 +585,55 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             redirect('modules/jobs/view.php?id=' . $jobId);
         }
 
+        if ($executionType === 'OUTSOURCED') {
+            if ($outsourceVendorId > 0) {
+                $vendor = fetch_outsource_vendor($companyId, $outsourceVendorId);
+                if (!$vendor) {
+                    flash_set('job_error', 'Selected outsourcing vendor is not active for this company.', 'danger');
+                    redirect('modules/jobs/view.php?id=' . $jobId);
+                }
+                $outsourceVendorName = (string) ($vendor['vendor_name'] ?? '');
+                if ($outsourcePartnerName === '') {
+                    $outsourcePartnerName = $outsourceVendorName;
+                }
+            }
+
+            if ($outsourcePartnerName === '') {
+                flash_set('job_error', 'Select vendor or enter outsourced partner name for outsourced labor.', 'danger');
+                redirect('modules/jobs/view.php?id=' . $jobId);
+            }
+            if ($outsourceCost <= 0) {
+                flash_set('job_error', 'Outsourced labor requires a payable cost greater than zero.', 'danger');
+                redirect('modules/jobs/view.php?id=' . $jobId);
+            }
+        } else {
+            $outsourceVendorId = 0;
+            $outsourcePartnerName = '';
+            $outsourceCost = 0.0;
+        }
+
         $gstRate = max(0, min(100, $gstRate));
         $totalAmount = round($quantity * $unitPrice, 2);
+        $payableStatus = ($executionType === 'OUTSOURCED' && $outsourceCost > 0) ? 'UNPAID' : 'PAID';
 
         $insertStmt = db()->prepare(
             'INSERT INTO job_labor
-              (job_card_id, service_id, description, quantity, unit_price, gst_rate, total_amount)
+              (job_card_id, service_id, execution_type, outsource_vendor_id, outsource_partner_name, outsource_cost,
+               outsource_payable_status, outsource_paid_at, outsource_paid_by, description, quantity, unit_price, gst_rate, total_amount)
              VALUES
-              (:job_card_id, :service_id, :description, :quantity, :unit_price, :gst_rate, :total_amount)'
+              (:job_card_id, :service_id, :execution_type, :outsource_vendor_id, :outsource_partner_name, :outsource_cost,
+               :outsource_payable_status, :outsource_paid_at, :outsource_paid_by, :description, :quantity, :unit_price, :gst_rate, :total_amount)'
         );
         $insertStmt->execute([
             'job_card_id' => $jobId,
             'service_id' => $serviceId > 0 ? $serviceId : null,
+            'execution_type' => $executionType,
+            'outsource_vendor_id' => ($executionType === 'OUTSOURCED' && $outsourceVendorId > 0) ? $outsourceVendorId : null,
+            'outsource_partner_name' => ($executionType === 'OUTSOURCED' && $outsourcePartnerName !== '') ? $outsourcePartnerName : null,
+            'outsource_cost' => round($executionType === 'OUTSOURCED' ? $outsourceCost : 0.0, 2),
+            'outsource_payable_status' => $payableStatus,
+            'outsource_paid_at' => null,
+            'outsource_paid_by' => null,
             'description' => $description,
             'quantity' => round($quantity, 2),
             'unit_price' => round($unitPrice, 2),
@@ -562,6 +656,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'description' => $description,
                 'quantity' => round($quantity, 2),
                 'unit_price' => round($unitPrice, 2),
+                'execution_type' => $executionType,
+                'outsource_vendor_id' => ($executionType === 'OUTSOURCED' && $outsourceVendorId > 0) ? $outsourceVendorId : null,
+                'outsource_vendor_name' => $outsourceVendorName,
+                'outsource_partner_name' => $executionType === 'OUTSOURCED' ? $outsourcePartnerName : null,
+                'outsource_cost' => round($executionType === 'OUTSOURCED' ? $outsourceCost : 0.0, 2),
+                'outsource_payable_status' => $payableStatus,
             ]
         );
         log_audit('job_cards', 'add_labor', $jobId, 'Added labor line to job card');
@@ -576,6 +676,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $quantity = post_decimal('quantity', 0.0);
         $unitPrice = post_decimal('unit_price', 0.0);
         $gstRate = post_decimal('gst_rate', 18.0);
+        $executionType = normalize_labor_execution_type($_POST['execution_type'] ?? 'IN_HOUSE');
+        $outsourceVendorId = post_int('outsource_vendor_id');
+        $outsourcePartnerName = post_string('outsource_partner_name', 150);
+        $outsourceCost = post_decimal('outsource_cost', 0.0);
+        $outsourceVendorName = null;
 
         if ($laborId <= 0 || $description === '' || $quantity <= 0 || $unitPrice < 0) {
             flash_set('job_error', 'Invalid labor update payload.', 'danger');
@@ -583,7 +688,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
 
         $lineStmt = db()->prepare(
-            'SELECT jl.id
+            'SELECT jl.id, jl.execution_type, jl.outsource_cost, jl.outsource_payable_status, jl.outsource_paid_at, jl.outsource_paid_by
              FROM job_labor jl
              INNER JOIN job_cards jc ON jc.id = jl.job_card_id
              WHERE jl.id = :line_id
@@ -599,17 +704,77 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'garage_id' => $garageId,
         ]);
 
-        if (!$lineStmt->fetch()) {
+        $line = $lineStmt->fetch();
+        if (!$line) {
             flash_set('job_error', 'Labor line not found for this job.', 'danger');
             redirect('modules/jobs/view.php?id=' . $jobId);
         }
 
+        if ($executionType === 'OUTSOURCED') {
+            if ($outsourceVendorId > 0) {
+                $vendor = fetch_outsource_vendor($companyId, $outsourceVendorId);
+                if (!$vendor) {
+                    flash_set('job_error', 'Selected outsourcing vendor is not active for this company.', 'danger');
+                    redirect('modules/jobs/view.php?id=' . $jobId);
+                }
+                $outsourceVendorName = (string) ($vendor['vendor_name'] ?? '');
+                if ($outsourcePartnerName === '') {
+                    $outsourcePartnerName = $outsourceVendorName;
+                }
+            }
+
+            if ($outsourcePartnerName === '') {
+                flash_set('job_error', 'Select vendor or enter outsourced partner name for outsourced labor.', 'danger');
+                redirect('modules/jobs/view.php?id=' . $jobId);
+            }
+            if ($outsourceCost <= 0) {
+                flash_set('job_error', 'Outsourced labor requires a payable cost greater than zero.', 'danger');
+                redirect('modules/jobs/view.php?id=' . $jobId);
+            }
+        } else {
+            $outsourceVendorId = 0;
+            $outsourcePartnerName = '';
+            $outsourceCost = 0.0;
+        }
+
         $gstRate = max(0, min(100, $gstRate));
         $totalAmount = round($quantity * $unitPrice, 2);
+        $previousExecutionType = normalize_labor_execution_type((string) ($line['execution_type'] ?? 'IN_HOUSE'));
+        $payableStatus = normalize_outsource_payable_status((string) ($line['outsource_payable_status'] ?? 'UNPAID'));
+        $paidAt = !empty($line['outsource_paid_at']) ? (string) $line['outsource_paid_at'] : null;
+        $paidBy = (int) ($line['outsource_paid_by'] ?? 0);
+
+        if ($executionType === 'OUTSOURCED') {
+            if ($previousExecutionType !== 'OUTSOURCED') {
+                $payableStatus = 'UNPAID';
+            }
+            if ($payableStatus === 'PAID') {
+                if ($paidAt === null) {
+                    $paidAt = date('Y-m-d H:i:s');
+                }
+                if ($paidBy <= 0) {
+                    $paidBy = $userId;
+                }
+            } else {
+                $paidAt = null;
+                $paidBy = 0;
+            }
+        } else {
+            $payableStatus = 'PAID';
+            $paidAt = null;
+            $paidBy = 0;
+        }
 
         $updateStmt = db()->prepare(
             'UPDATE job_labor
              SET description = :description,
+                 execution_type = :execution_type,
+                 outsource_vendor_id = :outsource_vendor_id,
+                 outsource_partner_name = :outsource_partner_name,
+                 outsource_cost = :outsource_cost,
+                 outsource_payable_status = :outsource_payable_status,
+                 outsource_paid_at = :outsource_paid_at,
+                 outsource_paid_by = :outsource_paid_by,
                  quantity = :quantity,
                  unit_price = :unit_price,
                  gst_rate = :gst_rate,
@@ -619,6 +784,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         );
         $updateStmt->execute([
             'description' => $description,
+            'execution_type' => $executionType,
+            'outsource_vendor_id' => ($executionType === 'OUTSOURCED' && $outsourceVendorId > 0) ? $outsourceVendorId : null,
+            'outsource_partner_name' => ($executionType === 'OUTSOURCED' && $outsourcePartnerName !== '') ? $outsourcePartnerName : null,
+            'outsource_cost' => round($executionType === 'OUTSOURCED' ? $outsourceCost : 0.0, 2),
+            'outsource_payable_status' => $payableStatus,
+            'outsource_paid_at' => $paidAt,
+            'outsource_paid_by' => $paidBy > 0 ? $paidBy : null,
             'quantity' => round($quantity, 2),
             'unit_price' => round($unitPrice, 2),
             'gst_rate' => round($gstRate, 2),
@@ -639,6 +811,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'description' => $description,
                 'quantity' => round($quantity, 2),
                 'unit_price' => round($unitPrice, 2),
+                'execution_type' => $executionType,
+                'outsource_vendor_id' => ($executionType === 'OUTSOURCED' && $outsourceVendorId > 0) ? $outsourceVendorId : null,
+                'outsource_vendor_name' => $outsourceVendorName,
+                'outsource_partner_name' => $executionType === 'OUTSOURCED' ? $outsourcePartnerName : null,
+                'outsource_cost' => round($executionType === 'OUTSOURCED' ? $outsourceCost : 0.0, 2),
+                'outsource_payable_status' => $payableStatus,
             ]
         );
         log_audit('job_cards', 'update_labor', $jobId, 'Updated labor line #' . $laborId);
@@ -682,6 +860,94 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         log_audit('job_cards', 'delete_labor', $jobId, 'Deleted labor line #' . $laborId);
 
         flash_set('job_success', 'Labor line removed.', 'success');
+        redirect('modules/jobs/view.php?id=' . $jobId);
+    }
+
+    if ($action === 'toggle_outsource_payable') {
+        $laborId = post_int('labor_id');
+        $nextPayableStatus = normalize_outsource_payable_status($_POST['next_payable_status'] ?? 'UNPAID');
+        if ($laborId <= 0) {
+            flash_set('job_error', 'Invalid outsourced labor line selected.', 'danger');
+            redirect('modules/jobs/view.php?id=' . $jobId);
+        }
+
+        $lineStmt = db()->prepare(
+            'SELECT jl.id, jl.execution_type, jl.outsource_cost, jl.outsource_payable_status
+             FROM job_labor jl
+             INNER JOIN job_cards jc ON jc.id = jl.job_card_id
+             WHERE jl.id = :line_id
+               AND jl.job_card_id = :job_id
+               AND jc.company_id = :company_id
+               AND jc.garage_id = :garage_id
+             LIMIT 1'
+        );
+        $lineStmt->execute([
+            'line_id' => $laborId,
+            'job_id' => $jobId,
+            'company_id' => $companyId,
+            'garage_id' => $garageId,
+        ]);
+        $line = $lineStmt->fetch();
+        if (!$line) {
+            flash_set('job_error', 'Outsourced labor line not found for this job.', 'danger');
+            redirect('modules/jobs/view.php?id=' . $jobId);
+        }
+
+        if (normalize_labor_execution_type((string) ($line['execution_type'] ?? 'IN_HOUSE')) !== 'OUTSOURCED') {
+            flash_set('job_error', 'Payable status can only be changed for outsourced labor lines.', 'danger');
+            redirect('modules/jobs/view.php?id=' . $jobId);
+        }
+
+        if ((float) ($line['outsource_cost'] ?? 0) <= 0) {
+            flash_set('job_error', 'Outsourced payable cost must be greater than zero.', 'danger');
+            redirect('modules/jobs/view.php?id=' . $jobId);
+        }
+
+        $updateStmt = db()->prepare(
+            'UPDATE job_labor
+             SET outsource_payable_status = :payable_status,
+                 outsource_paid_at = :paid_at,
+                 outsource_paid_by = :paid_by
+             WHERE id = :id
+               AND job_card_id = :job_card_id'
+        );
+        $updateStmt->execute([
+            'payable_status' => $nextPayableStatus,
+            'paid_at' => $nextPayableStatus === 'PAID' ? date('Y-m-d H:i:s') : null,
+            'paid_by' => $nextPayableStatus === 'PAID' ? $userId : null,
+            'id' => $laborId,
+            'job_card_id' => $jobId,
+        ]);
+
+        job_append_history(
+            $jobId,
+            'OUTSOURCE_PAYABLE',
+            null,
+            null,
+            'Outsourced payable marked as ' . $nextPayableStatus,
+            [
+                'labor_id' => $laborId,
+                'from_status' => normalize_outsource_payable_status((string) ($line['outsource_payable_status'] ?? 'UNPAID')),
+                'to_status' => $nextPayableStatus,
+                'outsource_cost' => round((float) ($line['outsource_cost'] ?? 0), 2),
+            ]
+        );
+        log_audit('job_cards', 'outsource_payable', $jobId, 'Updated outsourced payable status on labor line #' . $laborId, [
+            'entity' => 'job_labor',
+            'source' => 'UI',
+            'before' => [
+                'outsource_payable_status' => normalize_outsource_payable_status((string) ($line['outsource_payable_status'] ?? 'UNPAID')),
+            ],
+            'after' => [
+                'outsource_payable_status' => $nextPayableStatus,
+            ],
+            'metadata' => [
+                'labor_id' => $laborId,
+                'outsource_cost' => round((float) ($line['outsource_cost'] ?? 0), 2),
+            ],
+        ]);
+
+        flash_set('job_success', 'Outsourced payable marked as ' . $nextPayableStatus . '.', 'success');
         redirect('modules/jobs/view.php?id=' . $jobId);
     }
 
@@ -914,6 +1180,7 @@ $currentAssignmentIds = array_map(static fn (array $row): int => (int) $row['use
 
 $serviceCategories = fetch_service_categories_for_labor($companyId);
 $servicesMaster = fetch_services_master($companyId);
+$outsourceVendors = fetch_outsource_vendors($companyId);
 $hasLegacyUncategorizedServices = false;
 foreach ($servicesMaster as $serviceMasterRow) {
     if ((int) ($serviceMasterRow['category_id'] ?? 0) <= 0) {
@@ -925,6 +1192,23 @@ $partsMaster = fetch_parts_master($companyId, $garageId);
 $laborEntries = fetch_job_labor($jobId);
 $partEntries = fetch_job_parts($jobId, $garageId);
 $historyEntries = fetch_job_history_timeline($jobId);
+$outsourceLineCount = 0;
+$outsourceCostTotal = 0.0;
+$outsourceUnpaidTotal = 0.0;
+$outsourcePaidTotal = 0.0;
+foreach ($laborEntries as $laborEntry) {
+    if (normalize_labor_execution_type((string) ($laborEntry['execution_type'] ?? 'IN_HOUSE')) !== 'OUTSOURCED') {
+        continue;
+    }
+    $lineCost = (float) ($laborEntry['outsource_cost'] ?? 0);
+    $outsourceLineCount++;
+    $outsourceCostTotal += $lineCost;
+    if (normalize_outsource_payable_status((string) ($laborEntry['outsource_payable_status'] ?? 'UNPAID')) === 'PAID') {
+        $outsourcePaidTotal += $lineCost;
+    } else {
+        $outsourceUnpaidTotal += $lineCost;
+    }
+}
 
 $totalsStmt = db()->prepare(
     'SELECT
@@ -1250,6 +1534,22 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         <div class="col-xl-8">
           <div class="card card-success">
             <div class="card-header"><h3 class="card-title">Service / Labour Lines</h3></div>
+            <div class="card-body border-bottom py-2">
+              <div class="row g-2">
+                <div class="col-md-4">
+                  <div class="small text-muted">Outsourced Lines</div>
+                  <div class="fw-semibold"><?= e(number_format($outsourceLineCount)); ?></div>
+                </div>
+                <div class="col-md-4">
+                  <div class="small text-muted">Outsource Cost (Total)</div>
+                  <div class="fw-semibold"><?= e(format_currency($outsourceCostTotal)); ?></div>
+                </div>
+                <div class="col-md-4">
+                  <div class="small text-muted">Outsource Payable (Unpaid)</div>
+                  <div class="fw-semibold text-danger"><?= e(format_currency($outsourceUnpaidTotal)); ?></div>
+                </div>
+              </div>
+            </div>
             <?php if ($canEdit): ?>
               <form method="post">
                 <div class="card-body border-bottom row g-2">
@@ -1292,11 +1592,35 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                     <label class="form-label">Description</label>
                     <input id="add-labor-description" type="text" name="description" class="form-control" required <?= $jobLocked ? 'disabled' : ''; ?>>
                   </div>
+                  <div class="col-md-2">
+                    <label class="form-label">Execution</label>
+                    <select id="add-labor-execution" name="execution_type" class="form-select" <?= $jobLocked ? 'disabled' : ''; ?>>
+                      <option value="IN_HOUSE">In-house</option>
+                      <option value="OUTSOURCED">Outsourced</option>
+                    </select>
+                  </div>
+                  <div class="col-md-2">
+                    <label class="form-label">Vendor</label>
+                    <select id="add-labor-vendor" name="outsource_vendor_id" class="form-select" <?= $jobLocked ? 'disabled' : ''; ?>>
+                      <option value="0">Select Vendor (Optional)</option>
+                      <?php foreach ($outsourceVendors as $vendor): ?>
+                        <option value="<?= (int) $vendor['id']; ?>" data-vendor-name="<?= e((string) $vendor['vendor_name']); ?>"><?= e((string) $vendor['vendor_code']); ?> - <?= e((string) $vendor['vendor_name']); ?></option>
+                      <?php endforeach; ?>
+                    </select>
+                  </div>
+                  <div class="col-md-3">
+                    <label class="form-label">Outsourced To</label>
+                    <input id="add-labor-partner" type="text" name="outsource_partner_name" class="form-control" maxlength="150" placeholder="Vendor or individual name" <?= $jobLocked ? 'disabled' : ''; ?>>
+                  </div>
+                  <div class="col-md-2">
+                    <label class="form-label">Outsource Cost</label>
+                    <input id="add-labor-cost" type="number" step="0.01" min="0" name="outsource_cost" class="form-control" value="0" <?= $jobLocked ? 'disabled' : ''; ?>>
+                  </div>
                   <div class="col-md-1">
                     <label class="form-label">Qty</label>
                     <input type="number" step="0.01" min="0.01" name="quantity" class="form-control" value="1" required <?= $jobLocked ? 'disabled' : ''; ?>>
                   </div>
-                  <div class="col-md-1">
+                  <div class="col-md-2">
                     <label class="form-label">Rate</label>
                     <input id="add-labor-rate" type="number" step="0.01" min="0" name="unit_price" class="form-control" value="0" required <?= $jobLocked ? 'disabled' : ''; ?>>
                   </div>
@@ -1306,6 +1630,9 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                   </div>
                   <div class="col-md-1 d-flex align-items-end">
                     <button type="submit" class="btn btn-success w-100" <?= $jobLocked ? 'disabled' : ''; ?>>Add</button>
+                  </div>
+                  <div class="col-md-1 d-flex align-items-end">
+                    <small id="add-labor-outsourced-hint" class="text-muted"></small>
                   </div>
                 </div>
               </form>
@@ -1317,18 +1644,30 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                   <tr>
                     <th>Service</th>
                     <th>Description</th>
+                    <th>Execution</th>
                     <th>Qty</th>
                     <th>Rate</th>
                     <th>GST%</th>
-                    <th>Total</th>
+                    <th>Bill Total</th>
+                    <th>Outsource Cost</th>
+                    <th>Payable</th>
                     <th>Actions</th>
                   </tr>
                 </thead>
                 <tbody>
                   <?php if (empty($laborEntries)): ?>
-                    <tr><td colspan="7" class="text-center text-muted py-4">No labor lines added yet.</td></tr>
+                    <tr><td colspan="10" class="text-center text-muted py-4">No labor lines added yet.</td></tr>
                   <?php else: ?>
                     <?php foreach ($laborEntries as $line): ?>
+                      <?php
+                        $lineExecutionType = normalize_labor_execution_type((string) ($line['execution_type'] ?? 'IN_HOUSE'));
+                        $lineIsOutsourced = $lineExecutionType === 'OUTSOURCED';
+                        $lineOutsourceCost = (float) ($line['outsource_cost'] ?? 0);
+                        $linePayableStatus = normalize_outsource_payable_status((string) ($line['outsource_payable_status'] ?? 'UNPAID'));
+                        $lineVendorName = trim((string) ($line['outsource_vendor_name'] ?? ''));
+                        $linePartnerName = trim((string) ($line['outsource_partner_name'] ?? ''));
+                        $linePartnerLabel = $lineVendorName !== '' ? $lineVendorName : ($linePartnerName !== '' ? $linePartnerName : '-');
+                      ?>
                       <tr>
                         <td>
                           <?php if (!empty($line['service_code'])): ?>
@@ -1348,10 +1687,29 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                           <?php endif; ?>
                         </td>
                         <td><?= e((string) $line['description']); ?></td>
+                        <td>
+                          <?php if ($lineIsOutsourced): ?>
+                            <span class="badge text-bg-warning">Outsourced</span>
+                            <div class="small text-muted"><?= e($linePartnerLabel); ?></div>
+                          <?php else: ?>
+                            <span class="badge text-bg-success">In-house</span>
+                          <?php endif; ?>
+                        </td>
                         <td><?= e(number_format((float) $line['quantity'], 2)); ?></td>
                         <td><?= e(format_currency((float) $line['unit_price'])); ?></td>
                         <td><?= e(number_format((float) $line['gst_rate'], 2)); ?></td>
                         <td><?= e(format_currency((float) $line['total_amount'])); ?></td>
+                        <td><?= $lineIsOutsourced ? e(format_currency($lineOutsourceCost)) : '-'; ?></td>
+                        <td>
+                          <?php if ($lineIsOutsourced): ?>
+                            <span class="badge text-bg-<?= $linePayableStatus === 'PAID' ? 'success' : 'danger'; ?>"><?= e($linePayableStatus); ?></span>
+                            <?php if ($linePayableStatus === 'PAID' && !empty($line['outsource_paid_at'])): ?>
+                              <div class="small text-muted"><?= e((string) $line['outsource_paid_at']); ?></div>
+                            <?php endif; ?>
+                          <?php else: ?>
+                            -
+                          <?php endif; ?>
+                        </td>
                         <td>
                           <?php if ($canEdit && !$jobLocked): ?>
                             <button
@@ -1369,6 +1727,17 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                               <input type="hidden" name="labor_id" value="<?= (int) $line['id']; ?>">
                               <button type="submit" class="btn btn-sm btn-outline-danger" onclick="return confirm('Remove this labor line?');">Remove</button>
                             </form>
+                            <?php if ($lineIsOutsourced): ?>
+                              <form method="post" class="d-inline">
+                                <?= csrf_field(); ?>
+                                <input type="hidden" name="_action" value="toggle_outsource_payable">
+                                <input type="hidden" name="labor_id" value="<?= (int) $line['id']; ?>">
+                                <input type="hidden" name="next_payable_status" value="<?= $linePayableStatus === 'PAID' ? 'UNPAID' : 'PAID'; ?>">
+                                <button type="submit" class="btn btn-sm btn-outline-<?= $linePayableStatus === 'PAID' ? 'secondary' : 'success'; ?>">
+                                  <?= $linePayableStatus === 'PAID' ? 'Mark Unpaid' : 'Mark Paid'; ?>
+                                </button>
+                              </form>
+                            <?php endif; ?>
                           <?php else: ?>
                             <span class="text-muted">Locked</span>
                           <?php endif; ?>
@@ -1376,13 +1745,33 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                       </tr>
                       <?php if ($canEdit && !$jobLocked): ?>
                         <tr class="collapse" id="labor-edit-<?= (int) $line['id']; ?>">
-                          <td colspan="7">
-                            <form method="post" class="row g-2 p-2 bg-light">
+                          <td colspan="10">
+                            <form method="post" class="row g-2 p-2 bg-light labor-edit-form">
                               <?= csrf_field(); ?>
                               <input type="hidden" name="_action" value="update_labor">
                               <input type="hidden" name="labor_id" value="<?= (int) $line['id']; ?>">
-                              <div class="col-md-5">
+                              <div class="col-md-3">
                                 <input type="text" name="description" class="form-control form-control-sm" value="<?= e((string) $line['description']); ?>" required>
+                              </div>
+                              <div class="col-md-2">
+                                <select name="execution_type" class="form-select form-select-sm js-labor-execution">
+                                  <option value="IN_HOUSE" <?= $lineExecutionType === 'IN_HOUSE' ? 'selected' : ''; ?>>In-house</option>
+                                  <option value="OUTSOURCED" <?= $lineExecutionType === 'OUTSOURCED' ? 'selected' : ''; ?>>Outsourced</option>
+                                </select>
+                              </div>
+                              <div class="col-md-3">
+                                <select name="outsource_vendor_id" class="form-select form-select-sm js-labor-vendor">
+                                  <option value="0">Select Vendor (Optional)</option>
+                                  <?php foreach ($outsourceVendors as $vendor): ?>
+                                    <option value="<?= (int) $vendor['id']; ?>" data-vendor-name="<?= e((string) $vendor['vendor_name']); ?>" <?= ((int) ($line['outsource_vendor_id'] ?? 0) === (int) $vendor['id']) ? 'selected' : ''; ?>><?= e((string) $vendor['vendor_code']); ?> - <?= e((string) $vendor['vendor_name']); ?></option>
+                                  <?php endforeach; ?>
+                                </select>
+                              </div>
+                              <div class="col-md-2">
+                                <input type="text" name="outsource_partner_name" class="form-control form-control-sm js-labor-partner" maxlength="150" value="<?= e((string) ($line['outsource_partner_name'] ?? '')); ?>" placeholder="Outsourced To">
+                              </div>
+                              <div class="col-md-2">
+                                <input type="number" step="0.01" min="0" name="outsource_cost" class="form-control form-control-sm js-labor-cost" value="<?= e((string) ($line['outsource_cost'] ?? '0')); ?>" placeholder="Outsource Cost">
                               </div>
                               <div class="col-md-2">
                                 <input type="number" step="0.01" min="0.01" name="quantity" class="form-control form-control-sm" value="<?= e((string) $line['quantity']); ?>" required>
@@ -1393,8 +1782,11 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                               <div class="col-md-2">
                                 <input type="number" step="0.01" min="0" max="100" name="gst_rate" class="form-control form-control-sm" value="<?= e((string) $line['gst_rate']); ?>" required>
                               </div>
-                              <div class="col-md-1">
+                              <div class="col-md-2">
                                 <button type="submit" class="btn btn-sm btn-primary w-100">Save</button>
+                              </div>
+                              <div class="col-md-4 d-flex align-items-center">
+                                <small class="text-muted js-labor-outsource-hint"></small>
                               </div>
                             </form>
                           </td>
@@ -1575,6 +1967,51 @@ require_once __DIR__ . '/../../includes/sidebar.php';
     var laborDescription = document.getElementById('add-labor-description');
     var laborRate = document.getElementById('add-labor-rate');
     var laborGst = document.getElementById('add-labor-gst');
+    var laborExecutionSelect = document.getElementById('add-labor-execution');
+    var laborVendorSelect = document.getElementById('add-labor-vendor');
+    var laborPartnerInput = document.getElementById('add-labor-partner');
+    var laborCostInput = document.getElementById('add-labor-cost');
+    var laborOutsourceHint = document.getElementById('add-labor-outsourced-hint');
+
+    function getSelectedVendorName(select) {
+      if (!select) {
+        return '';
+      }
+      var option = select.options[select.selectedIndex];
+      if (!option) {
+        return '';
+      }
+      return (option.getAttribute('data-vendor-name') || '').trim();
+    }
+
+    function toggleOutsourceFields(executionSelect, vendorSelect, partnerInput, costInput, hintNode, locked) {
+      if (!executionSelect || !vendorSelect || !partnerInput || !costInput) {
+        return;
+      }
+
+      var outsourced = (executionSelect.value || 'IN_HOUSE') === 'OUTSOURCED';
+      vendorSelect.disabled = !!locked || !outsourced;
+      partnerInput.disabled = !!locked || !outsourced;
+      costInput.disabled = !!locked || !outsourced;
+      costInput.required = outsourced;
+
+      if (!outsourced) {
+        vendorSelect.value = '0';
+        partnerInput.value = '';
+        costInput.value = '0';
+        if (hintNode) {
+          hintNode.textContent = '';
+        }
+        return;
+      }
+
+      if (partnerInput.value.trim() === '' && vendorSelect.value !== '0') {
+        partnerInput.value = getSelectedVendorName(vendorSelect);
+      }
+      if (hintNode) {
+        hintNode.textContent = 'Vendor/partner and outsource cost are required for outsourced lines.';
+      }
+    }
 
     if (laborCategorySelect && laborServiceSelect && laborDescription && laborRate && laborGst) {
       var laborInputsLocked = laborCategorySelect.disabled || laborServiceSelect.disabled;
@@ -1632,10 +2069,60 @@ require_once __DIR__ . '/../../includes/sidebar.php';
           syncLaborServiceOptions();
           applyServiceDefaults();
         });
+        if (laborExecutionSelect && laborVendorSelect && laborPartnerInput && laborCostInput) {
+          laborExecutionSelect.addEventListener('change', function () {
+            toggleOutsourceFields(laborExecutionSelect, laborVendorSelect, laborPartnerInput, laborCostInput, laborOutsourceHint, false);
+          });
+          laborVendorSelect.addEventListener('change', function () {
+            if (laborExecutionSelect.value === 'OUTSOURCED' && laborPartnerInput.value.trim() === '') {
+              laborPartnerInput.value = getSelectedVendorName(laborVendorSelect);
+            }
+          });
+        }
       }
 
       laborServiceSelect.addEventListener('change', applyServiceDefaults);
       syncLaborServiceOptions();
+      toggleOutsourceFields(
+        laborExecutionSelect,
+        laborVendorSelect,
+        laborPartnerInput,
+        laborCostInput,
+        laborOutsourceHint,
+        laborInputsLocked
+      );
+    }
+
+    var laborEditForms = document.querySelectorAll('.labor-edit-form');
+    if (laborEditForms && laborEditForms.length > 0) {
+      for (var formIndex = 0; formIndex < laborEditForms.length; formIndex++) {
+        var laborEditForm = laborEditForms[formIndex];
+        if (!laborEditForm) {
+          continue;
+        }
+        (function (formNode) {
+          var editExecutionSelect = formNode.querySelector('.js-labor-execution');
+          var editVendorSelect = formNode.querySelector('.js-labor-vendor');
+          var editPartnerInput = formNode.querySelector('.js-labor-partner');
+          var editCostInput = formNode.querySelector('.js-labor-cost');
+          var editHint = formNode.querySelector('.js-labor-outsource-hint');
+          if (!editExecutionSelect || !editVendorSelect || !editPartnerInput || !editCostInput) {
+            return;
+          }
+
+          function syncEditOutsourceFields() {
+            toggleOutsourceFields(editExecutionSelect, editVendorSelect, editPartnerInput, editCostInput, editHint, false);
+          }
+
+          editExecutionSelect.addEventListener('change', syncEditOutsourceFields);
+          editVendorSelect.addEventListener('change', function () {
+            if (editExecutionSelect.value === 'OUTSOURCED' && editPartnerInput.value.trim() === '') {
+              editPartnerInput.value = getSelectedVendorName(editVendorSelect);
+            }
+          });
+          syncEditOutsourceFields();
+        })(laborEditForm);
+      }
     }
 
     var partSelect = document.getElementById('add-part-select');

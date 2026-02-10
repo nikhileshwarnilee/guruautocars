@@ -271,14 +271,27 @@ CREATE TABLE job_issues (
 CREATE TABLE job_labor (
   id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
   job_card_id INT UNSIGNED NOT NULL,
+  service_id INT UNSIGNED NULL,
+  execution_type ENUM('IN_HOUSE', 'OUTSOURCED') NOT NULL DEFAULT 'IN_HOUSE',
+  outsource_vendor_id INT UNSIGNED NULL,
+  outsource_partner_name VARCHAR(150) NULL,
+  outsource_cost DECIMAL(12,2) NOT NULL DEFAULT 0,
+  outsource_payable_status ENUM('UNPAID', 'PAID') NOT NULL DEFAULT 'PAID',
+  outsource_paid_at DATETIME NULL,
+  outsource_paid_by INT UNSIGNED NULL,
   description VARCHAR(255) NOT NULL,
   quantity DECIMAL(10,2) NOT NULL DEFAULT 1,
   unit_price DECIMAL(12,2) NOT NULL DEFAULT 0,
   gst_rate DECIMAL(5,2) NOT NULL DEFAULT 18.00,
   total_amount DECIMAL(12,2) NOT NULL DEFAULT 0,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   CONSTRAINT fk_job_labor_job_card FOREIGN KEY (job_card_id) REFERENCES job_cards(id) ON DELETE CASCADE,
-  KEY idx_job_labor_job_card (job_card_id)
+  KEY idx_job_labor_job_card (job_card_id),
+  KEY idx_job_labor_service (service_id),
+  KEY idx_job_labor_execution_payable (execution_type, outsource_payable_status),
+  KEY idx_job_labor_outsource_vendor (outsource_vendor_id),
+  KEY idx_job_labor_outsource_paid_at (outsource_paid_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE job_parts (

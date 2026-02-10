@@ -308,6 +308,111 @@ $frequencyStmt = db()->prepare(
 $frequencyStmt->execute($frequencyParams);
 $serviceFrequencyRows = $frequencyStmt->fetchAll();
 
+$outsourcePayableRows = [];
+$outsourcePayableSummaryRows = [];
+$outsourcePayableTotals = [
+    'line_count' => 0,
+    'payable_total' => 0.0,
+    'paid_total' => 0.0,
+    'unpaid_total' => 0.0,
+];
+
+$outsourceDetailParams = ['company_id' => $companyId, 'from_date' => $fromDate, 'to_date' => $toDate];
+$outsourceDetailScopeSql = analytics_garage_scope_sql('jc.garage_id', $selectedGarageId, $garageIds, $outsourceDetailParams, 'outsource_detail_scope');
+$outsourceDetailStmt = db()->prepare(
+    'SELECT jl.id AS labor_id,
+            jc.job_number,
+            DATE(jl.created_at) AS outsource_date,
+            c.full_name AS customer_name,
+            v.registration_no,
+            jl.description,
+            jl.outsource_cost,
+            jl.outsource_payable_status,
+            jl.outsource_paid_at,
+            vd.vendor_name,
+            jl.outsource_partner_name
+     FROM job_labor jl
+     INNER JOIN job_cards jc ON jc.id = jl.job_card_id
+     INNER JOIN customers c ON c.id = jc.customer_id
+     INNER JOIN vehicles v ON v.id = jc.vehicle_id
+     LEFT JOIN vendors vd ON vd.id = jl.outsource_vendor_id
+     WHERE jc.company_id = :company_id
+       AND jc.status_code <> "DELETED"
+       AND jl.execution_type = "OUTSOURCED"
+       AND COALESCE(jl.outsource_cost, 0) > 0
+       ' . $outsourceDetailScopeSql . '
+       AND DATE(jl.created_at) BETWEEN :from_date AND :to_date
+     ORDER BY
+       CASE WHEN COALESCE(jl.outsource_payable_status, "UNPAID") = "UNPAID" THEN 0 ELSE 1 END,
+       jl.created_at DESC
+     LIMIT 300'
+);
+$outsourceDetailStmt->execute($outsourceDetailParams);
+foreach ($outsourceDetailStmt->fetchAll() as $row) {
+    $status = strtoupper(trim((string) ($row['outsource_payable_status'] ?? 'UNPAID')));
+    if ($status !== 'PAID') {
+        $status = 'UNPAID';
+    }
+    $partnerName = trim((string) ($row['vendor_name'] ?? ''));
+    if ($partnerName === '') {
+        $partnerName = trim((string) ($row['outsource_partner_name'] ?? ''));
+    }
+    if ($partnerName === '') {
+        $partnerName = '-';
+    }
+
+    $outsourcePayableRows[] = [
+        'job_number' => (string) ($row['job_number'] ?? ''),
+        'outsource_date' => (string) ($row['outsource_date'] ?? ''),
+        'customer_name' => (string) ($row['customer_name'] ?? ''),
+        'registration_no' => (string) ($row['registration_no'] ?? ''),
+        'description' => (string) ($row['description'] ?? ''),
+        'outsource_partner' => $partnerName,
+        'outsource_cost' => (float) ($row['outsource_cost'] ?? 0),
+        'outsource_payable_status' => $status,
+        'outsource_paid_at' => (string) ($row['outsource_paid_at'] ?? ''),
+    ];
+}
+
+$outsourceSummaryMap = [
+    'UNPAID' => ['status' => 'UNPAID', 'line_count' => 0, 'payable_total' => 0.0],
+    'PAID' => ['status' => 'PAID', 'line_count' => 0, 'payable_total' => 0.0],
+];
+$outsourceSummaryParams = ['company_id' => $companyId, 'from_date' => $fromDate, 'to_date' => $toDate];
+$outsourceSummaryScopeSql = analytics_garage_scope_sql('jc.garage_id', $selectedGarageId, $garageIds, $outsourceSummaryParams, 'outsource_summary_scope');
+$outsourceSummaryStmt = db()->prepare(
+    'SELECT COALESCE(jl.outsource_payable_status, "UNPAID") AS payable_status,
+            COUNT(*) AS line_count,
+            COALESCE(SUM(jl.outsource_cost), 0) AS payable_total
+     FROM job_labor jl
+     INNER JOIN job_cards jc ON jc.id = jl.job_card_id
+     WHERE jc.company_id = :company_id
+       AND jc.status_code <> "DELETED"
+       AND jl.execution_type = "OUTSOURCED"
+       AND COALESCE(jl.outsource_cost, 0) > 0
+       ' . $outsourceSummaryScopeSql . '
+       AND DATE(jl.created_at) BETWEEN :from_date AND :to_date
+     GROUP BY COALESCE(jl.outsource_payable_status, "UNPAID")'
+);
+$outsourceSummaryStmt->execute($outsourceSummaryParams);
+foreach ($outsourceSummaryStmt->fetchAll() as $row) {
+    $status = strtoupper(trim((string) ($row['payable_status'] ?? 'UNPAID')));
+    if (!isset($outsourceSummaryMap[$status])) {
+        $status = 'UNPAID';
+    }
+    $outsourceSummaryMap[$status]['line_count'] = (int) ($row['line_count'] ?? 0);
+    $outsourceSummaryMap[$status]['payable_total'] = (float) ($row['payable_total'] ?? 0);
+}
+
+foreach (['UNPAID', 'PAID'] as $statusKey) {
+    $row = $outsourceSummaryMap[$statusKey];
+    $outsourcePayableSummaryRows[] = $row;
+    $outsourcePayableTotals['line_count'] += (int) ($row['line_count'] ?? 0);
+    $outsourcePayableTotals['payable_total'] += (float) ($row['payable_total'] ?? 0);
+}
+$outsourcePayableTotals['unpaid_total'] = (float) ($outsourceSummaryMap['UNPAID']['payable_total'] ?? 0);
+$outsourcePayableTotals['paid_total'] = (float) ($outsourceSummaryMap['PAID']['payable_total'] ?? 0);
+
 $revenueDaily = [];
 $revenueMonthly = [];
 $revenueGarageWise = [];
@@ -765,6 +870,30 @@ if ($exportKey !== '') {
             $rows = array_map(static fn (array $row): array => [$row['part_name'], (int) ($row['jobs_count'] ?? 0), (float) ($row['total_qty'] ?? 0), (float) ($row['usage_value'] ?? 0)], $partsUsageRows);
             reports_csv_download('parts_usage_' . $timestamp . '.csv', ['Part', 'Jobs', 'Total Qty', 'Usage Value'], $rows);
 
+        case 'outsource_payables':
+            $rows = array_map(
+                static fn (array $row): array => [
+                    $row['outsource_date'],
+                    $row['job_number'],
+                    $row['customer_name'],
+                    $row['registration_no'],
+                    $row['outsource_partner'],
+                    $row['description'],
+                    (float) ($row['outsource_cost'] ?? 0),
+                    $row['outsource_payable_status'],
+                    $row['outsource_paid_at'],
+                ],
+                $outsourcePayableRows
+            );
+            reports_csv_download('outsource_payables_' . $timestamp . '.csv', ['Date', 'Job', 'Customer', 'Vehicle', 'Outsourced To', 'Service', 'Cost', 'Payable Status', 'Paid At'], $rows);
+
+        case 'outsource_paid_unpaid':
+            $rows = array_map(
+                static fn (array $row): array => [$row['status'], (int) ($row['line_count'] ?? 0), (float) ($row['payable_total'] ?? 0)],
+                $outsourcePayableSummaryRows
+            );
+            reports_csv_download('outsource_paid_unpaid_' . $timestamp . '.csv', ['Status', 'Lines', 'Payable Amount'], $rows);
+
         case 'revenue_daily':
         case 'revenue_monthly':
         case 'revenue_garage':
@@ -943,6 +1072,12 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         <div class="col-md-3"><div class="info-box"><span class="info-box-icon text-bg-primary"><i class="bi bi-box-seam"></i></span><div class="info-box-content"><span class="info-box-text">Stock Valuation</span><span class="info-box-number"><?= e(format_currency($totalStockValue)); ?></span></div></div></div>
       </div>
 
+      <div class="row g-3 mb-3">
+        <div class="col-md-4"><div class="info-box"><span class="info-box-icon text-bg-warning"><i class="bi bi-tools"></i></span><div class="info-box-content"><span class="info-box-text">Outsourced Lines</span><span class="info-box-number"><?= number_format((int) ($outsourcePayableTotals['line_count'] ?? 0)); ?></span></div></div></div>
+        <div class="col-md-4"><div class="info-box"><span class="info-box-icon text-bg-danger"><i class="bi bi-cash-stack"></i></span><div class="info-box-content"><span class="info-box-text">Outsource Payable (Unpaid)</span><span class="info-box-number"><?= e(format_currency((float) ($outsourcePayableTotals['unpaid_total'] ?? 0))); ?></span></div></div></div>
+        <div class="col-md-4"><div class="info-box"><span class="info-box-icon text-bg-success"><i class="bi bi-cash-coin"></i></span><div class="info-box-content"><span class="info-box-text">Outsource Paid</span><span class="info-box-number"><?= e(format_currency((float) ($outsourcePayableTotals['paid_total'] ?? 0))); ?></span></div></div></div>
+      </div>
+
       <?php if ($canViewFinancial): ?>
       <div class="row g-3 mb-3">
         <div class="col-md-6"><div class="info-box"><span class="info-box-icon text-bg-success"><i class="bi bi-currency-rupee"></i></span><div class="info-box-content"><span class="info-box-text">Finalized Revenue</span><span class="info-box-number"><?= e(format_currency((float) ($gstSummary['grand_total'] ?? 0))); ?></span></div></div></div>
@@ -1058,6 +1193,61 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                   <?php endforeach; endif; ?>
                 </tbody>
               </table>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card mb-3">
+        <div class="card-header"><h3 class="card-title mb-0">Outsourced Service Payables</h3></div>
+        <div class="card-body row g-3">
+          <div class="col-lg-4">
+            <div class="card card-outline card-warning h-100 mb-0">
+              <div class="card-header d-flex justify-content-between align-items-center"><h3 class="card-title mb-0">Paid vs Unpaid</h3><a href="<?= e(reports_export_url($exportBaseParams, 'outsource_paid_unpaid')); ?>" class="btn btn-sm btn-outline-warning">CSV</a></div>
+              <div class="card-body p-0 table-responsive">
+                <table class="table table-sm table-striped mb-0">
+                  <thead><tr><th>Status</th><th>Lines</th><th>Amount</th></tr></thead>
+                  <tbody>
+                    <?php if (empty($outsourcePayableSummaryRows)): ?>
+                      <tr><td colspan="3" class="text-center text-muted py-4">No outsourced payable summary.</td></tr>
+                    <?php else: foreach ($outsourcePayableSummaryRows as $row): ?>
+                      <tr>
+                        <td><span class="badge text-bg-<?= ((string) ($row['status'] ?? '') === 'PAID') ? 'success' : 'danger'; ?>"><?= e((string) ($row['status'] ?? 'UNPAID')); ?></span></td>
+                        <td><?= (int) ($row['line_count'] ?? 0); ?></td>
+                        <td><?= e(format_currency((float) ($row['payable_total'] ?? 0))); ?></td>
+                      </tr>
+                    <?php endforeach; endif; ?>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+
+          <div class="col-lg-8">
+            <div class="card card-outline card-secondary h-100 mb-0">
+              <div class="card-header d-flex justify-content-between align-items-center"><h3 class="card-title mb-0">Outsourced Payable Detail</h3><a href="<?= e(reports_export_url($exportBaseParams, 'outsource_payables')); ?>" class="btn btn-sm btn-outline-secondary">CSV</a></div>
+              <div class="card-body p-0 table-responsive">
+                <table class="table table-sm table-striped mb-0">
+                  <thead><tr><th>Date</th><th>Job</th><th>Customer</th><th>Vehicle</th><th>Outsourced To</th><th>Service</th><th>Cost</th><th>Status</th><th>Paid At</th></tr></thead>
+                  <tbody>
+                    <?php if (empty($outsourcePayableRows)): ?>
+                      <tr><td colspan="9" class="text-center text-muted py-4">No outsourced payable rows for selected range.</td></tr>
+                    <?php else: foreach ($outsourcePayableRows as $row): ?>
+                      <tr>
+                        <td><?= e((string) ($row['outsource_date'] ?? '-')); ?></td>
+                        <td><?= e((string) ($row['job_number'] ?? '-')); ?></td>
+                        <td><?= e((string) ($row['customer_name'] ?? '-')); ?></td>
+                        <td><?= e((string) ($row['registration_no'] ?? '-')); ?></td>
+                        <td><?= e((string) ($row['outsource_partner'] ?? '-')); ?></td>
+                        <td><?= e((string) ($row['description'] ?? '-')); ?></td>
+                        <td><?= e(format_currency((float) ($row['outsource_cost'] ?? 0))); ?></td>
+                        <td><span class="badge text-bg-<?= ((string) ($row['outsource_payable_status'] ?? '') === 'PAID') ? 'success' : 'danger'; ?>"><?= e((string) ($row['outsource_payable_status'] ?? 'UNPAID')); ?></span></td>
+                        <td><?= e((string) (($row['outsource_paid_at'] ?? '') !== '' ? $row['outsource_paid_at'] : '-')); ?></td>
+                      </tr>
+                    <?php endforeach; endif; ?>
+                  </tbody>
+                </table>
+              </div>
             </div>
           </div>
         </div>
