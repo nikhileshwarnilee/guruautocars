@@ -576,6 +576,19 @@ $modelFilterId = get_int('vehicle_filter_model_id');
 $variantFilterId = get_int('vehicle_filter_variant_id');
 $modelYearFilterId = get_int('vehicle_filter_model_year_id');
 $colorFilterId = get_int('vehicle_filter_color_id');
+$customerFilterId = get_int('vehicle_filter_customer_id');
+$fuelTypeFilter = strtoupper(trim((string) ($_GET['vehicle_filter_fuel_type'] ?? '')));
+if (!in_array($fuelTypeFilter, $allowedFuelTypes, true)) {
+    $fuelTypeFilter = '';
+}
+$lastServiceFromFilter = trim((string) ($_GET['last_service_from'] ?? ''));
+if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $lastServiceFromFilter)) {
+    $lastServiceFromFilter = '';
+}
+$lastServiceToFilter = trim((string) ($_GET['last_service_to'] ?? ''));
+if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $lastServiceToFilter)) {
+    $lastServiceToFilter = '';
+}
 $allowedStatuses = ['ACTIVE', 'INACTIVE', 'DELETED', 'ALL'];
 if (!in_array($statusFilter, $allowedStatuses, true)) {
     $statusFilter = '';
@@ -636,6 +649,7 @@ $vehiclesStmt = db()->prepare($vehicleSql);
 $vehiclesStmt->execute($params);
 $vehicles = $vehiclesStmt->fetchAll();
 $attributeApiUrl = url('modules/vehicles/attributes_api.php');
+$vehicleInsightsApiUrl = url('modules/vehicles/master_insights_api.php');
 
 require_once __DIR__ . '/../../includes/header.php';
 require_once __DIR__ . '/../../includes/sidebar.php';
@@ -837,12 +851,43 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         </div>
       <?php endif; ?>
 
-      <div class="card">
-        <div class="card-header">
-          <h3 class="card-title">Vehicle List</h3>
+      <div class="row g-3 mb-3">
+        <div class="col-md-4 col-sm-6">
+          <div class="small-box text-bg-primary mb-0">
+            <div class="inner">
+              <h3 data-stat-value="total_vehicles"><?= count($vehicles); ?></h3>
+              <p>Total Vehicles</p>
+            </div>
+            <div class="small-box-icon"><i class="bi bi-car-front-fill"></i></div>
+          </div>
+        </div>
+        <div class="col-md-4 col-sm-6">
+          <div class="small-box text-bg-warning mb-0">
+            <div class="inner">
+              <h3 data-stat-value="vehicles_with_active_jobs">0</h3>
+              <p>Vehicles With Active Jobs</p>
+            </div>
+            <div class="small-box-icon"><i class="bi bi-tools"></i></div>
+          </div>
+        </div>
+        <div class="col-md-4 col-sm-6">
+          <div class="small-box text-bg-success mb-0">
+            <div class="inner">
+              <h3 data-stat-value="recently_serviced_vehicles">0</h3>
+              <p>Recently Serviced (Last 30 Days)</p>
+            </div>
+            <div class="small-box-icon"><i class="bi bi-check2-circle"></i></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card" data-master-insights-root="vehicles" data-master-insights-endpoint="<?= e($vehicleInsightsApiUrl); ?>">
+        <div class="card-header d-flex justify-content-between align-items-center">
+          <h3 class="card-title mb-0">Vehicle List</h3>
+          <span class="badge text-bg-light border" data-master-results-count="1"><?= count($vehicles); ?></span>
         </div>
         <div class="card-body border-bottom">
-          <form method="get" class="row g-2 align-items-end">
+          <form method="get" class="row g-2 align-items-end" data-master-filter-form="1">
               <div class="col-md-4">
                 <label class="form-label form-label-sm mb-1">Search</label>
                 <input type="text" name="q" value="<?= e($search); ?>" class="form-control form-control-sm" placeholder="Registration / brand / model / customer" />
@@ -855,6 +900,26 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                   <option value="INACTIVE" <?= $statusFilter === 'INACTIVE' ? 'selected' : ''; ?>>INACTIVE</option>
                   <option value="DELETED" <?= $statusFilter === 'DELETED' ? 'selected' : ''; ?>>DELETED</option>
                   <option value="ALL" <?= $statusFilter === 'ALL' ? 'selected' : ''; ?>>ALL</option>
+                </select>
+              </div>
+              <div class="col-md-2">
+                <label class="form-label form-label-sm mb-1">Customer</label>
+                <select name="vehicle_filter_customer_id" class="form-select form-select-sm">
+                  <option value="">All Customers</option>
+                  <?php foreach ($customers as $customer): ?>
+                    <option value="<?= (int) $customer['id']; ?>" <?= $customerFilterId === (int) $customer['id'] ? 'selected' : ''; ?>>
+                      <?= e((string) $customer['full_name']); ?>
+                    </option>
+                  <?php endforeach; ?>
+                </select>
+              </div>
+              <div class="col-md-2">
+                <label class="form-label form-label-sm mb-1">Fuel Type</label>
+                <select name="vehicle_filter_fuel_type" class="form-select form-select-sm">
+                  <option value="" <?= $fuelTypeFilter === '' ? 'selected' : ''; ?>>All Fuel Types</option>
+                  <?php foreach ($allowedFuelTypes as $fuel): ?>
+                    <option value="<?= e($fuel); ?>" <?= $fuelTypeFilter === $fuel ? 'selected' : ''; ?>><?= e($fuel); ?></option>
+                  <?php endforeach; ?>
                 </select>
               </div>
 
@@ -895,11 +960,20 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                 </div>
               <?php endif; ?>
 
+              <div class="col-md-2">
+                <label class="form-label form-label-sm mb-1">Last Serviced From</label>
+                <input type="date" name="last_service_from" value="<?= e($lastServiceFromFilter); ?>" class="form-control form-control-sm" />
+              </div>
+              <div class="col-md-2">
+                <label class="form-label form-label-sm mb-1">Last Serviced To</label>
+                <input type="date" name="last_service_to" value="<?= e($lastServiceToFilter); ?>" class="form-control form-control-sm" />
+              </div>
               <div class="col-md-2 d-flex gap-2">
-                <button type="submit" class="btn btn-sm btn-outline-primary">Filter</button>
-                <a href="<?= e(url('modules/vehicles/index.php')); ?>" class="btn btn-sm btn-outline-secondary">Reset</a>
+                <button type="submit" class="btn btn-sm btn-outline-primary">Apply</button>
+                <button type="button" class="btn btn-sm btn-outline-secondary" data-master-filter-reset="1">Reset</button>
               </div>
           </form>
+          <div class="alert alert-danger d-none mt-3 mb-0" data-master-insights-error="1"></div>
         </div>
         <div class="card-body table-responsive p-0">
           <table class="table table-striped mb-0">
@@ -916,7 +990,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                 <th>Actions</th>
               </tr>
             </thead>
-            <tbody>
+            <tbody data-master-table-body="1" data-table-colspan="9">
               <?php if (empty($vehicles)): ?>
                 <tr><td colspan="9" class="text-center text-muted py-4">No vehicles found.</td></tr>
               <?php else: ?>

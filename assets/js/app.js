@@ -2,11 +2,16 @@ document.addEventListener('DOMContentLoaded', function () {
   bindConfirmForms();
   initSearchableSelects();
   initVehicleAttributeSelectors();
+  initMasterInsightsFilters();
 });
 
 function bindConfirmForms() {
   var dangerousForms = document.querySelectorAll('form[data-confirm]');
   for (var i = 0; i < dangerousForms.length; i++) {
+    if (dangerousForms[i].getAttribute('data-confirm-bound') === '1') {
+      continue;
+    }
+    dangerousForms[i].setAttribute('data-confirm-bound', '1');
     dangerousForms[i].addEventListener('submit', function (event) {
       var message = this.getAttribute('data-confirm') || 'Are you sure?';
       if (!window.confirm(message)) {
@@ -33,6 +38,7 @@ function initSearchableSelects() {
     variant_id: true,
     model_year_id: true,
     color_id: true,
+    vehicle_filter_customer_id: true,
     vehicle_filter_brand_id: true,
     vehicle_filter_model_id: true,
     vehicle_filter_variant_id: true,
@@ -920,7 +926,215 @@ function initVehicleAttributeSelectors() {
       syncFallback('model_year', false);
       syncFallback('color', false);
       reloadVehiclePicker();
+      root.dispatchEvent(new CustomEvent('gac:vehicle-attributes-ready', { bubbles: true }));
     });
+  }
+}
+
+function initMasterInsightsFilters() {
+  var roots = document.querySelectorAll('[data-master-insights-root]');
+  if (!roots || roots.length === 0) {
+    return;
+  }
+
+  for (var i = 0; i < roots.length; i++) {
+    initMasterInsightsRoot(roots[i]);
+  }
+
+  function initMasterInsightsRoot(root) {
+    if (!root || root.getAttribute('data-master-insights-init') === '1') {
+      return;
+    }
+
+    var endpoint = (root.getAttribute('data-master-insights-endpoint') || '').trim();
+    var form = root.querySelector('form[data-master-filter-form="1"]');
+    var tableBody = root.querySelector('[data-master-table-body="1"]');
+    if (endpoint === '' || !form || !tableBody) {
+      return;
+    }
+
+    root.setAttribute('data-master-insights-init', '1');
+
+    var errorBox = root.querySelector('[data-master-insights-error="1"]');
+    var resultCountNode = root.querySelector('[data-master-results-count="1"]');
+    var statNodes = root.querySelectorAll('[data-stat-value]');
+    var requestSequence = 0;
+    var debouncedRefresh = debounce(function () {
+      requestAndRender();
+    }, 220);
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      requestAndRender();
+    });
+
+    form.addEventListener('change', function () {
+      requestAndRender();
+    });
+
+    form.addEventListener('input', function (event) {
+      var target = event.target;
+      if (!target) {
+        return;
+      }
+      var fieldName = (target.getAttribute('name') || '').trim();
+      if (fieldName === '') {
+        return;
+      }
+      var tagName = (target.tagName || '').toUpperCase();
+      var inputType = (target.getAttribute('type') || '').toLowerCase();
+      if (tagName === 'INPUT' && (inputType === 'search' || inputType === 'text' || inputType === 'date')) {
+        debouncedRefresh();
+      }
+    });
+
+    var resetButton = root.querySelector('[data-master-filter-reset="1"]');
+    if (resetButton) {
+      resetButton.addEventListener('click', function (event) {
+        event.preventDefault();
+        form.reset();
+        requestAndRender();
+      });
+    }
+
+    root.addEventListener('gac:vehicle-attributes-ready', function () {
+      requestAndRender();
+    });
+
+    requestAndRender();
+
+    function clearError() {
+      if (!errorBox) {
+        return;
+      }
+      errorBox.textContent = '';
+      errorBox.classList.add('d-none');
+    }
+
+    function showError(message) {
+      if (!errorBox) {
+        return;
+      }
+      errorBox.textContent = message || 'Unable to load filtered data.';
+      errorBox.classList.remove('d-none');
+    }
+
+    function serializeForm(formElement) {
+      var formData = new FormData(formElement);
+      var params = new URLSearchParams();
+      formData.forEach(function (value, key) {
+        if (typeof value !== 'string') {
+          return;
+        }
+        var normalized = value.trim();
+        if (normalized === '') {
+          return;
+        }
+        params.append(key, normalized);
+      });
+      return params;
+    }
+
+    function detectColumnCount() {
+      var configured = parseInt(tableBody.getAttribute('data-table-colspan') || '0', 10);
+      if (configured > 0) {
+        return configured;
+      }
+
+      var table = tableBody;
+      while (table && table.tagName !== 'TABLE') {
+        table = table.parentElement;
+      }
+      if (!table) {
+        return 1;
+      }
+
+      var headers = table.querySelectorAll('thead th');
+      return headers && headers.length > 0 ? headers.length : 1;
+    }
+
+    function renderInfoRow(message, cssClass) {
+      var colCount = detectColumnCount();
+      var rowClass = cssClass || 'text-muted';
+      tableBody.innerHTML = '<tr><td colspan="' + colCount + '" class="text-center ' + rowClass + ' py-4">' + message + '</td></tr>';
+    }
+
+    function updateStats(stats) {
+      if (!stats || typeof stats !== 'object') {
+        return;
+      }
+      for (var index = 0; index < statNodes.length; index++) {
+        var node = statNodes[index];
+        var statKey = (node.getAttribute('data-stat-value') || '').trim();
+        if (statKey === '' || !Object.prototype.hasOwnProperty.call(stats, statKey)) {
+          continue;
+        }
+        node.textContent = String(stats[statKey]);
+      }
+    }
+
+    function requestAndRender() {
+      var currentSequence = ++requestSequence;
+      clearError();
+      renderInfoRow('Loading filtered data...', 'text-muted');
+
+      var params = serializeForm(form);
+      var requestUrl = endpoint;
+      if (params.toString() !== '') {
+        requestUrl += (endpoint.indexOf('?') >= 0 ? '&' : '?') + params.toString();
+      }
+
+      fetch(requestUrl, {
+        credentials: 'same-origin',
+        headers: { 'X-Requested-With': 'XMLHttpRequest' }
+      })
+        .then(function (response) {
+          return response.text().then(function (text) {
+            var payload = null;
+            try {
+              payload = JSON.parse(text);
+            } catch (error) {
+              payload = null;
+            }
+            return {
+              ok: response.ok,
+              payload: payload
+            };
+          });
+        })
+        .then(function (result) {
+          if (currentSequence !== requestSequence) {
+            return;
+          }
+
+          var payload = result.payload || {};
+          if (!result.ok || !payload.ok) {
+            showError(payload.message || 'Unable to load filtered data.');
+            renderInfoRow('Unable to load records.', 'text-danger');
+            return;
+          }
+
+          if (typeof payload.table_rows_html === 'string' && payload.table_rows_html !== '') {
+            tableBody.innerHTML = payload.table_rows_html;
+          } else {
+            renderInfoRow('No records found.', 'text-muted');
+          }
+
+          if (resultCountNode && Object.prototype.hasOwnProperty.call(payload, 'rows_count')) {
+            resultCountNode.textContent = String(payload.rows_count);
+          }
+
+          updateStats(payload.stats || {});
+          bindConfirmForms();
+        })
+        .catch(function () {
+          if (currentSequence !== requestSequence) {
+            return;
+          }
+          showError('Unable to load filtered data.');
+          renderInfoRow('Unable to load records.', 'text-danger');
+        });
+    }
   }
 }
 

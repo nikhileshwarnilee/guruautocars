@@ -473,6 +473,7 @@ function job_fetch_vis_suggestions(int $companyId, int $garageId, int $vehicleId
 
         $serviceStmt = db()->prepare(
             'SELECT s.id AS service_id, s.service_code, s.service_name, s.default_rate, s.gst_rate,
+                    s.category_id, sc.category_name,
                     COUNT(DISTINCT spm.part_id) AS mapped_parts
              FROM vis_service_part_map spm
              INNER JOIN vis_part_compatibility vpc
@@ -484,10 +485,16 @@ function job_fetch_vis_suggestions(int $companyId, int $garageId, int $vehicleId
                ON s.id = spm.service_id
               AND s.company_id = :company_id
               AND s.status_code = "ACTIVE"
+             LEFT JOIN service_categories sc
+               ON sc.id = s.category_id
+              AND sc.company_id = s.company_id
              WHERE spm.company_id = :company_id
                AND spm.status_code = "ACTIVE"
-             GROUP BY s.id
-             ORDER BY s.service_name ASC'
+             GROUP BY s.id, s.category_id, sc.category_name
+             ORDER BY
+                CASE WHEN s.category_id IS NULL THEN 1 ELSE 0 END,
+                COALESCE(sc.category_name, "Uncategorized"),
+                s.service_name ASC'
         );
         $serviceStmt->execute([
             'variant_id' => $variantId,

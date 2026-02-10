@@ -9,6 +9,59 @@ $page_title = 'Service / Labour Master';
 $active_menu = 'services.master';
 $canManage = has_permission('service.manage');
 $companyId = active_company_id();
+$userId = (int) ($_SESSION['user_id'] ?? 0);
+
+function fetch_service_categories_master(int $companyId): array
+{
+    $stmt = db()->prepare(
+        'SELECT id, category_code, category_name, status_code
+         FROM service_categories
+         WHERE company_id = :company_id
+           AND status_code <> "DELETED"
+         ORDER BY category_name ASC'
+    );
+    $stmt->execute(['company_id' => $companyId]);
+    return $stmt->fetchAll();
+}
+
+function find_service_category(int $companyId, int $categoryId): ?array
+{
+    if ($categoryId <= 0) {
+        return null;
+    }
+
+    $stmt = db()->prepare(
+        'SELECT id, category_code, category_name, status_code
+         FROM service_categories
+         WHERE id = :id
+           AND company_id = :company_id
+           AND status_code <> "DELETED"
+         LIMIT 1'
+    );
+    $stmt->execute([
+        'id' => $categoryId,
+        'company_id' => $companyId,
+    ]);
+
+    $category = $stmt->fetch();
+    return $category ?: null;
+}
+
+function service_category_group_label(array $service): string
+{
+    $categoryId = (int) ($service['category_id'] ?? 0);
+    if ($categoryId <= 0) {
+        return 'Uncategorized (Legacy)';
+    }
+
+    $categoryName = trim((string) ($service['category_name'] ?? ''));
+    $categoryCode = trim((string) ($service['category_code'] ?? ''));
+    if ($categoryName === '') {
+        return 'Category #' . $categoryId;
+    }
+
+    return $categoryCode !== '' ? ($categoryName . ' (' . $categoryCode . ')') : $categoryName;
+}
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     require_csrf();
@@ -21,6 +74,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $action = (string) ($_POST['_action'] ?? '');
 
     if ($action === 'create') {
+        $categoryId = post_int('category_id');
         $serviceCode = strtoupper(post_string('service_code', 40));
         $serviceName = post_string('service_name', 150);
         $description = post_string('description', 1000);
@@ -29,20 +83,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $gstRate = (float) ($_POST['gst_rate'] ?? 18);
         $statusCode = normalize_status_code((string) ($_POST['status_code'] ?? 'ACTIVE'));
 
-        if ($serviceCode === '' || $serviceName === '') {
-            flash_set('service_error', 'Service code and service name are required.', 'danger');
+        $category = find_service_category($companyId, $categoryId);
+        if ($serviceCode === '' || $serviceName === '' || !$category) {
+            flash_set('service_error', 'Service code, service name and category are required.', 'danger');
             redirect('modules/services/index.php');
         }
 
         try {
             $stmt = db()->prepare(
                 'INSERT INTO services
-                  (company_id, service_code, service_name, description, default_hours, default_rate, gst_rate, status_code, deleted_at, created_by)
+                  (company_id, category_id, service_code, service_name, description, default_hours, default_rate, gst_rate, status_code, deleted_at, created_by)
                  VALUES
-                  (:company_id, :service_code, :service_name, :description, :default_hours, :default_rate, :gst_rate, :status_code, :deleted_at, :created_by)'
+                  (:company_id, :category_id, :service_code, :service_name, :description, :default_hours, :default_rate, :gst_rate, :status_code, :deleted_at, :created_by)'
             );
             $stmt->execute([
                 'company_id' => $companyId,
+                'category_id' => $categoryId,
                 'service_code' => $serviceCode,
                 'service_name' => $serviceName,
                 'description' => $description !== '' ? $description : null,
@@ -51,7 +107,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'gst_rate' => $gstRate,
                 'status_code' => $statusCode,
                 'deleted_at' => $statusCode === 'DELETED' ? date('Y-m-d H:i:s') : null,
-                'created_by' => (int) $_SESSION['user_id'],
+                'created_by' => $userId > 0 ? $userId : null,
             ]);
 
             $serviceId = (int) db()->lastInsertId();
@@ -61,6 +117,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'before' => ['exists' => false],
                 'after' => [
                     'service_id' => $serviceId,
+                    'category_id' => $categoryId,
+                    'category_name' => (string) ($category['category_name'] ?? ''),
                     'service_code' => $serviceCode,
                     'service_name' => $serviceName,
                     'status_code' => $statusCode,
@@ -78,14 +136,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     if ($action === 'update') {
         $serviceId = post_int('service_id');
+        $categoryId = post_int('category_id');
         $serviceName = post_string('service_name', 150);
         $description = post_string('description', 1000);
         $defaultHours = (float) ($_POST['default_hours'] ?? 0);
         $defaultRate = (float) ($_POST['default_rate'] ?? 0);
         $gstRate = (float) ($_POST['gst_rate'] ?? 18);
         $statusCode = normalize_status_code((string) ($_POST['status_code'] ?? 'ACTIVE'));
+
+        $category = find_service_category($companyId, $categoryId);
+        if ($serviceId <= 0 || $serviceName === '' || !$category) {
+            flash_set('service_error', 'Valid service, service name and category are required.', 'danger');
+            redirect('modules/services/index.php');
+        }
+
         $beforeStmt = db()->prepare(
-            'SELECT service_name, status_code, default_rate, gst_rate
+            'SELECT service_name, status_code, default_rate, gst_rate, category_id
              FROM services
              WHERE id = :id
                AND company_id = :company_id
@@ -99,7 +165,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         $stmt = db()->prepare(
             'UPDATE services
-             SET service_name = :service_name,
+             SET category_id = :category_id,
+                 service_name = :service_name,
                  description = :description,
                  default_hours = :default_hours,
                  default_rate = :default_rate,
@@ -110,6 +177,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                AND company_id = :company_id'
         );
         $stmt->execute([
+            'category_id' => $categoryId,
             'service_name' => $serviceName,
             'description' => $description !== '' ? $description : null,
             'default_hours' => $defaultHours,
@@ -124,12 +192,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'entity' => 'service',
             'source' => 'UI',
             'before' => is_array($beforeService) ? [
+                'category_id' => (int) ($beforeService['category_id'] ?? 0),
                 'service_name' => (string) ($beforeService['service_name'] ?? ''),
                 'status_code' => (string) ($beforeService['status_code'] ?? ''),
                 'default_rate' => (float) ($beforeService['default_rate'] ?? 0),
                 'gst_rate' => (float) ($beforeService['gst_rate'] ?? 0),
             ] : null,
             'after' => [
+                'category_id' => $categoryId,
+                'category_name' => (string) ($category['category_name'] ?? ''),
                 'service_name' => $serviceName,
                 'status_code' => $statusCode,
                 'default_rate' => (float) $defaultRate,
@@ -187,7 +258,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 $editId = get_int('edit_id');
 $editService = null;
 if ($editId > 0) {
-    $editStmt = db()->prepare('SELECT * FROM services WHERE id = :id AND company_id = :company_id LIMIT 1');
+    $editStmt = db()->prepare(
+        'SELECT s.*, sc.category_name, sc.category_code
+         FROM services s
+         LEFT JOIN service_categories sc ON sc.id = s.category_id AND sc.company_id = s.company_id
+         WHERE s.id = :id
+           AND s.company_id = :company_id
+         LIMIT 1'
+    );
     $editStmt->execute([
         'id' => $editId,
         'company_id' => $companyId,
@@ -195,15 +273,68 @@ if ($editId > 0) {
     $editService = $editStmt->fetch() ?: null;
 }
 
-$servicesStmt = db()->prepare(
-    'SELECT s.*,
+$serviceCategories = fetch_service_categories_master($companyId);
+$categoryFilterRaw = trim((string) ($_GET['category_filter'] ?? 'all'));
+$categoryFilterId = null;
+$filterUncategorized = false;
+
+if ($categoryFilterRaw === 'uncategorized') {
+    $filterUncategorized = true;
+} elseif (filter_var($categoryFilterRaw, FILTER_VALIDATE_INT) !== false && (int) $categoryFilterRaw > 0) {
+    $categoryFilterId = (int) $categoryFilterRaw;
+} else {
+    $categoryFilterRaw = 'all';
+}
+
+$uncategorizedCountStmt = db()->prepare(
+    'SELECT COUNT(*)
+     FROM services
+     WHERE company_id = :company_id
+       AND category_id IS NULL'
+);
+$uncategorizedCountStmt->execute(['company_id' => $companyId]);
+$uncategorizedServiceCount = (int) $uncategorizedCountStmt->fetchColumn();
+$showUncategorizedFilter = $uncategorizedServiceCount > 0 || $filterUncategorized;
+
+$sql =
+    'SELECT s.*, sc.category_name, sc.category_code,
             (SELECT COUNT(*) FROM vis_service_part_map m WHERE m.service_id = s.id AND m.status_code = "ACTIVE") AS mapped_parts
      FROM services s
-     WHERE s.company_id = :company_id
-     ORDER BY s.id DESC'
-);
-$servicesStmt->execute(['company_id' => $companyId]);
+     LEFT JOIN service_categories sc ON sc.id = s.category_id AND sc.company_id = s.company_id
+     WHERE s.company_id = :company_id';
+$params = ['company_id' => $companyId];
+
+if ($categoryFilterId !== null) {
+    $sql .= ' AND s.category_id = :category_id';
+    $params['category_id'] = $categoryFilterId;
+}
+
+if ($filterUncategorized) {
+    $sql .= ' AND s.category_id IS NULL';
+}
+
+$sql .= ' ORDER BY
+            CASE WHEN s.category_id IS NULL THEN 1 ELSE 0 END,
+            COALESCE(sc.category_name, "Uncategorized"),
+            s.service_name ASC,
+            s.id DESC';
+
+$servicesStmt = db()->prepare($sql);
+$servicesStmt->execute($params);
 $services = $servicesStmt->fetchAll();
+
+$serviceGroups = [];
+foreach ($services as $service) {
+    $groupKey = ((int) ($service['category_id'] ?? 0) > 0) ? (string) (int) $service['category_id'] : 'uncategorized';
+    if (!isset($serviceGroups[$groupKey])) {
+        $serviceGroups[$groupKey] = [
+            'label' => service_category_group_label($service),
+            'rows' => [],
+        ];
+    }
+
+    $serviceGroups[$groupKey]['rows'][] = $service;
+}
 
 require_once __DIR__ . '/../../includes/header.php';
 require_once __DIR__ . '/../../includes/sidebar.php';
@@ -226,6 +357,39 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 
   <div class="app-content">
     <div class="container-fluid">
+      <div class="card card-outline card-secondary">
+        <div class="card-body d-flex flex-wrap justify-content-between gap-2 align-items-end">
+          <form method="get" class="row g-2 align-items-end mb-0">
+            <div class="col-auto">
+              <label class="form-label">Filter by Category</label>
+              <select name="category_filter" class="form-select">
+                <option value="all" <?= $categoryFilterRaw === 'all' ? 'selected' : ''; ?>>All Categories</option>
+                <?php foreach ($serviceCategories as $category): ?>
+                  <?php $statusCode = normalize_status_code((string) ($category['status_code'] ?? 'ACTIVE')); ?>
+                  <option value="<?= (int) $category['id']; ?>" <?= $categoryFilterId === (int) $category['id'] ? 'selected' : ''; ?>>
+                    <?= e((string) $category['category_name']); ?><?= $statusCode !== 'ACTIVE' ? ' [' . e($statusCode) . ']' : ''; ?>
+                  </option>
+                <?php endforeach; ?>
+                <?php if ($showUncategorizedFilter): ?>
+                  <option value="uncategorized" <?= $filterUncategorized ? 'selected' : ''; ?>>Uncategorized (Legacy)</option>
+                <?php endif; ?>
+              </select>
+            </div>
+            <div class="col-auto d-flex gap-2">
+              <button type="submit" class="btn btn-outline-primary">Apply</button>
+              <a href="<?= e(url('modules/services/index.php')); ?>" class="btn btn-outline-secondary">Reset</a>
+            </div>
+          </form>
+          <a href="<?= e(url('modules/services/categories.php')); ?>" class="btn btn-outline-dark">Manage Service Categories</a>
+        </div>
+      </div>
+
+      <?php if ($uncategorizedServiceCount > 0): ?>
+        <div class="alert alert-warning">
+          <?= e((string) $uncategorizedServiceCount); ?> service(s) are still uncategorized and continue to work as legacy records.
+        </div>
+      <?php endif; ?>
+
       <?php if ($canManage): ?>
         <div class="card card-primary">
           <div class="card-header"><h3 class="card-title"><?= $editService ? 'Edit Service' : 'Add Service'; ?></h3></div>
@@ -236,15 +400,31 @@ require_once __DIR__ . '/../../includes/sidebar.php';
               <input type="hidden" name="service_id" value="<?= (int) ($editService['id'] ?? 0); ?>" />
 
               <div class="col-md-2">
+                <label class="form-label">Category</label>
+                <select name="category_id" class="form-select" required>
+                  <option value="">Select Category</option>
+                  <?php foreach ($serviceCategories as $category): ?>
+                    <?php
+                      $categoryId = (int) $category['id'];
+                      $statusCode = normalize_status_code((string) ($category['status_code'] ?? 'ACTIVE'));
+                      $selectedCategoryId = (int) ($editService['category_id'] ?? 0);
+                    ?>
+                    <option value="<?= $categoryId; ?>" <?= $selectedCategoryId === $categoryId ? 'selected' : ''; ?>>
+                      <?= e((string) $category['category_name']); ?><?= $statusCode !== 'ACTIVE' ? ' [' . e($statusCode) . ']' : ''; ?>
+                    </option>
+                  <?php endforeach; ?>
+                </select>
+              </div>
+              <div class="col-md-2">
                 <label class="form-label">Service Code</label>
                 <input type="text" name="service_code" class="form-control" <?= $editService ? 'readonly' : 'required'; ?> value="<?= e((string) ($editService['service_code'] ?? '')); ?>" />
               </div>
-              <div class="col-md-4">
+              <div class="col-md-3">
                 <label class="form-label">Service Name</label>
                 <input type="text" name="service_name" class="form-control" required value="<?= e((string) ($editService['service_name'] ?? '')); ?>" />
               </div>
-              <div class="col-md-2">
-                <label class="form-label">Default Hours</label>
+              <div class="col-md-1">
+                <label class="form-label">Hours</label>
                 <input type="number" name="default_hours" step="0.01" class="form-control" value="<?= e((string) ($editService['default_hours'] ?? '0')); ?>" />
               </div>
               <div class="col-md-2">
@@ -287,6 +467,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
               <tr>
                 <th>Code</th>
                 <th>Name</th>
+                <th>Category</th>
                 <th>Hours</th>
                 <th>Rate</th>
                 <th>GST%</th>
@@ -296,40 +477,46 @@ require_once __DIR__ . '/../../includes/sidebar.php';
               </tr>
             </thead>
             <tbody>
-              <?php if (empty($services)): ?>
-                <tr><td colspan="8" class="text-center text-muted py-4">No services found.</td></tr>
+              <?php if (empty($serviceGroups)): ?>
+                <tr><td colspan="9" class="text-center text-muted py-4">No services found.</td></tr>
               <?php else: ?>
-                <?php foreach ($services as $service): ?>
-                  <tr>
-                    <td><code><?= e((string) $service['service_code']); ?></code></td>
-                    <td><?= e((string) $service['service_name']); ?></td>
-                    <td><?= e((string) $service['default_hours']); ?></td>
-                    <td><?= e(format_currency((float) $service['default_rate'])); ?></td>
-                    <td><?= e((string) $service['gst_rate']); ?></td>
-                    <td><?= (int) $service['mapped_parts']; ?></td>
-                    <td><span class="badge text-bg-<?= e(status_badge_class((string) $service['status_code'])); ?>"><?= e((string) $service['status_code']); ?></span></td>
-                    <td class="d-flex gap-1">
-                      <a class="btn btn-sm btn-outline-primary" href="<?= e(url('modules/services/index.php?edit_id=' . (int) $service['id'])); ?>">Edit</a>
-                      <?php if ($canManage): ?>
-                        <form method="post" class="d-inline" data-confirm="Change service status?">
-                          <?= csrf_field(); ?>
-                          <input type="hidden" name="_action" value="change_status" />
-                          <input type="hidden" name="service_id" value="<?= (int) $service['id']; ?>" />
-                          <input type="hidden" name="next_status" value="<?= e(((string) $service['status_code'] === 'ACTIVE') ? 'INACTIVE' : 'ACTIVE'); ?>" />
-                          <button type="submit" class="btn btn-sm btn-outline-secondary"><?= ((string) $service['status_code'] === 'ACTIVE') ? 'Inactivate' : 'Activate'; ?></button>
-                        </form>
-                        <?php if ((string) $service['status_code'] !== 'DELETED'): ?>
-                          <form method="post" class="d-inline" data-confirm="Soft delete this service?">
+                <?php foreach ($serviceGroups as $group): ?>
+                  <tr class="table-secondary">
+                    <th colspan="9">Category: <?= e((string) $group['label']); ?> (<?= count($group['rows']); ?>)</th>
+                  </tr>
+                  <?php foreach ($group['rows'] as $service): ?>
+                    <tr>
+                      <td><code><?= e((string) $service['service_code']); ?></code></td>
+                      <td><?= e((string) $service['service_name']); ?></td>
+                      <td><?= e(service_category_group_label($service)); ?></td>
+                      <td><?= e((string) $service['default_hours']); ?></td>
+                      <td><?= e(format_currency((float) $service['default_rate'])); ?></td>
+                      <td><?= e((string) $service['gst_rate']); ?></td>
+                      <td><?= (int) $service['mapped_parts']; ?></td>
+                      <td><span class="badge text-bg-<?= e(status_badge_class((string) $service['status_code'])); ?>"><?= e((string) $service['status_code']); ?></span></td>
+                      <td class="d-flex gap-1">
+                        <a class="btn btn-sm btn-outline-primary" href="<?= e(url('modules/services/index.php?edit_id=' . (int) $service['id'])); ?>">Edit</a>
+                        <?php if ($canManage): ?>
+                          <form method="post" class="d-inline" data-confirm="Change service status?">
                             <?= csrf_field(); ?>
                             <input type="hidden" name="_action" value="change_status" />
                             <input type="hidden" name="service_id" value="<?= (int) $service['id']; ?>" />
-                            <input type="hidden" name="next_status" value="DELETED" />
-                            <button type="submit" class="btn btn-sm btn-outline-danger">Soft Delete</button>
+                            <input type="hidden" name="next_status" value="<?= e(((string) $service['status_code'] === 'ACTIVE') ? 'INACTIVE' : 'ACTIVE'); ?>" />
+                            <button type="submit" class="btn btn-sm btn-outline-secondary"><?= ((string) $service['status_code'] === 'ACTIVE') ? 'Inactivate' : 'Activate'; ?></button>
                           </form>
+                          <?php if ((string) $service['status_code'] !== 'DELETED'): ?>
+                            <form method="post" class="d-inline" data-confirm="Soft delete this service?">
+                              <?= csrf_field(); ?>
+                              <input type="hidden" name="_action" value="change_status" />
+                              <input type="hidden" name="service_id" value="<?= (int) $service['id']; ?>" />
+                              <input type="hidden" name="next_status" value="DELETED" />
+                              <button type="submit" class="btn btn-sm btn-outline-danger">Soft Delete</button>
+                            </form>
+                          <?php endif; ?>
                         <?php endif; ?>
-                      <?php endif; ?>
-                    </td>
-                  </tr>
+                      </td>
+                    </tr>
+                  <?php endforeach; ?>
                 <?php endforeach; ?>
               <?php endif; ?>
             </tbody>
@@ -341,3 +528,4 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 </main>
 
 <?php require_once __DIR__ . '/../../includes/footer.php'; ?>
+

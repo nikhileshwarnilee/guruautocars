@@ -128,9 +128,11 @@ function fetch_job_details(int $jobId, int $companyId, int $garageId): ?array
 function fetch_job_labor(int $jobId): array
 {
     $stmt = db()->prepare(
-        'SELECT jl.*, s.service_name, s.service_code
+        'SELECT jl.*, s.service_name, s.service_code, s.category_id AS service_category_id,
+                sc.category_name AS service_category_name
          FROM job_labor jl
          LEFT JOIN services s ON s.id = jl.service_id
+         LEFT JOIN service_categories sc ON sc.id = s.category_id AND sc.company_id = s.company_id
          WHERE jl.job_card_id = :job_id
          ORDER BY jl.id DESC'
     );
@@ -158,11 +160,34 @@ function fetch_job_parts(int $jobId, int $garageId): array
 function fetch_services_master(int $companyId): array
 {
     $stmt = db()->prepare(
-        'SELECT id, service_code, service_name, default_rate, gst_rate
-         FROM services
-         WHERE company_id = :company_id
-           AND status_code = "ACTIVE"
-         ORDER BY service_name ASC'
+        'SELECT s.id, s.service_code, s.service_name, s.default_rate, s.gst_rate, s.category_id,
+                sc.category_name
+         FROM services s
+         LEFT JOIN service_categories sc ON sc.id = s.category_id AND sc.company_id = s.company_id
+         WHERE s.company_id = :company_id
+           AND s.status_code = "ACTIVE"
+         ORDER BY
+            CASE WHEN s.category_id IS NULL THEN 1 ELSE 0 END,
+            COALESCE(sc.category_name, "Uncategorized"),
+            s.service_name ASC'
+    );
+    $stmt->execute(['company_id' => $companyId]);
+    return $stmt->fetchAll();
+}
+
+function fetch_service_categories_for_labor(int $companyId): array
+{
+    $stmt = db()->prepare(
+        'SELECT sc.id, sc.category_name, sc.category_code, sc.status_code,
+                (SELECT COUNT(*)
+                 FROM services s
+                 WHERE s.company_id = sc.company_id
+                   AND s.category_id = sc.id
+                   AND s.status_code = "ACTIVE") AS active_service_count
+         FROM service_categories sc
+         WHERE sc.company_id = :company_id
+           AND sc.status_code = "ACTIVE"
+         ORDER BY sc.category_name ASC'
     );
     $stmt->execute(['company_id' => $companyId]);
     return $stmt->fetchAll();
@@ -439,19 +464,28 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     if ($action === 'add_labor') {
         $serviceId = post_int('service_id');
+        $serviceCategoryKey = trim((string) ($_POST['service_category_key'] ?? ''));
         $description = post_string('description', 255);
         $quantity = post_decimal('quantity', 1.0);
         $unitPrice = post_decimal('unit_price', 0.0);
         $gstRate = post_decimal('gst_rate', 18.0);
         $serviceName = null;
+        $serviceCategoryName = null;
 
         if ($serviceId > 0) {
+            if ($serviceCategoryKey === '') {
+                flash_set('job_error', 'Select service category before selecting service.', 'danger');
+                redirect('modules/jobs/view.php?id=' . $jobId);
+            }
+
             $serviceStmt = db()->prepare(
-                'SELECT id, service_name, service_code, default_rate, gst_rate
-                 FROM services
-                 WHERE id = :id
-                   AND company_id = :company_id
-                   AND status_code = "ACTIVE"
+                'SELECT s.id, s.service_name, s.service_code, s.default_rate, s.gst_rate, s.category_id,
+                        sc.category_name
+                 FROM services s
+                 LEFT JOIN service_categories sc ON sc.id = s.category_id AND sc.company_id = s.company_id
+                 WHERE s.id = :id
+                   AND s.company_id = :company_id
+                   AND s.status_code = "ACTIVE"
                  LIMIT 1'
             );
             $serviceStmt->execute([
@@ -465,7 +499,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 redirect('modules/jobs/view.php?id=' . $jobId);
             }
 
+            $resolvedCategoryKey = ((int) ($service['category_id'] ?? 0) > 0)
+                ? (string) (int) $service['category_id']
+                : 'uncategorized';
+            if ($serviceCategoryKey !== $resolvedCategoryKey) {
+                flash_set('job_error', 'Selected service does not belong to the chosen category.', 'danger');
+                redirect('modules/jobs/view.php?id=' . $jobId);
+            }
+
             $serviceName = (string) $service['service_name'];
+            $serviceCategoryName = trim((string) ($service['category_name'] ?? ''));
+            if ($serviceCategoryName === '' && (int) ($service['category_id'] ?? 0) <= 0) {
+                $serviceCategoryName = 'Uncategorized (Legacy)';
+            }
             if ($description === '') {
                 $description = $serviceName;
             }
@@ -510,6 +556,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'Labor line added',
             [
                 'service_id' => $serviceId > 0 ? $serviceId : null,
+                'service_category_key' => $serviceId > 0 ? $serviceCategoryKey : null,
+                'service_category_name' => $serviceCategoryName,
                 'service_name' => $serviceName,
                 'description' => $description,
                 'quantity' => round($quantity, 2),
@@ -864,7 +912,15 @@ $assignmentCandidates = $canAssign ? job_assignment_candidates($companyId, $gara
 $currentAssignments = job_current_assignments($jobId);
 $currentAssignmentIds = array_map(static fn (array $row): int => (int) $row['user_id'], $currentAssignments);
 
+$serviceCategories = fetch_service_categories_for_labor($companyId);
 $servicesMaster = fetch_services_master($companyId);
+$hasLegacyUncategorizedServices = false;
+foreach ($servicesMaster as $serviceMasterRow) {
+    if ((int) ($serviceMasterRow['category_id'] ?? 0) <= 0) {
+        $hasLegacyUncategorizedServices = true;
+        break;
+    }
+}
 $partsMaster = fetch_parts_master($companyId, $garageId);
 $laborEntries = fetch_job_labor($jobId);
 $partEntries = fetch_job_parts($jobId, $garageId);
@@ -1118,11 +1174,21 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                 <?php else: ?>
                   <ul class="list-group mb-3">
                     <?php foreach ($visServiceSuggestions as $suggestion): ?>
+                      <?php
+                        $suggestionCategoryKey = ((int) ($suggestion['category_id'] ?? 0) > 0)
+                          ? (string) (int) $suggestion['category_id']
+                          : 'uncategorized';
+                        $suggestionCategoryName = trim((string) ($suggestion['category_name'] ?? ''));
+                        if ($suggestionCategoryName === '' && $suggestionCategoryKey === 'uncategorized') {
+                            $suggestionCategoryName = 'Uncategorized (Legacy)';
+                        }
+                      ?>
                       <li class="list-group-item d-flex justify-content-between align-items-center">
                         <div>
                           <div class="fw-semibold"><?= e((string) $suggestion['service_name']); ?></div>
                           <small class="text-muted">
                             Code: <?= e((string) $suggestion['service_code']); ?> |
+                            Category: <?= e($suggestionCategoryName !== '' ? $suggestionCategoryName : ('Category #' . (int) $suggestion['category_id'])); ?> |
                             Default Rate: <?= e(format_currency((float) $suggestion['default_rate'])); ?> |
                             GST: <?= e((string) $suggestion['gst_rate']); ?>%
                           </small>
@@ -1132,6 +1198,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                             <?= csrf_field(); ?>
                             <input type="hidden" name="_action" value="add_labor">
                             <input type="hidden" name="service_id" value="<?= (int) $suggestion['service_id']; ?>">
+                            <input type="hidden" name="service_category_key" value="<?= e($suggestionCategoryKey); ?>">
                             <input type="hidden" name="description" value="<?= e((string) $suggestion['service_name']); ?>">
                             <input type="hidden" name="quantity" value="1">
                             <input type="hidden" name="unit_price" value="<?= e((string) $suggestion['default_rate']); ?>">
@@ -1188,13 +1255,29 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                 <div class="card-body border-bottom row g-2">
                   <?= csrf_field(); ?>
                   <input type="hidden" name="_action" value="add_labor">
-                  <div class="col-md-4">
+                  <div class="col-md-2">
+                    <label class="form-label">Category</label>
+                    <select id="add-labor-category" name="service_category_key" class="form-select" <?= $jobLocked ? 'disabled' : ''; ?>>
+                      <option value="">Select Category</option>
+                      <?php foreach ($serviceCategories as $category): ?>
+                        <option value="<?= (int) $category['id']; ?>">
+                          <?= e((string) $category['category_name']); ?>
+                        </option>
+                      <?php endforeach; ?>
+                      <?php if ($hasLegacyUncategorizedServices): ?>
+                        <option value="uncategorized">Uncategorized (Legacy)</option>
+                      <?php endif; ?>
+                    </select>
+                  </div>
+                  <div class="col-md-3">
                     <label class="form-label">Service Master</label>
                     <select id="add-labor-service" name="service_id" class="form-select" <?= $jobLocked ? 'disabled' : ''; ?>>
-                      <option value="0">Custom Labor Item</option>
+                      <option value="0" data-category-key="">Custom Labor Item</option>
                       <?php foreach ($servicesMaster as $service): ?>
+                        <?php $serviceCategoryKey = ((int) ($service['category_id'] ?? 0) > 0) ? (string) (int) $service['category_id'] : 'uncategorized'; ?>
                         <option
                           value="<?= (int) $service['id']; ?>"
+                          data-category-key="<?= e($serviceCategoryKey); ?>"
                           data-name="<?= e((string) $service['service_name']); ?>"
                           data-rate="<?= e((string) $service['default_rate']); ?>"
                           data-gst="<?= e((string) $service['gst_rate']); ?>"
@@ -1203,8 +1286,9 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                         </option>
                       <?php endforeach; ?>
                     </select>
+                    <small class="text-muted">Choose category first for service master entries.</small>
                   </div>
-                  <div class="col-md-4">
+                  <div class="col-md-3">
                     <label class="form-label">Description</label>
                     <input id="add-labor-description" type="text" name="description" class="form-control" required <?= $jobLocked ? 'disabled' : ''; ?>>
                   </div>
@@ -1249,6 +1333,16 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                         <td>
                           <?php if (!empty($line['service_code'])): ?>
                             <?= e((string) $line['service_code']); ?> - <?= e((string) ($line['service_name'] ?? '')); ?>
+                            <div class="small text-muted">
+                              Category:
+                              <?php if (!empty($line['service_category_name'])): ?>
+                                <?= e((string) $line['service_category_name']); ?>
+                              <?php elseif (!empty($line['service_id'])): ?>
+                                Uncategorized (Legacy)
+                              <?php else: ?>
+                                -
+                              <?php endif; ?>
+                            </div>
                           <?php else: ?>
                             <span class="text-muted">Custom</span>
                           <?php endif; ?>
@@ -1476,13 +1570,51 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 
 <script>
   (function () {
+    var laborCategorySelect = document.getElementById('add-labor-category');
     var laborServiceSelect = document.getElementById('add-labor-service');
     var laborDescription = document.getElementById('add-labor-description');
     var laborRate = document.getElementById('add-labor-rate');
     var laborGst = document.getElementById('add-labor-gst');
 
-    if (laborServiceSelect && laborDescription && laborRate && laborGst) {
-      laborServiceSelect.addEventListener('change', function () {
+    if (laborCategorySelect && laborServiceSelect && laborDescription && laborRate && laborGst) {
+      var laborInputsLocked = laborCategorySelect.disabled || laborServiceSelect.disabled;
+
+      function syncLaborServiceOptions() {
+        var selectedCategoryKey = laborCategorySelect.value || '';
+        var hasCategory = selectedCategoryKey !== '';
+        for (var i = 0; i < laborServiceSelect.options.length; i++) {
+          var option = laborServiceSelect.options[i];
+          if (!option) {
+            continue;
+          }
+
+          if (option.value === '0') {
+            option.hidden = false;
+            continue;
+          }
+
+          var optionCategoryKey = option.getAttribute('data-category-key') || '';
+          option.hidden = !hasCategory || optionCategoryKey !== selectedCategoryKey;
+        }
+
+        if (laborInputsLocked) {
+          return;
+        }
+
+        if (!hasCategory) {
+          laborServiceSelect.value = '0';
+          laborServiceSelect.disabled = true;
+          return;
+        }
+
+        laborServiceSelect.disabled = false;
+        var currentOption = laborServiceSelect.options[laborServiceSelect.selectedIndex];
+        if (!currentOption || currentOption.hidden) {
+          laborServiceSelect.value = '0';
+        }
+      }
+
+      function applyServiceDefaults() {
         var selected = laborServiceSelect.options[laborServiceSelect.selectedIndex];
         if (!selected) {
           return;
@@ -1493,7 +1625,17 @@ require_once __DIR__ . '/../../includes/sidebar.php';
           laborRate.value = selected.getAttribute('data-rate') || laborRate.value;
           laborGst.value = selected.getAttribute('data-gst') || laborGst.value;
         }
-      });
+      }
+
+      if (!laborInputsLocked) {
+        laborCategorySelect.addEventListener('change', function () {
+          syncLaborServiceOptions();
+          applyServiceDefaults();
+        });
+      }
+
+      laborServiceSelect.addEventListener('change', applyServiceDefaults);
+      syncLaborServiceOptions();
     }
 
     var partSelect = document.getElementById('add-part-select');

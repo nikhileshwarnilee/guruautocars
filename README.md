@@ -19,6 +19,7 @@ Core PHP + MySQL + AdminLTE based ERP for Indian multi-branch garage operations.
    - `mysql -u root guruautocars < database/schema.sql`
 3. Apply upgrade scripts (idempotent):
    - `mysql -u root guruautocars < database/master_upgrade.sql`
+   - `mysql -u root guruautocars < database/service_category_upgrade.sql`
    - `mysql -u root guruautocars < database/job_workflow_upgrade.sql`
    - `mysql -u root guruautocars < database/job_workflow_hardening.sql`
    - `mysql -u root guruautocars < database/inventory_intelligence_upgrade.sql`

@@ -218,6 +218,26 @@ $allowedStatuses = ['ACTIVE', 'INACTIVE', 'DELETED', 'ALL'];
 if (!in_array($statusFilter, $allowedStatuses, true)) {
     $statusFilter = '';
 }
+$customerTypeColumnSupported = in_array('customer_type', table_columns('customers'), true);
+$customerTypeFilter = strtoupper(trim((string) ($_GET['customer_type'] ?? '')));
+$allowedCustomerTypes = $customerTypeColumnSupported
+    ? ['', 'INDIVIDUAL', 'BUSINESS', 'FLEET', 'GOVERNMENT', 'OTHER', 'UNSPECIFIED']
+    : ['', 'INDIVIDUAL', 'BUSINESS'];
+if (!in_array($customerTypeFilter, $allowedCustomerTypes, true)) {
+    $customerTypeFilter = '';
+}
+$gstinPresenceFilter = strtoupper(trim((string) ($_GET['gstin_presence'] ?? '')));
+if (!in_array($gstinPresenceFilter, ['', 'HAS_GSTIN', 'NO_GSTIN'], true)) {
+    $gstinPresenceFilter = '';
+}
+$fromDateFilter = trim((string) ($_GET['from_date'] ?? ''));
+if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $fromDateFilter)) {
+    $fromDateFilter = '';
+}
+$toDateFilter = trim((string) ($_GET['to_date'] ?? ''));
+if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $toDateFilter)) {
+    $toDateFilter = '';
+}
 
 $whereParts = ['c.company_id = :company_id'];
 $params = ['company_id' => $companyId];
@@ -245,6 +265,7 @@ $listSql =
 $customerStmt = db()->prepare($listSql);
 $customerStmt->execute($params);
 $customers = $customerStmt->fetchAll();
+$customerInsightsApiUrl = url('modules/customers/master_insights_api.php');
 
 require_once __DIR__ . '/../../includes/header.php';
 require_once __DIR__ . '/../../includes/sidebar.php';
@@ -340,12 +361,58 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         </div>
       <?php endif; ?>
 
-      <div class="card">
-        <div class="card-header">
-          <h3 class="card-title">Customer List</h3>
-          <div class="card-tools">
-            <form method="get" class="d-flex gap-2">
-              <input type="text" name="q" value="<?= e($search); ?>" class="form-control form-control-sm" placeholder="Search name/phone/email/GSTIN" />
+      <div class="row g-3 mb-3">
+        <div class="col-md-3 col-sm-6">
+          <div class="small-box text-bg-primary mb-0">
+            <div class="inner">
+              <h3 data-stat-value="total_customers"><?= count($customers); ?></h3>
+              <p>Total Customers</p>
+            </div>
+            <div class="small-box-icon"><i class="bi bi-people-fill"></i></div>
+          </div>
+        </div>
+        <div class="col-md-3 col-sm-6">
+          <div class="small-box text-bg-success mb-0">
+            <div class="inner">
+              <h3 data-stat-value="active_customers">0</h3>
+              <p>Active Customers</p>
+            </div>
+            <div class="small-box-icon"><i class="bi bi-person-check-fill"></i></div>
+          </div>
+        </div>
+        <div class="col-md-3 col-sm-6">
+          <div class="small-box text-bg-info mb-0">
+            <div class="inner">
+              <h3 data-stat-value="repeat_customers">0</h3>
+              <p>Repeat Customers</p>
+            </div>
+            <div class="small-box-icon"><i class="bi bi-arrow-repeat"></i></div>
+          </div>
+        </div>
+        <div class="col-md-3 col-sm-6">
+          <div class="small-box text-bg-warning mb-0">
+            <div class="inner">
+              <h3 data-stat-value="customers_with_open_jobs">0</h3>
+              <p>Customers With Open Jobs</p>
+            </div>
+            <div class="small-box-icon"><i class="bi bi-tools"></i></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card" data-master-insights-root="customers" data-master-insights-endpoint="<?= e($customerInsightsApiUrl); ?>">
+        <div class="card-header d-flex justify-content-between align-items-center">
+          <h3 class="card-title mb-0">Customer List</h3>
+          <span class="badge text-bg-light border" data-master-results-count="1"><?= count($customers); ?></span>
+        </div>
+        <div class="card-body border-bottom">
+          <form method="get" class="row g-2 align-items-end" data-master-filter-form="1">
+            <div class="col-md-3">
+              <label class="form-label form-label-sm mb-1">Search</label>
+              <input type="text" name="q" value="<?= e($search); ?>" class="form-control form-control-sm" placeholder="Name / phone / email / GSTIN" />
+            </div>
+            <div class="col-md-2">
+              <label class="form-label form-label-sm mb-1">Status</label>
               <select name="status" class="form-select form-select-sm">
                 <option value="" <?= $statusFilter === '' ? 'selected' : ''; ?>>Active + Inactive</option>
                 <option value="ACTIVE" <?= $statusFilter === 'ACTIVE' ? 'selected' : ''; ?>>ACTIVE</option>
@@ -353,9 +420,43 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                 <option value="DELETED" <?= $statusFilter === 'DELETED' ? 'selected' : ''; ?>>DELETED</option>
                 <option value="ALL" <?= $statusFilter === 'ALL' ? 'selected' : ''; ?>>ALL</option>
               </select>
-              <button type="submit" class="btn btn-sm btn-outline-primary">Filter</button>
-            </form>
-          </div>
+            </div>
+            <div class="col-md-2">
+              <label class="form-label form-label-sm mb-1">Customer Type</label>
+              <select name="customer_type" class="form-select form-select-sm">
+                <option value="" <?= $customerTypeFilter === '' ? 'selected' : ''; ?>>All Types</option>
+                <option value="INDIVIDUAL" <?= $customerTypeFilter === 'INDIVIDUAL' ? 'selected' : ''; ?>>INDIVIDUAL</option>
+                <option value="BUSINESS" <?= $customerTypeFilter === 'BUSINESS' ? 'selected' : ''; ?>>BUSINESS</option>
+                <?php if ($customerTypeColumnSupported): ?>
+                  <option value="FLEET" <?= $customerTypeFilter === 'FLEET' ? 'selected' : ''; ?>>FLEET</option>
+                  <option value="GOVERNMENT" <?= $customerTypeFilter === 'GOVERNMENT' ? 'selected' : ''; ?>>GOVERNMENT</option>
+                  <option value="OTHER" <?= $customerTypeFilter === 'OTHER' ? 'selected' : ''; ?>>OTHER</option>
+                  <option value="UNSPECIFIED" <?= $customerTypeFilter === 'UNSPECIFIED' ? 'selected' : ''; ?>>UNSPECIFIED</option>
+                <?php endif; ?>
+              </select>
+            </div>
+            <div class="col-md-2">
+              <label class="form-label form-label-sm mb-1">GSTIN</label>
+              <select name="gstin_presence" class="form-select form-select-sm">
+                <option value="" <?= $gstinPresenceFilter === '' ? 'selected' : ''; ?>>All</option>
+                <option value="HAS_GSTIN" <?= $gstinPresenceFilter === 'HAS_GSTIN' ? 'selected' : ''; ?>>Has GSTIN</option>
+                <option value="NO_GSTIN" <?= $gstinPresenceFilter === 'NO_GSTIN' ? 'selected' : ''; ?>>No GSTIN</option>
+              </select>
+            </div>
+            <div class="col-md-1">
+              <label class="form-label form-label-sm mb-1">From</label>
+              <input type="date" name="from_date" value="<?= e($fromDateFilter); ?>" class="form-control form-control-sm" />
+            </div>
+            <div class="col-md-1">
+              <label class="form-label form-label-sm mb-1">To</label>
+              <input type="date" name="to_date" value="<?= e($toDateFilter); ?>" class="form-control form-control-sm" />
+            </div>
+            <div class="col-md-1 d-flex gap-2">
+              <button type="submit" class="btn btn-sm btn-outline-primary">Apply</button>
+              <button type="button" class="btn btn-sm btn-outline-secondary" data-master-filter-reset="1">Reset</button>
+            </div>
+          </form>
+          <div class="alert alert-danger d-none mt-3 mb-0" data-master-insights-error="1"></div>
         </div>
         <div class="card-body table-responsive p-0">
           <table class="table table-striped mb-0">
@@ -371,7 +472,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                 <th>Actions</th>
               </tr>
             </thead>
-            <tbody>
+            <tbody data-master-table-body="1" data-table-colspan="8">
               <?php if (empty($customers)): ?>
                 <tr><td colspan="8" class="text-center text-muted py-4">No customers found.</td></tr>
               <?php else: ?>

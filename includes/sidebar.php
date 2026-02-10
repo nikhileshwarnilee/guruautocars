@@ -163,6 +163,12 @@ $isVisOpen = is_menu_group_open('vis.', $activeMenu);
             <ul class="nav nav-treeview">
               <?php if (has_permission('service.view')): ?>
                 <li class="nav-item">
+                  <a href="<?= e(url('modules/services/categories.php')); ?>" class="nav-link <?= e(is_active_menu('services.categories', $activeMenu)); ?>">
+                    <i class="nav-icon bi bi-circle"></i>
+                    <p>Service Category Master</p>
+                  </a>
+                </li>
+                <li class="nav-item">
                   <a href="<?= e(url('modules/services/index.php')); ?>" class="nav-link <?= e(is_active_menu('services.master', $activeMenu)); ?>">
                     <i class="nav-icon bi bi-circle"></i>
                     <p>Service / Labour Master</p>
