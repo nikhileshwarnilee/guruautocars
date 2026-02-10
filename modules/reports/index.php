@@ -337,10 +337,26 @@ $servicedModels = $modelStmt->fetchAll();
 $frequencyParams = ['company_id' => $companyId, 'from_date' => $fromDate, 'to_date' => $toDate];
 $frequencyScopeSql = analytics_garage_scope_sql('jc.garage_id', $selectedGarageId, $garageIds, $frequencyParams, 'frequency_scope');
 $frequencyVehicleScopeSql = vehicle_master_scope_sql('v', $reportVehicleFilters, $frequencyParams, 'report_frequency_scope');
+$frequencyOdometerSelect = $jobOdometerEnabled
+    ? ',
+            MAX(CASE WHEN jc.odometer_km > 0 THEN jc.odometer_km END) AS latest_odometer_km,
+            CASE
+              WHEN SUM(CASE WHEN jc.odometer_km > 0 THEN 1 ELSE 0 END) > 1
+              THEN ROUND(
+                (MAX(CASE WHEN jc.odometer_km > 0 THEN jc.odometer_km END) - MIN(CASE WHEN jc.odometer_km > 0 THEN jc.odometer_km END))
+                / (SUM(CASE WHEN jc.odometer_km > 0 THEN 1 ELSE 0 END) - 1),
+                1
+              )
+              ELSE NULL
+            END AS avg_km_between_services'
+    : ',
+            NULL AS latest_odometer_km,
+            NULL AS avg_km_between_services';
 $frequencyStmt = db()->prepare(
     'SELECT v.registration_no, v.brand, v.model,
             COUNT(jc.id) AS service_count,
             CASE WHEN COUNT(jc.id) > 1 THEN ROUND(DATEDIFF(MAX(DATE(jc.closed_at)), MIN(DATE(jc.closed_at))) / (COUNT(jc.id) - 1), 1) ELSE NULL END AS avg_days_between_services
+            ' . $frequencyOdometerSelect . '
      FROM job_cards jc
      INNER JOIN vehicles v ON v.id = jc.vehicle_id
      WHERE jc.company_id = :company_id
@@ -918,8 +934,17 @@ if ($exportKey !== '') {
             reports_csv_download('serviced_models_' . $timestamp . '.csv', ['Brand', 'Model', 'Service Count'], $rows);
 
         case 'service_frequency':
-            $rows = array_map(static fn (array $row): array => [$row['registration_no'], (int) ($row['service_count'] ?? 0), $row['avg_days_between_services']], $serviceFrequencyRows);
-            reports_csv_download('service_frequency_' . $timestamp . '.csv', ['Registration', 'Services', 'Avg Days Between'], $rows);
+            $rows = array_map(
+                static fn (array $row): array => [
+                    $row['registration_no'],
+                    (int) ($row['service_count'] ?? 0),
+                    $row['avg_days_between_services'],
+                    $row['latest_odometer_km'],
+                    $row['avg_km_between_services'],
+                ],
+                $serviceFrequencyRows
+            );
+            reports_csv_download('service_frequency_' . $timestamp . '.csv', ['Registration', 'Services', 'Avg Days Between', 'Latest Odometer KM', 'Avg KM Between'], $rows);
 
         case 'stock_valuation':
             $rows = array_map(static fn (array $row): array => [$row['garage_name'], (float) ($row['total_qty'] ?? 0), (float) ($row['stock_value'] ?? 0), (int) ($row['low_stock_parts'] ?? 0)], $stockValuationRows);
@@ -1300,12 +1325,18 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             <div class="card-header d-flex justify-content-between align-items-center"><h3 class="card-title mb-0">Vehicle Service Frequency</h3><a href="<?= e(reports_export_url($exportBaseParams, 'service_frequency')); ?>" class="btn btn-sm btn-outline-primary">CSV</a></div>
             <div class="card-body p-0 table-responsive">
               <table class="table table-sm table-striped mb-0">
-                <thead><tr><th>Vehicle</th><th>Services</th><th>Avg Days Between</th></tr></thead>
+                <thead><tr><th>Vehicle</th><th>Services</th><th>Avg Days Between</th><th>Latest Odometer</th><th>Avg KM Between</th></tr></thead>
                 <tbody>
                   <?php if (empty($serviceFrequencyRows)): ?>
-                    <tr><td colspan="3" class="text-center text-muted py-4">No service-frequency data.</td></tr>
+                    <tr><td colspan="5" class="text-center text-muted py-4">No service-frequency data.</td></tr>
                   <?php else: foreach ($serviceFrequencyRows as $row): ?>
-                    <tr><td><?= e((string) $row['registration_no']); ?><div class="text-muted small"><?= e((string) $row['brand']); ?> <?= e((string) $row['model']); ?></div></td><td><?= (int) ($row['service_count'] ?? 0); ?></td><td><?= $row['avg_days_between_services'] !== null ? e(number_format((float) $row['avg_days_between_services'], 1)) : '-'; ?></td></tr>
+                    <tr>
+                      <td><?= e((string) $row['registration_no']); ?><div class="text-muted small"><?= e((string) $row['brand']); ?> <?= e((string) $row['model']); ?></div></td>
+                      <td><?= (int) ($row['service_count'] ?? 0); ?></td>
+                      <td><?= $row['avg_days_between_services'] !== null ? e(number_format((float) $row['avg_days_between_services'], 1)) : '-'; ?></td>
+                      <td><?= $row['latest_odometer_km'] !== null ? e(number_format((float) $row['latest_odometer_km'], 0)) . ' KM' : '-'; ?></td>
+                      <td><?= $row['avg_km_between_services'] !== null ? e(number_format((float) $row['avg_km_between_services'], 1)) : '-'; ?></td>
+                    </tr>
                   <?php endforeach; endif; ?>
                 </tbody>
               </table>

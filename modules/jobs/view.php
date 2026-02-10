@@ -15,6 +15,8 @@ $userId = (int) ($_SESSION['user_id'] ?? 0);
 $canEdit = has_permission('job.edit') || has_permission('job.update') || has_permission('job.manage');
 $canAssign = has_permission('job.assign') || has_permission('job.manage');
 $canClose = has_permission('job.close') || has_permission('job.manage');
+$jobCardColumns = table_columns('job_cards');
+$jobOdometerEnabled = in_array('odometer_km', $jobCardColumns, true);
 
 function post_decimal(string $key, float $default = 0.0): float
 {
@@ -1355,6 +1357,9 @@ require_once __DIR__ . '/../../includes/sidebar.php';
               <p class="mb-2"><strong>Assigned Staff:</strong> <?= e((string) (($job['assigned_staff'] ?? '') !== '' ? $job['assigned_staff'] : 'Unassigned')); ?></p>
               <p class="mb-2"><strong>Customer:</strong> <?= e((string) $job['customer_name']); ?> (<?= e((string) $job['customer_phone']); ?>)</p>
               <p class="mb-2"><strong>Vehicle:</strong> <?= e((string) $job['registration_no']); ?> | <?= e((string) $job['brand']); ?> <?= e((string) $job['model']); ?> <?= e((string) ($job['variant'] ?? '')); ?></p>
+              <?php if ($jobOdometerEnabled): ?>
+                <p class="mb-2"><strong>Odometer:</strong> <?= e(number_format((float) ($job['odometer_km'] ?? 0), 0)); ?> KM</p>
+              <?php endif; ?>
               <p class="mb-2"><strong>Complaint:</strong><br><?= nl2br(e((string) $job['complaint'])); ?></p>
               <p class="mb-0"><strong>Diagnosis:</strong><br><?= nl2br(e((string) ($job['diagnosis'] ?? '-'))); ?></p>
               <?php if (!empty($job['cancel_note'])): ?>

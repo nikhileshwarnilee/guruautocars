@@ -1,0 +1,1 @@
+user_id|i:1;company_id|i:1;role_key|s:11:"super_admin";active_garage_id|i:1;_csrf_token|s:64:"3c063bde3e6ab9381ac2d9e2a889101be38b1604de4e23d9091d43014b457228";_flash|a:1:{s:9:"job_error";a:2:{s:7:"message";s:53:"This job card is locked and status cannot be changed.";s:4:"type";s:6:"danger";}}
