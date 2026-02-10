@@ -764,7 +764,7 @@ $assignPurchaseId = get_int('assign_purchase_id', 0);
 $allowedPaymentStatuses = ['UNPAID', 'PARTIAL', 'PAID'];
 $allowedPurchaseStatuses = ['DRAFT', 'FINALIZED'];
 $allowedAssignmentStatuses = ['ASSIGNED', 'UNASSIGNED'];
-$allowedSourceStatuses = ['VENDOR_ENTRY', 'MANUAL_ADJUSTMENT'];
+$allowedSourceStatuses = ['VENDOR_ENTRY', 'MANUAL_ADJUSTMENT', 'TEMP_CONVERSION'];
 
 if (!in_array($paymentFilter, $allowedPaymentStatuses, true)) {
     $paymentFilter = '';

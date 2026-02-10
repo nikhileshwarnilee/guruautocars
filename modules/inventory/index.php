@@ -18,6 +18,7 @@ $canAdjust = has_permission('inventory.adjust') || has_permission('inventory.man
 $canTransfer = has_permission('inventory.transfer') || has_permission('inventory.manage');
 $canNegative = has_permission('inventory.negative') || has_permission('inventory.manage');
 $purchaseTablesReady = table_columns('purchases') !== [] && table_columns('purchase_items') !== [];
+$tempStockReady = table_columns('temp_stock_entries') !== [] && table_columns('temp_stock_events') !== [];
 
 function inv_decimal(string $key, float $default = 0.0): float
 {
@@ -146,6 +147,24 @@ function inv_generate_transfer_ref(PDO $pdo, int $companyId): string
     return sprintf('TRF-%s-%s', date('ymdHis'), bin2hex(random_bytes(3)));
 }
 
+function inv_generate_temp_ref(PDO $pdo, int $companyId): string
+{
+    for ($i = 0; $i < 10; $i++) {
+        $ref = sprintf('TMP-%s-%03d', date('ymdHis'), random_int(1, 999));
+        $stmt = $pdo->prepare('SELECT COUNT(*) FROM temp_stock_entries WHERE company_id = :company_id AND temp_ref = :temp_ref');
+        $stmt->execute([
+            'company_id' => $companyId,
+            'temp_ref' => $ref,
+        ]);
+
+        if ((int) $stmt->fetchColumn() === 0) {
+            return $ref;
+        }
+    }
+
+    return sprintf('TMP-%s-%s', date('ymdHis'), bin2hex(random_bytes(3)));
+}
+
 function inv_is_valid_date(?string $date): bool
 {
     if ($date === null || $date === '') {
@@ -167,6 +186,17 @@ function inv_movement_source_label(string $source): string
     };
 }
 
+function inv_temp_status_badge_class(string $status): string
+{
+    return match ($status) {
+        'OPEN' => 'primary',
+        'PURCHASED' => 'success',
+        'RETURNED' => 'secondary',
+        'CONSUMED' => 'danger',
+        default => 'secondary',
+    };
+}
+
 $accessibleGarageIds = inv_accessible_garage_ids();
 if (!in_array($activeGarageId, $accessibleGarageIds, true) && $activeGarageId > 0) {
     $accessibleGarageIds[] = $activeGarageId;
@@ -176,6 +206,357 @@ $accessibleGarageIds = array_values(array_unique(array_filter($accessibleGarageI
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     require_csrf();
     $action = (string) ($_POST['_action'] ?? '');
+
+    if ($action === 'temp_stock_in') {
+        if (!$canAdjust) {
+            flash_set('inventory_error', 'You do not have permission to post temporary stock.', 'danger');
+            redirect('modules/inventory/index.php');
+        }
+        if (!$tempStockReady) {
+            flash_set('inventory_error', 'Temporary stock tables are missing. Run database/temporary_stock_management_upgrade.sql first.', 'danger');
+            redirect('modules/inventory/index.php');
+        }
+
+        $actionToken = trim((string) ($_POST['action_token'] ?? ''));
+        if (!inv_consume_action_token('temp_stock_in', $actionToken)) {
+            flash_set('inventory_warning', 'Duplicate or expired temporary stock request ignored.', 'warning');
+            redirect('modules/inventory/index.php');
+        }
+
+        $partId = post_int('part_id');
+        $quantity = abs(inv_decimal('quantity'));
+        $notes = post_string('notes', 255);
+
+        if ($partId <= 0 || $quantity <= 0) {
+            flash_set('inventory_error', 'Part and quantity are required for temporary stock.', 'danger');
+            redirect('modules/inventory/index.php');
+        }
+
+        $partStmt = db()->prepare(
+            'SELECT id, part_name, part_sku, unit
+             FROM parts
+             WHERE id = :id
+               AND company_id = :company_id
+               AND status_code <> "DELETED"
+             LIMIT 1'
+        );
+        $partStmt->execute([
+            'id' => $partId,
+            'company_id' => $companyId,
+        ]);
+        $part = $partStmt->fetch();
+        if (!$part) {
+            flash_set('inventory_error', 'Invalid part selected for temporary stock.', 'danger');
+            redirect('modules/inventory/index.php');
+        }
+
+        $pdo = db();
+        $pdo->beginTransaction();
+        try {
+            $tempRef = inv_generate_temp_ref($pdo, $companyId);
+
+            $entryInsert = $pdo->prepare(
+                'INSERT INTO temp_stock_entries
+                  (company_id, garage_id, temp_ref, part_id, quantity, status_code, notes, created_by)
+                 VALUES
+                  (:company_id, :garage_id, :temp_ref, :part_id, :quantity, "OPEN", :notes, :created_by)'
+            );
+            $entryInsert->execute([
+                'company_id' => $companyId,
+                'garage_id' => $activeGarageId,
+                'temp_ref' => $tempRef,
+                'part_id' => $partId,
+                'quantity' => round($quantity, 2),
+                'notes' => $notes !== '' ? $notes : null,
+                'created_by' => $userId,
+            ]);
+            $entryId = (int) $pdo->lastInsertId();
+
+            $eventInsert = $pdo->prepare(
+                'INSERT INTO temp_stock_events
+                  (temp_entry_id, company_id, garage_id, event_type, quantity, from_status, to_status, notes, purchase_id, created_by)
+                 VALUES
+                  (:temp_entry_id, :company_id, :garage_id, "TEMP_IN", :quantity, NULL, "OPEN", :notes, NULL, :created_by)'
+            );
+            $eventInsert->execute([
+                'temp_entry_id' => $entryId,
+                'company_id' => $companyId,
+                'garage_id' => $activeGarageId,
+                'quantity' => round($quantity, 2),
+                'notes' => $notes !== '' ? $notes : null,
+                'created_by' => $userId,
+            ]);
+
+            $pdo->commit();
+            log_audit(
+                'inventory',
+                'temp_in',
+                $entryId,
+                sprintf('Temporary stock %s created for %s (%s), qty %.2f', $tempRef, (string) $part['part_name'], (string) $part['part_sku'], $quantity),
+                [
+                    'entity' => 'temp_stock_entry',
+                    'source' => 'UI',
+                    'after' => [
+                        'temp_ref' => $tempRef,
+                        'garage_id' => $activeGarageId,
+                        'part_id' => $partId,
+                        'quantity' => round($quantity, 2),
+                        'status_code' => 'OPEN',
+                        'notes' => $notes !== '' ? $notes : null,
+                    ],
+                ]
+            );
+            flash_set('inventory_success', 'Temporary stock recorded with ref ' . $tempRef . '.', 'success');
+        } catch (Throwable $exception) {
+            $pdo->rollBack();
+            flash_set('inventory_error', $exception->getMessage(), 'danger');
+        }
+
+        redirect('modules/inventory/index.php');
+    }
+
+    if ($action === 'resolve_temp_stock') {
+        if (!$canAdjust) {
+            flash_set('inventory_error', 'You do not have permission to resolve temporary stock.', 'danger');
+            redirect('modules/inventory/index.php');
+        }
+        if (!$tempStockReady) {
+            flash_set('inventory_error', 'Temporary stock tables are missing. Run database/temporary_stock_management_upgrade.sql first.', 'danger');
+            redirect('modules/inventory/index.php');
+        }
+
+        $entryId = post_int('temp_entry_id');
+        $resolution = strtoupper(trim((string) ($_POST['resolution'] ?? '')));
+        $resolutionNotes = post_string('resolution_notes', 255);
+        $confirmConsumed = post_int('confirm_consumed') === 1;
+
+        if ($entryId <= 0) {
+            flash_set('inventory_error', 'Invalid temporary stock reference.', 'danger');
+            redirect('modules/inventory/index.php');
+        }
+
+        $actionToken = trim((string) ($_POST['action_token'] ?? ''));
+        if (!inv_consume_action_token('resolve_temp_stock_' . $entryId, $actionToken)) {
+            flash_set('inventory_warning', 'Duplicate or expired temporary stock resolution request ignored.', 'warning');
+            redirect('modules/inventory/index.php');
+        }
+
+        $allowedResolutions = ['RETURNED', 'PURCHASED', 'CONSUMED'];
+        if (!in_array($resolution, $allowedResolutions, true)) {
+            flash_set('inventory_error', 'Invalid temporary stock resolution.', 'danger');
+            redirect('modules/inventory/index.php');
+        }
+        if ($resolution === 'CONSUMED' && !$confirmConsumed) {
+            flash_set('inventory_error', 'Consumed resolution requires explicit confirmation.', 'danger');
+            redirect('modules/inventory/index.php');
+        }
+        if ($resolution === 'PURCHASED' && !$purchaseTablesReady) {
+            flash_set('inventory_error', 'Purchase module tables are missing. Run database/purchase_module_upgrade.sql before converting to purchase.', 'danger');
+            redirect('modules/inventory/index.php');
+        }
+
+        $pdo = db();
+        $pdo->beginTransaction();
+        try {
+            $entryStmt = $pdo->prepare(
+                'SELECT te.id, te.temp_ref, te.part_id, te.quantity, te.status_code,
+                        p.part_name, p.part_sku, p.purchase_price, p.gst_rate
+                 FROM temp_stock_entries te
+                 INNER JOIN parts p
+                    ON p.id = te.part_id
+                   AND p.company_id = te.company_id
+                   AND p.status_code <> "DELETED"
+                 WHERE te.id = :id
+                   AND te.company_id = :company_id
+                   AND te.garage_id = :garage_id
+                 FOR UPDATE'
+            );
+            $entryStmt->execute([
+                'id' => $entryId,
+                'company_id' => $companyId,
+                'garage_id' => $activeGarageId,
+            ]);
+            $entry = $entryStmt->fetch();
+            if (!$entry) {
+                throw new RuntimeException('Temporary stock entry not found for this garage.');
+            }
+            if ((string) ($entry['status_code'] ?? '') !== 'OPEN') {
+                throw new RuntimeException('Temporary stock entry is already resolved.');
+            }
+
+            $partId = (int) $entry['part_id'];
+            $qty = round((float) $entry['quantity'], 2);
+            $purchaseId = null;
+            $currentQty = null;
+            $newQty = null;
+
+            if ($resolution === 'PURCHASED') {
+                $unitCost = round((float) ($entry['purchase_price'] ?? 0), 2);
+                $gstRate = round((float) ($entry['gst_rate'] ?? 0), 2);
+                if ($gstRate < 0) {
+                    $gstRate = 0.0;
+                }
+                if ($gstRate > 100) {
+                    $gstRate = 100.0;
+                }
+
+                $taxableAmount = round($qty * $unitCost, 2);
+                $gstAmount = round(($taxableAmount * $gstRate) / 100, 2);
+                $lineTotal = round($taxableAmount + $gstAmount, 2);
+                $tempRef = (string) ($entry['temp_ref'] ?? '');
+                $purchaseNote = 'Converted from temporary stock ' . $tempRef;
+                if ($resolutionNotes !== '') {
+                    $purchaseNote .= ' | ' . $resolutionNotes;
+                }
+
+                $currentQty = inv_lock_inventory_row($pdo, $activeGarageId, $partId);
+                $newQty = $currentQty + $qty;
+
+                $stockUpdate = $pdo->prepare(
+                    'UPDATE garage_inventory
+                     SET quantity = :quantity
+                     WHERE garage_id = :garage_id
+                       AND part_id = :part_id'
+                );
+                $stockUpdate->execute([
+                    'quantity' => round($newQty, 2),
+                    'garage_id' => $activeGarageId,
+                    'part_id' => $partId,
+                ]);
+
+                $purchaseInsert = $pdo->prepare(
+                    'INSERT INTO purchases
+                      (company_id, garage_id, vendor_id, invoice_number, purchase_date, purchase_source, assignment_status, purchase_status, payment_status, taxable_amount, gst_amount, grand_total, notes, created_by)
+                     VALUES
+                      (:company_id, :garage_id, NULL, NULL, :purchase_date, "TEMP_CONVERSION", "UNASSIGNED", "DRAFT", "UNPAID", :taxable_amount, :gst_amount, :grand_total, :notes, :created_by)'
+                );
+                $purchaseInsert->execute([
+                    'company_id' => $companyId,
+                    'garage_id' => $activeGarageId,
+                    'purchase_date' => date('Y-m-d'),
+                    'taxable_amount' => $taxableAmount,
+                    'gst_amount' => $gstAmount,
+                    'grand_total' => $lineTotal,
+                    'notes' => $purchaseNote,
+                    'created_by' => $userId,
+                ]);
+                $purchaseId = (int) $pdo->lastInsertId();
+
+                $purchaseItemInsert = $pdo->prepare(
+                    'INSERT INTO purchase_items
+                      (purchase_id, part_id, quantity, unit_cost, gst_rate, taxable_amount, gst_amount, total_amount)
+                     VALUES
+                      (:purchase_id, :part_id, :quantity, :unit_cost, :gst_rate, :taxable_amount, :gst_amount, :total_amount)'
+                );
+                $purchaseItemInsert->execute([
+                    'purchase_id' => $purchaseId,
+                    'part_id' => $partId,
+                    'quantity' => $qty,
+                    'unit_cost' => $unitCost,
+                    'gst_rate' => $gstRate,
+                    'taxable_amount' => $taxableAmount,
+                    'gst_amount' => $gstAmount,
+                    'total_amount' => $lineTotal,
+                ]);
+
+                inv_insert_movement($pdo, [
+                    'company_id' => $companyId,
+                    'garage_id' => $activeGarageId,
+                    'part_id' => $partId,
+                    'movement_type' => 'IN',
+                    'quantity' => $qty,
+                    'reference_type' => 'PURCHASE',
+                    'reference_id' => $purchaseId,
+                    'movement_uid' => 'tmppur-' . substr(hash('sha256', $actionToken . '|' . $entryId . '|' . microtime(true)), 0, 56),
+                    'notes' => $purchaseNote,
+                    'created_by' => $userId,
+                ]);
+            }
+
+            $entryUpdate = $pdo->prepare(
+                'UPDATE temp_stock_entries
+                 SET status_code = :status_code,
+                     resolved_at = NOW(),
+                     resolved_by = :resolved_by,
+                     resolution_notes = :resolution_notes,
+                     purchase_id = :purchase_id
+                 WHERE id = :id'
+            );
+            $entryUpdate->execute([
+                'status_code' => $resolution,
+                'resolved_by' => $userId,
+                'resolution_notes' => $resolutionNotes !== '' ? $resolutionNotes : null,
+                'purchase_id' => $purchaseId,
+                'id' => $entryId,
+            ]);
+
+            $eventInsert = $pdo->prepare(
+                'INSERT INTO temp_stock_events
+                  (temp_entry_id, company_id, garage_id, event_type, quantity, from_status, to_status, notes, purchase_id, created_by)
+                 VALUES
+                  (:temp_entry_id, :company_id, :garage_id, :event_type, :quantity, "OPEN", :to_status, :notes, :purchase_id, :created_by)'
+            );
+            $eventInsert->execute([
+                'temp_entry_id' => $entryId,
+                'company_id' => $companyId,
+                'garage_id' => $activeGarageId,
+                'event_type' => $resolution,
+                'quantity' => $qty,
+                'to_status' => $resolution,
+                'notes' => $resolutionNotes !== '' ? $resolutionNotes : null,
+                'purchase_id' => $purchaseId,
+                'created_by' => $userId,
+            ]);
+
+            $pdo->commit();
+
+            $auditAction = match ($resolution) {
+                'PURCHASED' => 'temp_purchased',
+                'CONSUMED' => 'temp_consumed',
+                default => 'temp_returned',
+            };
+            $tempRef = (string) ($entry['temp_ref'] ?? ('TEMP-' . $entryId));
+            log_audit(
+                'inventory',
+                $auditAction,
+                $entryId,
+                sprintf('Temporary stock %s resolved as %s', $tempRef, $resolution),
+                [
+                    'entity' => 'temp_stock_entry',
+                    'source' => 'UI',
+                    'before' => [
+                        'temp_ref' => $tempRef,
+                        'status_code' => 'OPEN',
+                    ],
+                    'after' => [
+                        'temp_ref' => $tempRef,
+                        'status_code' => $resolution,
+                        'purchase_id' => $purchaseId,
+                        'resolution_notes' => $resolutionNotes !== '' ? $resolutionNotes : null,
+                    ],
+                    'metadata' => [
+                        'part_id' => $partId,
+                        'part_name' => (string) ($entry['part_name'] ?? ''),
+                        'part_sku' => (string) ($entry['part_sku'] ?? ''),
+                        'quantity' => $qty,
+                        'stock_before_purchase' => $currentQty,
+                        'stock_after_purchase' => $newQty,
+                    ],
+                ]
+            );
+
+            if ($resolution === 'PURCHASED' && $purchaseId !== null) {
+                flash_set('inventory_success', 'Temporary stock converted to purchase #' . $purchaseId . '.', 'success');
+            } else {
+                flash_set('inventory_success', 'Temporary stock marked as ' . $resolution . '.', 'success');
+            }
+        } catch (Throwable $exception) {
+            $pdo->rollBack();
+            flash_set('inventory_error', $exception->getMessage(), 'danger');
+        }
+
+        redirect('modules/inventory/index.php');
+    }
 
     if ($action === 'stock_adjust') {
         if (!$canAdjust) {
@@ -690,6 +1071,89 @@ $partsStockStmt->execute([
 ]);
 $parts = $partsStockStmt->fetchAll();
 
+$tempStatusFilter = strtoupper(trim((string) ($_GET['temp_status'] ?? '')));
+$allowedTempStatusFilter = ['OPEN', 'RETURNED', 'PURCHASED', 'CONSUMED'];
+if (!in_array($tempStatusFilter, $allowedTempStatusFilter, true)) {
+    $tempStatusFilter = '';
+}
+
+$tempSummary = [
+    'OPEN' => ['count' => 0, 'qty' => 0.0],
+    'RETURNED' => ['count' => 0, 'qty' => 0.0],
+    'PURCHASED' => ['count' => 0, 'qty' => 0.0],
+    'CONSUMED' => ['count' => 0, 'qty' => 0.0],
+];
+$tempEntries = [];
+$tempEvents = [];
+
+if ($tempStockReady) {
+    $tempSummaryStmt = db()->prepare(
+        'SELECT status_code, COUNT(*) AS item_count, COALESCE(SUM(quantity), 0) AS total_qty
+         FROM temp_stock_entries
+         WHERE company_id = :company_id
+           AND garage_id = :garage_id
+         GROUP BY status_code'
+    );
+    $tempSummaryStmt->execute([
+        'company_id' => $companyId,
+        'garage_id' => $activeGarageId,
+    ]);
+    foreach ($tempSummaryStmt->fetchAll() as $row) {
+        $status = (string) ($row['status_code'] ?? '');
+        if (!isset($tempSummary[$status])) {
+            continue;
+        }
+        $tempSummary[$status]['count'] = (int) ($row['item_count'] ?? 0);
+        $tempSummary[$status]['qty'] = (float) ($row['total_qty'] ?? 0);
+    }
+
+    $tempWhere = ['te.company_id = :company_id', 'te.garage_id = :garage_id'];
+    $tempParams = [
+        'company_id' => $companyId,
+        'garage_id' => $activeGarageId,
+    ];
+    if ($tempStatusFilter !== '') {
+        $tempWhere[] = 'te.status_code = :temp_status';
+        $tempParams['temp_status'] = $tempStatusFilter;
+    }
+
+    $purchaseSelectSql = $purchaseTablesReady ? ', pur.purchase_status, pur.invoice_number' : ', NULL AS purchase_status, NULL AS invoice_number';
+    $purchaseJoinSql = $purchaseTablesReady ? 'LEFT JOIN purchases pur ON pur.id = te.purchase_id' : '';
+    $tempListSql =
+        'SELECT te.*, p.part_name, p.part_sku, p.unit,
+                cu.name AS created_by_name,
+                ru.name AS resolved_by_name
+                ' . $purchaseSelectSql . '
+         FROM temp_stock_entries te
+         INNER JOIN parts p ON p.id = te.part_id
+         LEFT JOIN users cu ON cu.id = te.created_by
+         LEFT JOIN users ru ON ru.id = te.resolved_by
+         ' . $purchaseJoinSql . '
+         WHERE ' . implode(' AND ', $tempWhere) . '
+         ORDER BY CASE WHEN te.status_code = "OPEN" THEN 0 ELSE 1 END, te.id DESC
+         LIMIT 160';
+    $tempListStmt = db()->prepare($tempListSql);
+    $tempListStmt->execute($tempParams);
+    $tempEntries = $tempListStmt->fetchAll();
+
+    $tempEventStmt = db()->prepare(
+        'SELECT tse.*, te.temp_ref, p.part_name, p.part_sku, p.unit, u.name AS created_by_name
+         FROM temp_stock_events tse
+         INNER JOIN temp_stock_entries te ON te.id = tse.temp_entry_id
+         INNER JOIN parts p ON p.id = te.part_id
+         LEFT JOIN users u ON u.id = tse.created_by
+         WHERE tse.company_id = :company_id
+           AND tse.garage_id = :garage_id
+         ORDER BY tse.id DESC
+         LIMIT 120'
+    );
+    $tempEventStmt->execute([
+        'company_id' => $companyId,
+        'garage_id' => $activeGarageId,
+    ]);
+    $tempEvents = $tempEventStmt->fetchAll();
+}
+
 $movementWhere = ['im.company_id = :company_id', 'im.garage_id = :garage_id'];
 $movementParams = [
     'company_id' => $companyId,
@@ -887,6 +1351,20 @@ try {
 
 $adjustActionToken = inv_issue_action_token('stock_adjust');
 $transferActionToken = inv_issue_action_token('stock_transfer');
+$tempInActionToken = $tempStockReady ? inv_issue_action_token('temp_stock_in') : '';
+$tempResolveTokens = [];
+if ($tempStockReady) {
+    foreach ($tempEntries as $tempEntry) {
+        if ((string) ($tempEntry['status_code'] ?? '') !== 'OPEN') {
+            continue;
+        }
+        $entryId = (int) ($tempEntry['id'] ?? 0);
+        if ($entryId <= 0) {
+            continue;
+        }
+        $tempResolveTokens[$entryId] = inv_issue_action_token('resolve_temp_stock_' . $entryId);
+    }
+}
 
 require_once __DIR__ . '/../../includes/header.php';
 require_once __DIR__ . '/../../includes/sidebar.php';
@@ -1073,6 +1551,262 @@ require_once __DIR__ . '/../../includes/sidebar.php';
               </div>
             </div>
           <?php endif; ?>
+        </div>
+      <?php endif; ?>
+
+      <?php if (!$tempStockReady): ?>
+        <div class="alert alert-warning mb-3">
+          Temporary stock management tables are missing. Run <code>database/temporary_stock_management_upgrade.sql</code> and refresh.
+        </div>
+      <?php else: ?>
+        <div class="row g-3 mb-3">
+          <div class="col-md-3">
+            <div class="small-box text-bg-primary">
+              <div class="inner">
+                <h4><?= e((string) ((int) ($tempSummary['OPEN']['count'] ?? 0))); ?></h4>
+                <p>TEMP OPEN (Qty <?= e(number_format((float) ($tempSummary['OPEN']['qty'] ?? 0), 2)); ?>)</p>
+              </div>
+              <span class="small-box-icon"><i class="bi bi-hourglass-split"></i></span>
+            </div>
+          </div>
+          <div class="col-md-3">
+            <div class="small-box text-bg-secondary">
+              <div class="inner">
+                <h4><?= e((string) ((int) ($tempSummary['RETURNED']['count'] ?? 0))); ?></h4>
+                <p>Returned</p>
+              </div>
+              <span class="small-box-icon"><i class="bi bi-arrow-return-left"></i></span>
+            </div>
+          </div>
+          <div class="col-md-3">
+            <div class="small-box text-bg-success">
+              <div class="inner">
+                <h4><?= e((string) ((int) ($tempSummary['PURCHASED']['count'] ?? 0))); ?></h4>
+                <p>Converted to Purchase</p>
+              </div>
+              <span class="small-box-icon"><i class="bi bi-bag-check"></i></span>
+            </div>
+          </div>
+          <div class="col-md-3">
+            <div class="small-box text-bg-danger">
+              <div class="inner">
+                <h4><?= e((string) ((int) ($tempSummary['CONSUMED']['count'] ?? 0))); ?></h4>
+                <p>Consumed</p>
+              </div>
+              <span class="small-box-icon"><i class="bi bi-exclamation-triangle"></i></span>
+            </div>
+          </div>
+        </div>
+
+        <?php if ($canAdjust): ?>
+          <div class="card mb-3 card-outline card-primary">
+            <div class="card-header"><h3 class="card-title">Temporary Stock In (Fitment / Compatibility)</h3></div>
+            <form method="post">
+              <div class="card-body row g-2">
+                <?= csrf_field(); ?>
+                <input type="hidden" name="_action" value="temp_stock_in">
+                <input type="hidden" name="action_token" value="<?= e($tempInActionToken); ?>">
+                <div class="col-md-6">
+                  <label class="form-label">Part</label>
+                  <select name="part_id" class="form-select" required>
+                    <option value="">Select Part</option>
+                    <?php foreach ($parts as $part): ?>
+                      <option value="<?= (int) $part['id']; ?>">
+                        <?= e((string) $part['part_name']); ?> (<?= e((string) $part['part_sku']); ?>)
+                      </option>
+                    <?php endforeach; ?>
+                  </select>
+                </div>
+                <div class="col-md-2">
+                  <label class="form-label">Quantity</label>
+                  <input type="number" step="0.01" min="0.01" name="quantity" class="form-control" required>
+                </div>
+                <div class="col-md-4">
+                  <label class="form-label">Notes</label>
+                  <input type="text" name="notes" class="form-control" maxlength="255" placeholder="Vendor trial / fitment note">
+                </div>
+                <div class="col-12">
+                  <small class="text-muted">TEMP_IN is held outside valuation and purchase reports until explicitly resolved as PURCHASED.</small>
+                </div>
+              </div>
+              <div class="card-footer">
+                <button type="submit" class="btn btn-primary">Post TEMP_IN</button>
+              </div>
+            </form>
+          </div>
+        <?php endif; ?>
+
+        <div class="card mb-3">
+          <div class="card-header">
+            <div class="d-flex flex-wrap justify-content-between align-items-center gap-2">
+              <h3 class="card-title mb-0">Temporary Stock Register</h3>
+              <form method="get" class="d-flex align-items-center gap-2">
+                <input type="hidden" name="history_garage_id" value="<?= (int) $historyGarageId; ?>">
+                <input type="hidden" name="history_part_id" value="<?= (int) $historyPartId; ?>">
+                <input type="hidden" name="source" value="<?= e($sourceFilter); ?>">
+                <input type="hidden" name="from" value="<?= e($dateFrom); ?>">
+                <input type="hidden" name="to" value="<?= e($dateTo); ?>">
+                <input type="hidden" name="vis_variant_id" value="<?= (int) $visVariantId; ?>">
+                <label class="form-label mb-0">Status</label>
+                <select name="temp_status" class="form-select form-select-sm">
+                  <option value="">All</option>
+                  <?php foreach ($allowedTempStatusFilter as $status): ?>
+                    <option value="<?= e($status); ?>" <?= $tempStatusFilter === $status ? 'selected' : ''; ?>><?= e($status); ?></option>
+                  <?php endforeach; ?>
+                </select>
+                <button type="submit" class="btn btn-sm btn-outline-primary">Apply</button>
+              </form>
+            </div>
+          </div>
+          <div class="card-body table-responsive p-0">
+            <table class="table table-sm table-striped mb-0">
+              <thead>
+                <tr>
+                  <th>Date</th>
+                  <th>Ref</th>
+                  <th>Part</th>
+                  <th>Qty</th>
+                  <th>Status</th>
+                  <th>Created By</th>
+                  <th>Resolved</th>
+                  <th>Purchase Ref</th>
+                  <th>Notes</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                <?php if (empty($tempEntries)): ?>
+                  <tr><td colspan="10" class="text-center text-muted py-4">No temporary stock entries for selected filter.</td></tr>
+                <?php else: ?>
+                  <?php foreach ($tempEntries as $entry): ?>
+                    <?php
+                      $entryId = (int) ($entry['id'] ?? 0);
+                      $status = (string) ($entry['status_code'] ?? '');
+                      $isOpen = $status === 'OPEN';
+                      $resolvedBy = (string) ($entry['resolved_by_name'] ?? '-');
+                      $resolvedAt = (string) ($entry['resolved_at'] ?? '');
+                      $resolvedLabel = $isOpen ? '-' : (($resolvedAt !== '' ? $resolvedAt : '-') . ' / ' . $resolvedBy);
+                      $purchaseRef = (int) ($entry['purchase_id'] ?? 0);
+                      $notes = trim((string) ($entry['notes'] ?? ''));
+                      $resolutionNotes = trim((string) ($entry['resolution_notes'] ?? ''));
+                      if ($resolutionNotes !== '') {
+                          $notes = $notes !== '' ? ($notes . ' | ' . $resolutionNotes) : $resolutionNotes;
+                      }
+                    ?>
+                    <tr>
+                      <td><?= e((string) ($entry['created_at'] ?? '')); ?></td>
+                      <td><code><?= e((string) ($entry['temp_ref'] ?? ('TMP-' . $entryId))); ?></code></td>
+                      <td><?= e((string) ($entry['part_name'] ?? '')); ?> (<?= e((string) ($entry['part_sku'] ?? '')); ?>)</td>
+                      <td><?= e(number_format((float) ($entry['quantity'] ?? 0), 2)); ?> <?= e((string) ($entry['unit'] ?? '')); ?></td>
+                      <td><span class="badge text-bg-<?= e(inv_temp_status_badge_class($status)); ?>"><?= e($status); ?></span></td>
+                      <td><?= e((string) ($entry['created_by_name'] ?? '-')); ?></td>
+                      <td><?= e($resolvedLabel); ?></td>
+                      <td>
+                        <?php if ($purchaseRef > 0): ?>
+                          <code>#<?= e((string) $purchaseRef); ?></code>
+                          <?php if (trim((string) ($entry['purchase_status'] ?? '')) !== ''): ?>
+                            <span class="badge text-bg-secondary"><?= e((string) $entry['purchase_status']); ?></span>
+                          <?php endif; ?>
+                        <?php else: ?>
+                          -
+                        <?php endif; ?>
+                      </td>
+                      <td><?= e($notes !== '' ? $notes : '-'); ?></td>
+                      <td class="text-nowrap">
+                        <?php if ($isOpen && $canAdjust): ?>
+                          <?php $resolveToken = (string) ($tempResolveTokens[$entryId] ?? ''); ?>
+                          <form method="post" class="d-inline" data-confirm="Mark this temporary stock as RETURNED?">
+                            <?= csrf_field(); ?>
+                            <input type="hidden" name="_action" value="resolve_temp_stock">
+                            <input type="hidden" name="temp_entry_id" value="<?= (int) $entryId; ?>">
+                            <input type="hidden" name="resolution" value="RETURNED">
+                            <input type="hidden" name="action_token" value="<?= e($resolveToken); ?>">
+                            <button type="submit" class="btn btn-sm btn-outline-secondary">Returned</button>
+                          </form>
+                          <?php if ($purchaseTablesReady): ?>
+                            <form method="post" class="d-inline" data-confirm="Convert this temporary stock to PURCHASED inventory?">
+                              <?= csrf_field(); ?>
+                              <input type="hidden" name="_action" value="resolve_temp_stock">
+                              <input type="hidden" name="temp_entry_id" value="<?= (int) $entryId; ?>">
+                              <input type="hidden" name="resolution" value="PURCHASED">
+                              <input type="hidden" name="action_token" value="<?= e($resolveToken); ?>">
+                              <button type="submit" class="btn btn-sm btn-outline-success">Purchased</button>
+                            </form>
+                          <?php else: ?>
+                            <button type="button" class="btn btn-sm btn-outline-success" disabled>Purchased</button>
+                          <?php endif; ?>
+                          <form method="post" class="d-inline-flex align-items-center gap-1">
+                            <?= csrf_field(); ?>
+                            <input type="hidden" name="_action" value="resolve_temp_stock">
+                            <input type="hidden" name="temp_entry_id" value="<?= (int) $entryId; ?>">
+                            <input type="hidden" name="resolution" value="CONSUMED">
+                            <input type="hidden" name="action_token" value="<?= e($resolveToken); ?>">
+                            <input class="form-check-input mt-0" type="checkbox" name="confirm_consumed" value="1" id="confirm_consumed_<?= (int) $entryId; ?>">
+                            <label class="form-check-label small" for="confirm_consumed_<?= (int) $entryId; ?>">Confirm</label>
+                            <button type="submit" class="btn btn-sm btn-outline-danger">Consumed</button>
+                          </form>
+                        <?php else: ?>
+                          <span class="text-muted">Resolved</span>
+                        <?php endif; ?>
+                      </td>
+                    </tr>
+                  <?php endforeach; ?>
+                <?php endif; ?>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="card mb-3">
+          <div class="card-header"><h3 class="card-title">Temporary Stock Event Trail</h3></div>
+          <div class="card-body table-responsive p-0">
+            <table class="table table-sm table-striped mb-0">
+              <thead>
+                <tr>
+                  <th>Date</th>
+                  <th>Ref</th>
+                  <th>Event</th>
+                  <th>Part</th>
+                  <th>Qty</th>
+                  <th>From</th>
+                  <th>To</th>
+                  <th>Purchase</th>
+                  <th>User</th>
+                  <th>Notes</th>
+                </tr>
+              </thead>
+              <tbody>
+                <?php if (empty($tempEvents)): ?>
+                  <tr><td colspan="10" class="text-center text-muted py-4">No temporary stock events.</td></tr>
+                <?php else: ?>
+                  <?php foreach ($tempEvents as $event): ?>
+                    <?php
+                      $eventType = (string) ($event['event_type'] ?? '');
+                      $eventBadge = match ($eventType) {
+                          'TEMP_IN' => 'primary',
+                          'PURCHASED' => 'success',
+                          'RETURNED' => 'secondary',
+                          'CONSUMED' => 'danger',
+                          default => 'secondary',
+                      };
+                    ?>
+                    <tr>
+                      <td><?= e((string) ($event['created_at'] ?? '')); ?></td>
+                      <td><code><?= e((string) ($event['temp_ref'] ?? '-')); ?></code></td>
+                      <td><span class="badge text-bg-<?= e($eventBadge); ?>"><?= e($eventType); ?></span></td>
+                      <td><?= e((string) ($event['part_name'] ?? '')); ?> (<?= e((string) ($event['part_sku'] ?? '')); ?>)</td>
+                      <td><?= e(number_format((float) ($event['quantity'] ?? 0), 2)); ?> <?= e((string) ($event['unit'] ?? '')); ?></td>
+                      <td><?= e((string) (($event['from_status'] ?? '') !== '' ? $event['from_status'] : '-')); ?></td>
+                      <td><?= e((string) (($event['to_status'] ?? '') !== '' ? $event['to_status'] : '-')); ?></td>
+                      <td><?= (int) ($event['purchase_id'] ?? 0) > 0 ? ('#' . e((string) ((int) $event['purchase_id']))) : '-'; ?></td>
+                      <td><?= e((string) ($event['created_by_name'] ?? '-')); ?></td>
+                      <td><?= e((string) (($event['notes'] ?? '') !== '' ? $event['notes'] : '-')); ?></td>
+                    </tr>
+                  <?php endforeach; ?>
+                <?php endif; ?>
+              </tbody>
+            </table>
+          </div>
         </div>
       <?php endif; ?>
 
