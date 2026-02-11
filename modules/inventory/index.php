@@ -174,6 +174,21 @@ function inv_is_valid_date(?string $date): bool
     return (bool) preg_match('/^\d{4}-\d{2}-\d{2}$/', $date);
 }
 
+function inv_format_datetime(?string $value): string
+{
+    $raw = trim((string) $value);
+    if ($raw === '') {
+        return '-';
+    }
+
+    $timestamp = strtotime($raw);
+    if ($timestamp === false) {
+        return $raw;
+    }
+
+    return date('d M Y, h:i A', $timestamp);
+}
+
 function inv_movement_source_label(string $source): string
 {
     return match ($source) {
@@ -1049,10 +1064,44 @@ if (!inv_is_valid_date($dateTo)) {
     $dateTo = '';
 }
 
+$partsStockFilterPartName = '';
+$partsStockFilterCategoryId = 0;
+$partsStockFilterGarageId = $activeGarageId;
+if (!in_array($partsStockFilterGarageId, $accessibleGarageIds, true) && !empty($accessibleGarageIds)) {
+    $partsStockFilterGarageId = (int) $accessibleGarageIds[0];
+}
+$partsStockFilterStockLevel = '';
+$partsStockFilterVendorId = 0;
+$partsStockLastMovementFrom = '';
+$partsStockLastMovementTo = '';
+$allowedPartsStockLevels = ['ZERO', 'LOW', 'AVAILABLE'];
+
+$partsStockCategoriesStmt = db()->prepare(
+    'SELECT id, category_name
+     FROM part_categories
+     WHERE company_id = :company_id
+       AND status_code <> "DELETED"
+     ORDER BY category_name ASC'
+);
+$partsStockCategoriesStmt->execute(['company_id' => $companyId]);
+$partsStockCategories = $partsStockCategoriesStmt->fetchAll();
+
+$partsStockVendorsStmt = db()->prepare(
+    'SELECT id, vendor_name
+     FROM vendors
+     WHERE company_id = :company_id
+       AND status_code <> "DELETED"
+     ORDER BY vendor_name ASC'
+);
+$partsStockVendorsStmt->execute(['company_id' => $companyId]);
+$partsStockVendors = $partsStockVendorsStmt->fetchAll();
+
 $partsStockStmt = db()->prepare(
     'SELECT p.id, p.part_name, p.part_sku, p.hsn_code, p.unit, p.selling_price, p.gst_rate, p.min_stock, p.status_code,
             pc.category_name,
+            v.vendor_name,
             COALESCE(gi.quantity, 0) AS stock_qty,
+            lm.last_movement_at,
             CASE
                 WHEN COALESCE(gi.quantity, 0) <= 0 THEN "OUT"
                 WHEN COALESCE(gi.quantity, 0) <= p.min_stock THEN "LOW"
@@ -1060,16 +1109,28 @@ $partsStockStmt = db()->prepare(
             END AS stock_state
      FROM parts p
      LEFT JOIN part_categories pc ON pc.id = p.category_id
-     LEFT JOIN garage_inventory gi ON gi.part_id = p.id AND gi.garage_id = :garage_id
+     LEFT JOIN vendors v ON v.id = p.vendor_id
+     LEFT JOIN garage_inventory gi ON gi.part_id = p.id AND gi.garage_id = :inventory_garage_id
+     LEFT JOIN (
+        SELECT part_id, garage_id, MAX(created_at) AS last_movement_at
+        FROM inventory_movements
+        WHERE company_id = :movement_company_id
+        GROUP BY part_id, garage_id
+     ) lm ON lm.part_id = p.id AND lm.garage_id = :movement_garage_id
      WHERE p.company_id = :company_id
        AND p.status_code <> "DELETED"
      ORDER BY p.part_name ASC'
 );
 $partsStockStmt->execute([
-    'garage_id' => $activeGarageId,
+    'inventory_garage_id' => $activeGarageId,
+    'movement_company_id' => $companyId,
+    'movement_garage_id' => $activeGarageId,
     'company_id' => $companyId,
 ]);
 $parts = $partsStockStmt->fetchAll();
+$partsTrackedCount = count($parts);
+$partsOutCount = count(array_filter($parts, static fn (array $part): bool => (string) ($part['stock_state'] ?? 'OK') === 'OUT'));
+$partsLowCount = count(array_filter($parts, static fn (array $part): bool => (string) ($part['stock_state'] ?? 'OK') === 'LOW'));
 
 $tempStatusFilter = strtoupper(trim((string) ($_GET['temp_status'] ?? '')));
 $allowedTempStatusFilter = ['OPEN', 'RETURNED', 'PURCHASED', 'CONSUMED'];
@@ -1366,6 +1427,8 @@ if ($tempStockReady) {
     }
 }
 
+$partsStockApiUrl = url('modules/inventory/parts_stock_api.php');
+
 require_once __DIR__ . '/../../includes/header.php';
 require_once __DIR__ . '/../../includes/sidebar.php';
 ?>
@@ -1385,14 +1448,14 @@ require_once __DIR__ . '/../../includes/sidebar.php';
   </div>
 
   <div class="app-content">
-    <div class="container-fluid">
+    <div class="container-fluid" data-master-insights-root="inventory-parts-stock" data-master-insights-endpoint="<?= e($partsStockApiUrl); ?>">
       <div class="card mb-3">
         <div class="card-body">
           <div class="row g-3">
             <div class="col-md-3">
               <div class="small-box text-bg-primary">
                 <div class="inner">
-                  <h4><?= e((string) count($parts)); ?></h4>
+                  <h4 data-stat-value="tracked_parts"><?= e((string) $partsTrackedCount); ?></h4>
                   <p>Tracked Parts (Active Garage)</p>
                 </div>
                 <span class="small-box-icon"><i class="bi bi-box-seam"></i></span>
@@ -1401,8 +1464,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             <div class="col-md-3">
               <div class="small-box text-bg-danger">
                 <div class="inner">
-                  <?php $outCount = count(array_filter($parts, static fn (array $part): bool => (string) ($part['stock_state'] ?? 'OK') === 'OUT')); ?>
-                  <h4><?= e((string) $outCount); ?></h4>
+                  <h4 data-stat-value="out_of_stock_parts"><?= e((string) $partsOutCount); ?></h4>
                   <p>Out of Stock</p>
                 </div>
                 <span class="small-box-icon"><i class="bi bi-exclamation-octagon"></i></span>
@@ -1411,8 +1473,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             <div class="col-md-3">
               <div class="small-box text-bg-warning">
                 <div class="inner">
-                  <?php $lowCount = count(array_filter($parts, static fn (array $part): bool => (string) ($part['stock_state'] ?? 'OK') === 'LOW')); ?>
-                  <h4><?= e((string) $lowCount); ?></h4>
+                  <h4 data-stat-value="low_stock_parts"><?= e((string) $partsLowCount); ?></h4>
                   <p>Low Stock</p>
                 </div>
                 <span class="small-box-icon"><i class="bi bi-graph-down-arrow"></i></span>
@@ -1876,7 +1937,86 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       <?php endif; ?>
 
       <div class="card mb-3">
-        <div class="card-header"><h3 class="card-title">Parts Stock (Active Garage)</h3></div>
+        <div class="card-header d-flex justify-content-between align-items-center">
+          <h3 class="card-title mb-0">Parts Stock</h3>
+          <span class="badge text-bg-light border" data-master-results-count="1"><?= e((string) count($parts)); ?></span>
+        </div>
+        <div class="card-body border-bottom">
+          <form method="get" class="row g-2 align-items-end" data-master-filter-form="1">
+            <div class="col-lg-3 col-md-6">
+              <label class="form-label form-label-sm mb-1">Part Name</label>
+              <input
+                type="text"
+                name="part_name"
+                value="<?= e($partsStockFilterPartName); ?>"
+                class="form-control form-control-sm"
+                placeholder="Part name or SKU"
+              >
+            </div>
+            <div class="col-lg-2 col-md-6">
+              <label class="form-label form-label-sm mb-1">Category</label>
+              <select name="category_id" class="form-select form-select-sm">
+                <option value="0">All Categories</option>
+                <?php foreach ($partsStockCategories as $category): ?>
+                  <option value="<?= (int) $category['id']; ?>" <?= ((int) $partsStockFilterCategoryId === (int) $category['id']) ? 'selected' : ''; ?>>
+                    <?= e((string) $category['category_name']); ?>
+                  </option>
+                <?php endforeach; ?>
+              </select>
+            </div>
+            <div class="col-lg-2 col-md-6">
+              <label class="form-label form-label-sm mb-1">Garage</label>
+              <select name="garage_id" class="form-select form-select-sm">
+                <?php foreach ($garageOptions as $garage): ?>
+                  <?php $garageCode = trim((string) ($garage['code'] ?? '')); ?>
+                  <option value="<?= (int) $garage['id']; ?>" <?= ((int) $partsStockFilterGarageId === (int) $garage['id']) ? 'selected' : ''; ?>>
+                    <?= e((string) $garage['name']); ?><?= $garageCode !== '' ? ' (' . e($garageCode) . ')' : ''; ?>
+                  </option>
+                <?php endforeach; ?>
+              </select>
+            </div>
+            <div class="col-lg-2 col-md-6">
+              <label class="form-label form-label-sm mb-1">Stock Level</label>
+              <select name="stock_level" class="form-select form-select-sm">
+                <option value="">All Levels</option>
+                <?php foreach ($allowedPartsStockLevels as $stockLevel): ?>
+                  <?php
+                    $stockLabel = $stockLevel === 'ZERO'
+                        ? 'Zero Stock'
+                        : ($stockLevel === 'LOW' ? 'Low Stock' : 'Available Stock');
+                  ?>
+                  <option value="<?= e($stockLevel); ?>" <?= $partsStockFilterStockLevel === $stockLevel ? 'selected' : ''; ?>>
+                    <?= e($stockLabel); ?>
+                  </option>
+                <?php endforeach; ?>
+              </select>
+            </div>
+            <div class="col-lg-3 col-md-6">
+              <label class="form-label form-label-sm mb-1">Vendor</label>
+              <select name="vendor_id" class="form-select form-select-sm">
+                <option value="0">All Vendors</option>
+                <?php foreach ($partsStockVendors as $vendor): ?>
+                  <option value="<?= (int) $vendor['id']; ?>" <?= ((int) $partsStockFilterVendorId === (int) $vendor['id']) ? 'selected' : ''; ?>>
+                    <?= e((string) $vendor['vendor_name']); ?>
+                  </option>
+                <?php endforeach; ?>
+              </select>
+            </div>
+            <div class="col-lg-2 col-md-6">
+              <label class="form-label form-label-sm mb-1">Last Movement From</label>
+              <input type="date" name="last_movement_from" value="<?= e($partsStockLastMovementFrom); ?>" class="form-control form-control-sm">
+            </div>
+            <div class="col-lg-2 col-md-6">
+              <label class="form-label form-label-sm mb-1">Last Movement To</label>
+              <input type="date" name="last_movement_to" value="<?= e($partsStockLastMovementTo); ?>" class="form-control form-control-sm">
+            </div>
+            <div class="col-lg-2 col-md-6 d-flex gap-2">
+              <button type="submit" class="btn btn-sm btn-outline-primary">Apply</button>
+              <button type="button" class="btn btn-sm btn-outline-secondary" data-master-filter-reset="1">Reset</button>
+            </div>
+          </form>
+          <div class="alert alert-danger d-none mt-3 mb-0" data-master-insights-error="1"></div>
+        </div>
         <div class="card-body table-responsive p-0">
           <table class="table table-striped mb-0">
             <thead>
@@ -1884,17 +2024,20 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                 <th>SKU</th>
                 <th>Part Name</th>
                 <th>Category</th>
+                <th>Vendor</th>
+                <th>Garage</th>
                 <th>HSN</th>
                 <th>Sell Price</th>
                 <th>GST%</th>
                 <th>Min Stock</th>
                 <th>Current Stock</th>
                 <th>Alert</th>
+                <th>Last Movement</th>
               </tr>
             </thead>
-            <tbody>
+            <tbody data-master-table-body="1" data-table-colspan="12">
               <?php if (empty($parts)): ?>
-                <tr><td colspan="9" class="text-center text-muted py-4">No parts configured.</td></tr>
+                <tr><td colspan="12" class="text-center text-muted py-4">No parts configured.</td></tr>
               <?php else: ?>
                 <?php foreach ($parts as $part): ?>
                   <?php
@@ -1906,12 +2049,15 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                     <td><code><?= e((string) $part['part_sku']); ?></code></td>
                     <td><?= e((string) $part['part_name']); ?></td>
                     <td><?= e((string) ($part['category_name'] ?? '-')); ?></td>
+                    <td><?= e((string) ($part['vendor_name'] ?? '-')); ?></td>
+                    <td><?= e($activeGarageName); ?></td>
                     <td><?= e((string) ($part['hsn_code'] ?? '-')); ?></td>
                     <td><?= e(format_currency((float) $part['selling_price'])); ?></td>
                     <td><?= e(number_format((float) $part['gst_rate'], 2)); ?></td>
                     <td><?= e(number_format((float) $part['min_stock'], 2)); ?> <?= e((string) $part['unit']); ?></td>
                     <td><?= e(number_format((float) $part['stock_qty'], 2)); ?> <?= e((string) $part['unit']); ?></td>
                     <td><span class="badge text-bg-<?= e($badgeClass); ?>"><?= e($label); ?></span></td>
+                    <td><?= e(inv_format_datetime((string) ($part['last_movement_at'] ?? ''))); ?></td>
                   </tr>
                 <?php endforeach; ?>
               <?php endif; ?>

@@ -780,23 +780,20 @@ require_once __DIR__ . '/../../includes/sidebar.php';
               <?php if ($vehicleAttributeEnabled): ?>
                 <div class="col-12" data-vehicle-attributes-root="1" data-vehicle-attributes-mode="entry" data-vehicle-attributes-endpoint="<?= e($attributeApiUrl); ?>">
                   <div class="row g-3">
-                    <div class="col-md-4">
-                      <label class="form-label">Brand</label>
-                      <select name="brand_id" data-vehicle-attr="brand" class="form-select" required data-selected-id="<?= e($editAttrIds['brand_id'] > 0 ? (string) $editAttrIds['brand_id'] : ((trim((string) ($editVehicle['brand'] ?? '')) !== '') ? '__custom__' : '')); ?>">
-                        <option value="">Loading Brands...</option>
+                    <div class="col-md-8">
+                      <label class="form-label">Brand / Model / Variant</label>
+                      <select
+                        name="vehicle_combo_selector"
+                        data-vehicle-attr="combo"
+                        class="form-select"
+                        required
+                        data-selected-label="<?= e(trim((string) ($editVehicle['brand'] ?? '') . ' -> ' . (string) ($editVehicle['model'] ?? '') . ' -> ' . (string) ($editVehicle['variant'] ?? ''))); ?>"
+                      >
+                        <option value="">Loading vehicle combinations...</option>
                       </select>
-                    </div>
-                    <div class="col-md-4">
-                      <label class="form-label">Model</label>
-                      <select name="model_id" data-vehicle-attr="model" class="form-select" required data-selected-id="<?= e($editAttrIds['model_id'] > 0 ? (string) $editAttrIds['model_id'] : ((trim((string) ($editVehicle['model'] ?? '')) !== '') ? '__custom__' : '')); ?>">
-                        <option value="">Select Model</option>
-                      </select>
-                    </div>
-                    <div class="col-md-4">
-                      <label class="form-label">Variant</label>
-                      <select name="variant_id" data-vehicle-attr="variant" class="form-select" data-selected-id="<?= e($editAttrIds['variant_id'] > 0 ? (string) $editAttrIds['variant_id'] : ((trim((string) ($editVehicle['variant'] ?? '')) !== '') ? '__custom__' : '')); ?>">
-                        <option value="">Select Variant</option>
-                      </select>
+                      <input type="hidden" name="brand_id" data-vehicle-attr-id="brand" value="<?= e($editAttrIds['brand_id'] > 0 ? (string) $editAttrIds['brand_id'] : ''); ?>" />
+                      <input type="hidden" name="model_id" data-vehicle-attr-id="model" value="<?= e($editAttrIds['model_id'] > 0 ? (string) $editAttrIds['model_id'] : ''); ?>" />
+                      <input type="hidden" name="variant_id" data-vehicle-attr-id="variant" value="<?= e($editAttrIds['variant_id'] > 0 ? (string) $editAttrIds['variant_id'] : ''); ?>" />
                     </div>
 
                     <div class="col-md-2">
@@ -834,7 +831,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                     </div>
                   </div>
                   <div class="form-hint mt-2">
-                    Use master dropdowns for speed and consistency. If value is missing, choose "Not listed" and enter manual text.
+                    Search across Brand + Model + Variant in one dropdown. If a combination is missing, choose "Not listed" and enter manual text.
                   </div>
                 </div>
               <?php else: ?>
@@ -973,23 +970,14 @@ require_once __DIR__ . '/../../includes/sidebar.php';
               <?php if ($vehicleAttributeEnabled): ?>
                 <div class="col-12" data-vehicle-attributes-root="1" data-vehicle-attributes-mode="filter" data-vehicle-attributes-endpoint="<?= e($attributeApiUrl); ?>">
                   <div class="row g-2">
-                    <div class="col-md-2">
-                      <label class="form-label form-label-sm mb-1">Brand</label>
-                      <select name="vehicle_filter_brand_id" data-vehicle-attr="brand" data-selected-id="<?= e((string) $brandFilterId); ?>" class="form-select form-select-sm">
-                        <option value="">All Brands</option>
+                    <div class="col-md-4">
+                      <label class="form-label form-label-sm mb-1">Brand / Model / Variant</label>
+                      <select name="vehicle_filter_combo_selector" data-vehicle-attr="combo" class="form-select form-select-sm">
+                        <option value="">All Brand / Model / Variant</option>
                       </select>
-                    </div>
-                    <div class="col-md-2">
-                      <label class="form-label form-label-sm mb-1">Model</label>
-                      <select name="vehicle_filter_model_id" data-vehicle-attr="model" data-selected-id="<?= e((string) $modelFilterId); ?>" class="form-select form-select-sm">
-                        <option value="">All Models</option>
-                      </select>
-                    </div>
-                    <div class="col-md-2">
-                      <label class="form-label form-label-sm mb-1">Variant</label>
-                      <select name="vehicle_filter_variant_id" data-vehicle-attr="variant" data-selected-id="<?= e((string) $variantFilterId); ?>" class="form-select form-select-sm">
-                        <option value="">All Variants</option>
-                      </select>
+                      <input type="hidden" name="vehicle_filter_brand_id" data-vehicle-attr-id="brand" value="<?= e((string) $brandFilterId); ?>" />
+                      <input type="hidden" name="vehicle_filter_model_id" data-vehicle-attr-id="model" value="<?= e((string) $modelFilterId); ?>" />
+                      <input type="hidden" name="vehicle_filter_variant_id" data-vehicle-attr-id="variant" value="<?= e((string) $variantFilterId); ?>" />
                     </div>
                     <div class="col-md-2">
                       <label class="form-label form-label-sm mb-1">Year</label>

@@ -1000,7 +1000,12 @@ function initSearchableSelects() {
     job_vehicle_model_id: true,
     job_vehicle_variant_id: true,
     job_vehicle_model_year_id: true,
-    job_vehicle_color_id: true
+    job_vehicle_color_id: true,
+    vehicle_combo_selector: true,
+    vehicle_filter_combo_selector: true,
+    job_vehicle_combo_selector: true,
+    report_vehicle_combo_selector: true,
+    estimate_vehicle_combo_selector: true
   };
   var inlineAddValue = '__inline_add_customer__';
   var inlineCustomerFormUrl = document.body
@@ -1220,6 +1225,7 @@ function initSearchableSelects() {
       refreshIndexedOptions(state);
       applySearchFilter(state, state.input.value || '');
     };
+    select.gacSearchableState = state;
   }
 
   function ensureInlineCustomerOption(select, value) {
@@ -1414,11 +1420,17 @@ function initVehicleAttributeSelectors() {
     }
 
     var mode = (root.getAttribute('data-vehicle-attributes-mode') || 'entry').trim().toLowerCase();
+    var comboSelect = root.querySelector('select[data-vehicle-attr="combo"]');
     var brandSelect = root.querySelector('select[data-vehicle-attr="brand"]');
     var modelSelect = root.querySelector('select[data-vehicle-attr="model"]');
     var variantSelect = root.querySelector('select[data-vehicle-attr="variant"]');
     var yearSelect = root.querySelector('select[data-vehicle-attr="model_year"]');
     var colorSelect = root.querySelector('select[data-vehicle-attr="color"]');
+    var brandField = brandSelect || root.querySelector('[data-vehicle-attr-id="brand"]');
+    var modelField = modelSelect || root.querySelector('[data-vehicle-attr-id="model"]');
+    var variantField = variantSelect || root.querySelector('[data-vehicle-attr-id="variant"]');
+    var rootForm = root.closest('form');
+    var visVariantSelect = mode === 'entry' && rootForm ? rootForm.querySelector('select[name="vis_variant_id"]') : null;
 
     var fallbackInputs = {
       brand: root.querySelector('input[data-vehicle-fallback="brand"]'),
@@ -1440,22 +1452,70 @@ function initVehicleAttributeSelectors() {
     var vehiclePicker = pickerTargetSelector !== '' ? document.querySelector(pickerTargetSelector) : null;
     var customerSelect = customerSelectSelector !== '' ? document.querySelector(customerSelectSelector) : null;
 
-    function selectedIdFromData(select) {
-      if (!select) {
+    function selectedIdFromField(field) {
+      if (!field) {
         return '';
       }
-      var raw = (select.getAttribute('data-selected-id') || '').trim();
-      return raw !== '' ? raw : (select.value || '');
+      var raw = (field.getAttribute('data-selected-id') || '').trim();
+      return raw !== '' ? raw : (field.value || '');
+    }
+
+    function parseId(value) {
+      return parseInt(String(value || '').trim(), 10) || 0;
+    }
+
+    function comboKey(brandId, modelId, variantId) {
+      var brandValue = parseId(brandId);
+      var modelValue = parseId(modelId);
+      var variantValue = parseId(variantId);
+      if (brandValue <= 0 || modelValue <= 0 || variantValue <= 0) {
+        return '';
+      }
+      return String(brandValue) + ':' + String(modelValue) + ':' + String(variantValue);
+    }
+
+    function comboKeyFromOption(option) {
+      if (!option) {
+        return '';
+      }
+      var direct = (option.getAttribute('data-combo-key') || '').trim();
+      if (direct !== '') {
+        return direct;
+      }
+      return comboKey(
+        option.getAttribute('data-brand-id') || '',
+        option.getAttribute('data-model-id') || '',
+        option.getAttribute('data-variant-id') || ''
+      );
+    }
+
+    function currentFieldValue(field) {
+      return field ? String(field.value || '').trim() : '';
+    }
+
+    function setFieldValue(field, value) {
+      if (!field) {
+        return;
+      }
+      field.value = String(value || '');
+      if (field.tagName === 'SELECT') {
+        gacRefreshSearchableSelect(field);
+      }
     }
 
     var state = {
       mode: mode,
-      brandSelectedId: selectedIdFromData(brandSelect),
-      modelSelectedId: selectedIdFromData(modelSelect),
-      variantSelectedId: selectedIdFromData(variantSelect),
-      yearSelectedId: selectedIdFromData(yearSelect),
-      colorSelectedId: selectedIdFromData(colorSelect)
+      brandSelectedId: selectedIdFromField(brandField),
+      modelSelectedId: selectedIdFromField(modelField),
+      variantSelectedId: selectedIdFromField(variantField),
+      yearSelectedId: selectedIdFromField(yearSelect),
+      colorSelectedId: selectedIdFromField(colorSelect),
+      comboSelectedKey: '',
+      comboSelectedLabel: comboSelect ? String(comboSelect.getAttribute('data-selected-label') || '').trim() : '',
+      comboCache: {},
+      comboRequestSequence: 0
     };
+    state.comboSelectedKey = comboKey(state.brandSelectedId, state.modelSelectedId, state.variantSelectedId);
 
     function hasFallback(attrKey) {
       return !!fallbackInputs[attrKey];
@@ -1572,7 +1632,9 @@ function initVehicleAttributeSelectors() {
       }
 
       var select = null;
-      if (attrKey === 'brand') {
+      if (comboSelect && (attrKey === 'brand' || attrKey === 'model' || attrKey === 'variant')) {
+        select = comboSelect;
+      } else if (attrKey === 'brand') {
         select = brandSelect;
       } else if (attrKey === 'model') {
         select = modelSelect;
@@ -1596,6 +1658,193 @@ function initVehicleAttributeSelectors() {
       }
       input.disabled = !useFallback;
       input.required = !!required && useFallback;
+    }
+
+    function applyComboSelection(option) {
+      if (!option) {
+        setFieldValue(brandField, '');
+        setFieldValue(modelField, '');
+        setFieldValue(variantField, '');
+        state.brandSelectedId = '';
+        state.modelSelectedId = '';
+        state.variantSelectedId = '';
+        state.comboSelectedKey = '';
+        return;
+      }
+
+      var parsedBrandId = parseId(option.getAttribute('data-brand-id') || '');
+      var parsedModelId = parseId(option.getAttribute('data-model-id') || '');
+      var parsedVariantId = parseId(option.getAttribute('data-variant-id') || '');
+      var brandId = parsedBrandId > 0 ? String(parsedBrandId) : '';
+      var modelId = parsedModelId > 0 ? String(parsedModelId) : '';
+      var variantId = parsedVariantId > 0 ? String(parsedVariantId) : '';
+      setFieldValue(brandField, brandId);
+      setFieldValue(modelField, modelId);
+      setFieldValue(variantField, variantId);
+      state.brandSelectedId = brandId;
+      state.modelSelectedId = modelId;
+      state.variantSelectedId = variantId;
+      state.comboSelectedKey = comboKeyFromOption(option);
+      state.comboSelectedLabel = String(option.textContent || '').trim();
+
+      var visVariantId = parseId(option.getAttribute('data-vis-variant-id') || '');
+      if (visVariantSelect && visVariantId > 0) {
+        visVariantSelect.value = String(visVariantId);
+        gacRefreshSearchableSelect(visVariantSelect);
+      }
+    }
+
+    function setComboOptions(items, selectedKey) {
+      if (!comboSelect) {
+        return;
+      }
+
+      var finalKey = String(selectedKey || '').trim();
+      comboSelect.innerHTML = '';
+      appendPlaceholder(comboSelect, mode === 'filter' ? 'All Brand / Model / Variant' : 'Select Brand / Model / Variant');
+
+      for (var idx = 0; idx < items.length; idx++) {
+        var item = items[idx] || {};
+        var optionBrandId = parseId(item.brand_id || '');
+        var optionModelId = parseId(item.model_id || '');
+        var optionVariantId = parseId(item.variant_id || '');
+        var optionKey = comboKey(optionBrandId, optionModelId, optionVariantId);
+        if (optionKey === '') {
+          continue;
+        }
+
+        var option = document.createElement('option');
+        option.value = optionKey;
+        option.setAttribute('data-combo-key', optionKey);
+        option.setAttribute('data-brand-id', String(optionBrandId));
+        option.setAttribute('data-model-id', String(optionModelId));
+        option.setAttribute('data-variant-id', String(optionVariantId));
+        option.setAttribute('data-vis-variant-id', String(parseId(item.vis_variant_id || '')));
+        option.setAttribute('data-source-code', String(item.source_code || 'MASTER'));
+        option.textContent = String(item.label || '').trim();
+        if (option.textContent === '') {
+          option.textContent =
+            String(item.brand_name || '').trim() + ' -> ' +
+            String(item.model_name || '').trim() + ' -> ' +
+            String(item.variant_name || '').trim();
+        }
+        comboSelect.appendChild(option);
+      }
+
+      if (mode === 'entry' && hasFallback('brand') && hasFallback('model')) {
+        var customOption = document.createElement('option');
+        customOption.value = customValue;
+        customOption.textContent = 'Not listed (type manually)';
+        comboSelect.appendChild(customOption);
+      }
+
+      if (finalKey !== '' && finalKey !== customValue) {
+        comboSelect.value = finalKey;
+      }
+
+      if (comboSelect.value === '' && finalKey !== '' && finalKey !== customValue) {
+        var fallbackOption = document.createElement('option');
+        fallbackOption.value = finalKey;
+        fallbackOption.setAttribute('data-combo-key', finalKey);
+        fallbackOption.setAttribute('data-brand-id', state.brandSelectedId);
+        fallbackOption.setAttribute('data-model-id', state.modelSelectedId);
+        fallbackOption.setAttribute('data-variant-id', state.variantSelectedId);
+        fallbackOption.setAttribute('data-vis-variant-id', '0');
+        fallbackOption.textContent = state.comboSelectedLabel !== '' ? state.comboSelectedLabel : 'Current Selection';
+        comboSelect.appendChild(fallbackOption);
+        comboSelect.value = finalKey;
+      }
+
+      if (mode === 'entry' && comboSelect.value === '' && finalKey === customValue) {
+        comboSelect.value = customValue;
+      }
+
+      gacRefreshSearchableSelect(comboSelect);
+    }
+
+    function loadComboOptions(searchQuery, preserveSelection) {
+      if (!comboSelect) {
+        return Promise.resolve();
+      }
+
+      var queryValue = collapseWhitespace(String(searchQuery || '')).trim();
+      var selectedKey = preserveSelection ? (comboSelect.value || state.comboSelectedKey || '') : '';
+
+      var params = {
+        q: queryValue,
+        limit: 120
+      };
+
+      if (preserveSelection && queryValue === '') {
+        var selectedBrandId = parseId(state.brandSelectedId);
+        var selectedModelId = parseId(state.modelSelectedId);
+        var selectedVariantId = parseId(state.variantSelectedId);
+        if (selectedBrandId > 0) {
+          params.brand_id = selectedBrandId;
+        }
+        if (selectedModelId > 0) {
+          params.model_id = selectedModelId;
+        }
+        if (selectedVariantId > 0) {
+          params.variant_id = selectedVariantId;
+        }
+      }
+
+      var cacheKey = JSON.stringify(params);
+      if (Object.prototype.hasOwnProperty.call(state.comboCache, cacheKey)) {
+        setComboOptions(state.comboCache[cacheKey], selectedKey);
+        if (comboSelect.value !== '' && comboSelect.value !== customValue) {
+          applyComboSelection(comboSelect.options[comboSelect.selectedIndex] || null);
+        }
+        return Promise.resolve();
+      }
+
+      if (!preserveSelection) {
+        setLoading(comboSelect, mode === 'filter' ? 'Loading combinations...' : 'Loading vehicle combinations...');
+      }
+
+      var requestSequence = ++state.comboRequestSequence;
+      return request('combo', params).then(function (payload) {
+        if (requestSequence !== state.comboRequestSequence) {
+          return;
+        }
+        var items = payload && payload.ok && Array.isArray(payload.items) ? payload.items : [];
+        state.comboCache[cacheKey] = items;
+        setComboOptions(items, selectedKey);
+        if (comboSelect.value !== '' && comboSelect.value !== customValue) {
+          applyComboSelection(comboSelect.options[comboSelect.selectedIndex] || null);
+        } else if (comboSelect.value === '') {
+          applyComboSelection(null);
+        }
+      }).catch(function () {
+        if (requestSequence !== state.comboRequestSequence) {
+          return;
+        }
+        setComboOptions([], selectedKey);
+      }).then(function () {
+        syncFallback('brand', true);
+        syncFallback('model', true);
+        syncFallback('variant', false);
+      });
+    }
+
+    function currentAttrValue(attrKey) {
+      if (attrKey === 'brand') {
+        return currentFieldValue(brandField);
+      }
+      if (attrKey === 'model') {
+        return currentFieldValue(modelField);
+      }
+      if (attrKey === 'variant') {
+        return currentFieldValue(variantField);
+      }
+      if (attrKey === 'model_year') {
+        return currentFieldValue(yearSelect);
+      }
+      if (attrKey === 'color') {
+        return currentFieldValue(colorSelect);
+      }
+      return '';
     }
 
     function loadModels() {
@@ -1767,14 +2016,14 @@ function initVehicleAttributeSelectors() {
 
       var params = {
         customer_id: customerSelect ? customerSelect.value : '',
-        brand_id: brandSelect ? brandSelect.value : '',
-        model_id: modelSelect ? modelSelect.value : '',
-        variant_id: variantSelect ? variantSelect.value : '',
-        model_year_id: yearSelect ? yearSelect.value : '',
-        color_id: colorSelect ? colorSelect.value : ''
+        brand_id: currentAttrValue('brand'),
+        model_id: currentAttrValue('model'),
+        variant_id: currentAttrValue('variant'),
+        model_year_id: currentAttrValue('model_year'),
+        color_id: currentAttrValue('color')
       };
 
-      if (params.brand_id === customValue || params.model_id === customValue || params.variant_id === customValue || params.model_year_id === customValue || params.color_id === customValue) {
+      if ((comboSelect && comboSelect.value === customValue) || params.brand_id === customValue || params.model_id === customValue || params.variant_id === customValue || params.model_year_id === customValue || params.color_id === customValue) {
         return;
       }
 
@@ -1814,7 +2063,41 @@ function initVehicleAttributeSelectors() {
       });
     }
 
-    if (brandSelect) {
+    if (comboSelect) {
+      comboSelect.addEventListener('change', function () {
+        var selectedValue = comboSelect.value || '';
+        state.comboSelectedKey = selectedValue;
+
+        if (selectedValue === customValue) {
+          applyComboSelection(null);
+        } else if (selectedValue === '') {
+          applyComboSelection(null);
+        } else {
+          applyComboSelection(comboSelect.options[comboSelect.selectedIndex] || null);
+        }
+
+        syncFallback('brand', true);
+        syncFallback('model', true);
+        syncFallback('variant', false);
+        reloadVehiclePicker();
+      });
+
+      var comboSearchState = comboSelect.gacSearchableState || null;
+      var comboSearchInput = comboSearchState ? comboSearchState.input : null;
+      if (comboSearchInput) {
+        var debouncedComboSearch = debounce(function () {
+          loadComboOptions(comboSearchInput.value || '', true);
+        }, 180);
+        comboSearchInput.addEventListener('input', debouncedComboSearch);
+        comboSearchInput.addEventListener('focus', function () {
+          if (!comboSelect.options || comboSelect.options.length <= 1) {
+            loadComboOptions(comboSearchInput.value || '', true);
+          }
+        });
+      }
+    }
+
+    if (!comboSelect && brandSelect) {
       brandSelect.addEventListener('change', function () {
         state.brandSelectedId = brandSelect.value || '';
         state.modelSelectedId = '';
@@ -1826,7 +2109,7 @@ function initVehicleAttributeSelectors() {
       });
     }
 
-    if (modelSelect) {
+    if (!comboSelect && modelSelect) {
       modelSelect.addEventListener('change', function () {
         state.modelSelectedId = modelSelect.value || '';
         state.variantSelectedId = '';
@@ -1837,7 +2120,7 @@ function initVehicleAttributeSelectors() {
       });
     }
 
-    if (variantSelect) {
+    if (!comboSelect && variantSelect) {
       variantSelect.addEventListener('change', function () {
         state.variantSelectedId = variantSelect.value || '';
         syncFallback('variant', false);
@@ -1867,12 +2150,31 @@ function initVehicleAttributeSelectors() {
       });
     }
 
-    Promise.all([loadBrands(), loadYears(), loadColors()]).then(function () {
+    var comboManualDefault = mode === 'entry'
+      && comboSelect
+      && state.comboSelectedKey === ''
+      && (
+        (fallbackInputs.brand && (fallbackInputs.brand.value || '').trim() !== '')
+        || (fallbackInputs.model && (fallbackInputs.model.value || '').trim() !== '')
+        || (fallbackInputs.variant && (fallbackInputs.variant.value || '').trim() !== '')
+      );
+    if (comboManualDefault) {
+      state.comboSelectedKey = customValue;
+    }
+
+    var primaryLoader = comboSelect
+      ? loadComboOptions('', true)
+      : loadBrands();
+
+    Promise.all([primaryLoader, loadYears(), loadColors()]).then(function () {
       syncFallback('brand', true);
       syncFallback('model', true);
       syncFallback('variant', false);
       syncFallback('model_year', false);
       syncFallback('color', false);
+      if (comboSelect && comboSelect.value === customValue) {
+        applyComboSelection(null);
+      }
       reloadVehiclePicker();
       root.dispatchEvent(new CustomEvent('gac:vehicle-attributes-ready', { bubbles: true }));
     });

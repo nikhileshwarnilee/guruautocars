@@ -11,6 +11,33 @@ $canManage = has_permission('part_master.manage');
 $companyId = active_company_id();
 $garageId = active_garage_id();
 
+$visCompatibilityEnabled = table_columns('vis_part_compatibility') !== []
+    && table_columns('vis_variants') !== []
+    && table_columns('vis_models') !== []
+    && table_columns('vis_brands') !== [];
+
+$visVariants = [];
+$visVariantLookup = [];
+if ($visCompatibilityEnabled) {
+    $visVariants = db()->query(
+        'SELECT vv.id, vv.variant_name, vm.model_name, vb.brand_name
+         FROM vis_variants vv
+         INNER JOIN vis_models vm ON vm.id = vv.model_id
+         INNER JOIN vis_brands vb ON vb.id = vm.brand_id
+         WHERE vv.status_code = "ACTIVE"
+           AND vm.status_code = "ACTIVE"
+           AND vb.status_code = "ACTIVE"
+         ORDER BY vb.brand_name ASC, vm.model_name ASC, vv.variant_name ASC'
+    )->fetchAll();
+
+    foreach ($visVariants as $variant) {
+        $variantId = (int) ($variant['id'] ?? 0);
+        if ($variantId > 0) {
+            $visVariantLookup[$variantId] = true;
+        }
+    }
+}
+
 $categoriesStmt = db()->prepare(
     'SELECT id, category_name, category_code
      FROM part_categories
@@ -54,6 +81,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $minStock = (float) ($_POST['min_stock'] ?? 0);
         $openingStock = (float) ($_POST['opening_stock'] ?? 0);
         $statusCode = normalize_status_code((string) ($_POST['status_code'] ?? 'ACTIVE'));
+        $compatibilityNote = post_string('compatibility_note', 255);
+
+        $selectedVariantIds = [];
+        if ($visCompatibilityEnabled) {
+            $rawVariantIds = $_POST['compatibility_variant_ids'] ?? [];
+            if (is_array($rawVariantIds)) {
+                foreach ($rawVariantIds as $rawVariantId) {
+                    $variantId = (int) $rawVariantId;
+                    if ($variantId > 0 && isset($visVariantLookup[$variantId])) {
+                        $selectedVariantIds[$variantId] = true;
+                    }
+                }
+            }
+        }
+        $selectedVariantIds = array_keys($selectedVariantIds);
 
         if ($partSku === '' || $partName === '') {
             flash_set('parts_error', 'Part SKU and part name are required.', 'danger');
@@ -117,6 +159,28 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 ]);
             }
 
+            if ($visCompatibilityEnabled && !empty($selectedVariantIds)) {
+                $compatibilityStmt = $pdo->prepare(
+                    'INSERT INTO vis_part_compatibility
+                      (company_id, variant_id, part_id, compatibility_note, status_code, deleted_at)
+                     VALUES
+                      (:company_id, :variant_id, :part_id, :compatibility_note, "ACTIVE", NULL)
+                     ON DUPLICATE KEY UPDATE
+                        compatibility_note = VALUES(compatibility_note),
+                        status_code = "ACTIVE",
+                        deleted_at = NULL'
+                );
+
+                foreach ($selectedVariantIds as $variantId) {
+                    $compatibilityStmt->execute([
+                        'company_id' => $companyId,
+                        'variant_id' => (int) $variantId,
+                        'part_id' => $partId,
+                        'compatibility_note' => $compatibilityNote !== '' ? $compatibilityNote : null,
+                    ]);
+                }
+            }
+
             $pdo->commit();
             log_audit('parts_master', 'create', $partId, 'Created part ' . $partSku, [
                 'entity' => 'part',
@@ -132,6 +196,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 ],
                 'metadata' => [
                     'opening_stock' => max(0, (float) $openingStock),
+                    'compatibility_variant_count' => count($selectedVariantIds),
                 ],
             ]);
             if ($openingStock > 0) {
@@ -301,6 +366,24 @@ if ($editId > 0) {
     $editPart = $editStmt->fetch() ?: null;
 }
 
+$partCompatibilityCounts = [];
+if ($visCompatibilityEnabled) {
+    $countStmt = db()->prepare(
+        'SELECT part_id, COUNT(*) AS compatibility_count
+         FROM vis_part_compatibility
+         WHERE company_id = :company_id
+           AND status_code = "ACTIVE"
+         GROUP BY part_id'
+    );
+    $countStmt->execute(['company_id' => $companyId]);
+    foreach ($countStmt->fetchAll() as $row) {
+        $mappedPartId = (int) ($row['part_id'] ?? 0);
+        if ($mappedPartId > 0) {
+            $partCompatibilityCounts[$mappedPartId] = (int) ($row['compatibility_count'] ?? 0);
+        }
+    }
+}
+
 $partsStmt = db()->prepare(
     'SELECT p.*, pc.category_name, v.vendor_name, COALESCE(gi.quantity, 0) AS stock_qty
      FROM parts p
@@ -406,6 +489,31 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                   <label class="form-label">Opening Stock (Current Garage)</label>
                   <input type="number" step="0.01" min="0" name="opening_stock" class="form-control" value="0" />
                 </div>
+
+                <?php if ($visCompatibilityEnabled): ?>
+                  <div class="col-md-6">
+                    <label class="form-label">VIS Compatibility (Optional)</label>
+                    <select name="compatibility_variant_ids[]" class="form-select" multiple size="7">
+                      <?php foreach ($visVariants as $variant): ?>
+                        <option value="<?= (int) $variant['id']; ?>">
+                          <?= e((string) $variant['brand_name']); ?> / <?= e((string) $variant['model_name']); ?> / <?= e((string) $variant['variant_name']); ?>
+                        </option>
+                      <?php endforeach; ?>
+                    </select>
+                    <small class="text-muted">Select one or more VIS vehicle variants compatible with this part.</small>
+                  </div>
+                  <div class="col-md-4">
+                    <label class="form-label">Compatibility Note (Optional)</label>
+                    <input type="text" name="compatibility_note" class="form-control" maxlength="255" placeholder="Example: Diesel variant only" />
+                    <small class="text-muted">You can also map later using the Map Compatibility button.</small>
+                  </div>
+                <?php else: ?>
+                  <div class="col-md-6">
+                    <div class="alert alert-light border mb-0">
+                      VIS mapping is optional and currently unavailable. Part creation is unaffected.
+                    </div>
+                  </div>
+                <?php endif; ?>
               <?php endif; ?>
               <div class="col-md-2">
                 <label class="form-label">Status</label>
@@ -447,9 +555,16 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                 <tr><td colspan="8" class="text-center text-muted py-4">No parts found.</td></tr>
               <?php else: ?>
                 <?php foreach ($parts as $part): ?>
+                  <?php $compatibilityCount = (int) ($partCompatibilityCounts[(int) $part['id']] ?? 0); ?>
                   <tr>
                     <td><code><?= e((string) $part['part_sku']); ?></code></td>
-                    <td><?= e((string) $part['part_name']); ?><br><small class="text-muted">HSN: <?= e((string) ($part['hsn_code'] ?? '-')); ?></small></td>
+                    <td>
+                      <?= e((string) $part['part_name']); ?><br>
+                      <small class="text-muted">HSN: <?= e((string) ($part['hsn_code'] ?? '-')); ?></small>
+                      <?php if ($visCompatibilityEnabled): ?>
+                        <br><small class="text-muted">Compatible VIS variants: <?= $compatibilityCount; ?></small>
+                      <?php endif; ?>
+                    </td>
                     <td><?= e((string) ($part['category_name'] ?? '-')); ?></td>
                     <td><?= e((string) ($part['vendor_name'] ?? '-')); ?></td>
                     <td><?= e(format_currency((float) $part['selling_price'])); ?></td>
@@ -457,6 +572,11 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                     <td><span class="badge text-bg-<?= e(status_badge_class((string) $part['status_code'])); ?>"><?= e((string) $part['status_code']); ?></span></td>
                     <td class="d-flex gap-1">
                       <a class="btn btn-sm btn-outline-primary" href="<?= e(url('modules/inventory/parts_master.php?edit_id=' . (int) $part['id'])); ?>">Edit</a>
+                      <?php if ($visCompatibilityEnabled): ?>
+                        <a class="btn btn-sm btn-outline-info" href="<?= e(url('modules/inventory/part_compatibility_map.php?part_id=' . (int) $part['id'])); ?>">Map Compatibility</a>
+                      <?php else: ?>
+                        <button type="button" class="btn btn-sm btn-outline-info" disabled>Map Compatibility</button>
+                      <?php endif; ?>
                       <?php if ($canManage): ?>
                         <form method="post" class="d-inline" data-confirm="Change part status?">
                           <?= csrf_field(); ?>

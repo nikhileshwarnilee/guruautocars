@@ -1116,23 +1116,14 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             <?php if ($vehicleAttributeEnabled): ?>
               <div class="col-12" data-vehicle-attributes-root="1" data-vehicle-attributes-mode="filter" data-vehicle-attributes-endpoint="<?= e($vehicleAttributesApiUrl); ?>">
                 <div class="row g-2">
-                  <div class="col-md-2">
-                    <label class="form-label">Brand</label>
-                    <select name="report_brand_id" data-vehicle-attr="brand" data-selected-id="<?= e((string) $reportBrandId); ?>" class="form-select">
-                      <option value="">All Brands</option>
+                  <div class="col-md-4">
+                    <label class="form-label">Brand / Model / Variant</label>
+                    <select name="report_vehicle_combo_selector" data-vehicle-attr="combo" class="form-select">
+                      <option value="">All Brand / Model / Variant</option>
                     </select>
-                  </div>
-                  <div class="col-md-2">
-                    <label class="form-label">Model</label>
-                    <select name="report_model_id" data-vehicle-attr="model" data-selected-id="<?= e((string) $reportModelId); ?>" class="form-select">
-                      <option value="">All Models</option>
-                    </select>
-                  </div>
-                  <div class="col-md-2">
-                    <label class="form-label">Variant</label>
-                    <select name="report_variant_id" data-vehicle-attr="variant" data-selected-id="<?= e((string) $reportVariantId); ?>" class="form-select">
-                      <option value="">All Variants</option>
-                    </select>
+                    <input type="hidden" name="report_brand_id" data-vehicle-attr-id="brand" value="<?= e((string) $reportBrandId); ?>" />
+                    <input type="hidden" name="report_model_id" data-vehicle-attr-id="model" value="<?= e((string) $reportModelId); ?>" />
+                    <input type="hidden" name="report_variant_id" data-vehicle-attr-id="variant" value="<?= e((string) $reportVariantId); ?>" />
                   </div>
                   <div class="col-md-2">
                     <label class="form-label">Year</label>
@@ -1147,7 +1138,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                     </select>
                   </div>
                 </div>
-                <div class="form-hint mt-1">Vehicle filters apply to vehicle-focused report sections and VIS insights.</div>
+                <div class="form-hint mt-1">Use one searchable Brand / Model / Variant dropdown; filters apply to vehicle-focused report sections and VIS insights.</div>
               </div>
             <?php endif; ?>
             <div class="col-md-2 d-flex gap-2"><button type="submit" class="btn btn-primary">Apply</button><a href="<?= e(url('modules/reports/index.php')); ?>" class="btn btn-outline-secondary">Reset</a></div>

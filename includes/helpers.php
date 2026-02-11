@@ -1068,6 +1068,85 @@ function vehicle_master_search_variants(int $modelId, string $query = '', int $l
     }
 }
 
+function vehicle_master_search_combos(string $query = '', int $limit = 120, array $filters = []): array
+{
+    if (!vehicle_masters_enabled()) {
+        return [];
+    }
+
+    $query = vehicle_master_normalize_text($query, 150);
+    $limit = max(1, min(500, $limit));
+
+    $brandId = (int) ($filters['brand_id'] ?? 0);
+    $modelId = (int) ($filters['model_id'] ?? 0);
+    $variantId = (int) ($filters['variant_id'] ?? 0);
+
+    try {
+        $where = [
+            'vb.status_code = "ACTIVE"',
+            'vm.status_code = "ACTIVE"',
+            'vv.status_code = "ACTIVE"',
+        ];
+        $params = [];
+
+        if ($brandId > 0) {
+            $where[] = 'vb.id = :brand_id';
+            $params['brand_id'] = $brandId;
+        }
+
+        if ($modelId > 0) {
+            $where[] = 'vm.id = :model_id';
+            $params['model_id'] = $modelId;
+        }
+
+        if ($variantId > 0) {
+            $where[] = 'vv.id = :variant_id';
+            $params['variant_id'] = $variantId;
+        }
+
+        if ($query !== '') {
+            $where[] = '(vb.brand_name LIKE :query OR vm.model_name LIKE :query OR vv.variant_name LIKE :query OR CONCAT_WS(" ", vb.brand_name, vm.model_name, vv.variant_name) LIKE :query)';
+            $params['query'] = '%' . $query . '%';
+        }
+
+        $stmt = db()->prepare(
+            'SELECT vb.id AS brand_id,
+                    vm.id AS model_id,
+                    vv.id AS variant_id,
+                    vb.brand_name,
+                    vm.model_name,
+                    vv.variant_name,
+                    vv.fuel_type,
+                    vv.engine_cc,
+                    vv.vis_variant_id,
+                    vb.vis_brand_id,
+                    vm.vis_model_id,
+                    vb.source_code AS brand_source_code,
+                    vm.source_code AS model_source_code,
+                    vv.source_code AS variant_source_code,
+                    CASE
+                      WHEN vv.vis_variant_id IS NOT NULL
+                        OR vm.vis_model_id IS NOT NULL
+                        OR vb.vis_brand_id IS NOT NULL
+                        OR vv.source_code = "VIS"
+                        OR vm.source_code = "VIS"
+                        OR vb.source_code = "VIS"
+                      THEN 1 ELSE 0
+                    END AS vis_priority
+             FROM vehicle_variants vv
+             INNER JOIN vehicle_models vm ON vm.id = vv.model_id
+             INNER JOIN vehicle_brands vb ON vb.id = vm.brand_id
+             WHERE ' . implode(' AND ', $where) . '
+             ORDER BY vis_priority DESC, vb.brand_name ASC, vm.model_name ASC, vv.variant_name ASC
+             LIMIT ' . $limit
+        );
+        $stmt->execute($params);
+        return $stmt->fetchAll();
+    } catch (Throwable $exception) {
+        return [];
+    }
+}
+
 function vehicle_master_search_years(string $query = '', int $limit = 120): array
 {
     if (!vehicle_masters_enabled()) {

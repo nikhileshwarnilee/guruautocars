@@ -415,20 +415,13 @@ require_once __DIR__ . '/../../includes/sidebar.php';
           <div class="col-md-6" data-vehicle-attributes-root="1" data-vehicle-attributes-mode="filter" data-vehicle-attributes-endpoint="<?= e($vehicleAttributesApiUrl); ?>" data-vehicle-picker-target="#job-vehicle-select" data-vehicle-customer-select="#job-customer-select">
             <label class="form-label">Vehicle Filters</label>
             <div class="row g-2">
-              <div class="col-md-4">
-                <select name="job_vehicle_brand_id" data-vehicle-attr="brand" class="form-select">
-                  <option value="">All Brands</option>
+              <div class="col-md-12">
+                <select name="job_vehicle_combo_selector" data-vehicle-attr="combo" class="form-select">
+                  <option value="">All Brand / Model / Variant</option>
                 </select>
-              </div>
-              <div class="col-md-4">
-                <select name="job_vehicle_model_id" data-vehicle-attr="model" class="form-select">
-                  <option value="">All Models</option>
-                </select>
-              </div>
-              <div class="col-md-4">
-                <select name="job_vehicle_variant_id" data-vehicle-attr="variant" class="form-select">
-                  <option value="">All Variants</option>
-                </select>
+                <input type="hidden" name="job_vehicle_brand_id" data-vehicle-attr-id="brand" value="" />
+                <input type="hidden" name="job_vehicle_model_id" data-vehicle-attr-id="model" value="" />
+                <input type="hidden" name="job_vehicle_variant_id" data-vehicle-attr-id="variant" value="" />
               </div>
               <div class="col-md-6">
                 <select name="job_vehicle_model_year_id" data-vehicle-attr="model_year" class="form-select">
@@ -441,7 +434,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                 </select>
               </div>
             </div>
-            <div class="form-hint">Filter vehicle dropdown using standardized attributes.</div>
+            <div class="form-hint">Search and filter vehicle dropdown using one Brand / Model / Variant selector.</div>
           </div>
         <?php endif; ?>
 

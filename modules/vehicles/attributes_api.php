@@ -9,6 +9,7 @@ header('Content-Type: application/json; charset=utf-8');
 if (
     !has_permission('vehicle.view')
     && !has_permission('job.view')
+    && !has_permission('estimate.view')
     && !has_permission('reports.view')
     && !has_permission('report.view')
 ) {
@@ -83,6 +84,47 @@ if ($action === 'variants') {
                 'fuel_type' => isset($row['fuel_type']) ? (string) $row['fuel_type'] : null,
                 'engine_cc' => isset($row['engine_cc']) ? (string) $row['engine_cc'] : null,
                 'vis_variant_id' => isset($row['vis_variant_id']) ? (int) $row['vis_variant_id'] : null,
+            ];
+        }, $items),
+    ], JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
+if ($action === 'combo') {
+    $brandId = get_int('brand_id');
+    $modelId = get_int('model_id');
+    $variantId = get_int('variant_id');
+    $items = vehicle_master_search_combos($query, $limit, [
+        'brand_id' => $brandId,
+        'model_id' => $modelId,
+        'variant_id' => $variantId,
+    ]);
+    echo json_encode([
+        'ok' => true,
+        'items' => array_map(static function (array $row): array {
+            $brandIdValue = (int) ($row['brand_id'] ?? 0);
+            $modelIdValue = (int) ($row['model_id'] ?? 0);
+            $variantIdValue = (int) ($row['variant_id'] ?? 0);
+            $brandName = trim((string) ($row['brand_name'] ?? ''));
+            $modelName = trim((string) ($row['model_name'] ?? ''));
+            $variantName = trim((string) ($row['variant_name'] ?? ''));
+            $label = trim($brandName . ' -> ' . $modelName . ' -> ' . $variantName);
+            $sourceCode = (int) ($row['vis_priority'] ?? 0) === 1 ? 'VIS' : 'MASTER';
+
+            return [
+                'id' => $variantIdValue,
+                'combo_key' => $brandIdValue . ':' . $modelIdValue . ':' . $variantIdValue,
+                'brand_id' => $brandIdValue,
+                'model_id' => $modelIdValue,
+                'variant_id' => $variantIdValue,
+                'brand_name' => $brandName,
+                'model_name' => $modelName,
+                'variant_name' => $variantName,
+                'fuel_type' => isset($row['fuel_type']) ? (string) $row['fuel_type'] : null,
+                'engine_cc' => isset($row['engine_cc']) ? (string) $row['engine_cc'] : null,
+                'vis_variant_id' => isset($row['vis_variant_id']) ? (int) $row['vis_variant_id'] : null,
+                'source_code' => $sourceCode,
+                'label' => $label,
             ];
         }, $items),
     ], JSON_UNESCAPED_UNICODE);

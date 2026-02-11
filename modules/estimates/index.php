@@ -21,6 +21,8 @@ $active_menu = 'estimates';
 $companyId = active_company_id();
 $garageId = active_garage_id();
 $userId = (int) ($_SESSION['user_id'] ?? 0);
+$vehicleAttributesEnabled = vehicle_masters_enabled() && vehicle_master_link_columns_supported();
+$vehicleAttributesApiUrl = url('modules/vehicles/attributes_api.php');
 
 $canCreate = has_permission('estimate.create') || has_permission('estimate.manage');
 $canEdit = has_permission('estimate.edit') || has_permission('estimate.manage');
@@ -270,6 +272,17 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                   <?php endforeach; ?>
                 </select>
               </div>
+              <?php if ($vehicleAttributesEnabled): ?>
+                <div class="col-md-4" data-vehicle-attributes-root="1" data-vehicle-attributes-mode="filter" data-vehicle-attributes-endpoint="<?= e($vehicleAttributesApiUrl); ?>" data-vehicle-picker-target="#estimate-vehicle-select" data-vehicle-customer-select="#estimate-customer-select">
+                  <label class="form-label">Vehicle (Brand / Model / Variant)</label>
+                  <select name="estimate_vehicle_combo_selector" data-vehicle-attr="combo" class="form-select">
+                    <option value="">All Brand / Model / Variant</option>
+                  </select>
+                  <input type="hidden" name="estimate_vehicle_brand_id" data-vehicle-attr-id="brand" value="" />
+                  <input type="hidden" name="estimate_vehicle_model_id" data-vehicle-attr-id="model" value="" />
+                  <input type="hidden" name="estimate_vehicle_variant_id" data-vehicle-attr-id="variant" value="" />
+                </div>
+              <?php endif; ?>
               <div class="col-md-4">
                 <label class="form-label">Vehicle</label>
                 <select id="estimate-vehicle-select" name="vehicle_id" class="form-select" required>

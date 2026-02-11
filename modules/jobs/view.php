@@ -532,11 +532,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $serviceCategoryName = null;
 
         if ($serviceId > 0) {
-            if ($serviceCategoryKey === '') {
-                flash_set('job_error', 'Select service category before selecting service.', 'danger');
-                redirect('modules/jobs/view.php?id=' . $jobId);
-            }
-
             $serviceStmt = db()->prepare(
                 'SELECT s.id, s.service_name, s.service_code, s.default_rate, s.gst_rate, s.category_id,
                         sc.category_name
@@ -561,9 +556,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $resolvedCategoryKey = ((int) ($service['category_id'] ?? 0) > 0)
                 ? (string) (int) $service['category_id']
                 : 'uncategorized';
-            if ($serviceCategoryKey !== $resolvedCategoryKey) {
+            if ($serviceCategoryKey !== '' && $serviceCategoryKey !== $resolvedCategoryKey) {
                 flash_set('job_error', 'Selected service does not belong to the chosen category.', 'danger');
                 redirect('modules/jobs/view.php?id=' . $jobId);
+            }
+            if ($serviceCategoryKey === '') {
+                $serviceCategoryKey = $resolvedCategoryKey;
             }
 
             $serviceName = (string) $service['service_name'];
@@ -1264,6 +1262,25 @@ $visVariant = $visData['vehicle_variant'];
 $visServiceSuggestions = $visData['service_suggestions'] ?? [];
 $visPartSuggestions = $visData['part_suggestions'] ?? [];
 $hasVisData = $visVariant !== null || !empty($visServiceSuggestions) || !empty($visPartSuggestions);
+$visPartCompatibilityLookup = [];
+foreach ($visPartSuggestions as $visPartSuggestion) {
+    $visPartId = (int) ($visPartSuggestion['part_id'] ?? 0);
+    if ($visPartId > 0) {
+        $visPartCompatibilityLookup[$visPartId] = true;
+    }
+}
+$partsTotalCount = count($partsMaster);
+$partsVisCount = 0;
+$partsInStockCount = 0;
+foreach ($partsMaster as $partMasterRow) {
+    $partMasterId = (int) ($partMasterRow['id'] ?? 0);
+    if ($partMasterId > 0 && isset($visPartCompatibilityLookup[$partMasterId])) {
+        $partsVisCount++;
+    }
+    if ((float) ($partMasterRow['stock_qty'] ?? 0) > 0) {
+        $partsInStockCount++;
+    }
+}
 
 require_once __DIR__ . '/../../includes/header.php';
 require_once __DIR__ . '/../../includes/sidebar.php';
@@ -1568,7 +1585,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                   <div class="col-md-2">
                     <label class="form-label">Category</label>
                     <select id="add-labor-category" name="service_category_key" class="form-select" <?= $jobLocked ? 'disabled' : ''; ?>>
-                      <option value="">Select Category</option>
+                      <option value="">All Categories</option>
                       <?php foreach ($serviceCategories as $category): ?>
                         <option value="<?= (int) $category['id']; ?>">
                           <?= e((string) $category['category_name']); ?>
@@ -1581,7 +1598,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                   </div>
                   <div class="col-md-3">
                     <label class="form-label">Service Master</label>
-                    <select id="add-labor-service" name="service_id" class="form-select" <?= $jobLocked ? 'disabled' : ''; ?>>
+                    <select id="add-labor-service" name="service_id" class="form-select" data-searchable-select="off" <?= $jobLocked ? 'disabled' : ''; ?>>
                       <option value="0" data-category-key="">Custom Labor Item</option>
                       <?php foreach ($servicesMaster as $service): ?>
                         <?php $serviceCategoryKey = ((int) ($service['category_id'] ?? 0) > 0) ? (string) (int) $service['category_id'] : 'uncategorized'; ?>
@@ -1596,7 +1613,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                         </option>
                       <?php endforeach; ?>
                     </select>
-                    <small class="text-muted">Choose category first for service master entries.</small>
+                    <small class="text-muted">Category is optional. Choose one to narrow the service list.</small>
                   </div>
                   <div class="col-md-3">
                     <label class="form-label">Description</label>
@@ -1812,30 +1829,69 @@ require_once __DIR__ . '/../../includes/sidebar.php';
           <div class="card card-warning">
             <div class="card-header"><h3 class="card-title">Parts Lines</h3></div>
             <?php if ($canEdit): ?>
-              <form method="post">
+              <form method="post" id="add-part-form">
                 <div class="card-body border-bottom row g-2">
                   <?= csrf_field(); ?>
                   <input type="hidden" name="_action" value="add_part">
-                  <div class="col-md-5">
+                  <input type="hidden" id="add-part-mode" name="part_mode" value="all">
+                  <div class="col-12">
+                    <label class="form-label d-block mb-1">Selection Mode</label>
+                    <div id="add-part-mode-group" class="btn-group btn-group-sm" role="group" aria-label="Part selection mode">
+                      <button type="button" class="btn btn-outline-secondary active" data-part-mode="all" <?= $jobLocked ? 'disabled' : ''; ?>>
+                        All Parts (<?= e(number_format($partsTotalCount)); ?>)
+                      </button>
+                      <button type="button" class="btn btn-outline-secondary" data-part-mode="vis" <?= $jobLocked ? 'disabled' : ''; ?>>
+                        Vehicle-Compatible (VIS) (<?= e(number_format($partsVisCount)); ?>)
+                      </button>
+                      <button type="button" class="btn btn-outline-secondary" data-part-mode="stock" <?= $jobLocked ? 'disabled' : ''; ?>>
+                        In-Stock (<?= e(number_format($partsInStockCount)); ?>)
+                      </button>
+                    </div>
+                    <small id="add-part-mode-hint" class="text-muted d-block mt-1">VIS suggestions are optional. Use All Parts anytime for manual override.</small>
+                  </div>
+                  <div class="col-md-3">
+                    <label class="form-label">Search</label>
+                    <input
+                      type="search"
+                      id="add-part-search"
+                      class="form-control"
+                      placeholder="Part name or SKU"
+                      autocomplete="off"
+                      <?= $jobLocked ? 'disabled' : ''; ?>
+                    >
+                    <small class="text-muted d-block mt-1">Keyboard: <kbd>/</kbd> search, <kbd>Alt+1</kbd>/<kbd>Alt+2</kbd>/<kbd>Alt+3</kbd> mode.</small>
+                  </div>
+                  <div class="col-md-3">
                     <label class="form-label">Part Master</label>
-                    <select id="add-part-select" name="part_id" class="form-select" required <?= $jobLocked ? 'disabled' : ''; ?>>
+                    <select id="add-part-select" name="part_id" class="form-select" data-searchable-select="off" required <?= $jobLocked ? 'disabled' : ''; ?>>
                       <option value="">Select Part</option>
                       <?php foreach ($partsMaster as $part): ?>
+                        <?php
+                          $partId = (int) ($part['id'] ?? 0);
+                          $partStockQty = (float) ($part['stock_qty'] ?? 0);
+                          $partNameText = (string) ($part['part_name'] ?? '');
+                          $partSkuText = (string) ($part['part_sku'] ?? '');
+                          $partVisCompatible = isset($visPartCompatibilityLookup[$partId]);
+                        ?>
                         <option
-                          value="<?= (int) $part['id']; ?>"
+                          value="<?= $partId; ?>"
                           data-price="<?= e((string) $part['selling_price']); ?>"
                           data-gst="<?= e((string) $part['gst_rate']); ?>"
-                          data-stock="<?= e((string) $part['stock_qty']); ?>"
+                          data-stock="<?= e((string) $partStockQty); ?>"
+                          data-name="<?= e($partNameText); ?>"
+                          data-sku="<?= e($partSkuText); ?>"
+                          data-vis-compatible="<?= $partVisCompatible ? '1' : '0'; ?>"
+                          data-in-stock="<?= $partStockQty > 0 ? '1' : '0'; ?>"
                         >
-                          <?= e((string) $part['part_name']); ?> (<?= e((string) $part['part_sku']); ?>) | Stock <?= e(number_format((float) $part['stock_qty'], 2)); ?>
+                          <?= e($partNameText); ?> (<?= e($partSkuText); ?>) | Stock <?= e(number_format($partStockQty, 2)); ?><?= $partVisCompatible ? ' | VIS' : ''; ?>
                         </option>
                       <?php endforeach; ?>
                     </select>
-                    <small id="add-part-stock-hint" class="text-muted"></small>
+                    <small id="add-part-stock-hint" class="text-muted d-block mt-1"></small>
                   </div>
-                  <div class="col-md-2">
+                  <div class="col-md-1">
                     <label class="form-label">Qty</label>
-                    <input type="number" step="0.01" min="0.01" name="quantity" class="form-control" value="1" required <?= $jobLocked ? 'disabled' : ''; ?>>
+                    <input id="add-part-qty" type="number" step="0.01" min="0.01" name="quantity" class="form-control" value="1" required <?= $jobLocked ? 'disabled' : ''; ?>>
                   </div>
                   <div class="col-md-2">
                     <label class="form-label">Rate</label>
@@ -2041,22 +2097,16 @@ require_once __DIR__ . '/../../includes/sidebar.php';
           }
 
           var optionCategoryKey = option.getAttribute('data-category-key') || '';
-          option.hidden = !hasCategory || optionCategoryKey !== selectedCategoryKey;
+          option.hidden = hasCategory && optionCategoryKey !== selectedCategoryKey;
         }
 
         if (laborInputsLocked) {
           return;
         }
 
-        if (!hasCategory) {
-          laborServiceSelect.value = '0';
-          laborServiceSelect.disabled = true;
-          return;
-        }
-
         laborServiceSelect.disabled = false;
         var currentOption = laborServiceSelect.options[laborServiceSelect.selectedIndex];
-        if (!currentOption || currentOption.hidden) {
+        if (currentOption && currentOption.hidden) {
           laborServiceSelect.value = '0';
         }
       }
@@ -2139,19 +2189,267 @@ require_once __DIR__ . '/../../includes/sidebar.php';
     var partPrice = document.getElementById('add-part-price');
     var partGst = document.getElementById('add-part-gst');
     var partStockHint = document.getElementById('add-part-stock-hint');
+    var partQty = document.getElementById('add-part-qty');
+    var partSearchInput = document.getElementById('add-part-search');
+    var partModeInput = document.getElementById('add-part-mode');
+    var partModeGroup = document.getElementById('add-part-mode-group');
+    var partModeHint = document.getElementById('add-part-mode-hint');
+    var partModeButtons = partModeGroup ? partModeGroup.querySelectorAll('[data-part-mode]') : [];
+
+    function normalizePartSearch(value) {
+      return String(value || '').toLowerCase().replace(/\s+/g, ' ').trim();
+    }
+
+    function partModeLabel(mode) {
+      if (mode === 'vis') {
+        return 'Vehicle-Compatible (VIS)';
+      }
+      if (mode === 'stock') {
+        return 'In-Stock';
+      }
+      return 'All Parts';
+    }
+
+    function getPartOptionByValue(value) {
+      if (!partSelect) {
+        return null;
+      }
+      var targetValue = String(value || '');
+      for (var index = 0; index < partSelect.options.length; index++) {
+        var option = partSelect.options[index];
+        if (option && option.value === targetValue) {
+          return option;
+        }
+      }
+      return null;
+    }
+
+    function optionMatchesPartMode(option, mode) {
+      if (!option || option.value === '') {
+        return true;
+      }
+      if (mode === 'vis') {
+        return (option.getAttribute('data-vis-compatible') || '0') === '1';
+      }
+      if (mode === 'stock') {
+        return (option.getAttribute('data-in-stock') || '0') === '1';
+      }
+      return true;
+    }
+
+    function optionMatchesPartSearch(option, term) {
+      if (!option || option.value === '' || term === '') {
+        return true;
+      }
+      var text = normalizePartSearch((option.getAttribute('data-name') || '') + ' ' + (option.getAttribute('data-sku') || ''));
+      return text.indexOf(term) !== -1;
+    }
+
+    function updatePartModeButtons(activeMode) {
+      for (var index = 0; index < partModeButtons.length; index++) {
+        var button = partModeButtons[index];
+        if (!button) {
+          continue;
+        }
+        var mode = button.getAttribute('data-part-mode') || 'all';
+        var isActive = mode === activeMode;
+        button.classList.toggle('active', isActive);
+        button.setAttribute('aria-pressed', isActive ? 'true' : 'false');
+      }
+    }
+
+    function syncPartOptionVisibility() {
+      if (!partSelect) {
+        return;
+      }
+
+      var mode = partModeInput ? (partModeInput.value || 'all') : 'all';
+      var searchTerm = normalizePartSearch(partSearchInput ? partSearchInput.value : '');
+      var selectedValue = partSelect.value || '';
+      var visibleCount = 0;
+      var selectedForcedVisible = false;
+
+      for (var index = 0; index < partSelect.options.length; index++) {
+        var option = partSelect.options[index];
+        if (!option) {
+          continue;
+        }
+        if (option.value === '') {
+          option.hidden = false;
+          continue;
+        }
+
+        var visibleByRule = optionMatchesPartMode(option, mode) && optionMatchesPartSearch(option, searchTerm);
+        if (!visibleByRule && selectedValue !== '' && option.value === selectedValue) {
+          visibleByRule = true;
+          selectedForcedVisible = true;
+        }
+
+        option.hidden = !visibleByRule;
+        if (visibleByRule) {
+          visibleCount++;
+        }
+      }
+
+      if (selectedValue === '') {
+        return updatePartModeHint(mode, searchTerm, visibleCount, false);
+      }
+
+      var selectedOption = getPartOptionByValue(selectedValue);
+      if (!selectedOption) {
+        partSelect.value = '';
+      }
+
+      updatePartModeHint(mode, searchTerm, visibleCount, selectedForcedVisible);
+    }
+
+    function updatePartModeHint(mode, searchTerm, visibleCount, selectedForcedVisible) {
+      if (!partModeHint) {
+        return;
+      }
+
+      var message = visibleCount + ' part(s) in ' + partModeLabel(mode) + ' mode.';
+      if (searchTerm !== '') {
+        message += ' Search filter is active.';
+      }
+      if (visibleCount === 0) {
+        message += ' No matches. Switch mode or clear search.';
+      }
+      if (selectedForcedVisible) {
+        message += ' Selected part kept visible as manual override.';
+      }
+      if (mode === 'vis') {
+        message += ' VIS suggestions are optional.';
+      }
+      partModeHint.textContent = message;
+    }
+
+    function firstVisiblePartOption() {
+      if (!partSelect) {
+        return null;
+      }
+      for (var index = 0; index < partSelect.options.length; index++) {
+        var option = partSelect.options[index];
+        if (!option || option.value === '' || option.hidden) {
+          continue;
+        }
+        return option;
+      }
+      return null;
+    }
+
+    function applyPartDefaults() {
+      if (!partSelect || !partPrice || !partGst || !partStockHint) {
+        return;
+      }
+      var selected = partSelect.options[partSelect.selectedIndex];
+      if (!selected || selected.value === '') {
+        partStockHint.textContent = '';
+        return;
+      }
+
+      partPrice.value = selected.getAttribute('data-price') || partPrice.value;
+      partGst.value = selected.getAttribute('data-gst') || partGst.value;
+      var stock = selected.getAttribute('data-stock') || '0';
+      var visCompatible = (selected.getAttribute('data-vis-compatible') || '0') === '1';
+      partStockHint.textContent = 'Garage stock: ' + stock + ' | ' + (visCompatible ? 'VIS compatible' : 'Manual override part');
+    }
+
+    function setPartMode(mode, focusSearch) {
+      var normalizedMode = mode === 'vis' || mode === 'stock' ? mode : 'all';
+      if (partModeInput) {
+        partModeInput.value = normalizedMode;
+      }
+      updatePartModeButtons(normalizedMode);
+      syncPartOptionVisibility();
+      applyPartDefaults();
+
+      if (focusSearch && partSearchInput && !partSearchInput.disabled) {
+        partSearchInput.focus();
+        partSearchInput.select();
+      }
+    }
 
     if (partSelect && partPrice && partGst && partStockHint) {
       partSelect.addEventListener('change', function () {
-        var selected = partSelect.options[partSelect.selectedIndex];
-        if (!selected) {
+        applyPartDefaults();
+        syncPartOptionVisibility();
+      });
+
+      if (partSearchInput) {
+        partSearchInput.addEventListener('input', function () {
+          syncPartOptionVisibility();
+        });
+
+        partSearchInput.addEventListener('keydown', function (event) {
+          if (event.key !== 'Enter') {
+            return;
+          }
+          event.preventDefault();
+          var firstVisible = firstVisiblePartOption();
+          if (!firstVisible) {
+            return;
+          }
+          partSelect.value = firstVisible.value;
+          partSelect.dispatchEvent(new Event('change'));
+          if (partQty && !partQty.disabled) {
+            partQty.focus();
+            partQty.select();
+          }
+        });
+      }
+
+      for (var buttonIndex = 0; buttonIndex < partModeButtons.length; buttonIndex++) {
+        var modeButton = partModeButtons[buttonIndex];
+        if (!modeButton) {
+          continue;
+        }
+        modeButton.addEventListener('click', function () {
+          setPartMode((this.getAttribute('data-part-mode') || 'all'), false);
+        });
+      }
+
+      document.addEventListener('keydown', function (event) {
+        var targetTag = (event.target && event.target.tagName ? event.target.tagName : '').toUpperCase();
+        var isTypingContext = targetTag === 'INPUT' || targetTag === 'TEXTAREA' || targetTag === 'SELECT';
+
+        if (!isTypingContext && event.key === '/' && !event.altKey && !event.ctrlKey && !event.metaKey) {
+          if (partSearchInput && !partSearchInput.disabled) {
+            event.preventDefault();
+            partSearchInput.focus();
+            partSearchInput.select();
+          }
           return;
         }
 
-        partPrice.value = selected.getAttribute('data-price') || partPrice.value;
-        partGst.value = selected.getAttribute('data-gst') || partGst.value;
-        var stock = selected.getAttribute('data-stock') || '0';
-        partStockHint.textContent = 'Available stock in this garage: ' + stock;
+        if (!event.altKey || event.ctrlKey || event.metaKey) {
+          return;
+        }
+
+        var shortcut = String(event.key || '').toLowerCase();
+        if (shortcut === '1') {
+          event.preventDefault();
+          setPartMode('all', true);
+          return;
+        }
+        if (shortcut === '2') {
+          event.preventDefault();
+          setPartMode('vis', true);
+          return;
+        }
+        if (shortcut === '3') {
+          event.preventDefault();
+          setPartMode('stock', true);
+          return;
+        }
+        if (shortcut === 's' && laborServiceSelect && !laborServiceSelect.disabled) {
+          event.preventDefault();
+          laborServiceSelect.focus();
+        }
       });
+
+      setPartMode(partModeInput ? partModeInput.value : 'all', false);
+      applyPartDefaults();
     }
 
     var nextStatusSelect = document.getElementById('next-status-select');
