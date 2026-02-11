@@ -17,6 +17,9 @@ $canAssign = has_permission('job.assign') || has_permission('job.manage');
 $canClose = has_permission('job.close') || has_permission('job.manage');
 $jobCardColumns = table_columns('job_cards');
 $jobOdometerEnabled = in_array('odometer_km', $jobCardColumns, true);
+$jobLaborColumns = table_columns('job_labor');
+$outsourceExpectedReturnSupported = in_array('outsource_expected_return_date', $jobLaborColumns, true);
+$outsourcedModuleReady = table_columns('outsourced_works') !== [] && table_columns('outsourced_work_payments') !== [];
 
 function post_decimal(string $key, float $default = 0.0): float
 {
@@ -84,6 +87,247 @@ function normalize_outsource_payable_status(?string $value): string
 {
     $normalized = strtoupper(trim((string) $value));
     return $normalized === 'PAID' ? 'PAID' : 'UNPAID';
+}
+
+function normalize_outsourced_work_status(?string $value): string
+{
+    $normalized = strtoupper(trim((string) $value));
+    return in_array($normalized, ['SENT', 'RECEIVED', 'VERIFIED', 'PAYABLE', 'PAID'], true) ? $normalized : 'SENT';
+}
+
+function outsourced_work_status_badge_class(string $status): string
+{
+    return match (normalize_outsourced_work_status($status)) {
+        'SENT' => 'secondary',
+        'RECEIVED' => 'info',
+        'VERIFIED' => 'primary',
+        'PAYABLE' => 'warning',
+        'PAID' => 'success',
+        default => 'secondary',
+    };
+}
+
+function parse_iso_date_input(?string $value): ?string
+{
+    $raw = trim((string) $value);
+    if ($raw === '') {
+        return null;
+    }
+
+    if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $raw)) {
+        return null;
+    }
+
+    [$year, $month, $day] = array_map('intval', explode('-', $raw));
+    if (!checkdate($month, $day, $year)) {
+        return null;
+    }
+
+    return $raw;
+}
+
+function outsourced_work_tables_ready(): bool
+{
+    static $ready = null;
+    if ($ready !== null) {
+        return $ready;
+    }
+
+    $ready = table_columns('outsourced_works') !== [] && table_columns('outsourced_work_payments') !== [];
+    return $ready;
+}
+
+function fetch_linked_outsourced_work(int $companyId, int $garageId, int $laborId): ?array
+{
+    if (!outsourced_work_tables_ready() || $companyId <= 0 || $garageId <= 0 || $laborId <= 0) {
+        return null;
+    }
+
+    $stmt = db()->prepare(
+        'SELECT ow.*,
+                COALESCE(pay.total_paid, 0) AS paid_amount
+         FROM outsourced_works ow
+         LEFT JOIN (
+            SELECT outsourced_work_id, SUM(amount) AS total_paid
+            FROM outsourced_work_payments
+            GROUP BY outsourced_work_id
+         ) pay ON pay.outsourced_work_id = ow.id
+         WHERE ow.company_id = :company_id
+           AND ow.garage_id = :garage_id
+           AND ow.job_labor_id = :job_labor_id
+           AND ow.status_code = "ACTIVE"
+         LIMIT 1'
+    );
+    $stmt->execute([
+        'company_id' => $companyId,
+        'garage_id' => $garageId,
+        'job_labor_id' => $laborId,
+    ]);
+    $row = $stmt->fetch();
+    return $row ?: null;
+}
+
+function sync_linked_outsourced_work(
+    int $companyId,
+    int $garageId,
+    int $jobId,
+    int $laborId,
+    int $vendorId,
+    string $partnerName,
+    string $description,
+    float $agreedCost,
+    ?string $expectedReturnDate,
+    int $userId
+): ?int {
+    if (!outsourced_work_tables_ready() || $companyId <= 0 || $garageId <= 0 || $jobId <= 0 || $laborId <= 0) {
+        return null;
+    }
+
+    $pdo = db();
+    $existingStmt = $pdo->prepare(
+        'SELECT ow.id, ow.current_status, ow.payable_at, ow.paid_at,
+                COALESCE(pay.total_paid, 0) AS paid_amount
+         FROM outsourced_works ow
+         LEFT JOIN (
+            SELECT outsourced_work_id, SUM(amount) AS total_paid
+            FROM outsourced_work_payments
+            GROUP BY outsourced_work_id
+         ) pay ON pay.outsourced_work_id = ow.id
+         WHERE ow.company_id = :company_id
+           AND ow.garage_id = :garage_id
+           AND ow.job_labor_id = :job_labor_id
+         LIMIT 1'
+    );
+    $existingStmt->execute([
+        'company_id' => $companyId,
+        'garage_id' => $garageId,
+        'job_labor_id' => $laborId,
+    ]);
+    $existing = $existingStmt->fetch() ?: null;
+
+    $now = date('Y-m-d H:i:s');
+    if ($existing) {
+        $paidAmount = round((float) ($existing['paid_amount'] ?? 0), 2);
+        if ($agreedCost + 0.009 < $paidAmount) {
+            return null;
+        }
+
+        $status = normalize_outsourced_work_status((string) ($existing['current_status'] ?? 'SENT'));
+        if ($status === 'PAID' && $paidAmount + 0.009 < $agreedCost) {
+            $status = 'PAYABLE';
+        }
+        if ($paidAmount > 0 && !in_array($status, ['PAYABLE', 'PAID'], true)) {
+            $status = 'PAYABLE';
+        }
+        if ($agreedCost > 0 && $paidAmount + 0.009 >= $agreedCost) {
+            $status = 'PAID';
+        }
+
+        $payableAt = !empty($existing['payable_at']) ? (string) $existing['payable_at'] : null;
+        $paidAt = !empty($existing['paid_at']) ? (string) $existing['paid_at'] : null;
+        if ($status === 'PAYABLE' && $payableAt === null) {
+            $payableAt = $now;
+        }
+        if ($status === 'PAID') {
+            if ($payableAt === null) {
+                $payableAt = $now;
+            }
+            if ($paidAt === null) {
+                $paidAt = $now;
+            }
+        } else {
+            $paidAt = null;
+        }
+
+        $updateStmt = $pdo->prepare(
+            'UPDATE outsourced_works
+             SET vendor_id = :vendor_id,
+                 partner_name = :partner_name,
+                 service_description = :service_description,
+                 agreed_cost = :agreed_cost,
+                 expected_return_date = :expected_return_date,
+                 current_status = :current_status,
+                 payable_at = :payable_at,
+                 paid_at = :paid_at,
+                 status_code = "ACTIVE",
+                 deleted_at = NULL,
+                 updated_by = :updated_by
+             WHERE id = :id'
+        );
+        $updateStmt->execute([
+            'vendor_id' => $vendorId > 0 ? $vendorId : null,
+            'partner_name' => $partnerName,
+            'service_description' => $description,
+            'agreed_cost' => round($agreedCost, 2),
+            'expected_return_date' => $expectedReturnDate,
+            'current_status' => $status,
+            'payable_at' => $payableAt,
+            'paid_at' => $paidAt,
+            'updated_by' => $userId > 0 ? $userId : null,
+            'id' => (int) $existing['id'],
+        ]);
+        return (int) $existing['id'];
+    }
+
+    $insertStmt = $pdo->prepare(
+        'INSERT INTO outsourced_works
+          (company_id, garage_id, job_card_id, job_labor_id, vendor_id, partner_name, service_description, agreed_cost,
+           expected_return_date, current_status, sent_at, created_by, updated_by)
+         VALUES
+          (:company_id, :garage_id, :job_card_id, :job_labor_id, :vendor_id, :partner_name, :service_description, :agreed_cost,
+           :expected_return_date, "SENT", :sent_at, :created_by, :updated_by)'
+    );
+    $insertStmt->execute([
+        'company_id' => $companyId,
+        'garage_id' => $garageId,
+        'job_card_id' => $jobId,
+        'job_labor_id' => $laborId,
+        'vendor_id' => $vendorId > 0 ? $vendorId : null,
+        'partner_name' => $partnerName,
+        'service_description' => $description,
+        'agreed_cost' => round($agreedCost, 2),
+        'expected_return_date' => $expectedReturnDate,
+        'sent_at' => $now,
+        'created_by' => $userId > 0 ? $userId : null,
+        'updated_by' => $userId > 0 ? $userId : null,
+    ]);
+
+    return (int) $pdo->lastInsertId();
+}
+
+function soft_delete_linked_outsourced_work(int $companyId, int $garageId, int $laborId, int $userId): bool
+{
+    if (!outsourced_work_tables_ready() || $companyId <= 0 || $garageId <= 0 || $laborId <= 0) {
+        return true;
+    }
+
+    $work = fetch_linked_outsourced_work($companyId, $garageId, $laborId);
+    if (!$work) {
+        return true;
+    }
+
+    $paidAmount = round((float) ($work['paid_amount'] ?? 0), 2);
+    if ($paidAmount > 0.009) {
+        return false;
+    }
+
+    $stmt = db()->prepare(
+        'UPDATE outsourced_works
+         SET status_code = "DELETED",
+             deleted_at = NOW(),
+             updated_by = :updated_by
+         WHERE id = :id
+           AND company_id = :company_id
+           AND garage_id = :garage_id'
+    );
+    $stmt->execute([
+        'updated_by' => $userId > 0 ? $userId : null,
+        'id' => (int) $work['id'],
+        'company_id' => $companyId,
+        'garage_id' => $garageId,
+    ]);
+
+    return true;
 }
 
 function fetch_outsource_vendor(int $companyId, int $vendorId): ?array
@@ -163,16 +407,37 @@ function fetch_job_details(int $jobId, int $companyId, int $garageId): ?array
 
 function fetch_job_labor(int $jobId): array
 {
+    $selectExtras = '';
+    $joinExtras = '';
+    if (outsourced_work_tables_ready()) {
+        $selectExtras = ',
+                ow.id AS outsourced_work_id,
+                ow.current_status AS outsourced_work_status,
+                ow.expected_return_date AS outsourced_work_expected_return_date,
+                ow.agreed_cost AS outsourced_work_agreed_cost,
+                ow.payable_at AS outsourced_work_payable_at,
+                ow.paid_at AS outsourced_work_paid_at,
+                COALESCE(owp.total_paid, 0) AS outsourced_work_paid_amount,
+                GREATEST(ow.agreed_cost - COALESCE(owp.total_paid, 0), 0) AS outsourced_work_outstanding';
+        $joinExtras = '
+         LEFT JOIN outsourced_works ow ON ow.job_labor_id = jl.id AND ow.status_code = "ACTIVE"
+         LEFT JOIN (
+            SELECT outsourced_work_id, SUM(amount) AS total_paid
+            FROM outsourced_work_payments
+            GROUP BY outsourced_work_id
+         ) owp ON owp.outsourced_work_id = ow.id';
+    }
+
     $stmt = db()->prepare(
         'SELECT jl.*, s.service_name, s.service_code, s.category_id AS service_category_id,
                 sc.category_name AS service_category_name,
                 v.vendor_name AS outsource_vendor_name,
-                up.name AS outsource_paid_by_name
+                up.name AS outsource_paid_by_name' . $selectExtras . '
          FROM job_labor jl
          LEFT JOIN services s ON s.id = jl.service_id
          LEFT JOIN service_categories sc ON sc.id = s.category_id AND sc.company_id = s.company_id
          LEFT JOIN vendors v ON v.id = jl.outsource_vendor_id
-         LEFT JOIN users up ON up.id = jl.outsource_paid_by
+         LEFT JOIN users up ON up.id = jl.outsource_paid_by' . $joinExtras . '
          WHERE jl.job_card_id = :job_id
          ORDER BY jl.id DESC'
     );
@@ -527,6 +792,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $outsourceVendorId = post_int('outsource_vendor_id');
         $outsourcePartnerName = post_string('outsource_partner_name', 150);
         $outsourceCost = post_decimal('outsource_cost', 0.0);
+        $outsourceExpectedReturnRaw = trim((string) ($_POST['outsource_expected_return_date'] ?? ''));
+        $outsourceExpectedReturnDate = null;
         $outsourceVendorName = null;
         $serviceName = null;
         $serviceCategoryName = null;
@@ -585,6 +852,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             redirect('modules/jobs/view.php?id=' . $jobId);
         }
 
+        if ($outsourceExpectedReturnRaw !== '') {
+            $outsourceExpectedReturnDate = parse_iso_date_input($outsourceExpectedReturnRaw);
+            if ($outsourceExpectedReturnDate === null) {
+                flash_set('job_error', 'Invalid expected return date for outsourced labor.', 'danger');
+                redirect('modules/jobs/view.php?id=' . $jobId);
+            }
+        }
+
         if ($executionType === 'OUTSOURCED') {
             if ($outsourceVendorId > 0) {
                 $vendor = fetch_outsource_vendor($companyId, $outsourceVendorId);
@@ -610,6 +885,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $outsourceVendorId = 0;
             $outsourcePartnerName = '';
             $outsourceCost = 0.0;
+            $outsourceExpectedReturnDate = null;
         }
 
         $gstRate = max(0, min(100, $gstRate));
@@ -641,6 +917,40 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'total_amount' => $totalAmount,
         ]);
 
+        $laborId = (int) db()->lastInsertId();
+        if ($outsourceExpectedReturnSupported && $executionType === 'OUTSOURCED') {
+            $expectedStmt = db()->prepare(
+                'UPDATE job_labor
+                 SET outsource_expected_return_date = :expected_return_date
+                 WHERE id = :id
+                   AND job_card_id = :job_card_id'
+            );
+            $expectedStmt->execute([
+                'expected_return_date' => $outsourceExpectedReturnDate,
+                'id' => $laborId,
+                'job_card_id' => $jobId,
+            ]);
+        }
+
+        $linkedOutsourceWorkId = null;
+        if ($executionType === 'OUTSOURCED' && $outsourcedModuleReady) {
+            $linkedOutsourceWorkId = sync_linked_outsourced_work(
+                $companyId,
+                $garageId,
+                $jobId,
+                $laborId,
+                $outsourceVendorId,
+                $outsourcePartnerName,
+                $description,
+                (float) $outsourceCost,
+                $outsourceExpectedReturnDate,
+                $userId
+            );
+            if ($linkedOutsourceWorkId === null) {
+                flash_set('job_warning', 'Labor line added, but outsourced work register sync needs review.', 'warning');
+            }
+        }
+
         job_recalculate_estimate($jobId);
         job_append_history(
             $jobId,
@@ -661,7 +971,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'outsource_vendor_name' => $outsourceVendorName,
                 'outsource_partner_name' => $executionType === 'OUTSOURCED' ? $outsourcePartnerName : null,
                 'outsource_cost' => round($executionType === 'OUTSOURCED' ? $outsourceCost : 0.0, 2),
+                'outsource_expected_return_date' => $executionType === 'OUTSOURCED' ? $outsourceExpectedReturnDate : null,
                 'outsource_payable_status' => $payableStatus,
+                'outsourced_work_id' => $linkedOutsourceWorkId,
             ]
         );
         log_audit('job_cards', 'add_labor', $jobId, 'Added labor line to job card');
@@ -680,6 +992,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $outsourceVendorId = post_int('outsource_vendor_id');
         $outsourcePartnerName = post_string('outsource_partner_name', 150);
         $outsourceCost = post_decimal('outsource_cost', 0.0);
+        $outsourceExpectedReturnRaw = trim((string) ($_POST['outsource_expected_return_date'] ?? ''));
+        $outsourceExpectedReturnDate = null;
         $outsourceVendorName = null;
 
         if ($laborId <= 0 || $description === '' || $quantity <= 0 || $unitPrice < 0) {
@@ -710,6 +1024,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             redirect('modules/jobs/view.php?id=' . $jobId);
         }
 
+        if ($outsourceExpectedReturnRaw !== '') {
+            $outsourceExpectedReturnDate = parse_iso_date_input($outsourceExpectedReturnRaw);
+            if ($outsourceExpectedReturnDate === null) {
+                flash_set('job_error', 'Invalid expected return date for outsourced labor.', 'danger');
+                redirect('modules/jobs/view.php?id=' . $jobId);
+            }
+        }
+
         if ($executionType === 'OUTSOURCED') {
             if ($outsourceVendorId > 0) {
                 $vendor = fetch_outsource_vendor($companyId, $outsourceVendorId);
@@ -735,11 +1057,25 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $outsourceVendorId = 0;
             $outsourcePartnerName = '';
             $outsourceCost = 0.0;
+            $outsourceExpectedReturnDate = null;
         }
 
         $gstRate = max(0, min(100, $gstRate));
         $totalAmount = round($quantity * $unitPrice, 2);
         $previousExecutionType = normalize_labor_execution_type((string) ($line['execution_type'] ?? 'IN_HOUSE'));
+
+        if (
+            $outsourcedModuleReady
+            && $previousExecutionType === 'OUTSOURCED'
+            && $executionType !== 'OUTSOURCED'
+        ) {
+            $linkedWork = fetch_linked_outsourced_work($companyId, $garageId, $laborId);
+            if ($linkedWork && round((float) ($linkedWork['paid_amount'] ?? 0), 2) > 0.009) {
+                flash_set('job_error', 'Cannot convert outsourced labor to in-house after payments are recorded. Reverse payments from Outsourced Works module first.', 'danger');
+                redirect('modules/jobs/view.php?id=' . $jobId);
+            }
+        }
+
         $payableStatus = normalize_outsource_payable_status((string) ($line['outsource_payable_status'] ?? 'UNPAID'));
         $paidAt = !empty($line['outsource_paid_at']) ? (string) $line['outsource_paid_at'] : null;
         $paidBy = (int) ($line['outsource_paid_by'] ?? 0);
@@ -799,6 +1135,46 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'job_card_id' => $jobId,
         ]);
 
+        if ($outsourceExpectedReturnSupported) {
+            $expectedStmt = db()->prepare(
+                'UPDATE job_labor
+                 SET outsource_expected_return_date = :expected_return_date
+                 WHERE id = :id
+                   AND job_card_id = :job_card_id'
+            );
+            $expectedStmt->execute([
+                'expected_return_date' => $executionType === 'OUTSOURCED' ? $outsourceExpectedReturnDate : null,
+                'id' => $laborId,
+                'job_card_id' => $jobId,
+            ]);
+        }
+
+        $linkedOutsourceWorkId = null;
+        if ($outsourcedModuleReady) {
+            if ($executionType === 'OUTSOURCED') {
+                $linkedOutsourceWorkId = sync_linked_outsourced_work(
+                    $companyId,
+                    $garageId,
+                    $jobId,
+                    $laborId,
+                    $outsourceVendorId,
+                    $outsourcePartnerName,
+                    $description,
+                    (float) $outsourceCost,
+                    $outsourceExpectedReturnDate,
+                    $userId
+                );
+                if ($linkedOutsourceWorkId === null) {
+                    flash_set('job_warning', 'Labor updated, but outsourced work register sync needs review.', 'warning');
+                }
+            } elseif ($previousExecutionType === 'OUTSOURCED') {
+                if (!soft_delete_linked_outsourced_work($companyId, $garageId, $laborId, $userId)) {
+                    flash_set('job_error', 'Cannot remove outsourced linkage with paid records. Reverse payments from Outsourced Works module first.', 'danger');
+                    redirect('modules/jobs/view.php?id=' . $jobId);
+                }
+            }
+        }
+
         job_recalculate_estimate($jobId);
         job_append_history(
             $jobId,
@@ -816,7 +1192,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'outsource_vendor_name' => $outsourceVendorName,
                 'outsource_partner_name' => $executionType === 'OUTSOURCED' ? $outsourcePartnerName : null,
                 'outsource_cost' => round($executionType === 'OUTSOURCED' ? $outsourceCost : 0.0, 2),
+                'outsource_expected_return_date' => $executionType === 'OUTSOURCED' ? $outsourceExpectedReturnDate : null,
                 'outsource_payable_status' => $payableStatus,
+                'outsourced_work_id' => $linkedOutsourceWorkId,
             ]
         );
         log_audit('job_cards', 'update_labor', $jobId, 'Updated labor line #' . $laborId);
@@ -830,6 +1208,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         if ($laborId <= 0) {
             flash_set('job_error', 'Invalid labor line selected.', 'danger');
             redirect('modules/jobs/view.php?id=' . $jobId);
+        }
+
+        if ($outsourcedModuleReady) {
+            $linkedWork = fetch_linked_outsourced_work($companyId, $garageId, $laborId);
+            if ($linkedWork && round((float) ($linkedWork['paid_amount'] ?? 0), 2) > 0.009) {
+                flash_set('job_error', 'Cannot delete outsourced labor with paid records. Use payment reversal from Outsourced Works module.', 'danger');
+                redirect('modules/jobs/view.php?id=' . $jobId);
+            }
+            if ($linkedWork && !soft_delete_linked_outsourced_work($companyId, $garageId, $laborId, $userId)) {
+                flash_set('job_error', 'Unable to archive linked outsourced work.', 'danger');
+                redirect('modules/jobs/view.php?id=' . $jobId);
+            }
         }
 
         $deleteStmt = db()->prepare(
@@ -869,6 +1259,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         if ($laborId <= 0) {
             flash_set('job_error', 'Invalid outsourced labor line selected.', 'danger');
             redirect('modules/jobs/view.php?id=' . $jobId);
+        }
+
+        if ($outsourcedModuleReady) {
+            $linkedWork = fetch_linked_outsourced_work($companyId, $garageId, $laborId);
+            if ($linkedWork) {
+                flash_set('job_error', 'Use Outsourced Works module for payable lifecycle and payments.', 'danger');
+                redirect('modules/jobs/view.php?id=' . $jobId);
+            }
         }
 
         $lineStmt = db()->prepare(
@@ -1643,6 +2041,10 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                     <label class="form-label">Outsource Cost</label>
                     <input id="add-labor-cost" type="number" step="0.01" min="0" name="outsource_cost" class="form-control" value="0" <?= $jobLocked ? 'disabled' : ''; ?>>
                   </div>
+                  <div class="col-md-2">
+                    <label class="form-label">Expected Return</label>
+                    <input id="add-labor-expected-return" type="date" name="outsource_expected_return_date" class="form-control" <?= $jobLocked ? 'disabled' : ''; ?>>
+                  </div>
                   <div class="col-md-1">
                     <label class="form-label">Qty</label>
                     <input type="number" step="0.01" min="0.01" name="quantity" class="form-control" value="1" required <?= $jobLocked ? 'disabled' : ''; ?>>
@@ -1691,6 +2093,11 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                         $lineIsOutsourced = $lineExecutionType === 'OUTSOURCED';
                         $lineOutsourceCost = (float) ($line['outsource_cost'] ?? 0);
                         $linePayableStatus = normalize_outsource_payable_status((string) ($line['outsource_payable_status'] ?? 'UNPAID'));
+                        $lineOutsourcedWorkId = (int) ($line['outsourced_work_id'] ?? 0);
+                        $lineOutsourcedWorkStatus = normalize_outsourced_work_status((string) ($line['outsourced_work_status'] ?? 'SENT'));
+                        $lineOutsourcedPaidAmount = (float) ($line['outsourced_work_paid_amount'] ?? 0);
+                        $lineOutsourcedOutstanding = (float) ($line['outsourced_work_outstanding'] ?? 0);
+                        $lineOutsourceExpectedReturn = trim((string) ($line['outsourced_work_expected_return_date'] ?? ($line['outsource_expected_return_date'] ?? '')));
                         $lineVendorName = trim((string) ($line['outsource_vendor_name'] ?? ''));
                         $linePartnerName = trim((string) ($line['outsource_partner_name'] ?? ''));
                         $linePartnerLabel = $lineVendorName !== '' ? $lineVendorName : ($linePartnerName !== '' ? $linePartnerName : '-');
@@ -1718,6 +2125,16 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                           <?php if ($lineIsOutsourced): ?>
                             <span class="badge text-bg-warning">Outsourced</span>
                             <div class="small text-muted"><?= e($linePartnerLabel); ?></div>
+                            <?php if ($lineOutsourceExpectedReturn !== ''): ?>
+                              <div class="small text-muted">Return: <?= e($lineOutsourceExpectedReturn); ?></div>
+                            <?php endif; ?>
+                            <?php if ($outsourcedModuleReady && $lineOutsourcedWorkId > 0): ?>
+                              <div class="small">
+                                <span class="badge text-bg-<?= e(outsourced_work_status_badge_class($lineOutsourcedWorkStatus)); ?>">
+                                  <?= e($lineOutsourcedWorkStatus); ?>
+                                </span>
+                              </div>
+                            <?php endif; ?>
                           <?php else: ?>
                             <span class="badge text-bg-success">In-house</span>
                           <?php endif; ?>
@@ -1729,9 +2146,15 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                         <td><?= $lineIsOutsourced ? e(format_currency($lineOutsourceCost)) : '-'; ?></td>
                         <td>
                           <?php if ($lineIsOutsourced): ?>
-                            <span class="badge text-bg-<?= $linePayableStatus === 'PAID' ? 'success' : 'danger'; ?>"><?= e($linePayableStatus); ?></span>
-                            <?php if ($linePayableStatus === 'PAID' && !empty($line['outsource_paid_at'])): ?>
-                              <div class="small text-muted"><?= e((string) $line['outsource_paid_at']); ?></div>
+                            <?php if ($outsourcedModuleReady && $lineOutsourcedWorkId > 0): ?>
+                              <span class="badge text-bg-<?= e(outsourced_work_status_badge_class($lineOutsourcedWorkStatus)); ?>"><?= e($lineOutsourcedWorkStatus); ?></span>
+                              <div class="small text-muted">Paid: <?= e(format_currency($lineOutsourcedPaidAmount)); ?></div>
+                              <div class="small text-muted">O/S: <?= e(format_currency($lineOutsourcedOutstanding)); ?></div>
+                            <?php else: ?>
+                              <span class="badge text-bg-<?= $linePayableStatus === 'PAID' ? 'success' : 'danger'; ?>"><?= e($linePayableStatus); ?></span>
+                              <?php if ($linePayableStatus === 'PAID' && !empty($line['outsource_paid_at'])): ?>
+                                <div class="small text-muted"><?= e((string) $line['outsource_paid_at']); ?></div>
+                              <?php endif; ?>
                             <?php endif; ?>
                           <?php else: ?>
                             -
@@ -1755,15 +2178,19 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                               <button type="submit" class="btn btn-sm btn-outline-danger" onclick="return confirm('Remove this labor line?');">Remove</button>
                             </form>
                             <?php if ($lineIsOutsourced): ?>
-                              <form method="post" class="d-inline">
-                                <?= csrf_field(); ?>
-                                <input type="hidden" name="_action" value="toggle_outsource_payable">
-                                <input type="hidden" name="labor_id" value="<?= (int) $line['id']; ?>">
-                                <input type="hidden" name="next_payable_status" value="<?= $linePayableStatus === 'PAID' ? 'UNPAID' : 'PAID'; ?>">
-                                <button type="submit" class="btn btn-sm btn-outline-<?= $linePayableStatus === 'PAID' ? 'secondary' : 'success'; ?>">
-                                  <?= $linePayableStatus === 'PAID' ? 'Mark Unpaid' : 'Mark Paid'; ?>
-                                </button>
-                              </form>
+                              <?php if ($outsourcedModuleReady && $lineOutsourcedWorkId > 0): ?>
+                                <a href="<?= e(url('modules/outsourced/index.php?edit_id=' . $lineOutsourcedWorkId)); ?>" class="btn btn-sm btn-outline-warning">Outsource Desk</a>
+                              <?php else: ?>
+                                <form method="post" class="d-inline">
+                                  <?= csrf_field(); ?>
+                                  <input type="hidden" name="_action" value="toggle_outsource_payable">
+                                  <input type="hidden" name="labor_id" value="<?= (int) $line['id']; ?>">
+                                  <input type="hidden" name="next_payable_status" value="<?= $linePayableStatus === 'PAID' ? 'UNPAID' : 'PAID'; ?>">
+                                  <button type="submit" class="btn btn-sm btn-outline-<?= $linePayableStatus === 'PAID' ? 'secondary' : 'success'; ?>">
+                                    <?= $linePayableStatus === 'PAID' ? 'Mark Unpaid' : 'Mark Paid'; ?>
+                                  </button>
+                                </form>
+                              <?php endif; ?>
                             <?php endif; ?>
                           <?php else: ?>
                             <span class="text-muted">Locked</span>
@@ -1799,6 +2226,9 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                               </div>
                               <div class="col-md-2">
                                 <input type="number" step="0.01" min="0" name="outsource_cost" class="form-control form-control-sm js-labor-cost" value="<?= e((string) ($line['outsource_cost'] ?? '0')); ?>" placeholder="Outsource Cost">
+                              </div>
+                              <div class="col-md-2">
+                                <input type="date" name="outsource_expected_return_date" class="form-control form-control-sm js-labor-expected-return" value="<?= e((string) ($line['outsourced_work_expected_return_date'] ?? ($line['outsource_expected_return_date'] ?? ''))); ?>" placeholder="Expected Return">
                               </div>
                               <div class="col-md-2">
                                 <input type="number" step="0.01" min="0.01" name="quantity" class="form-control form-control-sm" value="<?= e((string) $line['quantity']); ?>" required>

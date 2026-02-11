@@ -5,7 +5,7 @@ $activeMenu = $active_menu ?? '';
 
 $isOrganizationOpen = is_menu_group_open('organization.', $activeMenu) || is_menu_group_open('system.', $activeMenu);
 $isPeopleOpen = is_menu_group_open('people.', $activeMenu);
-$isServicePartsOpen = is_menu_group_open('services.', $activeMenu) || is_menu_group_open('inventory.', $activeMenu) || is_menu_group_open('vendors.', $activeMenu) || is_menu_group_open('purchases.', $activeMenu);
+$isServicePartsOpen = is_menu_group_open('services.', $activeMenu) || is_menu_group_open('inventory.', $activeMenu) || is_menu_group_open('vendors.', $activeMenu) || is_menu_group_open('purchases.', $activeMenu) || is_menu_group_open('outsourced.', $activeMenu);
 $isVisOpen = is_menu_group_open('vis.', $activeMenu);
 $isReportsOpen = is_menu_group_open('reports', $activeMenu);
 ?>
@@ -152,7 +152,7 @@ $isReportsOpen = is_menu_group_open('reports', $activeMenu);
           </li>
         <?php endif; ?>
 
-        <?php if (has_permission('service.view') || has_permission('part_category.view') || has_permission('part_master.view') || has_permission('vendor.view') || has_permission('inventory.view') || has_permission('purchase.view')): ?>
+        <?php if (has_permission('service.view') || has_permission('part_category.view') || has_permission('part_master.view') || has_permission('vendor.view') || has_permission('inventory.view') || has_permission('purchase.view') || has_permission('outsourced.view')): ?>
           <li class="nav-item <?= $isServicePartsOpen ? 'menu-open' : ''; ?>">
             <a href="#" class="nav-link <?= $isServicePartsOpen ? 'active' : ''; ?>">
               <i class="nav-icon bi bi-tools"></i>
@@ -213,6 +213,14 @@ $isReportsOpen = is_menu_group_open('reports', $activeMenu);
                   <a href="<?= e(url('modules/purchases/index.php')); ?>" class="nav-link <?= e(is_active_menu('purchases.index', $activeMenu)); ?>">
                     <i class="nav-icon bi bi-circle"></i>
                     <p>Purchases</p>
+                  </a>
+                </li>
+              <?php endif; ?>
+              <?php if (has_permission('outsourced.view')): ?>
+                <li class="nav-item">
+                  <a href="<?= e(url('modules/outsourced/index.php')); ?>" class="nav-link <?= e(is_active_menu('outsourced.index', $activeMenu)); ?>">
+                    <i class="nav-icon bi bi-circle"></i>
+                    <p>Outsourced Works</p>
                   </a>
                 </li>
               <?php endif; ?>
