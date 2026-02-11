@@ -7,6 +7,7 @@ $isOrganizationOpen = is_menu_group_open('organization.', $activeMenu) || is_men
 $isPeopleOpen = is_menu_group_open('people.', $activeMenu);
 $isServicePartsOpen = is_menu_group_open('services.', $activeMenu) || is_menu_group_open('inventory.', $activeMenu) || is_menu_group_open('vendors.', $activeMenu) || is_menu_group_open('purchases.', $activeMenu);
 $isVisOpen = is_menu_group_open('vis.', $activeMenu);
+$isReportsOpen = is_menu_group_open('reports', $activeMenu);
 ?>
 <aside class="app-sidebar bg-body-secondary shadow" data-bs-theme="dark">
   <div class="sidebar-brand">
@@ -273,11 +274,54 @@ $isVisOpen = is_menu_group_open('vis.', $activeMenu);
         <?php endif; ?>
 
         <?php if (has_permission('reports.view') || has_permission('report.view')): ?>
-          <li class="nav-item">
-            <a href="<?= e(url('modules/reports/index.php')); ?>" class="nav-link <?= e(is_active_menu('reports', $activeMenu)); ?>">
+          <li class="nav-item <?= $isReportsOpen ? 'menu-open' : ''; ?>">
+            <a href="#" class="nav-link <?= $isReportsOpen ? 'active' : ''; ?>">
               <i class="nav-icon bi bi-bar-chart"></i>
-              <p>Reports</p>
+              <p>
+                Reports
+                <i class="nav-arrow bi bi-chevron-right"></i>
+              </p>
             </a>
+            <ul class="nav nav-treeview">
+              <li class="nav-item">
+                <a href="<?= e(url('modules/reports/index.php')); ?>" class="nav-link <?= e(is_active_menu('reports', $activeMenu)); ?>">
+                  <i class="nav-icon bi bi-circle"></i>
+                  <p>Overview</p>
+                </a>
+              </li>
+              <li class="nav-item">
+                <a href="<?= e(url('modules/reports/jobs.php')); ?>" class="nav-link <?= e(is_active_menu('reports.jobs', $activeMenu)); ?>">
+                  <i class="nav-icon bi bi-circle"></i>
+                  <p>Job Reports</p>
+                </a>
+              </li>
+              <li class="nav-item">
+                <a href="<?= e(url('modules/reports/inventory.php')); ?>" class="nav-link <?= e(is_active_menu('reports.inventory', $activeMenu)); ?>">
+                  <i class="nav-icon bi bi-circle"></i>
+                  <p>Inventory Reports</p>
+                </a>
+              </li>
+              <?php if (has_permission('reports.financial')): ?>
+                <li class="nav-item">
+                  <a href="<?= e(url('modules/reports/billing_gst.php')); ?>" class="nav-link <?= e(is_active_menu('reports.billing', $activeMenu)); ?>">
+                    <i class="nav-icon bi bi-circle"></i>
+                    <p>Billing & GST</p>
+                  </a>
+                </li>
+              <?php endif; ?>
+              <li class="nav-item">
+                <a href="<?= e(url('modules/reports/customers.php')); ?>" class="nav-link <?= e(is_active_menu('reports.customers', $activeMenu)); ?>">
+                  <i class="nav-icon bi bi-circle"></i>
+                  <p>Customer Reports</p>
+                </a>
+              </li>
+              <li class="nav-item">
+                <a href="<?= e(url('modules/reports/vehicles.php')); ?>" class="nav-link <?= e(is_active_menu('reports.vehicles', $activeMenu)); ?>">
+                  <i class="nav-icon bi bi-circle"></i>
+                  <p>Vehicle Reports</p>
+                </a>
+              </li>
+            </ul>
           </li>
         <?php endif; ?>
       </ul>
