@@ -35,6 +35,30 @@ function payroll_valid_month(string $month): bool
     return checkdate((int) $mon, 1, (int) $year);
 }
 
+function payroll_staff_in_scope(PDO $pdo, int $userId, int $companyId, int $garageId): bool
+{
+    if ($userId <= 0 || $companyId <= 0 || $garageId <= 0) {
+        return false;
+    }
+
+    $stmt = $pdo->prepare(
+        'SELECT u.id
+         FROM users u
+         INNER JOIN user_garages ug ON ug.user_id = u.id AND ug.garage_id = :garage_id
+         WHERE u.id = :user_id
+           AND u.company_id = :company_id
+           AND u.status_code = "ACTIVE"
+         LIMIT 1'
+    );
+    $stmt->execute([
+        'user_id' => $userId,
+        'company_id' => $companyId,
+        'garage_id' => $garageId,
+    ]);
+
+    return (bool) $stmt->fetch();
+}
+
 function payroll_recompute_item(PDO $pdo, int $itemId): void
 {
     $itemStmt = $pdo->prepare(
@@ -125,6 +149,59 @@ function payroll_update_sheet_totals(PDO $pdo, int $sheetId): void
         'total_paid' => round((float) ($totals['total_paid'] ?? 0), 2),
         'id' => $sheetId,
     ]);
+}
+
+function payroll_sheet_set_lock_state(PDO $pdo, int $sheetId, bool $lock, ?int $userId): void
+{
+    if ($lock) {
+        $stmt = $pdo->prepare(
+            'UPDATE payroll_salary_sheets
+             SET status = "LOCKED",
+                 locked_at = :locked_at,
+                 locked_by = :locked_by
+             WHERE id = :id'
+        );
+        $stmt->execute([
+            'locked_at' => date('Y-m-d H:i:s'),
+            'locked_by' => $userId > 0 ? $userId : null,
+            'id' => $sheetId,
+        ]);
+        return;
+    }
+
+    $stmt = $pdo->prepare(
+        'UPDATE payroll_salary_sheets
+         SET status = "OPEN",
+             locked_at = NULL,
+             locked_by = NULL
+         WHERE id = :id'
+    );
+    $stmt->execute(['id' => $sheetId]);
+}
+
+function payroll_sync_sheet_lock_state(PDO $pdo, int $sheetId, ?int $userId): bool
+{
+    payroll_update_sheet_totals($pdo, $sheetId);
+
+    $sheetStmt = $pdo->prepare('SELECT status, total_payable, total_paid FROM payroll_salary_sheets WHERE id = :id LIMIT 1');
+    $sheetStmt->execute(['id' => $sheetId]);
+    $sheet = $sheetStmt->fetch();
+    if (!$sheet) {
+        return false;
+    }
+
+    $payable = round((float) ($sheet['total_payable'] ?? 0), 2);
+    $paid = round((float) ($sheet['total_paid'] ?? 0), 2);
+    $isSettled = $payable <= 0.009 || $paid + 0.009 >= $payable;
+    $isLocked = (string) ($sheet['status'] ?? '') === 'LOCKED';
+
+    if ($isSettled && !$isLocked) {
+        payroll_sheet_set_lock_state($pdo, $sheetId, true, $userId);
+    } elseif (!$isSettled && $isLocked) {
+        payroll_sheet_set_lock_state($pdo, $sheetId, false, $userId);
+    }
+
+    return $isSettled;
 }
 
 function payroll_apply_advance_deduction(PDO $pdo, int $userId, int $companyId, int $garageId, float $applyAmount): float
@@ -275,6 +352,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $commissionRate = round((float) ($_POST['commission_rate'] ?? 0), 3);
         $overtimeRate = payroll_decimal($_POST['overtime_rate'] ?? 0);
         $statusCode = normalize_status_code((string) ($_POST['status_code'] ?? 'ACTIVE'));
+        if (!in_array($statusCode, ['ACTIVE', 'INACTIVE'], true)) {
+            $statusCode = 'ACTIVE';
+        }
 
         if ($userId <= 0 || $baseAmount < 0) {
             flash_set('payroll_error', 'Select staff and enter base amount.', 'danger');
@@ -285,6 +365,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
 
         $pdo = db();
+        if (!payroll_staff_in_scope($pdo, $userId, $companyId, $garageId)) {
+            flash_set('payroll_error', 'Selected staff is outside current garage scope.', 'danger');
+            redirect('modules/payroll/index.php');
+        }
+
         $existingStmt = $pdo->prepare(
             'SELECT id FROM payroll_salary_structures WHERE user_id = :user_id AND garage_id = :garage_id LIMIT 1'
         );
@@ -314,6 +399,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'updated_by' => $_SESSION['user_id'] ?? null,
                 'id' => (int) $existing['id'],
             ]);
+            log_audit('payroll', 'salary_structure_update', (int) $existing['id'], 'Updated salary structure', [
+                'entity' => 'salary_structure',
+                'company_id' => $companyId,
+                'garage_id' => $garageId,
+                'after' => [
+                    'user_id' => $userId,
+                    'salary_type' => $salaryType,
+                    'base_amount' => $baseAmount,
+                    'commission_rate' => $commissionRate,
+                    'overtime_rate' => $overtimeRate > 0 ? $overtimeRate : null,
+                    'status_code' => $statusCode,
+                ],
+            ]);
             flash_set('payroll_success', 'Salary structure updated.', 'success');
         } else {
             $insertStmt = $pdo->prepare(
@@ -332,6 +430,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'overtime_rate' => $overtimeRate > 0 ? $overtimeRate : null,
                 'status_code' => $statusCode,
                 'created_by' => $_SESSION['user_id'] ?? null,
+            ]);
+            $structureId = (int) $pdo->lastInsertId();
+            log_audit('payroll', 'salary_structure_create', $structureId, 'Created salary structure', [
+                'entity' => 'salary_structure',
+                'company_id' => $companyId,
+                'garage_id' => $garageId,
+                'after' => [
+                    'user_id' => $userId,
+                    'salary_type' => $salaryType,
+                    'base_amount' => $baseAmount,
+                    'commission_rate' => $commissionRate,
+                    'overtime_rate' => $overtimeRate > 0 ? $overtimeRate : null,
+                    'status_code' => $statusCode,
+                ],
             ]);
             flash_set('payroll_success', 'Salary structure saved.', 'success');
         }
@@ -359,6 +471,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
       'garage_id' => $garageId,
     ]);
 
+    log_audit('payroll', 'salary_structure_inactivate', $structureId, 'Inactivated salary structure', [
+      'entity' => 'salary_structure',
+      'company_id' => $companyId,
+      'garage_id' => $garageId,
+    ]);
     flash_set('payroll_success', 'Salary structure removed.', 'success');
     redirect('modules/payroll/index.php');
   }
@@ -374,7 +491,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             redirect('modules/payroll/index.php');
         }
 
-        $insertStmt = db()->prepare(
+        $pdo = db();
+        if (!payroll_staff_in_scope($pdo, $userId, $companyId, $garageId)) {
+            flash_set('payroll_error', 'Selected staff is outside current garage scope.', 'danger');
+            redirect('modules/payroll/index.php');
+        }
+
+        $insertStmt = $pdo->prepare(
             'INSERT INTO payroll_advances (user_id, company_id, garage_id, advance_date, amount, notes, created_by)
              VALUES (:user_id, :company_id, :garage_id, :advance_date, :amount, :notes, :created_by)'
         );
@@ -388,6 +511,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'created_by' => $_SESSION['user_id'] ?? null,
         ]);
 
+        $advanceId = (int) $pdo->lastInsertId();
+        log_audit('payroll', 'advance_create', $advanceId, 'Recorded staff advance', [
+            'entity' => 'payroll_advance',
+            'company_id' => $companyId,
+            'garage_id' => $garageId,
+            'after' => [
+                'user_id' => $userId,
+                'advance_date' => $advanceDate,
+                'amount' => $amount,
+            ],
+        ]);
         flash_set('payroll_success', 'Advance recorded.', 'success');
         redirect('modules/payroll/index.php');
     }
@@ -441,6 +575,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'id' => $advanceId,
           ]);
 
+          log_audit('payroll', 'advance_update', $advanceId, 'Updated staff advance', [
+            'entity' => 'payroll_advance',
+            'company_id' => $companyId,
+            'garage_id' => $garageId,
+            'before' => [
+              'amount' => (float) ($advance['amount'] ?? 0),
+              'advance_date' => (string) ($advance['advance_date'] ?? ''),
+              'status' => (string) ($advance['status'] ?? ''),
+            ],
+            'after' => [
+              'amount' => $amount,
+              'advance_date' => $advanceDate,
+              'status' => $status,
+            ],
+          ]);
           $pdo->commit();
           flash_set('payroll_success', 'Advance updated.', 'success');
         } catch (Throwable $exception) {
@@ -482,6 +631,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'UPDATE payroll_advances SET status = "DELETED" WHERE id = :id'
           );
           $deleteStmt->execute(['id' => $advanceId]);
+          log_audit('payroll', 'advance_delete', $advanceId, 'Soft deleted staff advance', [
+            'entity' => 'payroll_advance',
+            'company_id' => $companyId,
+            'garage_id' => $garageId,
+          ]);
           $pdo->commit();
           flash_set('payroll_success', 'Advance deleted.', 'success');
         } catch (Throwable $exception) {
@@ -504,7 +658,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             redirect('modules/payroll/index.php');
         }
 
-        $insertStmt = db()->prepare(
+        $pdo = db();
+        if (!payroll_staff_in_scope($pdo, $userId, $companyId, $garageId)) {
+            flash_set('payroll_error', 'Selected staff is outside current garage scope.', 'danger');
+            redirect('modules/payroll/index.php');
+        }
+
+        $insertStmt = $pdo->prepare(
             'INSERT INTO payroll_loans (user_id, company_id, garage_id, loan_date, total_amount, emi_amount, notes, created_by)
              VALUES (:user_id, :company_id, :garage_id, :loan_date, :total_amount, :emi_amount, :notes, :created_by)'
         );
@@ -519,6 +679,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'created_by' => $_SESSION['user_id'] ?? null,
         ]);
 
+        $loanId = (int) $pdo->lastInsertId();
+        log_audit('payroll', 'loan_create', $loanId, 'Created staff loan', [
+            'entity' => 'payroll_loan',
+            'company_id' => $companyId,
+            'garage_id' => $garageId,
+            'after' => [
+                'user_id' => $userId,
+                'loan_date' => $loanDate,
+                'total_amount' => $totalAmount,
+                'emi_amount' => $emiAmount,
+            ],
+        ]);
         flash_set('payroll_success', 'Loan recorded for staff.', 'success');
         redirect('modules/payroll/index.php');
     }
@@ -575,6 +747,23 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'id' => $loanId,
           ]);
 
+          log_audit('payroll', 'loan_update', $loanId, 'Updated staff loan', [
+            'entity' => 'payroll_loan',
+            'company_id' => $companyId,
+            'garage_id' => $garageId,
+            'before' => [
+              'loan_date' => (string) ($loan['loan_date'] ?? ''),
+              'total_amount' => (float) ($loan['total_amount'] ?? 0),
+              'emi_amount' => (float) ($loan['emi_amount'] ?? 0),
+              'status' => (string) ($loan['status'] ?? ''),
+            ],
+            'after' => [
+              'loan_date' => $loanDate,
+              'total_amount' => $totalAmount,
+              'emi_amount' => $emiAmount,
+              'status' => $status,
+            ],
+          ]);
           $pdo->commit();
           flash_set('payroll_success', 'Loan updated.', 'success');
         } catch (Throwable $exception) {
@@ -614,6 +803,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
           $deleteStmt = $pdo->prepare('UPDATE payroll_loans SET status = "DELETED" WHERE id = :id');
           $deleteStmt->execute(['id' => $loanId]);
+          log_audit('payroll', 'loan_delete', $loanId, 'Soft deleted staff loan', [
+            'entity' => 'payroll_loan',
+            'company_id' => $companyId,
+            'garage_id' => $garageId,
+          ]);
           $pdo->commit();
           flash_set('payroll_success', 'Loan deleted.', 'success');
         } catch (Throwable $exception) {
@@ -672,6 +866,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'notes' => $notes !== '' ? $notes : null,
                 'created_by' => $_SESSION['user_id'] ?? null,
             ]);
+            $loanPaymentId = (int) $pdo->lastInsertId();
 
             $updateLoan = $pdo->prepare(
                 'UPDATE payroll_loans
@@ -684,8 +879,131 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'id' => $loanId,
             ]);
 
+            log_audit('payroll', 'loan_payment_manual', $loanId, 'Captured manual loan payment', [
+                'entity' => 'payroll_loan_payment',
+                'company_id' => $companyId,
+                'garage_id' => $garageId,
+                'after' => [
+                    'loan_id' => $loanId,
+                    'payment_id' => $loanPaymentId,
+                    'amount' => $amount,
+                    'payment_date' => $paymentDate,
+                ],
+            ]);
             $pdo->commit();
             flash_set('payroll_success', 'Loan payment captured.', 'success');
+        } catch (Throwable $exception) {
+            $pdo->rollBack();
+            flash_set('payroll_error', $exception->getMessage(), 'danger');
+        }
+
+        redirect('modules/payroll/index.php');
+    }
+
+    if ($action === 'reverse_loan_payment') {
+        $paymentId = post_int('payment_id');
+        $reverseReason = post_string('reverse_reason', 255);
+        if ($paymentId <= 0 || $reverseReason === '') {
+            flash_set('payroll_error', 'Payment and reversal reason are required.', 'danger');
+            redirect('modules/payroll/index.php');
+        }
+
+        $pdo = db();
+        $pdo->beginTransaction();
+        try {
+            $paymentStmt = $pdo->prepare(
+                'SELECT lp.*, pl.id AS loan_id, pl.total_amount
+                 FROM payroll_loan_payments lp
+                 INNER JOIN payroll_loans pl ON pl.id = lp.loan_id
+                 WHERE lp.id = :id
+                   AND lp.company_id = :company_id
+                   AND lp.garage_id = :garage_id
+                 LIMIT 1
+                 FOR UPDATE'
+            );
+            $paymentStmt->execute([
+                'id' => $paymentId,
+                'company_id' => $companyId,
+                'garage_id' => $garageId,
+            ]);
+            $payment = $paymentStmt->fetch();
+            if (!$payment) {
+                throw new RuntimeException('Loan payment not found.');
+            }
+            if ((string) ($payment['entry_type'] ?? '') === 'REVERSAL') {
+                throw new RuntimeException('Reversal entries cannot be reversed again.');
+            }
+            if ((float) ($payment['amount'] ?? 0) <= 0) {
+                throw new RuntimeException('Only positive payment entries can be reversed.');
+            }
+            if ((string) ($payment['entry_type'] ?? '') !== 'MANUAL') {
+                throw new RuntimeException('Only manual loan payments can be reversed from this screen.');
+            }
+
+            $checkStmt = $pdo->prepare(
+                'SELECT id
+                 FROM payroll_loan_payments
+                 WHERE reversed_payment_id = :payment_id
+                 LIMIT 1'
+            );
+            $checkStmt->execute(['payment_id' => $paymentId]);
+            if ($checkStmt->fetch()) {
+                throw new RuntimeException('This loan payment is already reversed.');
+            }
+
+            $paymentAmount = round((float) ($payment['amount'] ?? 0), 2);
+            $insertStmt = $pdo->prepare(
+                'INSERT INTO payroll_loan_payments
+                  (loan_id, company_id, garage_id, salary_item_id, payment_date, entry_type, amount, reference_no, notes, reversed_payment_id, created_by)
+                 VALUES
+                  (:loan_id, :company_id, :garage_id, :salary_item_id, :payment_date, "REVERSAL", :amount, :reference_no, :notes, :reversed_payment_id, :created_by)'
+            );
+            $insertStmt->execute([
+                'loan_id' => (int) $payment['loan_id'],
+                'company_id' => $companyId,
+                'garage_id' => $garageId,
+                'salary_item_id' => isset($payment['salary_item_id']) ? (int) $payment['salary_item_id'] : null,
+                'payment_date' => $today,
+                'amount' => -$paymentAmount,
+                'reference_no' => 'REV-' . $paymentId,
+                'notes' => $reverseReason,
+                'reversed_payment_id' => $paymentId,
+                'created_by' => $_SESSION['user_id'] ?? null,
+            ]);
+            $reversalId = (int) $pdo->lastInsertId();
+
+            $totalPaidStmt = $pdo->prepare(
+                'SELECT COALESCE(SUM(amount), 0) AS total_paid
+                 FROM payroll_loan_payments
+                 WHERE loan_id = :loan_id'
+            );
+            $totalPaidStmt->execute(['loan_id' => (int) $payment['loan_id']]);
+            $newPaidAmount = max(0.0, round((float) ($totalPaidStmt->fetchColumn() ?? 0), 2));
+
+            $updateLoanStmt = $pdo->prepare(
+                'UPDATE payroll_loans
+                 SET paid_amount = :paid_amount,
+                     status = CASE WHEN :paid_amount + 0.009 >= total_amount THEN "PAID" ELSE "ACTIVE" END
+                 WHERE id = :id'
+            );
+            $updateLoanStmt->execute([
+                'paid_amount' => $newPaidAmount,
+                'id' => (int) $payment['loan_id'],
+            ]);
+
+            log_audit('payroll', 'loan_payment_reverse', (int) $payment['loan_id'], 'Reversed manual loan payment', [
+                'entity' => 'payroll_loan_payment',
+                'company_id' => $companyId,
+                'garage_id' => $garageId,
+                'after' => [
+                    'payment_id' => $paymentId,
+                    'reversal_id' => $reversalId,
+                    'reversal_amount' => -$paymentAmount,
+                    'loan_id' => (int) $payment['loan_id'],
+                ],
+            ]);
+            $pdo->commit();
+            flash_set('payroll_success', 'Loan payment reversed.', 'success');
         } catch (Throwable $exception) {
             $pdo->rollBack();
             flash_set('payroll_error', $exception->getMessage(), 'danger');
@@ -841,7 +1159,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 ]);
             }
 
-            payroll_update_sheet_totals($pdo, $sheetId);
+            $isSettled = payroll_sync_sheet_lock_state($pdo, $sheetId, $_SESSION['user_id'] ?? null);
+            log_audit('payroll', 'salary_sheet_generate', $sheetId, 'Generated / synced salary sheet', [
+                'entity' => 'payroll_salary_sheet',
+                'company_id' => $companyId,
+                'garage_id' => $garageId,
+                'after' => [
+                    'salary_month' => $month,
+                    'auto_locked' => $isSettled ? 1 : 0,
+                    'staff_count' => count($structures),
+                ],
+            ]);
             $pdo->commit();
             flash_set('payroll_success', 'Salary sheet prepared for ' . e($month) . '.', 'success');
             redirect('modules/payroll/index.php?salary_month=' . urlencode($month));
@@ -915,6 +1243,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         ]);
 
         payroll_recompute_item($pdo, $itemId);
+        payroll_sync_sheet_lock_state($pdo, (int) $item['sheet_id'], $_SESSION['user_id'] ?? null);
+        log_audit('payroll', 'salary_item_update', $itemId, 'Updated salary item values', [
+            'entity' => 'payroll_salary_item',
+            'company_id' => $companyId,
+            'garage_id' => $garageId,
+            'after' => [
+                'base_amount' => $baseAmount,
+                'commission_base' => $commissionBase,
+                'commission_rate' => $commissionRate,
+                'overtime_hours' => $overtimeHours,
+                'overtime_rate' => $overtimeRate,
+                'advance_deduction' => $advanceDeduction,
+                'loan_deduction' => $loanDeduction,
+                'manual_deduction' => $manualDeduction,
+            ],
+        ]);
         flash_set('payroll_success', 'Salary row updated.', 'success');
         redirect('modules/payroll/index.php?salary_month=' . urlencode($salaryMonth));
     }
@@ -1010,9 +1354,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'id' => $itemId,
             ]);
 
-            payroll_update_sheet_totals($pdo, (int) $item['sheet_id']);
-            $pdo->commit();
-
+            $sheetId = (int) $item['sheet_id'];
+            $sheetSettled = payroll_sync_sheet_lock_state($pdo, $sheetId, $_SESSION['user_id'] ?? null);
+            log_audit('payroll', 'salary_payment_add', $itemId, 'Added salary payment entry', [
+                'entity' => 'payroll_salary_payment',
+                'company_id' => $companyId,
+                'garage_id' => $garageId,
+                'after' => [
+                    'payment_id' => $paymentId,
+                    'sheet_id' => $sheetId,
+                    'amount' => $amount,
+                    'payment_date' => $paymentDate,
+                    'payment_mode' => $paymentMode,
+                    'sheet_auto_locked' => $sheetSettled ? 1 : 0,
+                ],
+            ]);
             finance_record_expense_for_salary_payment(
                 $paymentId,
                 $itemId,
@@ -1027,6 +1383,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $_SESSION['user_id'] ?? null
             );
 
+            $pdo->commit();
             flash_set('payroll_success', 'Salary payment recorded.', 'success');
         } catch (Throwable $exception) {
             $pdo->rollBack();
@@ -1035,6 +1392,145 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         $sheetIdParam = isset($item) && isset($item['sheet_id']) ? (string) $item['sheet_id'] : '';
         redirect('modules/payroll/index.php?salary_month=' . urlencode($salaryMonth) . '&sheet=' . $sheetIdParam);
+    }
+
+    if ($action === 'reverse_salary_payment') {
+        $paymentId = post_int('payment_id');
+        $reverseReason = post_string('reverse_reason', 255);
+        if ($paymentId <= 0 || $reverseReason === '') {
+            flash_set('payroll_error', 'Payment and reversal reason are required.', 'danger');
+            redirect('modules/payroll/index.php?salary_month=' . urlencode($salaryMonth));
+        }
+
+        $pdo = db();
+        $pdo->beginTransaction();
+        try {
+            $paymentStmt = $pdo->prepare(
+                'SELECT psp.*, psi.net_payable, pss.id AS sheet_id, pss.salary_month
+                 FROM payroll_salary_payments psp
+                 INNER JOIN payroll_salary_items psi ON psi.id = psp.salary_item_id
+                 INNER JOIN payroll_salary_sheets pss ON pss.id = psp.sheet_id
+                 WHERE psp.id = :id
+                   AND psp.company_id = :company_id
+                   AND psp.garage_id = :garage_id
+                 LIMIT 1
+                 FOR UPDATE'
+            );
+            $paymentStmt->execute([
+                'id' => $paymentId,
+                'company_id' => $companyId,
+                'garage_id' => $garageId,
+            ]);
+            $payment = $paymentStmt->fetch();
+            if (!$payment) {
+                throw new RuntimeException('Salary payment not found.');
+            }
+            if ((string) ($payment['entry_type'] ?? '') !== 'PAYMENT') {
+                throw new RuntimeException('Only payment entries can be reversed.');
+            }
+            if ((float) ($payment['amount'] ?? 0) <= 0) {
+                throw new RuntimeException('Invalid payment amount for reversal.');
+            }
+
+            $checkStmt = $pdo->prepare(
+                'SELECT id
+                 FROM payroll_salary_payments
+                 WHERE reversed_payment_id = :payment_id
+                 LIMIT 1'
+            );
+            $checkStmt->execute(['payment_id' => $paymentId]);
+            if ($checkStmt->fetch()) {
+                throw new RuntimeException('This salary payment is already reversed.');
+            }
+
+            $paymentAmount = round((float) ($payment['amount'] ?? 0), 2);
+            $reversalDate = $today;
+            $insertStmt = $pdo->prepare(
+                'INSERT INTO payroll_salary_payments
+                  (sheet_id, salary_item_id, user_id, company_id, garage_id, payment_date, entry_type, amount, payment_mode, reference_no, notes, reversed_payment_id, created_by)
+                 VALUES
+                  (:sheet_id, :salary_item_id, :user_id, :company_id, :garage_id, :payment_date, "REVERSAL", :amount, "ADJUSTMENT", :reference_no, :notes, :reversed_payment_id, :created_by)'
+            );
+            $insertStmt->execute([
+                'sheet_id' => (int) $payment['sheet_id'],
+                'salary_item_id' => (int) $payment['salary_item_id'],
+                'user_id' => (int) $payment['user_id'],
+                'company_id' => $companyId,
+                'garage_id' => $garageId,
+                'payment_date' => $reversalDate,
+                'amount' => -$paymentAmount,
+                'reference_no' => 'REV-' . $paymentId,
+                'notes' => $reverseReason,
+                'reversed_payment_id' => $paymentId,
+                'created_by' => $_SESSION['user_id'] ?? null,
+            ]);
+            $reversalId = (int) $pdo->lastInsertId();
+
+            $paidStmt = $pdo->prepare(
+                'SELECT COALESCE(SUM(amount), 0)
+                 FROM payroll_salary_payments
+                 WHERE salary_item_id = :salary_item_id'
+            );
+            $paidStmt->execute(['salary_item_id' => (int) $payment['salary_item_id']]);
+            $newPaidAmount = max(0.0, round((float) ($paidStmt->fetchColumn() ?? 0), 2));
+
+            $netPayable = round((float) ($payment['net_payable'] ?? 0), 2);
+            $itemStatus = 'PENDING';
+            if ($netPayable <= 0.001 || $newPaidAmount + 0.009 >= $netPayable) {
+                $itemStatus = 'PAID';
+            } elseif ($newPaidAmount > 0) {
+                $itemStatus = 'PARTIAL';
+            }
+
+            $updateItemStmt = $pdo->prepare(
+                'UPDATE payroll_salary_items
+                 SET paid_amount = :paid_amount,
+                     status = :status
+                 WHERE id = :id'
+            );
+            $updateItemStmt->execute([
+                'paid_amount' => $newPaidAmount,
+                'status' => $itemStatus,
+                'id' => (int) $payment['salary_item_id'],
+            ]);
+
+            $sheetSettled = payroll_sync_sheet_lock_state($pdo, (int) $payment['sheet_id'], $_SESSION['user_id'] ?? null);
+            log_audit('payroll', 'salary_payment_reverse', (int) $payment['salary_item_id'], 'Reversed salary payment entry', [
+                'entity' => 'payroll_salary_payment',
+                'company_id' => $companyId,
+                'garage_id' => $garageId,
+                'after' => [
+                    'payment_id' => $paymentId,
+                    'reversal_id' => $reversalId,
+                    'reversal_amount' => -$paymentAmount,
+                    'sheet_id' => (int) $payment['sheet_id'],
+                    'sheet_settled_after_reversal' => $sheetSettled ? 1 : 0,
+                ],
+            ]);
+
+            finance_record_expense_for_salary_payment(
+                $reversalId,
+                (int) $payment['salary_item_id'],
+                (int) $payment['user_id'],
+                $companyId,
+                $garageId,
+                $paymentAmount,
+                $reversalDate,
+                'ADJUSTMENT',
+                $reverseReason,
+                true,
+                $_SESSION['user_id'] ?? null
+            );
+
+            $pdo->commit();
+
+            flash_set('payroll_success', 'Salary payment reversed.', 'success');
+        } catch (Throwable $exception) {
+            $pdo->rollBack();
+            flash_set('payroll_error', $exception->getMessage(), 'danger');
+        }
+
+        redirect('modules/payroll/index.php?salary_month=' . urlencode($salaryMonth));
     }
 
     if ($action === 'lock_sheet') {
@@ -1068,17 +1564,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 throw new RuntimeException('Cannot lock sheet with outstanding balance.');
             }
 
-            $updateStmt = $pdo->prepare(
-                'UPDATE payroll_salary_sheets
-                 SET status = "LOCKED",
-                     locked_at = :locked_at,
-                     locked_by = :locked_by
-                 WHERE id = :id'
-            );
-            $updateStmt->execute([
-                'locked_at' => date('Y-m-d H:i:s'),
-                'locked_by' => $_SESSION['user_id'] ?? null,
-                'id' => $sheetId,
+            payroll_sheet_set_lock_state($pdo, $sheetId, true, $_SESSION['user_id'] ?? null);
+            log_audit('payroll', 'salary_sheet_lock', $sheetId, 'Locked salary sheet', [
+                'entity' => 'payroll_salary_sheet',
+                'company_id' => $companyId,
+                'garage_id' => $garageId,
+                'after' => [
+                    'salary_month' => (string) ($sheet['salary_month'] ?? ''),
+                    'total_payable' => $payable,
+                    'total_paid' => $paid,
+                ],
             ]);
 
             $pdo->commit();
@@ -1150,6 +1645,29 @@ $loanStmt->execute([
 ]);
 $loans = $loanStmt->fetchAll();
 
+$loanPaymentStmt = db()->prepare(
+    'SELECT lp.*, u.name
+     FROM payroll_loan_payments lp
+     INNER JOIN payroll_loans pl ON pl.id = lp.loan_id
+     INNER JOIN users u ON u.id = pl.user_id
+     WHERE lp.company_id = :company_id
+       AND lp.garage_id = :garage_id
+     ORDER BY lp.payment_date DESC, lp.id DESC
+     LIMIT 40'
+);
+$loanPaymentStmt->execute([
+    'company_id' => $companyId,
+    'garage_id' => $garageId,
+]);
+$loanPayments = $loanPaymentStmt->fetchAll();
+$reversedLoanPaymentIds = [];
+foreach ($loanPayments as $loanPaymentRow) {
+    $reversedId = (int) ($loanPaymentRow['reversed_payment_id'] ?? 0);
+    if ($reversedId > 0) {
+        $reversedLoanPaymentIds[$reversedId] = true;
+    }
+}
+
 $sheetStmt = db()->prepare(
     'SELECT * FROM payroll_salary_sheets WHERE company_id = :company_id AND garage_id = :garage_id AND salary_month = :salary_month LIMIT 1'
 );
@@ -1183,6 +1701,14 @@ if ($currentSheet) {
     );
     $paymentsStmt->execute(['sheet_id' => (int) $currentSheet['id']]);
     $salaryPayments = $paymentsStmt->fetchAll();
+}
+
+$reversedSalaryPaymentIds = [];
+foreach ($salaryPayments as $salaryPaymentRow) {
+    $reversedId = (int) ($salaryPaymentRow['reversed_payment_id'] ?? 0);
+    if ($reversedId > 0) {
+        $reversedSalaryPaymentIds[$reversedId] = true;
+    }
 }
 
 include __DIR__ . '/../../includes/header.php';
@@ -1514,6 +2040,54 @@ include __DIR__ . '/../../includes/sidebar.php';
                 </div>
               </form>
               <?php endif; ?>
+
+              <div class="table-responsive mt-3">
+                <table class="table table-sm table-striped align-middle mb-0">
+                  <thead>
+                    <tr>
+                      <th>Date</th>
+                      <th>Staff</th>
+                      <th>Type</th>
+                      <th>Amount</th>
+                      <th>Notes</th>
+                      <th style="min-width: 140px;">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <?php if (empty($loanPayments)): ?>
+                      <tr><td colspan="6" class="text-center text-muted py-3">No loan payment history.</td></tr>
+                    <?php else: ?>
+                      <?php foreach ($loanPayments as $payment): ?>
+                        <?php
+                          $entryType = (string) ($payment['entry_type'] ?? '');
+                          $paymentId = (int) ($payment['id'] ?? 0);
+                          $isReversed = isset($reversedLoanPaymentIds[$paymentId]);
+                        ?>
+                        <tr>
+                          <td><?= e((string) ($payment['payment_date'] ?? '')) ?></td>
+                          <td><?= e((string) ($payment['name'] ?? '')) ?></td>
+                          <td><?= e($entryType) ?></td>
+                          <td><?= format_currency((float) ($payment['amount'] ?? 0)) ?></td>
+                          <td><?= e((string) ($payment['notes'] ?? '')) ?></td>
+                          <td>
+                            <?php if ($canManage && $entryType === 'MANUAL' && !$isReversed): ?>
+                              <form method="post" class="ajax-form d-inline">
+                                <?= csrf_field(); ?>
+                                <input type="hidden" name="_action" value="reverse_loan_payment" />
+                                <input type="hidden" name="payment_id" value="<?= $paymentId ?>" />
+                                <input type="hidden" name="reverse_reason" value="Manual reversal from payroll screen" />
+                                <button class="btn btn-xs btn-outline-secondary" type="submit">Reverse</button>
+                              </form>
+                            <?php else: ?>
+                              <span class="text-muted small">-</span>
+                            <?php endif; ?>
+                          </td>
+                        </tr>
+                      <?php endforeach; ?>
+                    <?php endif; ?>
+                  </tbody>
+                </table>
+              </div>
             </div>
           </div>
         </div>
@@ -1636,15 +2210,34 @@ include __DIR__ . '/../../includes/sidebar.php';
         <div class="card-header"><h3 class="card-title mb-0">Payment History</h3></div>
         <div class="card-body table-responsive">
           <table class="table table-sm table-striped align-middle mb-0">
-            <thead><tr><th>Date</th><th>Staff</th><th>Amount</th><th>Mode</th><th>Notes</th></tr></thead>
+            <thead><tr><th>Date</th><th>Staff</th><th>Type</th><th>Amount</th><th>Mode</th><th>Notes</th><th style="min-width: 140px;">Actions</th></tr></thead>
             <tbody>
               <?php foreach ($salaryPayments as $payment): ?>
+                <?php
+                  $entryType = (string) ($payment['entry_type'] ?? '');
+                  $paymentId = (int) ($payment['id'] ?? 0);
+                  $isReversed = isset($reversedSalaryPaymentIds[$paymentId]);
+                ?>
                 <tr>
                   <td><?= e($payment['payment_date']) ?></td>
                   <td><?= e($payment['name']) ?></td>
+                  <td><?= e($entryType) ?></td>
                   <td><?= format_currency((float) $payment['amount']) ?></td>
                   <td><?= e($payment['payment_mode']) ?></td>
                   <td><?= e($payment['notes'] ?? '') ?></td>
+                  <td>
+                    <?php if ($canManage && $entryType === 'PAYMENT' && !$isReversed): ?>
+                      <form method="post" class="ajax-form d-inline">
+                        <?= csrf_field(); ?>
+                        <input type="hidden" name="_action" value="reverse_salary_payment" />
+                        <input type="hidden" name="payment_id" value="<?= $paymentId ?>" />
+                        <input type="hidden" name="reverse_reason" value="Payment reversal from payroll history" />
+                        <button class="btn btn-xs btn-outline-secondary" type="submit">Reverse</button>
+                      </form>
+                    <?php else: ?>
+                      <span class="text-muted small">-</span>
+                    <?php endif; ?>
+                  </td>
                 </tr>
               <?php endforeach; ?>
             </tbody>

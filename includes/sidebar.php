@@ -348,6 +348,22 @@ $isReportsOpen = is_menu_group_open('reports', $activeMenu);
                   </a>
                 </li>
               <?php endif; ?>
+              <?php if (has_permission('payroll.view') || has_permission('payroll.manage')): ?>
+                <li class="nav-item">
+                  <a href="<?= e(url('modules/reports/payroll.php')); ?>" class="nav-link <?= e(is_active_menu('reports.payroll', $activeMenu)); ?>">
+                    <i class="nav-icon bi bi-circle"></i>
+                    <p>Payroll Reports</p>
+                  </a>
+                </li>
+              <?php endif; ?>
+              <?php if (has_permission('expense.view') || has_permission('expense.manage')): ?>
+                <li class="nav-item">
+                  <a href="<?= e(url('modules/reports/expenses.php')); ?>" class="nav-link <?= e(is_active_menu('reports.expenses', $activeMenu)); ?>">
+                    <i class="nav-icon bi bi-circle"></i>
+                    <p>Expense Reports</p>
+                  </a>
+                </li>
+              <?php endif; ?>
               <?php if (has_permission('gst.reports') || has_permission('financial.reports')): ?>
                 <li class="nav-item">
                   <a href="<?= e(url('modules/reports/gst_compliance.php')); ?>" class="nav-link <?= e(is_active_menu('reports.gst_compliance', $activeMenu)); ?>">

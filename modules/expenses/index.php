@@ -66,6 +66,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'category_name' => $categoryName,
             'created_by' => $_SESSION['user_id'] ?? null,
         ]);
+        $categoryId = (int) $pdo->lastInsertId();
+        log_audit('expenses', 'category_create', $categoryId, 'Created expense category', [
+            'entity' => 'expense_category',
+            'company_id' => $companyId,
+            'garage_id' => $garageId,
+            'after' => ['category_name' => $categoryName],
+        ]);
         flash_set('expense_success', 'Category added.', 'success');
         redirect('modules/expenses/index.php');
     }
@@ -74,6 +81,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $categoryId = post_int('category_id');
         $categoryName = trim((string) ($_POST['category_name'] ?? ''));
         $statusCode = normalize_status_code((string) ($_POST['status_code'] ?? 'ACTIVE'));
+        if (!in_array($statusCode, ['ACTIVE', 'INACTIVE'], true)) {
+            $statusCode = 'ACTIVE';
+        }
         if ($categoryId <= 0 || $categoryName === '') {
             flash_set('expense_error', 'Valid category and name are required.', 'danger');
             redirect('modules/expenses/index.php');
@@ -81,7 +91,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         $pdo = db();
         $catStmt = $pdo->prepare(
-            'SELECT * FROM expense_categories WHERE id = :id AND company_id = :company_id AND (garage_id = :garage_id OR garage_id = 0)'
+            'SELECT * FROM expense_categories WHERE id = :id AND company_id = :company_id AND garage_id = :garage_id'
         );
         $catStmt->execute([
             'id' => $categoryId,
@@ -100,7 +110,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         );
         $duplicateStmt->execute([
             'company_id' => $companyId,
-            'garage_id' => $existing['garage_id'],
+            'garage_id' => $garageId,
             'category_name' => $categoryName,
             'id' => $categoryId,
         ]);
@@ -123,6 +133,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'id' => $categoryId,
         ]);
 
+        log_audit('expenses', 'category_update', $categoryId, 'Updated expense category', [
+            'entity' => 'expense_category',
+            'company_id' => $companyId,
+            'garage_id' => $garageId,
+            'before' => [
+                'category_name' => (string) ($existing['category_name'] ?? ''),
+                'status_code' => (string) ($existing['status_code'] ?? ''),
+            ],
+            'after' => [
+                'category_name' => $categoryName,
+                'status_code' => $statusCode,
+            ],
+        ]);
         flash_set('expense_success', 'Category updated.', 'success');
         redirect('modules/expenses/index.php');
     }
@@ -137,12 +160,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $stmt = db()->prepare(
             'UPDATE expense_categories
              SET status_code = "INACTIVE",
-                 updated_by = :updated_by
-             WHERE id = :id AND company_id = :company_id AND (garage_id = :garage_id OR garage_id = 0)'
+                  updated_by = :updated_by
+             WHERE id = :id AND company_id = :company_id AND garage_id = :garage_id'
         );
         $stmt->execute([
             'updated_by' => $_SESSION['user_id'] ?? null,
             'id' => $categoryId,
+            'company_id' => $companyId,
+            'garage_id' => $garageId,
+        ]);
+        log_audit('expenses', 'category_inactivate', $categoryId, 'Inactivated expense category', [
+            'entity' => 'expense_category',
             'company_id' => $companyId,
             'garage_id' => $garageId,
         ]);
@@ -164,10 +192,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
 
         $pdo = db();
-        $catStmt = $pdo->prepare('SELECT category_name FROM expense_categories WHERE id = :id AND company_id = :company_id LIMIT 1');
+        $catStmt = $pdo->prepare('SELECT category_name FROM expense_categories WHERE id = :id AND company_id = :company_id AND garage_id = :garage_id LIMIT 1');
         $catStmt->execute([
             'id' => $categoryId,
             'company_id' => $companyId,
+            'garage_id' => $garageId,
         ]);
         $catRow = $catStmt->fetch();
         if (!$catRow) {
@@ -175,7 +204,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             redirect('modules/expenses/index.php');
         }
 
-        finance_record_expense([
+        $expenseId = finance_record_expense([
             'company_id' => $companyId,
             'garage_id' => $garageId,
             'category_name' => (string) $catRow['category_name'],
@@ -188,6 +217,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'entry_type' => 'EXPENSE',
             'created_by' => $_SESSION['user_id'] ?? null,
         ]);
+        if ($expenseId) {
+            log_audit('expenses', 'expense_create', (int) $expenseId, 'Recorded manual expense', [
+                'entity' => 'expense',
+                'company_id' => $companyId,
+                'garage_id' => $garageId,
+                'after' => [
+                    'category_id' => $categoryId,
+                    'amount' => $amount,
+                    'payment_mode' => $paymentMode,
+                    'expense_date' => $expenseDate,
+                ],
+            ]);
+        }
 
         flash_set('expense_success', 'Expense recorded.', 'success');
         redirect('modules/expenses/index.php');
@@ -226,10 +268,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 throw new RuntimeException('Only original expenses can be edited.');
             }
 
-            $catStmt = $pdo->prepare('SELECT category_name FROM expense_categories WHERE id = :id AND company_id = :company_id');
+            $catStmt = $pdo->prepare('SELECT category_name FROM expense_categories WHERE id = :id AND company_id = :company_id AND garage_id = :garage_id');
             $catStmt->execute([
                 'id' => $categoryId,
                 'company_id' => $companyId,
+                'garage_id' => $garageId,
             ]);
             if (!$catStmt->fetch()) {
                 throw new RuntimeException('Category not found.');
@@ -255,6 +298,23 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'id' => $expenseId,
             ]);
 
+            log_audit('expenses', 'expense_update', $expenseId, 'Updated expense', [
+                'entity' => 'expense',
+                'company_id' => $companyId,
+                'garage_id' => $garageId,
+                'before' => [
+                    'category_id' => (int) ($expense['category_id'] ?? 0),
+                    'amount' => (float) ($expense['amount'] ?? 0),
+                    'payment_mode' => (string) ($expense['payment_mode'] ?? ''),
+                    'expense_date' => (string) ($expense['expense_date'] ?? ''),
+                ],
+                'after' => [
+                    'category_id' => $categoryId,
+                    'amount' => $amount,
+                    'payment_mode' => $paymentMode,
+                    'expense_date' => $expenseDate,
+                ],
+            ]);
             $pdo->commit();
             flash_set('expense_success', 'Expense updated.', 'success');
         } catch (Throwable $exception) {
@@ -392,9 +452,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 $categoryStmt = db()->prepare(
     'SELECT * FROM expense_categories
      WHERE company_id = :company_id
-       AND (garage_id = :garage_id OR garage_id = 0)
+       AND garage_id = :garage_id
        AND status_code = "ACTIVE"
-     ORDER BY garage_id DESC, category_name ASC'
+     ORDER BY category_name ASC'
 );
 $categoryStmt->execute([
     'company_id' => $companyId,
@@ -427,7 +487,7 @@ $summaryStmt = db()->prepare(
      WHERE company_id = :company_id
        AND garage_id = :garage_id
        AND expense_date BETWEEN :from_date AND :to_date
-       AND entry_type = "EXPENSE"
+       AND entry_type <> "DELETED"
      GROUP BY expense_date
      ORDER BY expense_date ASC'
 );
@@ -446,7 +506,7 @@ $categoryBreakStmt = db()->prepare(
      WHERE e.company_id = :company_id
        AND e.garage_id = :garage_id
        AND e.expense_date BETWEEN :from_date AND :to_date
-       AND e.entry_type = "EXPENSE"
+       AND e.entry_type <> "DELETED"
      GROUP BY category_name
      ORDER BY total DESC'
 );
@@ -465,7 +525,8 @@ if (table_columns('invoices') !== []) {
          FROM invoices
          WHERE company_id = :company_id
            AND garage_id = :garage_id
-           AND invoice_date BETWEEN :from_date AND :to_date'
+           AND invoice_status = "FINALIZED"
+            AND invoice_date BETWEEN :from_date AND :to_date'
     );
     $revenueStmt->execute([
         'company_id' => $companyId,
@@ -482,7 +543,7 @@ $expenseTotalStmt = db()->prepare(
      WHERE company_id = :company_id
        AND garage_id = :garage_id
        AND expense_date BETWEEN :from_date AND :to_date
-       AND entry_type = "EXPENSE"'
+       AND entry_type <> "DELETED"'
 );
 $expenseTotalStmt->execute([
     'company_id' => $companyId,
@@ -526,7 +587,7 @@ include __DIR__ . '/../../includes/sidebar.php';
                                     <select name="category_id" class="form-control form-control-sm" required>
                                         <option value="">Select category</option>
                                         <?php foreach ($categories as $category): ?>
-                                            <option value="<?= (int) $category['id'] ?>"><?= e($category['category_name']) ?><?= $category['garage_id'] === 0 ? ' (Global)' : '' ?></option>
+                                            <option value="<?= (int) $category['id'] ?>"><?= e($category['category_name']) ?></option>
                                         <?php endforeach; ?>
                                     </select>
                                 </div>
@@ -586,7 +647,7 @@ include __DIR__ . '/../../includes/sidebar.php';
                                     <li class="list-group-item">
                                         <div class="d-flex justify-content-between align-items-center mb-1">
                                             <strong><?= e($category['category_name']) ?></strong>
-                                            <span class="badge badge-light"><?= $category['garage_id'] === 0 ? 'Global' : 'Garage' ?></span>
+                                            <span class="badge badge-light">Garage</span>
                                         </div>
                                         <?php if ($canManage): ?>
                                         <form method="post" class="ajax-form d-flex flex-wrap align-items-center mb-1" style="gap: 6px;">
@@ -659,7 +720,7 @@ include __DIR__ . '/../../includes/sidebar.php';
                                                     <select name="category_id" class="form-control form-control-sm" style="max-width: 150px;">
                                                         <option value="">Category</option>
                                                         <?php foreach ($categories as $category): ?>
-                                                            <option value="<?= (int) $category['id'] ?>" <?= (int) $expense['category_id'] === (int) $category['id'] ? 'selected' : '' ?>><?= e($category['category_name']) ?><?= $category['garage_id'] === 0 ? ' (Global)' : '' ?></option>
+                                                            <option value="<?= (int) $category['id'] ?>" <?= (int) $expense['category_id'] === (int) $category['id'] ? 'selected' : '' ?>><?= e($category['category_name']) ?></option>
                                                         <?php endforeach; ?>
                                                     </select>
                                                     <input type="number" step="0.01" name="amount" value="<?= e($expense['amount']) ?>" class="form-control form-control-sm" style="max-width: 110px;" />

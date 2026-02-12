@@ -97,6 +97,40 @@ if ($canViewFinancial) {
     $finalizedRevenue = (float) ($invoiceSummary['finalized_revenue'] ?? 0);
 }
 
+$payrollMonth = substr($toDate, 0, 7);
+$payrollPayable = 0.0;
+if ((has_permission('payroll.view') || has_permission('payroll.manage'))
+    && table_columns('payroll_salary_sheets') !== []
+    && preg_match('/^\d{4}-\d{2}$/', $payrollMonth)) {
+    $payrollParams = ['company_id' => $companyId, 'salary_month' => $payrollMonth];
+    $payrollScopeSql = analytics_garage_scope_sql('pss.garage_id', $selectedGarageId, $garageIds, $payrollParams, 'ov_payroll_scope');
+    $payrollStmt = db()->prepare(
+        'SELECT COALESCE(SUM(pss.total_payable), 0) AS total_payable
+         FROM payroll_salary_sheets pss
+         WHERE pss.company_id = :company_id
+           AND pss.salary_month = :salary_month
+           ' . $payrollScopeSql
+    );
+    $payrollStmt->execute($payrollParams);
+    $payrollPayable = (float) ($payrollStmt->fetchColumn() ?? 0);
+}
+
+$expenseNet = 0.0;
+if ((has_permission('expense.view') || has_permission('expense.manage')) && table_columns('expenses') !== []) {
+    $expenseParams = ['company_id' => $companyId, 'from_date' => $fromDate, 'to_date' => $toDate];
+    $expenseScopeSql = analytics_garage_scope_sql('e.garage_id', $selectedGarageId, $garageIds, $expenseParams, 'ov_exp_scope');
+    $expenseStmt = db()->prepare(
+        'SELECT COALESCE(SUM(e.amount), 0) AS net_expense
+         FROM expenses e
+         WHERE e.company_id = :company_id
+           AND e.entry_type <> "DELETED"
+           AND e.expense_date BETWEEN :from_date AND :to_date
+           ' . $expenseScopeSql
+    );
+    $expenseStmt->execute($expenseParams);
+    $expenseNet = (float) ($expenseStmt->fetchColumn() ?? 0);
+}
+
 $moduleCards = [
     [
         'title' => 'Job Reports',
@@ -139,6 +173,28 @@ $moduleCards = [
         'metric' => number_format($servicedVehicles),
     ],
 ];
+
+if (has_permission('payroll.view') || has_permission('payroll.manage')) {
+    $moduleCards[] = [
+        'title' => 'Payroll Reports',
+        'description' => 'Monthly salary sheets, payment history, advances, loans, and mechanic earnings.',
+        'path' => 'modules/reports/payroll.php',
+        'icon' => 'bi bi-wallet2',
+        'badge' => 'Month Payable (' . $payrollMonth . ')',
+        'metric' => format_currency($payrollPayable),
+    ];
+}
+
+if (has_permission('expense.view') || has_permission('expense.manage')) {
+    $moduleCards[] = [
+        'title' => 'Expense Reports',
+        'description' => 'Daily/monthly/category/garage expenses with finalized revenue vs expense profit view.',
+        'path' => 'modules/reports/expenses.php',
+        'icon' => 'bi bi-cash-stack',
+        'badge' => 'Net Expense',
+        'metric' => format_currency($expenseNet),
+    ];
+}
 
   if (has_permission('gst.reports') || has_permission('financial.reports')) {
     $moduleCards[] = [

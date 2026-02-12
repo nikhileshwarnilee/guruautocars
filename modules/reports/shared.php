@@ -248,6 +248,24 @@ function reports_module_links(): array
         ]]);
     }
 
+    if (has_permission('payroll.view') || has_permission('payroll.manage')) {
+        $links[] = [
+            'menu_key' => 'reports.payroll',
+            'label' => 'Payroll Reports',
+            'icon' => 'bi bi-wallet2',
+            'path' => 'modules/reports/payroll.php',
+        ];
+    }
+
+    if (has_permission('expense.view') || has_permission('expense.manage')) {
+        $links[] = [
+            'menu_key' => 'reports.expenses',
+            'label' => 'Expense Reports',
+            'icon' => 'bi bi-cash-stack',
+            'path' => 'modules/reports/expenses.php',
+        ];
+    }
+
     if (has_permission('gst.reports') || has_permission('financial.reports')) {
         $links[] = [
             'menu_key' => 'reports.gst_compliance',
