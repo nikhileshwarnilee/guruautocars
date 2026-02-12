@@ -717,46 +717,109 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             redirect('modules/jobs/view.php?id=' . $jobId);
         }
 
-        if (job_is_locked($jobForWrite)) {
-            flash_set('job_error', 'Locked job cards cannot be soft deleted.', 'danger');
-            redirect('modules/jobs/view.php?id=' . $jobId);
-        }
-
         $deleteNote = post_string('delete_note', 255);
         if ($deleteNote === '') {
             flash_set('job_error', 'Soft delete requires an audit note.', 'danger');
             redirect('modules/jobs/view.php?id=' . $jobId);
         }
 
-        $deleteStmt = db()->prepare(
-            'UPDATE job_cards
-             SET status_code = "DELETED",
-                 deleted_at = NOW(),
-                 cancel_note = :cancel_note,
-                 updated_by = :updated_by
-             WHERE id = :id
-               AND company_id = :company_id
-               AND garage_id = :garage_id'
-        );
-        $deleteStmt->execute([
-            'cancel_note' => $deleteNote,
-            'updated_by' => $userId,
-            'id' => $jobId,
-            'company_id' => $companyId,
-            'garage_id' => $garageId,
-        ]);
+        $pdo = db();
+        $pdo->beginTransaction();
+        try {
+            $dependencyReport = reversal_job_delete_dependency_report($pdo, $jobId, $companyId, $garageId);
+            $jobReportRow = $dependencyReport['job'] ?? null;
+            if (!is_array($jobReportRow)) {
+                throw new RuntimeException('Job card not found for delete operation.');
+            }
 
-        job_append_history(
-            $jobId,
-            'SOFT_DELETE',
-            (string) $jobForWrite['status'],
-            (string) $jobForWrite['status'],
-            $deleteNote
-        );
-        log_audit('job_cards', 'soft_delete', $jobId, 'Soft deleted job card');
+            if (!(bool) ($dependencyReport['can_delete'] ?? false)) {
+                $blockers = array_values(array_filter(array_map('trim', (array) ($dependencyReport['blockers'] ?? []))));
+                $steps = array_values(array_filter(array_map('trim', (array) ($dependencyReport['steps'] ?? []))));
+                $intro = 'Job deletion blocked.';
+                if ($blockers !== []) {
+                    $intro .= ' ' . implode(' ', $blockers);
+                }
+                throw new RuntimeException(reversal_chain_message($intro, $steps));
+            }
 
-        flash_set('job_success', 'Job card soft deleted.', 'success');
-        redirect('modules/jobs/index.php');
+            $cancellableOutsourcedIds = array_values(array_filter(
+                (array) ($dependencyReport['cancellable_outsourced_ids'] ?? []),
+                static fn (mixed $id): bool => (int) $id > 0
+            ));
+
+            if ($cancellableOutsourcedIds !== [] && table_columns('outsourced_works') !== []) {
+                $outsourceCancelStmt = $pdo->prepare(
+                    'UPDATE outsourced_works
+                     SET status_code = "INACTIVE",
+                         deleted_at = COALESCE(deleted_at, NOW()),
+                         notes = CONCAT(COALESCE(notes, ""), CASE WHEN COALESCE(notes, "") = "" THEN "" ELSE " | " END, :cancel_tag),
+                         updated_by = :updated_by
+                     WHERE id = :id
+                       AND company_id = :company_id
+                       AND garage_id = :garage_id
+                       AND status_code = "ACTIVE"'
+                );
+                foreach ($cancellableOutsourcedIds as $outsourcedId) {
+                    $outsourceCancelStmt->execute([
+                        'cancel_tag' => 'Cancelled due to job delete #' . $jobId,
+                        'updated_by' => $userId > 0 ? $userId : null,
+                        'id' => (int) $outsourcedId,
+                        'company_id' => $companyId,
+                        'garage_id' => $garageId,
+                    ]);
+                }
+            }
+
+            $deleteStmt = $pdo->prepare(
+                'UPDATE job_cards
+                 SET status_code = "DELETED",
+                     deleted_at = NOW(),
+                     cancel_note = :cancel_note,
+                     updated_by = :updated_by
+                 WHERE id = :id
+                   AND company_id = :company_id
+                   AND garage_id = :garage_id'
+            );
+            $deleteStmt->execute([
+                'cancel_note' => $deleteNote,
+                'updated_by' => $userId > 0 ? $userId : null,
+                'id' => $jobId,
+                'company_id' => $companyId,
+                'garage_id' => $garageId,
+            ]);
+
+            job_append_history(
+                $jobId,
+                'SOFT_DELETE',
+                (string) $jobForWrite['status'],
+                (string) $jobForWrite['status'],
+                $deleteNote
+            );
+            log_audit('job_cards', 'soft_delete', $jobId, 'Soft deleted job card with dependency enforcement', [
+                'entity' => 'job_card',
+                'source' => 'UI',
+                'before' => [
+                    'status' => (string) ($jobForWrite['status'] ?? ''),
+                    'status_code' => (string) ($jobForWrite['status_code'] ?? ''),
+                ],
+                'after' => [
+                    'status' => (string) ($jobForWrite['status'] ?? ''),
+                    'status_code' => 'DELETED',
+                ],
+                'metadata' => [
+                    'cancellable_outsourced_count' => count($cancellableOutsourcedIds),
+                    'inventory_movements' => (int) ($dependencyReport['inventory_movements'] ?? 0),
+                ],
+            ]);
+
+            $pdo->commit();
+            flash_set('job_success', 'Job card soft deleted with safe dependency checks.', 'success');
+            redirect('modules/jobs/index.php');
+        } catch (Throwable $exception) {
+            $pdo->rollBack();
+            flash_set('job_error', $exception->getMessage(), 'danger');
+            redirect('modules/jobs/view.php?id=' . $jobId);
+        }
     }
 
     $lineActions = [

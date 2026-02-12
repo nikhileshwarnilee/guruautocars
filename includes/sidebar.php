@@ -364,6 +364,14 @@ $isReportsOpen = is_menu_group_open('reports', $activeMenu);
                   </a>
                 </li>
               <?php endif; ?>
+              <?php if (has_permission('outsourced.view')): ?>
+                <li class="nav-item">
+                  <a href="<?= e(url('modules/reports/outsourced_labour.php')); ?>" class="nav-link <?= e(is_active_menu('reports.outsourced', $activeMenu)); ?>">
+                    <i class="nav-icon bi bi-circle"></i>
+                    <p>Outsourced Labour</p>
+                  </a>
+                </li>
+              <?php endif; ?>
               <?php if (has_permission('gst.reports') || has_permission('financial.reports')): ?>
                 <li class="nav-item">
                   <a href="<?= e(url('modules/reports/gst_compliance.php')); ?>" class="nav-link <?= e(is_active_menu('reports.gst_compliance', $activeMenu)); ?>">

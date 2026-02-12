@@ -266,6 +266,15 @@ function reports_module_links(): array
         ];
     }
 
+    if (has_permission('outsourced.view')) {
+        $links[] = [
+            'menu_key' => 'reports.outsourced',
+            'label' => 'Outsourced Labour',
+            'icon' => 'bi bi-gear-wide-connected',
+            'path' => 'modules/reports/outsourced_labour.php',
+        ];
+    }
+
     if (has_permission('gst.reports') || has_permission('financial.reports')) {
         $links[] = [
             'menu_key' => 'reports.gst_compliance',

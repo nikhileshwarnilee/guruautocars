@@ -17,6 +17,7 @@ $canFinalize = has_permission('purchase.finalize') || $canManage;
 $canExport = has_permission('export.data') || $canManage;
 $canPayPurchases = has_permission('purchase.payments') || $canManage;
 $canViewVendorPayables = has_permission('vendor.payments') || $canManage;
+$canDeletePurchases = has_permission('purchase.delete') || $canManage;
 
 function pur_decimal(mixed $raw, float $default = 0.0): float
 {
@@ -156,7 +157,7 @@ function pur_payment_status_from_amounts(float $grandTotal, float $paidAmount): 
 
 function pur_fetch_purchase_for_update(PDO $pdo, int $purchaseId, int $companyId, int $garageId): ?array
 {
-  $stmt = $pdo->prepare(
+  $sql =
     'SELECT p.*,
         COALESCE(pay.total_paid, 0) AS total_paid
      FROM purchases p
@@ -167,10 +168,11 @@ function pur_fetch_purchase_for_update(PDO $pdo, int $purchaseId, int $companyId
      ) pay ON pay.purchase_id = p.id
      WHERE p.id = :id
        AND p.company_id = :company_id
-       AND p.garage_id = :garage_id
+       AND p.garage_id = :garage_id'
+    . pur_deleted_scope_sql('p') . '
      LIMIT 1
-     FOR UPDATE'
-  );
+     FOR UPDATE';
+  $stmt = $pdo->prepare($sql);
   $stmt->execute([
     'id' => $purchaseId,
     'company_id' => $companyId,
@@ -179,6 +181,29 @@ function pur_fetch_purchase_for_update(PDO $pdo, int $purchaseId, int $companyId
 
   $row = $stmt->fetch();
   return $row ?: null;
+}
+
+function pur_supports_soft_delete(): bool
+{
+  return in_array('status_code', table_columns('purchases'), true);
+}
+
+function pur_purchase_is_deleted(array $purchase): bool
+{
+  if (!pur_supports_soft_delete()) {
+    return false;
+  }
+
+  return strtoupper(trim((string) ($purchase['status_code'] ?? 'ACTIVE'))) === 'DELETED';
+}
+
+function pur_deleted_scope_sql(string $alias = 'p'): string
+{
+  if (!pur_supports_soft_delete()) {
+    return '';
+  }
+
+  return ' AND ' . $alias . '.status_code <> "DELETED"';
 }
 
 function pur_purchase_badge_class(string $status): string
@@ -600,14 +625,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $pdo = db();
         $pdo->beginTransaction();
         try {
-            $purchaseLockStmt = $pdo->prepare(
-                'SELECT id, assignment_status, purchase_status, notes, grand_total
-                 FROM purchases
-                 WHERE id = :id
-                   AND company_id = :company_id
-                   AND garage_id = :garage_id
-                 FOR UPDATE'
-            );
+            $purchaseLockSql =
+                'SELECT p.id, p.assignment_status, p.purchase_status, p.notes, p.grand_total
+                 FROM purchases p
+                 WHERE p.id = :id
+                   AND p.company_id = :company_id
+                   AND p.garage_id = :garage_id'
+                . pur_deleted_scope_sql('p') . '
+                 FOR UPDATE';
+            $purchaseLockStmt = $pdo->prepare($purchaseLockSql);
             $purchaseLockStmt->execute([
                 'id' => $purchaseId,
                 'company_id' => $companyId,
@@ -736,14 +762,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $pdo = db();
         $pdo->beginTransaction();
         try {
-            $purchaseStmt = $pdo->prepare(
-                'SELECT id, vendor_id, invoice_number, assignment_status, purchase_status
-                 FROM purchases
-                 WHERE id = :id
-                   AND company_id = :company_id
-                   AND garage_id = :garage_id
-                 FOR UPDATE'
-            );
+            $purchaseSql =
+                'SELECT p.id, p.vendor_id, p.invoice_number, p.assignment_status, p.purchase_status
+                 FROM purchases p
+                 WHERE p.id = :id
+                   AND p.company_id = :company_id
+                   AND p.garage_id = :garage_id'
+                . pur_deleted_scope_sql('p') . '
+                 FOR UPDATE';
+            $purchaseStmt = $pdo->prepare($purchaseSql);
             $purchaseStmt->execute([
                 'id' => $purchaseId,
                 'company_id' => $companyId,
@@ -788,6 +815,457 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'source' => 'UI',
             ]);
             flash_set('purchase_success', 'Purchase #' . $purchaseId . ' finalized.', 'success');
+        } catch (Throwable $exception) {
+            $pdo->rollBack();
+            flash_set('purchase_error', $exception->getMessage(), 'danger');
+        }
+
+        redirect('modules/purchases/index.php');
+    }
+
+    if ($action === 'edit_purchase') {
+        if (!$canManage) {
+            flash_set('purchase_error', 'You do not have permission to edit purchases.', 'danger');
+            redirect('modules/purchases/index.php');
+        }
+
+        $purchaseId = post_int('purchase_id');
+        $vendorId = post_int('vendor_id');
+        $invoiceNumber = post_string('invoice_number', 80);
+        $purchaseDate = trim((string) ($_POST['purchase_date'] ?? date('Y-m-d')));
+        $notes = post_string('notes', 255);
+        $editReason = post_string('edit_reason', 255);
+
+        if ($purchaseId <= 0 || $editReason === '') {
+            flash_set('purchase_error', 'Purchase and audit reason are required for edit.', 'danger');
+            redirect('modules/purchases/index.php');
+        }
+        if (!pur_is_valid_date($purchaseDate)) {
+            flash_set('purchase_error', 'Invalid purchase date.', 'danger');
+            redirect('modules/purchases/index.php?edit_purchase_id=' . $purchaseId);
+        }
+
+        $partInputs = $_POST['item_part_id'] ?? [];
+        $qtyInputs = $_POST['item_quantity'] ?? [];
+        $costInputs = $_POST['item_unit_cost'] ?? [];
+        $gstInputs = $_POST['item_gst_rate'] ?? [];
+        if (!is_array($partInputs) || !is_array($qtyInputs) || !is_array($costInputs) || !is_array($gstInputs)) {
+            flash_set('purchase_error', 'Invalid edit payload for item rows.', 'danger');
+            redirect('modules/purchases/index.php?edit_purchase_id=' . $purchaseId);
+        }
+
+        $maxRows = max(count($partInputs), count($qtyInputs), count($costInputs), count($gstInputs));
+        $lineItems = [];
+        for ($i = 0; $i < $maxRows; $i++) {
+            $partId = filter_var($partInputs[$i] ?? 0, FILTER_VALIDATE_INT);
+            $partId = $partId !== false ? (int) $partId : 0;
+            $quantity = pur_decimal($qtyInputs[$i] ?? 0.0, 0.0);
+            $unitCost = pur_decimal($costInputs[$i] ?? 0.0, 0.0);
+            $gstRate = pur_decimal($gstInputs[$i] ?? 0.0, 0.0);
+
+            $rowIsEmpty = $partId <= 0 && abs($quantity) < 0.00001 && abs($unitCost) < 0.00001 && abs($gstRate) < 0.00001;
+            if ($rowIsEmpty) {
+                continue;
+            }
+
+            if ($partId <= 0 || $quantity <= 0) {
+                flash_set('purchase_error', 'Each edited item row must include part and quantity greater than zero.', 'danger');
+                redirect('modules/purchases/index.php?edit_purchase_id=' . $purchaseId);
+            }
+            if ($unitCost < 0 || $gstRate < 0 || $gstRate > 100) {
+                flash_set('purchase_error', 'Edited unit cost/GST values are out of range.', 'danger');
+                redirect('modules/purchases/index.php?edit_purchase_id=' . $purchaseId);
+            }
+
+            $taxableAmount = round($quantity * $unitCost, 2);
+            $gstAmount = round(($taxableAmount * $gstRate) / 100, 2);
+            $totalAmount = round($taxableAmount + $gstAmount, 2);
+
+            $lineItems[] = [
+                'part_id' => $partId,
+                'quantity' => round($quantity, 2),
+                'unit_cost' => round($unitCost, 2),
+                'gst_rate' => round($gstRate, 2),
+                'taxable_amount' => $taxableAmount,
+                'gst_amount' => $gstAmount,
+                'total_amount' => $totalAmount,
+            ];
+        }
+
+        if (empty($lineItems)) {
+            flash_set('purchase_error', 'At least one valid item row is required for edit.', 'danger');
+            redirect('modules/purchases/index.php?edit_purchase_id=' . $purchaseId);
+        }
+
+        $totals = ['taxable' => 0.0, 'gst' => 0.0, 'grand' => 0.0];
+        foreach ($lineItems as $item) {
+            $totals['taxable'] += (float) $item['taxable_amount'];
+            $totals['gst'] += (float) $item['gst_amount'];
+            $totals['grand'] += (float) $item['total_amount'];
+        }
+        $totals = [
+            'taxable' => round($totals['taxable'], 2),
+            'gst' => round($totals['gst'], 2),
+            'grand' => round($totals['grand'], 2),
+        ];
+
+        $pdo = db();
+        $pdo->beginTransaction();
+        try {
+            $purchase = pur_fetch_purchase_for_update($pdo, $purchaseId, $companyId, $activeGarageId);
+            if (!$purchase) {
+                throw new RuntimeException('Purchase not found for this garage.');
+            }
+            if (pur_purchase_is_deleted($purchase)) {
+                throw new RuntimeException('Deleted purchase entries cannot be edited.');
+            }
+
+            $paymentSummary = reversal_purchase_payment_summary($pdo, $purchaseId);
+            if ((int) ($paymentSummary['unreversed_count'] ?? 0) > 0) {
+                throw new RuntimeException(reversal_chain_message(
+                    'Purchase edit blocked. Payment entries exist.',
+                    ['Reverse purchase payments first, then retry edit.']
+                ));
+            }
+
+            $assignmentStatus = strtoupper((string) ($purchase['assignment_status'] ?? 'ASSIGNED'));
+            if ($assignmentStatus !== 'UNASSIGNED') {
+                if ($vendorId <= 0) {
+                    throw new RuntimeException('Vendor is required for assigned purchases.');
+                }
+                if ($invoiceNumber === '') {
+                    throw new RuntimeException('Invoice number is required for assigned purchases.');
+                }
+            } else {
+                $vendorId = max(0, $vendorId);
+            }
+
+            if ($vendorId > 0) {
+                $vendorStmt = $pdo->prepare(
+                    'SELECT id
+                     FROM vendors
+                     WHERE id = :id
+                       AND company_id = :company_id
+                       AND (status_code IS NULL OR status_code = "ACTIVE")
+                     LIMIT 1'
+                );
+                $vendorStmt->execute([
+                    'id' => $vendorId,
+                    'company_id' => $companyId,
+                ]);
+                if (!$vendorStmt->fetch()) {
+                    throw new RuntimeException('Selected vendor is invalid for this company.');
+                }
+            }
+
+            $existingItemsStmt = $pdo->prepare(
+                'SELECT part_id, quantity
+                 FROM purchase_items
+                 WHERE purchase_id = :purchase_id
+                 FOR UPDATE'
+            );
+            $existingItemsStmt->execute(['purchase_id' => $purchaseId]);
+            $existingItems = $existingItemsStmt->fetchAll();
+
+            $oldPartQty = [];
+            foreach ($existingItems as $row) {
+                $partId = (int) ($row['part_id'] ?? 0);
+                if ($partId <= 0) {
+                    continue;
+                }
+                $oldPartQty[$partId] = round(($oldPartQty[$partId] ?? 0) + (float) ($row['quantity'] ?? 0), 2);
+            }
+
+            $newPartQty = [];
+            foreach ($lineItems as $item) {
+                $partId = (int) ($item['part_id'] ?? 0);
+                if ($partId <= 0) {
+                    continue;
+                }
+                $newPartQty[$partId] = round(($newPartQty[$partId] ?? 0) + (float) ($item['quantity'] ?? 0), 2);
+            }
+
+            $stockUpdateStmt = $pdo->prepare(
+                'UPDATE garage_inventory
+                 SET quantity = :quantity
+                 WHERE garage_id = :garage_id
+                   AND part_id = :part_id'
+            );
+
+            $stockDeltas = [];
+            $partIds = array_values(array_unique(array_merge(array_keys($oldPartQty), array_keys($newPartQty))));
+            foreach ($partIds as $partId) {
+                $oldQty = round((float) ($oldPartQty[$partId] ?? 0), 2);
+                $newQty = round((float) ($newPartQty[$partId] ?? 0), 2);
+                $delta = round($newQty - $oldQty, 2);
+                if (abs($delta) <= 0.00001) {
+                    continue;
+                }
+
+                $currentQty = pur_lock_inventory_row($pdo, $activeGarageId, (int) $partId);
+                $nextQty = round($currentQty + $delta, 2);
+                if ($nextQty < -0.009) {
+                    throw new RuntimeException('Purchase edit blocked. Part #' . (int) $partId . ' stock is already consumed. Reverse downstream stock usage first.');
+                }
+
+                $stockDeltas[] = [
+                    'part_id' => (int) $partId,
+                    'delta' => $delta,
+                    'next_qty' => $nextQty,
+                ];
+            }
+
+            foreach ($stockDeltas as $stockDelta) {
+                $partId = (int) $stockDelta['part_id'];
+                $delta = (float) $stockDelta['delta'];
+                $stockUpdateStmt->execute([
+                    'quantity' => round((float) $stockDelta['next_qty'], 2),
+                    'garage_id' => $activeGarageId,
+                    'part_id' => $partId,
+                ]);
+
+                pur_insert_movement($pdo, [
+                    'company_id' => $companyId,
+                    'garage_id' => $activeGarageId,
+                    'part_id' => $partId,
+                    'movement_type' => $delta >= 0 ? 'IN' : 'OUT',
+                    'quantity' => abs($delta),
+                    'reference_type' => 'PURCHASE',
+                    'reference_id' => $purchaseId,
+                    'movement_uid' => 'pur-edit-' . hash('sha256', $purchaseId . '|' . $partId . '|' . $delta . '|' . microtime(true)),
+                    'notes' => 'Purchase #' . $purchaseId . ' edit adjustment.',
+                    'created_by' => $userId,
+                ]);
+            }
+
+            $deleteItemsStmt = $pdo->prepare('DELETE FROM purchase_items WHERE purchase_id = :purchase_id');
+            $deleteItemsStmt->execute(['purchase_id' => $purchaseId]);
+
+            $itemInsert = $pdo->prepare(
+                'INSERT INTO purchase_items
+                  (purchase_id, part_id, quantity, unit_cost, gst_rate, taxable_amount, gst_amount, total_amount)
+                 VALUES
+                  (:purchase_id, :part_id, :quantity, :unit_cost, :gst_rate, :taxable_amount, :gst_amount, :total_amount)'
+            );
+            foreach ($lineItems as $item) {
+                $itemInsert->execute([
+                    'purchase_id' => $purchaseId,
+                    'part_id' => (int) $item['part_id'],
+                    'quantity' => round((float) $item['quantity'], 2),
+                    'unit_cost' => round((float) $item['unit_cost'], 2),
+                    'gst_rate' => round((float) $item['gst_rate'], 2),
+                    'taxable_amount' => round((float) $item['taxable_amount'], 2),
+                    'gst_amount' => round((float) $item['gst_amount'], 2),
+                    'total_amount' => round((float) $item['total_amount'], 2),
+                ]);
+            }
+
+            $effectivePaid = max(0.0, round((float) ($purchase['total_paid'] ?? 0), 2));
+            $nextPaymentStatus = pur_payment_status_from_amounts((float) $totals['grand'], $effectivePaid);
+
+            $purchaseUpdateStmt = $pdo->prepare(
+                'UPDATE purchases
+                 SET vendor_id = :vendor_id,
+                     invoice_number = :invoice_number,
+                     purchase_date = :purchase_date,
+                     payment_status = :payment_status,
+                     taxable_amount = :taxable_amount,
+                     gst_amount = :gst_amount,
+                     grand_total = :grand_total,
+                     notes = :notes
+                 WHERE id = :id
+                   AND company_id = :company_id
+                   AND garage_id = :garage_id'
+            );
+            $purchaseUpdateStmt->execute([
+                'vendor_id' => $vendorId > 0 ? $vendorId : null,
+                'invoice_number' => $invoiceNumber !== '' ? $invoiceNumber : null,
+                'purchase_date' => $purchaseDate,
+                'payment_status' => $nextPaymentStatus,
+                'taxable_amount' => (float) $totals['taxable'],
+                'gst_amount' => (float) $totals['gst'],
+                'grand_total' => (float) $totals['grand'],
+                'notes' => $notes !== '' ? $notes : null,
+                'id' => $purchaseId,
+                'company_id' => $companyId,
+                'garage_id' => $activeGarageId,
+            ]);
+
+            $pdo->commit();
+            log_audit('purchases', 'update', $purchaseId, 'Edited purchase #' . $purchaseId, [
+                'entity' => 'purchase',
+                'source' => 'UI',
+                'before' => [
+                    'vendor_id' => (int) ($purchase['vendor_id'] ?? 0),
+                    'invoice_number' => (string) ($purchase['invoice_number'] ?? ''),
+                    'purchase_date' => (string) ($purchase['purchase_date'] ?? ''),
+                    'payment_status' => (string) ($purchase['payment_status'] ?? ''),
+                    'taxable_amount' => (float) ($purchase['taxable_amount'] ?? 0),
+                    'gst_amount' => (float) ($purchase['gst_amount'] ?? 0),
+                    'grand_total' => (float) ($purchase['grand_total'] ?? 0),
+                ],
+                'after' => [
+                    'vendor_id' => $vendorId,
+                    'invoice_number' => $invoiceNumber,
+                    'purchase_date' => $purchaseDate,
+                    'payment_status' => $nextPaymentStatus,
+                    'taxable_amount' => (float) $totals['taxable'],
+                    'gst_amount' => (float) $totals['gst'],
+                    'grand_total' => (float) $totals['grand'],
+                ],
+                'metadata' => [
+                    'reason' => $editReason,
+                    'item_count' => count($lineItems),
+                ],
+            ]);
+            flash_set('purchase_success', 'Purchase #' . $purchaseId . ' updated successfully.', 'success');
+        } catch (Throwable $exception) {
+            $pdo->rollBack();
+            flash_set('purchase_error', $exception->getMessage(), 'danger');
+        }
+
+        redirect('modules/purchases/index.php?edit_purchase_id=' . $purchaseId);
+    }
+
+    if ($action === 'delete_purchase') {
+        if (!$canDeletePurchases) {
+            flash_set('purchase_error', 'You do not have permission to delete purchases.', 'danger');
+            redirect('modules/purchases/index.php');
+        }
+        if (!pur_supports_soft_delete()) {
+            flash_set('purchase_error', 'Soft-delete columns are missing. Run database/reversal_integrity_hardening.sql first.', 'danger');
+            redirect('modules/purchases/index.php');
+        }
+
+        $purchaseId = post_int('purchase_id');
+        $deleteReason = post_string('delete_reason', 255);
+        if ($purchaseId <= 0 || $deleteReason === '') {
+            flash_set('purchase_error', 'Purchase and delete reason are required.', 'danger');
+            redirect('modules/purchases/index.php');
+        }
+
+        $pdo = db();
+        $pdo->beginTransaction();
+        try {
+            $purchase = pur_fetch_purchase_for_update($pdo, $purchaseId, $companyId, $activeGarageId);
+            if (!$purchase) {
+                throw new RuntimeException('Purchase not found for this garage.');
+            }
+            if (pur_purchase_is_deleted($purchase)) {
+                throw new RuntimeException('Purchase is already deleted.');
+            }
+
+            $dependencyReport = reversal_purchase_delete_dependency_report($pdo, $purchaseId, $companyId, $activeGarageId);
+            if (!(bool) ($dependencyReport['can_delete'] ?? false)) {
+                $blockers = array_values(array_filter(array_map('trim', (array) ($dependencyReport['blockers'] ?? []))));
+                $steps = array_values(array_filter(array_map('trim', (array) ($dependencyReport['steps'] ?? []))));
+                $intro = 'Purchase deletion blocked.';
+                if ($blockers !== []) {
+                    $intro .= ' ' . implode(' ', $blockers);
+                }
+                throw new RuntimeException(reversal_chain_message($intro, $steps));
+            }
+
+            $itemQtyStmt = $pdo->prepare(
+                'SELECT part_id, COALESCE(SUM(quantity), 0) AS total_qty
+                 FROM purchase_items
+                 WHERE purchase_id = :purchase_id
+                 GROUP BY part_id
+                 FOR UPDATE'
+            );
+            $itemQtyStmt->execute(['purchase_id' => $purchaseId]);
+            $itemRows = $itemQtyStmt->fetchAll();
+
+            $stockUpdateStmt = $pdo->prepare(
+                'UPDATE garage_inventory
+                 SET quantity = :quantity
+                 WHERE garage_id = :garage_id
+                   AND part_id = :part_id'
+            );
+
+            $stockAdjustments = [];
+            foreach ($itemRows as $itemRow) {
+                $partId = (int) ($itemRow['part_id'] ?? 0);
+                $qty = round((float) ($itemRow['total_qty'] ?? 0), 2);
+                if ($partId <= 0 || $qty <= 0.00001) {
+                    continue;
+                }
+
+                $currentQty = pur_lock_inventory_row($pdo, $activeGarageId, $partId);
+                $nextQty = round($currentQty - $qty, 2);
+                if ($nextQty < -0.009) {
+                    throw new RuntimeException(reversal_chain_message(
+                        'Purchase deletion blocked. Stock from this purchase is already consumed downstream.',
+                        ['Reverse downstream stock-out transactions first, then retry delete.']
+                    ));
+                }
+
+                $stockAdjustments[] = [
+                    'part_id' => $partId,
+                    'quantity' => $qty,
+                    'next_qty' => $nextQty,
+                ];
+            }
+
+            foreach ($stockAdjustments as $stockAdjustment) {
+                $partId = (int) $stockAdjustment['part_id'];
+                $qty = round((float) $stockAdjustment['quantity'], 2);
+                $stockUpdateStmt->execute([
+                    'quantity' => round((float) $stockAdjustment['next_qty'], 2),
+                    'garage_id' => $activeGarageId,
+                    'part_id' => $partId,
+                ]);
+
+                pur_insert_movement($pdo, [
+                    'company_id' => $companyId,
+                    'garage_id' => $activeGarageId,
+                    'part_id' => $partId,
+                    'movement_type' => 'OUT',
+                    'quantity' => $qty,
+                    'reference_type' => 'PURCHASE',
+                    'reference_id' => $purchaseId,
+                    'movement_uid' => 'pur-del-' . hash('sha256', $purchaseId . '|' . $partId . '|' . $qty . '|' . microtime(true)),
+                    'notes' => 'Purchase #' . $purchaseId . ' delete stock reversal. Reason: ' . $deleteReason,
+                    'created_by' => $userId,
+                ]);
+            }
+
+            $deleteStmt = $pdo->prepare(
+                'UPDATE purchases
+                 SET status_code = "DELETED",
+                     deleted_at = NOW(),
+                     deleted_by = :deleted_by,
+                     delete_reason = :delete_reason
+                 WHERE id = :id
+                   AND company_id = :company_id
+                   AND garage_id = :garage_id'
+            );
+            $deleteStmt->execute([
+                'deleted_by' => $userId > 0 ? $userId : null,
+                'delete_reason' => $deleteReason,
+                'id' => $purchaseId,
+                'company_id' => $companyId,
+                'garage_id' => $activeGarageId,
+            ]);
+
+            $pdo->commit();
+            log_audit('purchases', 'soft_delete', $purchaseId, 'Soft deleted purchase #' . $purchaseId, [
+                'entity' => 'purchase',
+                'source' => 'UI',
+                'before' => [
+                    'status_code' => (string) ($purchase['status_code'] ?? 'ACTIVE'),
+                    'payment_status' => (string) ($purchase['payment_status'] ?? ''),
+                    'grand_total' => (float) ($purchase['grand_total'] ?? 0),
+                ],
+                'after' => [
+                    'status_code' => 'DELETED',
+                    'delete_reason' => $deleteReason,
+                ],
+                'metadata' => [
+                    'stock_reverse_lines' => count($stockAdjustments),
+                ],
+            ]);
+            flash_set('purchase_success', 'Purchase #' . $purchaseId . ' soft deleted with stock reversal.', 'success');
         } catch (Throwable $exception) {
             $pdo->rollBack();
             flash_set('purchase_error', $exception->getMessage(), 'danger');
@@ -1111,6 +1589,7 @@ $fromDate = trim((string) ($_GET['from'] ?? ''));
 $toDate = trim((string) ($_GET['to'] ?? ''));
 $assignPurchaseId = get_int('assign_purchase_id', 0);
 $payPurchaseId = get_int('pay_purchase_id', 0);
+$editPurchaseId = get_int('edit_purchase_id', 0);
 
 $allowedPaymentStatuses = ['UNPAID', 'PARTIAL', 'PAID'];
 $allowedPurchaseStatuses = ['DRAFT', 'FINALIZED'];
@@ -1136,11 +1615,16 @@ if (!pur_is_valid_date($toDate)) {
     $toDate = '';
 }
 
+$purchaseDeletedScopeSql = pur_supports_soft_delete() ? ' AND p.status_code <> "DELETED"' : '';
+
 $purchaseWhere = ['p.company_id = :company_id', 'p.garage_id = :garage_id'];
 $purchaseParams = [
     'company_id' => $companyId,
     'garage_id' => $activeGarageId,
 ];
+if (pur_supports_soft_delete()) {
+    $purchaseWhere[] = 'p.status_code <> "DELETED"';
+}
 
 if ($vendorFilter > 0) {
     $purchaseWhere[] = 'p.vendor_id = :vendor_id';
@@ -1310,6 +1794,7 @@ if ($purchasesReady) {
          LEFT JOIN purchase_items pi ON pi.purchase_id = p.id
          WHERE p.company_id = :company_id
            AND p.garage_id = :garage_id
+           ' . $purchaseDeletedScopeSql . '
            AND p.assignment_status = "UNASSIGNED"
            AND p.purchase_status = "DRAFT"
          GROUP BY p.id, p.purchase_date, p.invoice_number, p.purchase_source, p.grand_total
@@ -1339,6 +1824,7 @@ if ($purchasesReady) {
          WHERE p.id = :id
            AND p.company_id = :company_id
            AND p.garage_id = :garage_id
+           ' . $purchaseDeletedScopeSql . '
          LIMIT 1'
       );
       $payStmt->execute([
@@ -1371,6 +1857,9 @@ if ($purchasesReady) {
         'p.purchase_status = "FINALIZED"',
         'p.assignment_status = "ASSIGNED"',
       ];
+      if (pur_supports_soft_delete()) {
+        $payableWhere[] = 'p.status_code <> "DELETED"';
+      }
       $payableParams = [
         'company_id' => $companyId,
         'garage_id' => $activeGarageId,
@@ -1612,6 +2101,59 @@ if ($purchasesReady) {
     }
 }
 
+$editPurchase = null;
+$editPurchaseItems = [];
+$editPurchasePaymentSummary = [
+    'unreversed_count' => 0,
+    'unreversed_amount' => 0.0,
+    'net_paid_amount' => 0.0,
+];
+if ($purchasesReady && $canManage && $editPurchaseId > 0) {
+    $editSql =
+        'SELECT p.*,
+                v.vendor_name,
+                COALESCE(pay.total_paid, 0) AS total_paid,
+                GREATEST(p.grand_total - COALESCE(pay.total_paid, 0), 0) AS outstanding_total
+         FROM purchases p
+         LEFT JOIN vendors v ON v.id = p.vendor_id
+         LEFT JOIN (
+            SELECT purchase_id, SUM(amount) AS total_paid
+            FROM purchase_payments
+            GROUP BY purchase_id
+         ) pay ON pay.purchase_id = p.id
+         WHERE p.id = :id
+           AND p.company_id = :company_id
+           AND p.garage_id = :garage_id'
+        . $purchaseDeletedScopeSql . '
+         LIMIT 1';
+    $editStmt = db()->prepare($editSql);
+    $editStmt->execute([
+        'id' => $editPurchaseId,
+        'company_id' => $companyId,
+        'garage_id' => $activeGarageId,
+    ]);
+    $editPurchase = $editStmt->fetch() ?: null;
+
+    if ($editPurchase) {
+        $editPurchasePaymentSummary = reversal_purchase_payment_summary(db(), (int) ($editPurchase['id'] ?? 0));
+        $editItemsStmt = db()->prepare(
+            'SELECT pi.*, p.part_name, p.part_sku, COALESCE(gi.quantity, 0) AS stock_qty
+             FROM purchase_items pi
+             INNER JOIN parts p ON p.id = pi.part_id
+             LEFT JOIN garage_inventory gi ON gi.part_id = p.id AND gi.garage_id = :garage_id
+             WHERE pi.purchase_id = :purchase_id
+             ORDER BY pi.id ASC'
+        );
+        $editItemsStmt->execute([
+            'purchase_id' => (int) $editPurchase['id'],
+            'garage_id' => $activeGarageId,
+        ]);
+        $editPurchaseItems = $editItemsStmt->fetchAll();
+    } else {
+        flash_set('purchase_warning', 'Selected purchase not found for edit in this garage scope.', 'warning');
+    }
+}
+
 $createToken = pur_issue_action_token('create_purchase');
 $assignToken = pur_issue_action_token('assign_unassigned');
 $finalizeToken = pur_issue_action_token('finalize_purchase');
@@ -1823,6 +2365,145 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             </div>
           <?php endif; ?>
         </div>
+
+        <?php if ($canManage && $editPurchase): ?>
+          <?php
+            $editBlockedByPayments = (int) ($editPurchasePaymentSummary['unreversed_count'] ?? 0) > 0;
+            $editAssignmentStatus = strtoupper((string) ($editPurchase['assignment_status'] ?? 'ASSIGNED'));
+            $editVendorRequired = $editAssignmentStatus !== 'UNASSIGNED';
+          ?>
+          <div class="card card-warning mb-3">
+            <div class="card-header d-flex justify-content-between align-items-center">
+              <h3 class="card-title mb-0">Edit Purchase #<?= (int) ($editPurchase['id'] ?? 0); ?></h3>
+              <a href="<?= e(url('modules/purchases/index.php')); ?>" class="btn btn-sm btn-outline-secondary">Close Edit</a>
+            </div>
+            <form method="post">
+              <div class="card-body">
+                <?= csrf_field(); ?>
+                <input type="hidden" name="_action" value="edit_purchase" />
+                <input type="hidden" name="purchase_id" value="<?= (int) ($editPurchase['id'] ?? 0); ?>" />
+
+                <?php if ($editBlockedByPayments): ?>
+                  <div class="alert alert-danger">
+                    <?= e(reversal_chain_message(
+                      'Edit is blocked because unreversed purchase payments exist.',
+                      ['Reverse purchase payments first, then retry edit.']
+                    )); ?>
+                  </div>
+                <?php endif; ?>
+
+                <div class="row g-2 mb-3">
+                  <div class="col-md-3">
+                    <label class="form-label">Assignment Status</label>
+                    <input type="text" class="form-control" value="<?= e($editAssignmentStatus); ?>" readonly />
+                  </div>
+                  <div class="col-md-3">
+                    <label class="form-label">Vendor</label>
+                    <select name="vendor_id" class="form-select" <?= $editVendorRequired ? 'required' : ''; ?>>
+                      <option value="0">Unassigned</option>
+                      <?php foreach ($vendors as $vendor): ?>
+                        <option value="<?= (int) $vendor['id']; ?>" <?= (int) ($editPurchase['vendor_id'] ?? 0) === (int) $vendor['id'] ? 'selected' : ''; ?>>
+                          <?= e((string) $vendor['vendor_name']); ?> (<?= e((string) $vendor['vendor_code']); ?>)
+                        </option>
+                      <?php endforeach; ?>
+                    </select>
+                  </div>
+                  <div class="col-md-2">
+                    <label class="form-label">Invoice Number</label>
+                    <input type="text" name="invoice_number" class="form-control" maxlength="80" value="<?= e((string) ($editPurchase['invoice_number'] ?? '')); ?>" <?= $editVendorRequired ? 'required' : ''; ?> />
+                  </div>
+                  <div class="col-md-2">
+                    <label class="form-label">Date</label>
+                    <input type="date" name="purchase_date" class="form-control" value="<?= e((string) ($editPurchase['purchase_date'] ?? date('Y-m-d'))); ?>" required />
+                  </div>
+                  <div class="col-md-2">
+                    <label class="form-label">Net Paid</label>
+                    <input type="text" class="form-control" value="<?= e(format_currency((float) ($editPurchasePaymentSummary['net_paid_amount'] ?? 0))); ?>" readonly />
+                  </div>
+                </div>
+
+                <div class="table-responsive">
+                  <table class="table table-sm table-bordered align-middle mb-2" id="purchase-edit-item-table">
+                    <thead>
+                      <tr>
+                        <th style="width: 42%;">Part</th>
+                        <th style="width: 14%;">Qty</th>
+                        <th style="width: 16%;">Unit Cost</th>
+                        <th style="width: 14%;">GST %</th>
+                        <th style="width: 14%;">Default Stock</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <?php foreach ($editPurchaseItems as $line): ?>
+                        <tr>
+                          <td>
+                            <select name="item_part_id[]" class="form-select form-select-sm js-item-part">
+                              <option value="">Select Part</option>
+                              <?php foreach ($parts as $part): ?>
+                                <option
+                                  value="<?= (int) $part['id']; ?>"
+                                  data-default-cost="<?= e(number_format((float) ($part['purchase_price'] ?? 0), 2, '.', '')); ?>"
+                                  data-default-gst="<?= e(number_format((float) ($part['gst_rate'] ?? 0), 2, '.', '')); ?>"
+                                  data-stock="<?= e(number_format((float) ($part['stock_qty'] ?? 0), 2, '.', '')); ?>"
+                                  <?= (int) ($line['part_id'] ?? 0) === (int) $part['id'] ? 'selected' : ''; ?>
+                                >
+                                  <?= e((string) $part['part_name']); ?> (<?= e((string) $part['part_sku']); ?>)
+                                </option>
+                              <?php endforeach; ?>
+                            </select>
+                          </td>
+                          <td><input type="number" name="item_quantity[]" class="form-control form-control-sm" step="0.01" min="0" value="<?= e(number_format((float) ($line['quantity'] ?? 0), 2, '.', '')); ?>"></td>
+                          <td><input type="number" name="item_unit_cost[]" class="form-control form-control-sm js-item-cost" step="0.01" min="0" value="<?= e(number_format((float) ($line['unit_cost'] ?? 0), 2, '.', '')); ?>"></td>
+                          <td><input type="number" name="item_gst_rate[]" class="form-control form-control-sm js-item-gst" step="0.01" min="0" value="<?= e(number_format((float) ($line['gst_rate'] ?? 0), 2, '.', '')); ?>"></td>
+                          <td class="text-muted small js-item-stock"><?= e(number_format((float) ($line['stock_qty'] ?? 0), 2, '.', '')); ?></td>
+                        </tr>
+                      <?php endforeach; ?>
+                      <?php for ($blank = 0; $blank < 2; $blank++): ?>
+                        <tr>
+                          <td>
+                            <select name="item_part_id[]" class="form-select form-select-sm js-item-part">
+                              <option value="">Select Part</option>
+                              <?php foreach ($parts as $part): ?>
+                                <option
+                                  value="<?= (int) $part['id']; ?>"
+                                  data-default-cost="<?= e(number_format((float) ($part['purchase_price'] ?? 0), 2, '.', '')); ?>"
+                                  data-default-gst="<?= e(number_format((float) ($part['gst_rate'] ?? 0), 2, '.', '')); ?>"
+                                  data-stock="<?= e(number_format((float) ($part['stock_qty'] ?? 0), 2, '.', '')); ?>"
+                                >
+                                  <?= e((string) $part['part_name']); ?> (<?= e((string) $part['part_sku']); ?>)
+                                </option>
+                              <?php endforeach; ?>
+                            </select>
+                          </td>
+                          <td><input type="number" name="item_quantity[]" class="form-control form-control-sm" step="0.01" min="0"></td>
+                          <td><input type="number" name="item_unit_cost[]" class="form-control form-control-sm js-item-cost" step="0.01" min="0"></td>
+                          <td><input type="number" name="item_gst_rate[]" class="form-control form-control-sm js-item-gst" step="0.01" min="0"></td>
+                          <td class="text-muted small js-item-stock">-</td>
+                        </tr>
+                      <?php endfor; ?>
+                    </tbody>
+                  </table>
+                </div>
+                <button type="button" class="btn btn-outline-secondary btn-sm" id="add-edit-item-row">Add Item Row</button>
+
+                <div class="row g-2 mt-2">
+                  <div class="col-md-6">
+                    <label class="form-label">Notes</label>
+                    <input type="text" name="notes" class="form-control" maxlength="255" value="<?= e((string) ($editPurchase['notes'] ?? '')); ?>" />
+                  </div>
+                  <div class="col-md-6">
+                    <label class="form-label">Audit Reason</label>
+                    <input type="text" name="edit_reason" class="form-control" maxlength="255" required placeholder="Why is this purchase being edited?" />
+                  </div>
+                </div>
+              </div>
+              <div class="card-footer d-flex gap-2">
+                <button type="submit" class="btn btn-warning" <?= $editBlockedByPayments ? 'disabled' : ''; ?>>Update Purchase</button>
+                <a href="<?= e(url('modules/purchases/index.php')); ?>" class="btn btn-outline-secondary">Cancel</a>
+              </div>
+            </form>
+          </div>
+        <?php endif; ?>
 
         <?php if ($purchasePaymentsReady): ?>
           <div class="row g-3 mb-3">
@@ -2270,6 +2951,9 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                         <?php if ($isUnassigned && $canManage): ?>
                           <a class="btn btn-sm btn-outline-warning" href="<?= e(url('modules/purchases/index.php?assign_purchase_id=' . $purchaseId)); ?>">Assign</a>
                         <?php endif; ?>
+                        <?php if ($canManage): ?>
+                          <a class="btn btn-sm btn-outline-secondary" href="<?= e(url('modules/purchases/index.php?edit_purchase_id=' . $purchaseId)); ?>">Edit</a>
+                        <?php endif; ?>
                         <?php if (!$isUnassigned && $isDraft && $canFinalize): ?>
                           <form method="post" class="d-inline" data-confirm="Finalize this purchase?">
                             <?= csrf_field(); ?>
@@ -2281,6 +2965,16 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                         <?php endif; ?>
                         <?php if ($purchasePaymentsReady && $canPayPurchases): ?>
                           <a class="btn btn-sm btn-outline-primary" href="<?= e(url('modules/purchases/index.php?pay_purchase_id=' . $purchaseId)); ?>">Payments</a>
+                        <?php endif; ?>
+                        <?php if ($canDeletePurchases): ?>
+                          <button
+                            type="button"
+                            class="btn btn-sm btn-outline-danger js-purchase-delete-btn"
+                            data-bs-toggle="modal"
+                            data-bs-target="#deletePurchaseModal"
+                            data-purchase-id="<?= $purchaseId; ?>"
+                            data-purchase-label="#<?= $purchaseId; ?> | <?= e((string) (($purchase['invoice_number'] ?? '') !== '' ? $purchase['invoice_number'] : 'NO-INVOICE')); ?> | <?= e(number_format((float) ($purchase['grand_total'] ?? 0), 2)); ?>"
+                          >Delete</button>
                         <?php endif; ?>
                       </td>
                     </tr>
@@ -2325,14 +3019,39 @@ require_once __DIR__ . '/../../includes/sidebar.php';
   </div>
 </main>
 
+<div class="modal fade" id="deletePurchaseModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <form method="post">
+        <div class="modal-header bg-danger-subtle">
+          <h5 class="modal-title">Delete Purchase</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+        </div>
+        <div class="modal-body">
+          <?= csrf_field(); ?>
+          <input type="hidden" name="_action" value="delete_purchase" />
+          <input type="hidden" name="purchase_id" id="delete-purchase-id" />
+          <div class="mb-3">
+            <label class="form-label">Purchase</label>
+            <input type="text" id="delete-purchase-label" class="form-control" readonly />
+          </div>
+          <div class="mb-0">
+            <label class="form-label">Delete Reason</label>
+            <textarea name="delete_reason" id="delete-purchase-reason" class="form-control" rows="3" maxlength="255" required></textarea>
+            <small class="text-muted">Deletion is blocked when unreversed payments or downstream stock dependencies exist.</small>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Close</button>
+          <button type="submit" class="btn btn-danger">Delete with Reversal</button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+
 <script>
   (function () {
-    var table = document.getElementById('purchase-item-table');
-    var addRowBtn = document.getElementById('add-item-row');
-    if (!table || !addRowBtn) {
-      return;
-    }
-
     function wirePartSelect(select) {
       if (!select) {
         return;
@@ -2370,33 +3089,62 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       });
     }
 
-    table.querySelectorAll('.js-item-part').forEach(wirePartSelect);
-
-    addRowBtn.addEventListener('click', function () {
-      var body = table.querySelector('tbody');
-      if (!body) {
+    function initItemTable(tableId, addButtonId) {
+      var table = document.getElementById(tableId);
+      var addRowBtn = document.getElementById(addButtonId);
+      if (!table || !addRowBtn) {
         return;
       }
 
-      var templateRow = body.querySelector('tr');
-      if (!templateRow) {
+      table.querySelectorAll('.js-item-part').forEach(wirePartSelect);
+
+      addRowBtn.addEventListener('click', function () {
+        var body = table.querySelector('tbody');
+        if (!body) {
+          return;
+        }
+
+        var templateRow = body.querySelector('tr');
+        if (!templateRow) {
+          return;
+        }
+
+        var clone = templateRow.cloneNode(true);
+        clone.querySelectorAll('input').forEach(function (input) {
+          input.value = '';
+        });
+        clone.querySelectorAll('select').forEach(function (select) {
+          select.selectedIndex = 0;
+        });
+        var stockCell = clone.querySelector('.js-item-stock');
+        if (stockCell) {
+          stockCell.textContent = '-';
+        }
+
+        body.appendChild(clone);
+        wirePartSelect(clone.querySelector('.js-item-part'));
+      });
+    }
+
+    initItemTable('purchase-item-table', 'add-item-row');
+    initItemTable('purchase-edit-item-table', 'add-edit-item-row');
+
+    function setValue(id, value) {
+      var field = document.getElementById(id);
+      if (!field) {
         return;
       }
+      field.value = value || '';
+    }
 
-      var clone = templateRow.cloneNode(true);
-      clone.querySelectorAll('input').forEach(function (input) {
-        input.value = '';
-      });
-      clone.querySelectorAll('select').forEach(function (select) {
-        select.selectedIndex = 0;
-      });
-      var stockCell = clone.querySelector('.js-item-stock');
-      if (stockCell) {
-        stockCell.textContent = '-';
+    document.addEventListener('click', function (event) {
+      var deleteTrigger = event.target.closest('.js-purchase-delete-btn');
+      if (!deleteTrigger) {
+        return;
       }
-
-      body.appendChild(clone);
-      wirePartSelect(clone.querySelector('.js-item-part'));
+      setValue('delete-purchase-id', deleteTrigger.getAttribute('data-purchase-id'));
+      setValue('delete-purchase-label', deleteTrigger.getAttribute('data-purchase-label'));
+      setValue('delete-purchase-reason', '');
     });
   })();
 </script>

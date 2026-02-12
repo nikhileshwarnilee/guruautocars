@@ -19,6 +19,13 @@ $canCreate = billing_can_create();
 $canFinalize = billing_can_finalize();
 $canCancel = billing_can_cancel();
 $canPay = billing_can_pay();
+$paymentColumns = table_columns('payments');
+$paymentHasEntryType = in_array('entry_type', $paymentColumns, true);
+$paymentHasReversedPaymentId = in_array('reversed_payment_id', $paymentColumns, true);
+$paymentHasIsReversed = in_array('is_reversed', $paymentColumns, true);
+$paymentHasReversedAt = in_array('reversed_at', $paymentColumns, true);
+$paymentHasReversedBy = in_array('reversed_by', $paymentColumns, true);
+$paymentHasReverseReason = in_array('reverse_reason', $paymentColumns, true);
 
 function billing_parse_date(?string $date): ?string
 {
@@ -472,23 +479,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $pdo->beginTransaction();
 
         try {
-            $invoiceStmt = $pdo->prepare(
-                'SELECT id, invoice_number, invoice_status, payment_status
-                 FROM invoices
-                 WHERE id = :invoice_id
-                   AND company_id = :company_id
-                   AND garage_id = :garage_id
-                 LIMIT 1
-                 FOR UPDATE'
-            );
-            $invoiceStmt->execute([
-                'invoice_id' => $invoiceId,
-                'company_id' => $companyId,
-                'garage_id' => $garageId,
-            ]);
-            $invoice = $invoiceStmt->fetch();
-
-            if (!$invoice) {
+            $dependencyReport = reversal_invoice_cancel_dependency_report($pdo, $invoiceId, $companyId, $garageId);
+            $invoice = $dependencyReport['invoice'] ?? null;
+            if (!is_array($invoice)) {
                 throw new RuntimeException('Invoice not found for cancellation.');
             }
 
@@ -497,13 +490,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 throw new RuntimeException('Invoice is already cancelled.');
             }
 
-            $paidStmt = $pdo->prepare('SELECT COALESCE(SUM(amount), 0) FROM payments WHERE invoice_id = :invoice_id');
-            $paidStmt->execute(['invoice_id' => $invoiceId]);
-            $paidAmount = (float) $paidStmt->fetchColumn();
-            if ($paidAmount > 0.01) {
-                throw new RuntimeException('Invoice with payments cannot be cancelled. Reverse payments first.');
+            $canCancelInvoice = (bool) ($dependencyReport['can_cancel'] ?? false);
+            if (!$canCancelInvoice) {
+                $blockers = array_values(array_filter(array_map('trim', (array) ($dependencyReport['blockers'] ?? []))));
+                $steps = array_values(array_filter(array_map('trim', (array) ($dependencyReport['steps'] ?? []))));
+                $intro = 'Invoice cancellation blocked.';
+                if ($blockers !== []) {
+                    $intro .= ' ' . implode(' ', $blockers);
+                }
+                throw new RuntimeException(reversal_chain_message($intro, $steps));
             }
 
+            $paymentSummary = (array) ($dependencyReport['payment_summary'] ?? []);
+            $paidAmount = round((float) ($paymentSummary['net_paid_amount'] ?? 0), 2);
             $cancelStmt = $pdo->prepare(
                 'UPDATE invoices
                  SET invoice_status = "CANCELLED",
@@ -527,7 +526,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'CANCEL',
                 $cancelReason,
                 $userId > 0 ? $userId : null,
-                ['paid_amount' => $paidAmount]
+                [
+                    'paid_amount' => $paidAmount,
+                    'blockers' => [],
+                    'dependency_report' => [
+                        'inventory_movements' => (int) ($dependencyReport['inventory_movements'] ?? 0),
+                        'outsourced_lines' => (int) ($dependencyReport['outsourced_lines'] ?? 0),
+                    ],
+                ]
             );
 
             log_audit('billing', 'cancel', $invoiceId, 'Cancelled invoice ' . (string) $invoice['invoice_number'], [
@@ -613,13 +619,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 throw new RuntimeException('Payment exceeds outstanding amount. Outstanding: ' . number_format(max(0.0, $remaining), 2));
             }
 
-            $paymentInsert = $pdo->prepare(
-                'INSERT INTO payments
-                  (invoice_id, amount, paid_on, payment_mode, reference_no, notes, received_by)
-                 VALUES
-                  (:invoice_id, :amount, :paid_on, :payment_mode, :reference_no, :notes, :received_by)'
-            );
-            $paymentInsert->execute([
+            $paymentInsertColumns = ['invoice_id', 'amount', 'paid_on', 'payment_mode', 'reference_no', 'notes', 'received_by'];
+            $paymentInsertParams = [
                 'invoice_id' => $invoiceId,
                 'amount' => billing_round($amount),
                 'paid_on' => $paidOn,
@@ -627,7 +628,40 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'reference_no' => $referenceNo !== '' ? $referenceNo : null,
                 'notes' => $notes !== '' ? $notes : null,
                 'received_by' => $userId > 0 ? $userId : null,
-            ]);
+            ];
+
+            if ($paymentHasEntryType) {
+                $paymentInsertColumns[] = 'entry_type';
+                $paymentInsertParams['entry_type'] = 'PAYMENT';
+            }
+            if ($paymentHasReversedPaymentId) {
+                $paymentInsertColumns[] = 'reversed_payment_id';
+                $paymentInsertParams['reversed_payment_id'] = null;
+            }
+            if ($paymentHasIsReversed) {
+                $paymentInsertColumns[] = 'is_reversed';
+                $paymentInsertParams['is_reversed'] = 0;
+            }
+            if ($paymentHasReversedAt) {
+                $paymentInsertColumns[] = 'reversed_at';
+                $paymentInsertParams['reversed_at'] = null;
+            }
+            if ($paymentHasReversedBy) {
+                $paymentInsertColumns[] = 'reversed_by';
+                $paymentInsertParams['reversed_by'] = null;
+            }
+            if ($paymentHasReverseReason) {
+                $paymentInsertColumns[] = 'reverse_reason';
+                $paymentInsertParams['reverse_reason'] = null;
+            }
+
+            $paymentInsert = $pdo->prepare(
+                'INSERT INTO payments
+                  (' . implode(', ', $paymentInsertColumns) . ')
+                 VALUES
+                  (:' . implode(', :', $paymentInsertColumns) . ')'
+            );
+            $paymentInsert->execute($paymentInsertParams);
             $paymentId = (int) $pdo->lastInsertId();
 
             $newPaid = billing_round($alreadyPaid + $amount);
@@ -698,6 +732,254 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         redirect('modules/billing/index.php');
     }
+
+    if ($action === 'reverse_payment' && $canPay) {
+        $paymentId = post_int('payment_id');
+        $reverseReason = post_string('reverse_reason', 255);
+        $reversalDate = billing_parse_date((string) ($_POST['reversal_date'] ?? date('Y-m-d')));
+
+        if ($paymentId <= 0 || $reverseReason === '' || $reversalDate === null) {
+            flash_set('billing_error', 'Payment, reversal date, and reversal reason are required.', 'danger');
+            redirect('modules/billing/index.php');
+        }
+
+        $pdo = db();
+        $pdo->beginTransaction();
+
+        try {
+            $selectFields = [
+                'p.id',
+                'p.invoice_id',
+                'p.amount',
+                'p.paid_on',
+                'p.payment_mode',
+                'p.reference_no',
+                'p.notes',
+                'p.received_by',
+                'i.invoice_number',
+                'i.grand_total',
+                'i.invoice_status',
+                'i.payment_status',
+            ];
+            if ($paymentHasEntryType) {
+                $selectFields[] = 'p.entry_type';
+            }
+            if ($paymentHasReversedPaymentId) {
+                $selectFields[] = 'p.reversed_payment_id';
+            }
+            if ($paymentHasIsReversed) {
+                $selectFields[] = 'p.is_reversed';
+            }
+
+            $paymentStmt = $pdo->prepare(
+                'SELECT ' . implode(', ', $selectFields) . '
+                 FROM payments p
+                 INNER JOIN invoices i ON i.id = p.invoice_id
+                 WHERE p.id = :payment_id
+                   AND i.company_id = :company_id
+                   AND i.garage_id = :garage_id
+                 LIMIT 1
+                 FOR UPDATE'
+            );
+            $paymentStmt->execute([
+                'payment_id' => $paymentId,
+                'company_id' => $companyId,
+                'garage_id' => $garageId,
+            ]);
+            $payment = $paymentStmt->fetch();
+            if (!$payment) {
+                throw new RuntimeException('Payment entry not found for this scope.');
+            }
+
+            $entryType = strtoupper((string) ($payment['entry_type'] ?? ((float) ($payment['amount'] ?? 0) > 0 ? 'PAYMENT' : 'REVERSAL')));
+            if ($entryType !== 'PAYMENT') {
+                throw new RuntimeException('Only original payment entries can be reversed.');
+            }
+
+            $paymentAmount = round((float) ($payment['amount'] ?? 0), 2);
+            if ($paymentAmount <= 0.009) {
+                throw new RuntimeException('Invalid payment amount for reversal.');
+            }
+
+            if ($paymentHasIsReversed && (int) ($payment['is_reversed'] ?? 0) === 1) {
+                throw new RuntimeException('Payment is already marked as reversed.');
+            }
+
+            if ($paymentHasReversedPaymentId) {
+                $alreadyReversedSql =
+                    'SELECT id
+                     FROM payments
+                     WHERE reversed_payment_id = :payment_id';
+                if ($paymentHasEntryType) {
+                    $alreadyReversedSql .= ' AND (entry_type = "REVERSAL" OR entry_type IS NULL)';
+                }
+                $alreadyReversedSql .= ' LIMIT 1';
+
+                $alreadyReversedStmt = $pdo->prepare($alreadyReversedSql);
+                $alreadyReversedStmt->execute(['payment_id' => $paymentId]);
+                if ($alreadyReversedStmt->fetch()) {
+                    throw new RuntimeException('This payment has already been reversed.');
+                }
+            } else {
+                $legacyReverseCheckStmt = $pdo->prepare(
+                    'SELECT id
+                     FROM payments
+                     WHERE invoice_id = :invoice_id
+                       AND amount < 0
+                       AND reference_no = :reference_no
+                     LIMIT 1'
+                );
+                $legacyReverseCheckStmt->execute([
+                    'invoice_id' => (int) ($payment['invoice_id'] ?? 0),
+                    'reference_no' => 'REV-' . $paymentId,
+                ]);
+                if ($legacyReverseCheckStmt->fetch()) {
+                    throw new RuntimeException('This payment appears to have already been reversed.');
+                }
+            }
+
+            $reversalInsertColumns = ['invoice_id', 'amount', 'paid_on', 'payment_mode', 'reference_no', 'notes', 'received_by'];
+            $reversalInsertParams = [
+                'invoice_id' => (int) ($payment['invoice_id'] ?? 0),
+                'amount' => -$paymentAmount,
+                'paid_on' => $reversalDate,
+                'payment_mode' => billing_normalize_payment_mode((string) ($payment['payment_mode'] ?? 'CASH')),
+                'reference_no' => 'REV-' . $paymentId,
+                'notes' => $reverseReason,
+                'received_by' => $userId > 0 ? $userId : null,
+            ];
+
+            if ($paymentHasEntryType) {
+                $reversalInsertColumns[] = 'entry_type';
+                $reversalInsertParams['entry_type'] = 'REVERSAL';
+            }
+            if ($paymentHasReversedPaymentId) {
+                $reversalInsertColumns[] = 'reversed_payment_id';
+                $reversalInsertParams['reversed_payment_id'] = $paymentId;
+            }
+            if ($paymentHasIsReversed) {
+                $reversalInsertColumns[] = 'is_reversed';
+                $reversalInsertParams['is_reversed'] = 0;
+            }
+            if ($paymentHasReversedAt) {
+                $reversalInsertColumns[] = 'reversed_at';
+                $reversalInsertParams['reversed_at'] = null;
+            }
+            if ($paymentHasReversedBy) {
+                $reversalInsertColumns[] = 'reversed_by';
+                $reversalInsertParams['reversed_by'] = null;
+            }
+            if ($paymentHasReverseReason) {
+                $reversalInsertColumns[] = 'reverse_reason';
+                $reversalInsertParams['reverse_reason'] = $reverseReason;
+            }
+
+            $reversalInsertStmt = $pdo->prepare(
+                'INSERT INTO payments
+                  (' . implode(', ', $reversalInsertColumns) . ')
+                 VALUES
+                  (:' . implode(', :', $reversalInsertColumns) . ')'
+            );
+            $reversalInsertStmt->execute($reversalInsertParams);
+            $reversalId = (int) $pdo->lastInsertId();
+
+            $paymentUpdateSets = [];
+            $paymentUpdateParams = ['payment_id' => $paymentId];
+            if ($paymentHasIsReversed) {
+                $paymentUpdateSets[] = 'is_reversed = 1';
+            }
+            if ($paymentHasReversedAt) {
+                $paymentUpdateSets[] = 'reversed_at = NOW()';
+            }
+            if ($paymentHasReversedBy) {
+                $paymentUpdateSets[] = 'reversed_by = :reversed_by';
+                $paymentUpdateParams['reversed_by'] = $userId > 0 ? $userId : null;
+            }
+            if ($paymentHasReverseReason) {
+                $paymentUpdateSets[] = 'reverse_reason = :reverse_reason';
+                $paymentUpdateParams['reverse_reason'] = $reverseReason;
+            }
+            if ($paymentUpdateSets !== []) {
+                $paymentUpdateStmt = $pdo->prepare(
+                    'UPDATE payments
+                     SET ' . implode(', ', $paymentUpdateSets) . '
+                     WHERE id = :payment_id'
+                );
+                $paymentUpdateStmt->execute($paymentUpdateParams);
+            }
+
+            $invoiceId = (int) ($payment['invoice_id'] ?? 0);
+            $paidSumStmt = $pdo->prepare('SELECT COALESCE(SUM(amount), 0) FROM payments WHERE invoice_id = :invoice_id');
+            $paidSumStmt->execute(['invoice_id' => $invoiceId]);
+            $netPaid = round((float) $paidSumStmt->fetchColumn(), 2);
+            $grandTotal = round((float) ($payment['grand_total'] ?? 0), 2);
+
+            $paymentStatus = 'PARTIAL';
+            if ($netPaid <= 0.009) {
+                $paymentStatus = 'UNPAID';
+            } elseif ($netPaid + 0.009 >= $grandTotal) {
+                $paymentStatus = 'PAID';
+            }
+
+            $summaryMode = billing_payment_mode_summary($pdo, $invoiceId);
+            $invoiceUpdate = $pdo->prepare(
+                'UPDATE invoices
+                 SET payment_status = :payment_status,
+                     payment_mode = :payment_mode
+                 WHERE id = :invoice_id'
+            );
+            $invoiceUpdate->execute([
+                'payment_status' => $paymentStatus,
+                'payment_mode' => $summaryMode,
+                'invoice_id' => $invoiceId,
+            ]);
+
+            billing_record_payment_history(
+                $pdo,
+                $invoiceId,
+                $reversalId,
+                'PAYMENT_REVERSED',
+                $reverseReason,
+                $userId > 0 ? $userId : null,
+                [
+                    'reversed_payment_id' => $paymentId,
+                    'reversal_amount' => -$paymentAmount,
+                    'reversal_date' => $reversalDate,
+                    'net_paid_amount' => $netPaid,
+                ]
+            );
+
+            log_audit('billing', 'payment_reverse', $invoiceId, 'Reversed payment #' . $paymentId . ' for invoice ' . (string) ($payment['invoice_number'] ?? ''), [
+                'entity' => 'invoice_payment',
+                'source' => 'UI',
+                'before' => [
+                    'payment_id' => $paymentId,
+                    'invoice_id' => $invoiceId,
+                    'invoice_status' => (string) ($payment['invoice_status'] ?? ''),
+                    'payment_status' => (string) ($payment['payment_status'] ?? ''),
+                    'amount' => $paymentAmount,
+                ],
+                'after' => [
+                    'reversal_id' => $reversalId,
+                    'payment_status' => $paymentStatus,
+                    'payment_mode' => $summaryMode,
+                    'net_paid' => $netPaid,
+                    'reason' => $reverseReason,
+                ],
+                'metadata' => [
+                    'invoice_number' => (string) ($payment['invoice_number'] ?? ''),
+                ],
+            ]);
+
+            $pdo->commit();
+            flash_set('billing_success', 'Payment reversed successfully.', 'success');
+        } catch (Throwable $exception) {
+            $pdo->rollBack();
+            flash_set('billing_error', $exception->getMessage(), 'danger');
+        }
+
+        redirect('modules/billing/index.php');
+    }
 }
 
 $eligibleJobsStmt = db()->prepare(
@@ -756,15 +1038,25 @@ foreach ($invoices as &$invoice) {
 }
 unset($invoice);
 
+$paymentRecentSelect = 'p.*, i.invoice_number, u.name AS received_by_name';
+$paymentRecentJoin = '';
+if ($paymentHasReversedPaymentId) {
+    $paymentRecentSelect .= ', r.id AS reversal_id';
+    $paymentRecentJoin =
+        ' LEFT JOIN payments r
+            ON r.reversed_payment_id = p.id'
+        . ($paymentHasEntryType ? ' AND (r.entry_type = "REVERSAL" OR r.entry_type IS NULL)' : '');
+}
 $paymentsStmt = db()->prepare(
-    'SELECT p.*, i.invoice_number, u.name AS received_by_name
+    'SELECT ' . $paymentRecentSelect . '
      FROM payments p
      INNER JOIN invoices i ON i.id = p.invoice_id
-     LEFT JOIN users u ON u.id = p.received_by
+     LEFT JOIN users u ON u.id = p.received_by'
+     . $paymentRecentJoin . '
      WHERE i.company_id = :company_id
        AND i.garage_id = :garage_id
      ORDER BY p.id DESC
-     LIMIT 30'
+     LIMIT 60'
 );
 $paymentsStmt->execute([
     'company_id' => $companyId,
@@ -998,13 +1290,14 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                         </form>
                       <?php endif; ?>
                       <?php if ($canCancel && $invoiceStatus !== 'CANCELLED'): ?>
-                        <form method="post" class="d-inline js-cancel-invoice-form">
-                          <?= csrf_field(); ?>
-                          <input type="hidden" name="_action" value="cancel_invoice" />
-                          <input type="hidden" name="invoice_id" value="<?= (int) $invoice['id']; ?>" />
-                          <input type="hidden" name="cancel_reason" value="" />
-                          <button type="submit" class="btn btn-sm btn-outline-danger">Cancel</button>
-                        </form>
+                        <button
+                          type="button"
+                          class="btn btn-sm btn-outline-danger js-cancel-invoice-btn"
+                          data-bs-toggle="modal"
+                          data-bs-target="#cancelInvoiceModal"
+                          data-invoice-id="<?= (int) $invoice['id']; ?>"
+                          data-invoice-label="<?= e((string) ($invoice['invoice_number'] ?? '')); ?> | <?= e(format_currency((float) ($invoice['grand_total'] ?? 0))); ?> | Paid <?= e(format_currency((float) ($invoice['paid_amount'] ?? 0))); ?>"
+                        >Cancel</button>
                       <?php endif; ?>
                     </td>
                   </tr>
@@ -1097,24 +1390,55 @@ require_once __DIR__ . '/../../includes/sidebar.php';
               <tr>
                 <th>Date</th>
                 <th>Invoice</th>
+                <th>Type</th>
                 <th>Amount</th>
                 <th>Mode</th>
                 <th>Reference</th>
                 <th>Received By</th>
+                <th>Action</th>
               </tr>
             </thead>
             <tbody>
               <?php if (empty($payments)): ?>
-                <tr><td colspan="6" class="text-center text-muted py-4">No payments recorded.</td></tr>
+                <tr><td colspan="8" class="text-center text-muted py-4">No payments recorded.</td></tr>
               <?php else: ?>
                 <?php foreach ($payments as $payment): ?>
+                  <?php
+                    $entryType = strtoupper((string) ($payment['entry_type'] ?? ((float) ($payment['amount'] ?? 0) < 0 ? 'REVERSAL' : 'PAYMENT')));
+                    $isMarkedReversed = $paymentHasIsReversed && (int) ($payment['is_reversed'] ?? 0) === 1;
+                    $hasLinkedReversal = $paymentHasReversedPaymentId && (int) ($payment['reversal_id'] ?? 0) > 0;
+                    $alreadyReversed = $isMarkedReversed || $hasLinkedReversal;
+                    $canReverseEntry = $canPay && $entryType === 'PAYMENT' && (float) ($payment['amount'] ?? 0) > 0.009 && !$alreadyReversed;
+                  ?>
                   <tr>
                     <td><?= e((string) $payment['paid_on']); ?></td>
                     <td><?= e((string) $payment['invoice_number']); ?></td>
+                    <td>
+                      <span class="badge text-bg-<?= e($entryType === 'REVERSAL' ? 'danger' : 'success'); ?>">
+                        <?= e($entryType); ?>
+                      </span>
+                      <?php if ($alreadyReversed && $entryType === 'PAYMENT'): ?>
+                        <div><small class="text-muted">Reversed</small></div>
+                      <?php endif; ?>
+                    </td>
                     <td><?= e(format_currency((float) $payment['amount'])); ?></td>
                     <td><?= e((string) $payment['payment_mode']); ?></td>
                     <td><?= e((string) ($payment['reference_no'] ?? '-')); ?></td>
                     <td><?= e((string) ($payment['received_by_name'] ?? '-')); ?></td>
+                    <td>
+                      <?php if ($canReverseEntry): ?>
+                        <button
+                          type="button"
+                          class="btn btn-sm btn-outline-danger js-payment-reverse-btn"
+                          data-bs-toggle="modal"
+                          data-bs-target="#paymentReverseModal"
+                          data-payment-id="<?= (int) $payment['id']; ?>"
+                          data-payment-label="#<?= (int) $payment['id']; ?> | <?= e((string) ($payment['invoice_number'] ?? '')); ?> | <?= e((string) ($payment['paid_on'] ?? '')); ?> | <?= e(format_currency((float) ($payment['amount'] ?? 0))); ?>"
+                        >Reverse</button>
+                      <?php else: ?>
+                        <span class="text-muted">-</span>
+                      <?php endif; ?>
+                    </td>
                   </tr>
                 <?php endforeach; ?>
               <?php endif; ?>
@@ -1126,22 +1450,96 @@ require_once __DIR__ . '/../../includes/sidebar.php';
   </div>
 </main>
 
+<div class="modal fade" id="cancelInvoiceModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <form method="post">
+        <div class="modal-header bg-danger-subtle">
+          <h5 class="modal-title">Cancel Invoice</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+        </div>
+        <div class="modal-body">
+          <?= csrf_field(); ?>
+          <input type="hidden" name="_action" value="cancel_invoice" />
+          <input type="hidden" name="invoice_id" id="cancel-invoice-id" />
+          <div class="mb-3">
+            <label class="form-label">Invoice</label>
+            <input type="text" id="cancel-invoice-label" class="form-control" readonly />
+          </div>
+          <div class="mb-0">
+            <label class="form-label">Cancellation Reason</label>
+            <textarea name="cancel_reason" id="cancel-invoice-reason" class="form-control" rows="3" maxlength="255" required></textarea>
+            <small class="text-muted">Cancellation is blocked until all dependency reversals are completed.</small>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Close</button>
+          <button type="submit" class="btn btn-danger">Confirm Cancel</button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+
+<div class="modal fade" id="paymentReverseModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <form method="post">
+        <div class="modal-header bg-danger-subtle">
+          <h5 class="modal-title">Reverse Payment</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+        </div>
+        <div class="modal-body">
+          <?= csrf_field(); ?>
+          <input type="hidden" name="_action" value="reverse_payment" />
+          <input type="hidden" name="payment_id" id="reverse-payment-id" />
+          <div class="mb-3">
+            <label class="form-label">Payment Entry</label>
+            <input type="text" id="reverse-payment-label" class="form-control" readonly />
+          </div>
+          <div class="mb-3">
+            <label class="form-label">Reversal Date</label>
+            <input type="date" name="reversal_date" class="form-control" value="<?= e(date('Y-m-d')); ?>" required />
+          </div>
+          <div class="mb-0">
+            <label class="form-label">Reversal Reason</label>
+            <textarea name="reverse_reason" id="reverse-payment-reason" class="form-control" rows="3" maxlength="255" required></textarea>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Close</button>
+          <button type="submit" class="btn btn-danger">Confirm Reversal</button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+
 <script>
   (function () {
-    var cancelForms = document.querySelectorAll('.js-cancel-invoice-form');
-    for (var i = 0; i < cancelForms.length; i++) {
-      cancelForms[i].addEventListener('submit', function (event) {
-        var reason = window.prompt('Cancellation reason is required for audit trail. Enter reason:');
-        if (!reason || !reason.trim()) {
-          event.preventDefault();
-          return;
-        }
-        var input = this.querySelector('input[name="cancel_reason"]');
-        if (input) {
-          input.value = reason.trim();
-        }
-      });
+    function setValue(id, value) {
+      var field = document.getElementById(id);
+      if (!field) {
+        return;
+      }
+      field.value = value || '';
     }
+
+    document.addEventListener('click', function (event) {
+      var cancelTrigger = event.target.closest('.js-cancel-invoice-btn');
+      if (cancelTrigger) {
+        setValue('cancel-invoice-id', cancelTrigger.getAttribute('data-invoice-id'));
+        setValue('cancel-invoice-label', cancelTrigger.getAttribute('data-invoice-label'));
+        setValue('cancel-invoice-reason', '');
+      }
+
+      var reverseTrigger = event.target.closest('.js-payment-reverse-btn');
+      if (reverseTrigger) {
+        setValue('reverse-payment-id', reverseTrigger.getAttribute('data-payment-id'));
+        setValue('reverse-payment-label', reverseTrigger.getAttribute('data-payment-label'));
+        setValue('reverse-payment-reason', '');
+      }
+    });
   })();
 </script>
 

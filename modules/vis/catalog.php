@@ -8,6 +8,8 @@ require_permission('vis.view');
 $page_title = 'VIS Vehicle Catalog';
 $active_menu = 'vis.catalog';
 $canManage = has_permission('vis.manage');
+$companyId = active_company_id();
+$garageId = active_garage_id();
 
 function vis_table_for_entity(string $entity): ?string
 {
@@ -18,6 +20,140 @@ function vis_table_for_entity(string $entity): ?string
         'spec' => 'vis_variant_specs',
         default => null,
     };
+}
+
+function vis_catalog_dependency_counts(PDO $pdo, string $entity, int $id, int $companyId, int $garageId): array
+{
+    $partLinks = 0;
+    $jobLinks = 0;
+    if ($id <= 0) {
+        return ['part_links' => 0, 'job_links' => 0];
+    }
+
+    $jobScopeSql = ' AND jc.company_id = :company_id AND jc.status_code = "ACTIVE"';
+    $jobScopeParams = ['company_id' => $companyId];
+    if ($garageId > 0) {
+        $jobScopeSql .= ' AND jc.garage_id = :garage_id';
+        $jobScopeParams['garage_id'] = $garageId;
+    }
+
+    if ($entity === 'brand') {
+        $partStmt = $pdo->prepare(
+            'SELECT COUNT(*)
+             FROM vis_part_compatibility c
+             INNER JOIN vis_variants vv ON vv.id = c.variant_id
+             INNER JOIN vis_models vm ON vm.id = vv.model_id
+             WHERE vm.brand_id = :id
+               AND c.company_id = :company_id
+               AND c.status_code = "ACTIVE"'
+        );
+        $partStmt->execute(['id' => $id, 'company_id' => $companyId]);
+        $partLinks = (int) $partStmt->fetchColumn();
+
+        if (table_columns('vehicle_brands') !== [] && table_columns('vehicles') !== []) {
+            $jobStmt = $pdo->prepare(
+                'SELECT COUNT(DISTINCT jc.id)
+                 FROM job_cards jc
+                 INNER JOIN vehicles v ON v.id = jc.vehicle_id
+                 INNER JOIN vehicle_brands vb ON vb.id = v.brand_id
+                 WHERE vb.vis_brand_id = :id'
+                 . $jobScopeSql
+            );
+            $jobStmt->execute(array_merge(['id' => $id], $jobScopeParams));
+            $jobLinks = (int) $jobStmt->fetchColumn();
+        }
+    } elseif ($entity === 'model') {
+        $partStmt = $pdo->prepare(
+            'SELECT COUNT(*)
+             FROM vis_part_compatibility c
+             INNER JOIN vis_variants vv ON vv.id = c.variant_id
+             WHERE vv.model_id = :id
+               AND c.company_id = :company_id
+               AND c.status_code = "ACTIVE"'
+        );
+        $partStmt->execute(['id' => $id, 'company_id' => $companyId]);
+        $partLinks = (int) $partStmt->fetchColumn();
+
+        if (table_columns('vehicle_models') !== [] && table_columns('vehicles') !== []) {
+            $jobStmt = $pdo->prepare(
+                'SELECT COUNT(DISTINCT jc.id)
+                 FROM job_cards jc
+                 INNER JOIN vehicles v ON v.id = jc.vehicle_id
+                 INNER JOIN vehicle_models vm ON vm.id = v.model_id
+                 WHERE vm.vis_model_id = :id'
+                 . $jobScopeSql
+            );
+            $jobStmt->execute(array_merge(['id' => $id], $jobScopeParams));
+            $jobLinks = (int) $jobStmt->fetchColumn();
+        }
+    } elseif ($entity === 'variant' || $entity === 'spec') {
+        $variantId = $id;
+        if ($entity === 'spec') {
+            $variantStmt = $pdo->prepare('SELECT variant_id FROM vis_variant_specs WHERE id = :id LIMIT 1');
+            $variantStmt->execute(['id' => $id]);
+            $variantId = (int) ($variantStmt->fetchColumn() ?: 0);
+        }
+
+        if ($variantId > 0) {
+            $partStmt = $pdo->prepare(
+                'SELECT COUNT(*)
+                 FROM vis_part_compatibility
+                 WHERE variant_id = :variant_id
+                   AND company_id = :company_id
+                   AND status_code = "ACTIVE"'
+            );
+            $partStmt->execute([
+                'variant_id' => $variantId,
+                'company_id' => $companyId,
+            ]);
+            $partLinks = (int) $partStmt->fetchColumn();
+
+            if (table_columns('vehicle_variants') !== [] && table_columns('vehicles') !== []) {
+                $jobStmt = $pdo->prepare(
+                    'SELECT COUNT(DISTINCT jc.id)
+                     FROM job_cards jc
+                     INNER JOIN vehicles v ON v.id = jc.vehicle_id
+                     INNER JOIN vehicle_variants vv ON vv.id = v.variant_id
+                     WHERE vv.vis_variant_id = :variant_id'
+                    . $jobScopeSql
+                );
+                $jobStmt->execute(array_merge(['variant_id' => $variantId], $jobScopeParams));
+                $jobLinks = (int) $jobStmt->fetchColumn();
+            }
+        }
+    }
+
+    return [
+        'part_links' => $partLinks,
+        'job_links' => $jobLinks,
+    ];
+}
+
+function vis_catalog_resolve_status(PDO $pdo, string $entity, int $id, string $requestedStatus, int $companyId, int $garageId): array
+{
+    $statusCode = normalize_status_code($requestedStatus);
+    $dependency = [
+        'status_code' => $statusCode,
+        'blocked' => false,
+        'part_links' => 0,
+        'job_links' => 0,
+        'message' => null,
+    ];
+
+    if ($statusCode !== 'DELETED' || $id <= 0) {
+        return $dependency;
+    }
+
+    $counts = vis_catalog_dependency_counts($pdo, $entity, $id, $companyId, $garageId);
+    $dependency['part_links'] = (int) ($counts['part_links'] ?? 0);
+    $dependency['job_links'] = (int) ($counts['job_links'] ?? 0);
+    if ($dependency['part_links'] > 0 || $dependency['job_links'] > 0) {
+        $dependency['status_code'] = 'INACTIVE';
+        $dependency['blocked'] = true;
+        $dependency['message'] = 'Active links found (parts: ' . $dependency['part_links'] . ', jobs: ' . $dependency['job_links'] . '). Record was disabled instead of deleted.';
+    }
+
+    return $dependency;
 }
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
@@ -39,6 +175,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
         try {
             if ($id > 0) {
+                $statusMeta = vis_catalog_resolve_status(db(), 'brand', $id, $statusCode, $companyId, $garageId);
+                $resolvedStatus = (string) ($statusMeta['status_code'] ?? $statusCode);
                 $stmt = db()->prepare(
                     'UPDATE vis_brands
                      SET brand_name = :brand_name,
@@ -48,14 +186,26 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 );
                 $stmt->execute([
                     'brand_name' => $brandName,
-                    'status_code' => $statusCode,
+                    'status_code' => $resolvedStatus,
                     'id' => $id,
                 ]);
-                if ($statusCode === 'ACTIVE') {
+                if ($resolvedStatus === 'ACTIVE') {
                     vehicle_master_ensure_brand($brandName, $id);
                 }
-                log_audit('vis_catalog', 'update_brand', $id, 'Updated brand ' . $brandName);
+                log_audit('vis_catalog', 'update_brand', $id, 'Updated brand ' . $brandName, [
+                    'entity' => 'vis_brand',
+                    'source' => 'UI',
+                    'metadata' => [
+                        'requested_status' => $statusCode,
+                        'applied_status' => $resolvedStatus,
+                        'dependency_part_links' => (int) ($statusMeta['part_links'] ?? 0),
+                        'dependency_job_links' => (int) ($statusMeta['job_links'] ?? 0),
+                    ],
+                ]);
                 flash_set('vis_success', 'Brand updated.', 'success');
+                if (($statusMeta['blocked'] ?? false) && !empty($statusMeta['message'])) {
+                    flash_set('vis_warning', (string) $statusMeta['message'], 'warning');
+                }
             } else {
                 $stmt = db()->prepare(
                     'INSERT INTO vis_brands (brand_name, status_code, deleted_at)
@@ -94,6 +244,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
         try {
             if ($id > 0) {
+                $statusMeta = vis_catalog_resolve_status(db(), 'model', $id, $statusCode, $companyId, $garageId);
+                $resolvedStatus = (string) ($statusMeta['status_code'] ?? $statusCode);
                 $stmt = db()->prepare(
                     'UPDATE vis_models
                      SET brand_id = :brand_id,
@@ -107,10 +259,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'brand_id' => $brandId,
                     'model_name' => $modelName,
                     'vehicle_type' => $vehicleType,
-                    'status_code' => $statusCode,
+                    'status_code' => $resolvedStatus,
                     'id' => $id,
                 ]);
-                if ($statusCode === 'ACTIVE') {
+                if ($resolvedStatus === 'ACTIVE') {
                     $visBrandStmt = db()->prepare('SELECT brand_name FROM vis_brands WHERE id = :id LIMIT 1');
                     $visBrandStmt->execute(['id' => $brandId]);
                     $visBrandName = (string) ($visBrandStmt->fetchColumn() ?: '');
@@ -121,8 +273,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         }
                     }
                 }
-                log_audit('vis_catalog', 'update_model', $id, 'Updated model ' . $modelName);
+                log_audit('vis_catalog', 'update_model', $id, 'Updated model ' . $modelName, [
+                    'entity' => 'vis_model',
+                    'source' => 'UI',
+                    'metadata' => [
+                        'requested_status' => $statusCode,
+                        'applied_status' => $resolvedStatus,
+                        'dependency_part_links' => (int) ($statusMeta['part_links'] ?? 0),
+                        'dependency_job_links' => (int) ($statusMeta['job_links'] ?? 0),
+                    ],
+                ]);
                 flash_set('vis_success', 'Model updated.', 'success');
+                if (($statusMeta['blocked'] ?? false) && !empty($statusMeta['message'])) {
+                    flash_set('vis_warning', (string) $statusMeta['message'], 'warning');
+                }
             } else {
                 $stmt = db()->prepare(
                     'INSERT INTO vis_models (brand_id, model_name, vehicle_type, status_code, deleted_at)
@@ -172,6 +336,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
         try {
             if ($id > 0) {
+                $statusMeta = vis_catalog_resolve_status(db(), 'variant', $id, $statusCode, $companyId, $garageId);
+                $resolvedStatus = (string) ($statusMeta['status_code'] ?? $statusCode);
                 $stmt = db()->prepare(
                     'UPDATE vis_variants
                      SET model_id = :model_id,
@@ -187,10 +353,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'variant_name' => $variantName,
                     'fuel_type' => $fuelType,
                     'engine_cc' => $engineCc !== '' ? $engineCc : null,
-                    'status_code' => $statusCode,
+                    'status_code' => $resolvedStatus,
                     'id' => $id,
                 ]);
-                if ($statusCode === 'ACTIVE') {
+                if ($resolvedStatus === 'ACTIVE') {
                     $visModelStmt = db()->prepare(
                         'SELECT vm.id AS vis_model_id, vm.model_name, vm.vehicle_type, vb.id AS vis_brand_id, vb.brand_name
                          FROM vis_models vm
@@ -221,8 +387,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         }
                     }
                 }
-                log_audit('vis_catalog', 'update_variant', $id, 'Updated variant ' . $variantName);
+                log_audit('vis_catalog', 'update_variant', $id, 'Updated variant ' . $variantName, [
+                    'entity' => 'vis_variant',
+                    'source' => 'UI',
+                    'metadata' => [
+                        'requested_status' => $statusCode,
+                        'applied_status' => $resolvedStatus,
+                        'dependency_part_links' => (int) ($statusMeta['part_links'] ?? 0),
+                        'dependency_job_links' => (int) ($statusMeta['job_links'] ?? 0),
+                    ],
+                ]);
                 flash_set('vis_success', 'Variant updated.', 'success');
+                if (($statusMeta['blocked'] ?? false) && !empty($statusMeta['message'])) {
+                    flash_set('vis_warning', (string) $statusMeta['message'], 'warning');
+                }
             } else {
                 $stmt = db()->prepare(
                     'INSERT INTO vis_variants (model_id, variant_name, fuel_type, engine_cc, status_code, deleted_at)
@@ -288,6 +466,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             redirect('modules/vis/catalog.php');
         }
         if ($id > 0) {
+            $statusMeta = vis_catalog_resolve_status(db(), 'spec', $id, $statusCode, $companyId, $garageId);
+            $resolvedStatus = (string) ($statusMeta['status_code'] ?? $statusCode);
             $stmt = db()->prepare(
                 'UPDATE vis_variant_specs
                  SET variant_id = :variant_id,
@@ -301,11 +481,23 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'variant_id' => $variantId,
                 'spec_key' => $specKey,
                 'spec_value' => $specValue,
-                'status_code' => $statusCode,
+                'status_code' => $resolvedStatus,
                 'id' => $id,
             ]);
-            log_audit('vis_catalog', 'update_spec', $id, 'Updated spec ' . $specKey);
+            log_audit('vis_catalog', 'update_spec', $id, 'Updated spec ' . $specKey, [
+                'entity' => 'vis_variant_spec',
+                'source' => 'UI',
+                'metadata' => [
+                    'requested_status' => $statusCode,
+                    'applied_status' => $resolvedStatus,
+                    'dependency_part_links' => (int) ($statusMeta['part_links'] ?? 0),
+                    'dependency_job_links' => (int) ($statusMeta['job_links'] ?? 0),
+                ],
+            ]);
             flash_set('vis_success', 'Specification updated.', 'success');
+            if (($statusMeta['blocked'] ?? false) && !empty($statusMeta['message'])) {
+                flash_set('vis_warning', (string) $statusMeta['message'], 'warning');
+            }
         } else {
             $stmt = db()->prepare(
                 'INSERT INTO vis_variant_specs (variant_id, spec_key, spec_value, status_code, deleted_at)
@@ -333,6 +525,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             flash_set('vis_error', 'Invalid status payload.', 'danger');
             redirect('modules/vis/catalog.php');
         }
+
+        $statusMeta = vis_catalog_resolve_status(db(), $entity, $id, $nextStatus, $companyId, $garageId);
+        $resolvedStatus = (string) ($statusMeta['status_code'] ?? $nextStatus);
         $stmt = db()->prepare(
             "UPDATE {$table}
              SET status_code = :status_code,
@@ -340,11 +535,23 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
              WHERE id = :id"
         );
         $stmt->execute([
-            'status_code' => $nextStatus,
+            'status_code' => $resolvedStatus,
             'id' => $id,
         ]);
-        log_audit('vis_catalog', 'status_' . $entity, $id, 'Changed status to ' . $nextStatus);
+        log_audit('vis_catalog', 'status_' . $entity, $id, 'Changed status to ' . $resolvedStatus, [
+            'entity' => 'vis_' . $entity,
+            'source' => 'UI',
+            'metadata' => [
+                'requested_status' => $nextStatus,
+                'applied_status' => $resolvedStatus,
+                'dependency_part_links' => (int) ($statusMeta['part_links'] ?? 0),
+                'dependency_job_links' => (int) ($statusMeta['job_links'] ?? 0),
+            ],
+        ]);
         flash_set('vis_success', 'Status updated.', 'success');
+        if (($statusMeta['blocked'] ?? false) && !empty($statusMeta['message'])) {
+            flash_set('vis_warning', (string) $statusMeta['message'], 'warning');
+        }
         redirect('modules/vis/catalog.php');
     }
 }
@@ -487,17 +694,100 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       <div class="row g-3 mt-1">
         <div class="col-lg-4">
           <div class="card"><div class="card-header"><h3 class="card-title">Brands</h3></div><div class="card-body table-responsive p-0" style="max-height: 280px;"><table class="table table-sm table-striped mb-0"><thead><tr><th>Brand</th><th>Status</th><th></th></tr></thead><tbody>
-          <?php foreach ($brands as $brand): ?><tr><td><?= e((string) $brand['brand_name']); ?></td><td><span class="badge text-bg-<?= e(status_badge_class((string) $brand['status_code'])); ?>"><?= e((string) $brand['status_code']); ?></span></td><td><?php if ($canManage): ?><a class="btn btn-sm btn-outline-primary" href="<?= e(url('modules/vis/catalog.php?edit_brand_id=' . (int) $brand['id'])); ?>">Edit</a> <form method="post" class="d-inline"><?= csrf_field(); ?><input type="hidden" name="_action" value="change_status"><input type="hidden" name="entity" value="brand"><input type="hidden" name="id" value="<?= (int) $brand['id']; ?>"><input type="hidden" name="next_status" value="<?= e(((string) $brand['status_code'] === 'ACTIVE') ? 'INACTIVE' : 'ACTIVE'); ?>"><button class="btn btn-sm btn-outline-secondary" type="submit">Toggle</button></form><?php endif; ?></td></tr><?php endforeach; ?>
+          <?php foreach ($brands as $brand): ?>
+            <tr>
+              <td><?= e((string) $brand['brand_name']); ?></td>
+              <td><span class="badge text-bg-<?= e(status_badge_class((string) $brand['status_code'])); ?>"><?= e((string) $brand['status_code']); ?></span></td>
+              <td>
+                <?php if ($canManage): ?>
+                  <a class="btn btn-sm btn-outline-primary" href="<?= e(url('modules/vis/catalog.php?edit_brand_id=' . (int) $brand['id'])); ?>">Edit</a>
+                  <form method="post" class="d-inline">
+                    <?= csrf_field(); ?>
+                    <input type="hidden" name="_action" value="change_status">
+                    <input type="hidden" name="entity" value="brand">
+                    <input type="hidden" name="id" value="<?= (int) $brand['id']; ?>">
+                    <input type="hidden" name="next_status" value="<?= e(((string) $brand['status_code'] === 'ACTIVE') ? 'INACTIVE' : 'ACTIVE'); ?>">
+                    <button class="btn btn-sm btn-outline-secondary" type="submit">Toggle</button>
+                  </form>
+                  <button
+                    type="button"
+                    class="btn btn-sm btn-outline-danger js-vis-delete-btn"
+                    data-bs-toggle="modal"
+                    data-bs-target="#visDeleteModal"
+                    data-entity="brand"
+                    data-record-id="<?= (int) $brand['id']; ?>"
+                    data-record-label="Brand: <?= e((string) $brand['brand_name']); ?>"
+                  >Delete</button>
+                <?php endif; ?>
+              </td>
+            </tr>
+          <?php endforeach; ?>
           </tbody></table></div></div>
         </div>
         <div class="col-lg-4">
           <div class="card"><div class="card-header"><h3 class="card-title">Models</h3></div><div class="card-body table-responsive p-0" style="max-height: 280px;"><table class="table table-sm table-striped mb-0"><thead><tr><th>Model</th><th>Type</th><th>Status</th><th></th></tr></thead><tbody>
-          <?php foreach ($models as $model): ?><tr><td><?= e((string) $model['brand_name']); ?> / <?= e((string) $model['model_name']); ?></td><td><?= e((string) $model['vehicle_type']); ?></td><td><span class="badge text-bg-<?= e(status_badge_class((string) $model['status_code'])); ?>"><?= e((string) $model['status_code']); ?></span></td><td><?php if ($canManage): ?><a class="btn btn-sm btn-outline-primary" href="<?= e(url('modules/vis/catalog.php?edit_model_id=' . (int) $model['id'])); ?>">Edit</a> <form method="post" class="d-inline"><?= csrf_field(); ?><input type="hidden" name="_action" value="change_status"><input type="hidden" name="entity" value="model"><input type="hidden" name="id" value="<?= (int) $model['id']; ?>"><input type="hidden" name="next_status" value="<?= e(((string) $model['status_code'] === 'ACTIVE') ? 'INACTIVE' : 'ACTIVE'); ?>"><button class="btn btn-sm btn-outline-secondary" type="submit">Toggle</button></form><?php endif; ?></td></tr><?php endforeach; ?>
+          <?php foreach ($models as $model): ?>
+            <tr>
+              <td><?= e((string) $model['brand_name']); ?> / <?= e((string) $model['model_name']); ?></td>
+              <td><?= e((string) $model['vehicle_type']); ?></td>
+              <td><span class="badge text-bg-<?= e(status_badge_class((string) $model['status_code'])); ?>"><?= e((string) $model['status_code']); ?></span></td>
+              <td>
+                <?php if ($canManage): ?>
+                  <a class="btn btn-sm btn-outline-primary" href="<?= e(url('modules/vis/catalog.php?edit_model_id=' . (int) $model['id'])); ?>">Edit</a>
+                  <form method="post" class="d-inline">
+                    <?= csrf_field(); ?>
+                    <input type="hidden" name="_action" value="change_status">
+                    <input type="hidden" name="entity" value="model">
+                    <input type="hidden" name="id" value="<?= (int) $model['id']; ?>">
+                    <input type="hidden" name="next_status" value="<?= e(((string) $model['status_code'] === 'ACTIVE') ? 'INACTIVE' : 'ACTIVE'); ?>">
+                    <button class="btn btn-sm btn-outline-secondary" type="submit">Toggle</button>
+                  </form>
+                  <button
+                    type="button"
+                    class="btn btn-sm btn-outline-danger js-vis-delete-btn"
+                    data-bs-toggle="modal"
+                    data-bs-target="#visDeleteModal"
+                    data-entity="model"
+                    data-record-id="<?= (int) $model['id']; ?>"
+                    data-record-label="Model: <?= e((string) $model['brand_name']); ?> / <?= e((string) $model['model_name']); ?>"
+                  >Delete</button>
+                <?php endif; ?>
+              </td>
+            </tr>
+          <?php endforeach; ?>
           </tbody></table></div></div>
         </div>
         <div class="col-lg-4">
           <div class="card"><div class="card-header"><h3 class="card-title">Variants</h3></div><div class="card-body table-responsive p-0" style="max-height: 280px;"><table class="table table-sm table-striped mb-0"><thead><tr><th>Variant</th><th>Fuel</th><th>Status</th><th></th></tr></thead><tbody>
-          <?php foreach ($variants as $variant): ?><tr><td><?= e((string) $variant['brand_name']); ?> / <?= e((string) $variant['model_name']); ?> / <?= e((string) $variant['variant_name']); ?></td><td><?= e((string) $variant['fuel_type']); ?></td><td><span class="badge text-bg-<?= e(status_badge_class((string) $variant['status_code'])); ?>"><?= e((string) $variant['status_code']); ?></span></td><td><?php if ($canManage): ?><a class="btn btn-sm btn-outline-primary" href="<?= e(url('modules/vis/catalog.php?edit_variant_id=' . (int) $variant['id'])); ?>">Edit</a> <form method="post" class="d-inline"><?= csrf_field(); ?><input type="hidden" name="_action" value="change_status"><input type="hidden" name="entity" value="variant"><input type="hidden" name="id" value="<?= (int) $variant['id']; ?>"><input type="hidden" name="next_status" value="<?= e(((string) $variant['status_code'] === 'ACTIVE') ? 'INACTIVE' : 'ACTIVE'); ?>"><button class="btn btn-sm btn-outline-secondary" type="submit">Toggle</button></form><?php endif; ?></td></tr><?php endforeach; ?>
+          <?php foreach ($variants as $variant): ?>
+            <tr>
+              <td><?= e((string) $variant['brand_name']); ?> / <?= e((string) $variant['model_name']); ?> / <?= e((string) $variant['variant_name']); ?></td>
+              <td><?= e((string) $variant['fuel_type']); ?></td>
+              <td><span class="badge text-bg-<?= e(status_badge_class((string) $variant['status_code'])); ?>"><?= e((string) $variant['status_code']); ?></span></td>
+              <td>
+                <?php if ($canManage): ?>
+                  <a class="btn btn-sm btn-outline-primary" href="<?= e(url('modules/vis/catalog.php?edit_variant_id=' . (int) $variant['id'])); ?>">Edit</a>
+                  <form method="post" class="d-inline">
+                    <?= csrf_field(); ?>
+                    <input type="hidden" name="_action" value="change_status">
+                    <input type="hidden" name="entity" value="variant">
+                    <input type="hidden" name="id" value="<?= (int) $variant['id']; ?>">
+                    <input type="hidden" name="next_status" value="<?= e(((string) $variant['status_code'] === 'ACTIVE') ? 'INACTIVE' : 'ACTIVE'); ?>">
+                    <button class="btn btn-sm btn-outline-secondary" type="submit">Toggle</button>
+                  </form>
+                  <button
+                    type="button"
+                    class="btn btn-sm btn-outline-danger js-vis-delete-btn"
+                    data-bs-toggle="modal"
+                    data-bs-target="#visDeleteModal"
+                    data-entity="variant"
+                    data-record-id="<?= (int) $variant['id']; ?>"
+                    data-record-label="Variant: <?= e((string) $variant['brand_name']); ?> / <?= e((string) $variant['model_name']); ?> / <?= e((string) $variant['variant_name']); ?>"
+                  >Delete</button>
+                <?php endif; ?>
+              </td>
+            </tr>
+          <?php endforeach; ?>
           </tbody></table></div></div>
         </div>
       </div>
@@ -517,7 +807,28 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                     <td><code><?= e((string) $spec['spec_key']); ?></code></td>
                     <td><?= e((string) $spec['spec_value']); ?></td>
                     <td><span class="badge text-bg-<?= e(status_badge_class((string) $spec['status_code'])); ?>"><?= e((string) $spec['status_code']); ?></span></td>
-                    <td><?php if ($canManage): ?><a class="btn btn-sm btn-outline-primary" href="<?= e(url('modules/vis/catalog.php?edit_spec_id=' . (int) $spec['id'])); ?>">Edit</a> <form method="post" class="d-inline"><?= csrf_field(); ?><input type="hidden" name="_action" value="change_status"><input type="hidden" name="entity" value="spec"><input type="hidden" name="id" value="<?= (int) $spec['id']; ?>"><input type="hidden" name="next_status" value="<?= e(((string) $spec['status_code'] === 'ACTIVE') ? 'INACTIVE' : 'ACTIVE'); ?>"><button class="btn btn-sm btn-outline-secondary" type="submit">Toggle</button></form><?php endif; ?></td>
+                    <td>
+                      <?php if ($canManage): ?>
+                        <a class="btn btn-sm btn-outline-primary" href="<?= e(url('modules/vis/catalog.php?edit_spec_id=' . (int) $spec['id'])); ?>">Edit</a>
+                        <form method="post" class="d-inline">
+                          <?= csrf_field(); ?>
+                          <input type="hidden" name="_action" value="change_status">
+                          <input type="hidden" name="entity" value="spec">
+                          <input type="hidden" name="id" value="<?= (int) $spec['id']; ?>">
+                          <input type="hidden" name="next_status" value="<?= e(((string) $spec['status_code'] === 'ACTIVE') ? 'INACTIVE' : 'ACTIVE'); ?>">
+                          <button class="btn btn-sm btn-outline-secondary" type="submit">Toggle</button>
+                        </form>
+                        <button
+                          type="button"
+                          class="btn btn-sm btn-outline-danger js-vis-delete-btn"
+                          data-bs-toggle="modal"
+                          data-bs-target="#visDeleteModal"
+                          data-entity="spec"
+                          data-record-id="<?= (int) $spec['id']; ?>"
+                          data-record-label="Spec: <?= e((string) $spec['brand_name']); ?> / <?= e((string) $spec['model_name']); ?> / <?= e((string) $spec['variant_name']); ?> / <?= e((string) $spec['spec_key']); ?>"
+                        >Delete</button>
+                      <?php endif; ?>
+                    </td>
                   </tr>
                 <?php endforeach; ?>
               <?php endif; ?>
@@ -528,5 +839,59 @@ require_once __DIR__ . '/../../includes/sidebar.php';
     </div>
   </div>
 </main>
+
+<div class="modal fade" id="visDeleteModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <form method="post">
+        <div class="modal-header bg-danger-subtle">
+          <h5 class="modal-title">Delete VIS Record</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+        </div>
+        <div class="modal-body">
+          <?= csrf_field(); ?>
+          <input type="hidden" name="_action" value="change_status" />
+          <input type="hidden" name="entity" id="vis-delete-entity" />
+          <input type="hidden" name="id" id="vis-delete-id" />
+          <input type="hidden" name="next_status" value="DELETED" />
+          <div class="mb-3">
+            <label class="form-label">Record</label>
+            <input type="text" id="vis-delete-label" class="form-control" readonly />
+          </div>
+          <div class="alert alert-warning mb-0">
+            If active part or job links exist, the system will safely disable this record instead of deleting it.
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Close</button>
+          <button type="submit" class="btn btn-danger">Confirm Delete</button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+
+<script>
+  (function () {
+    function setValue(id, value) {
+      var field = document.getElementById(id);
+      if (!field) {
+        return;
+      }
+      field.value = value || '';
+    }
+
+    document.addEventListener('click', function (event) {
+      var trigger = event.target.closest('.js-vis-delete-btn');
+      if (!trigger) {
+        return;
+      }
+
+      setValue('vis-delete-entity', trigger.getAttribute('data-entity'));
+      setValue('vis-delete-id', trigger.getAttribute('data-record-id'));
+      setValue('vis-delete-label', trigger.getAttribute('data-record-label'));
+    });
+  })();
+</script>
 
 <?php require_once __DIR__ . '/../../includes/footer.php'; ?>

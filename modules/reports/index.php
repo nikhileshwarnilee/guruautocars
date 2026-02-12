@@ -174,6 +174,31 @@ $moduleCards = [
     ],
 ];
 
+if (has_permission('outsourced.view') && table_columns('outsourced_works') !== []) {
+    $outsourcedSummaryParams = ['company_id' => $companyId, 'from_date' => $fromDate, 'to_date' => $toDate];
+    $outsourcedScopeSql = analytics_garage_scope_sql('ow.garage_id', $selectedGarageId, $garageIds, $outsourcedSummaryParams, 'ov_out_scope');
+    $outsourcedSummaryStmt = db()->prepare(
+        'SELECT COUNT(*) AS work_count,
+                COALESCE(SUM(ow.agreed_cost), 0) AS agreed_total
+         FROM outsourced_works ow
+         WHERE ow.company_id = :company_id
+           AND ow.status_code = "ACTIVE"
+           ' . $outsourcedScopeSql . '
+           AND DATE(ow.sent_at) BETWEEN :from_date AND :to_date'
+    );
+    $outsourcedSummaryStmt->execute($outsourcedSummaryParams);
+    $outsourcedSummary = $outsourcedSummaryStmt->fetch() ?: ['work_count' => 0, 'agreed_total' => 0];
+
+    $moduleCards[] = [
+        'title' => 'Outsourced Labour',
+        'description' => 'Vendor-wise outsourced cost, paid amount, and outstanding with status drilldown.',
+        'path' => 'modules/reports/outsourced_labour.php',
+        'icon' => 'bi bi-gear-wide-connected',
+        'badge' => 'Outsourced Works',
+        'metric' => number_format((int) ($outsourcedSummary['work_count'] ?? 0)),
+    ];
+}
+
 if (has_permission('payroll.view') || has_permission('payroll.manage')) {
     $moduleCards[] = [
         'title' => 'Payroll Reports',

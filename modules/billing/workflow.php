@@ -466,12 +466,42 @@ function billing_record_payment_history(
 
 function billing_payment_mode_summary(PDO $pdo, int $invoiceId): ?string
 {
-    $modeStmt = $pdo->prepare(
-        'SELECT DISTINCT payment_mode
-         FROM payments
-         WHERE invoice_id = :invoice_id'
-    );
-    $modeStmt->execute(['invoice_id' => $invoiceId]);
+    $paymentColumns = table_columns('payments');
+    $hasEntryType = in_array('entry_type', $paymentColumns, true);
+    $hasReversedPaymentId = in_array('reversed_payment_id', $paymentColumns, true);
+    $hasIsReversed = in_array('is_reversed', $paymentColumns, true);
+
+    if ($hasEntryType && $hasReversedPaymentId) {
+        $sql =
+            'SELECT DISTINCT p.payment_mode
+             FROM payments p
+             LEFT JOIN payments rev
+               ON rev.reversed_payment_id = p.id
+              AND (rev.entry_type = "REVERSAL" OR rev.entry_type IS NULL)
+             WHERE p.invoice_id = :invoice_id
+               AND p.entry_type = "PAYMENT"
+               AND rev.id IS NULL';
+
+        if ($hasIsReversed) {
+            $sql .= ' AND COALESCE(p.is_reversed, 0) = 0';
+        }
+
+        $modeStmt = $pdo->prepare($sql);
+        $modeStmt->execute(['invoice_id' => $invoiceId]);
+    } else {
+        $where = ['invoice_id = :invoice_id', 'amount > 0'];
+        if ($hasEntryType) {
+            $where[] = 'entry_type = "PAYMENT"';
+        }
+
+        $modeStmt = $pdo->prepare(
+            'SELECT DISTINCT payment_mode
+             FROM payments
+             WHERE ' . implode(' AND ', $where)
+        );
+        $modeStmt->execute(['invoice_id' => $invoiceId]);
+    }
+
     $modes = array_values(
         array_filter(
             array_map(static fn (array $row): string => billing_normalize_payment_mode((string) ($row['payment_mode'] ?? '')), $modeStmt->fetchAll()),

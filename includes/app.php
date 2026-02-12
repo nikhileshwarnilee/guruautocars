@@ -21,6 +21,7 @@ require_once __DIR__ . '/helpers.php';
 require_once __DIR__ . '/auth.php';
 require_once __DIR__ . '/finance.php';
 require_once __DIR__ . '/analytics.php';
+require_once __DIR__ . '/reversal.php';
 
 if (is_logged_in() && ($_POST['_action'] ?? '') === 'switch_garage') {
     require_csrf();
