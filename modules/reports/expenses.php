@@ -151,7 +151,8 @@ $expenseTotals = $expenseTotalsStmt->fetch() ?: [
 
 $revenueTotal = 0.0;
 $finalizedInvoiceCount = 0;
-if (table_columns('invoices') !== []) {
+$invoiceTableAvailable = table_columns('invoices') !== [];
+if ($invoiceTableAvailable) {
     $revenueParams = [
         'company_id' => $companyId,
         'from_date' => $fromDate,
@@ -177,6 +178,13 @@ $grossExpense = round((float) ($expenseTotals['expense_total'] ?? 0), 2);
 $reversalTotal = round((float) ($expenseTotals['reversal_total'] ?? 0), 2);
 $netExpense = round((float) ($expenseTotals['net_expense'] ?? 0), 2);
 $netProfit = round($revenueTotal - $netExpense, 2);
+$monthlySummaryCards = array_slice($monthlyRows, -6);
+$topCategoryName = '';
+$topCategoryNet = 0.0;
+if (!empty($categoryRows)) {
+    $topCategoryName = (string) ($categoryRows[0]['category_name'] ?? '');
+    $topCategoryNet = round((float) ($categoryRows[0]['net_total'] ?? 0), 2);
+}
 
 $exportKey = trim((string) ($_GET['export'] ?? ''));
 if ($exportKey !== '') {
@@ -273,6 +281,216 @@ if ($exportKey !== '') {
     }
 }
 
+$renderReportBody = static function (
+    array $dailyRows,
+    array $monthlyRows,
+    array $categoryRows,
+    array $garageRows,
+    array $pageParams,
+    bool $canExportData,
+    float $grossExpense,
+    float $reversalTotal,
+    float $netExpense,
+    float $revenueTotal,
+    int $finalizedInvoiceCount,
+    float $netProfit,
+    bool $invoiceTableAvailable,
+    array $monthlySummaryCards,
+    string $topCategoryName,
+    float $topCategoryNet
+): void {
+    ?>
+      <div class="row g-3 mb-3">
+        <div class="col-md-3"><div class="info-box"><span class="info-box-icon text-bg-danger"><i class="bi bi-cash-stack"></i></span><div class="info-box-content"><span class="info-box-text">Gross Expense</span><span class="info-box-number"><?= e(format_currency($grossExpense)); ?></span></div></div></div>
+        <div class="col-md-3"><div class="info-box"><span class="info-box-icon text-bg-secondary"><i class="bi bi-arrow-counterclockwise"></i></span><div class="info-box-content"><span class="info-box-text">Reversal Total</span><span class="info-box-number"><?= e(format_currency($reversalTotal)); ?></span></div></div></div>
+        <div class="col-md-3"><div class="info-box"><span class="info-box-icon text-bg-warning"><i class="bi bi-wallet"></i></span><div class="info-box-content"><span class="info-box-text">Net Expense</span><span class="info-box-number"><?= e(format_currency($netExpense)); ?></span></div></div></div>
+        <div class="col-md-3"><div class="info-box"><span class="info-box-icon text-bg-success"><i class="bi bi-graph-up-arrow"></i></span><div class="info-box-content"><span class="info-box-text">Finalized Revenue</span><span class="info-box-number"><?= e(format_currency($revenueTotal)); ?></span></div></div></div>
+      </div>
+
+      <div class="row g-3 mb-3">
+        <div class="col-md-4"><div class="small-box text-bg-primary"><div class="inner"><h4><?= number_format(count($monthlySummaryCards)); ?></h4><p>Months in Scope</p></div><span class="small-box-icon"><i class="bi bi-calendar3"></i></span></div></div>
+        <div class="col-md-4"><div class="small-box text-bg-dark"><div class="inner"><h4><?= number_format($finalizedInvoiceCount); ?></h4><p>Finalized Invoices</p></div><span class="small-box-icon"><i class="bi bi-receipt"></i></span></div></div>
+        <div class="col-md-4"><div class="small-box text-bg-info"><div class="inner"><h4><?= e($topCategoryName !== '' ? $topCategoryName : 'N/A'); ?></h4><p>Top Category (<?= e(format_currency($topCategoryNet)); ?>)</p></div><span class="small-box-icon"><i class="bi bi-tags"></i></span></div></div>
+      </div>
+
+      <?php if (!empty($monthlySummaryCards)): ?>
+      <div class="row g-3 mb-3">
+        <?php foreach ($monthlySummaryCards as $monthCard): ?>
+          <div class="col-md-2 col-sm-4">
+            <div class="card card-outline card-secondary h-100">
+              <div class="card-body p-2">
+                <div class="small text-muted"><?= e((string) ($monthCard['expense_month'] ?? '')); ?></div>
+                <div><strong><?= e(format_currency((float) ($monthCard['net_total'] ?? 0))); ?></strong></div>
+                <div class="small">Expense: <?= e(format_currency((float) ($monthCard['expense_total'] ?? 0))); ?></div>
+                <div class="small">Reversal: <?= e(format_currency((float) ($monthCard['reversal_total'] ?? 0))); ?></div>
+              </div>
+            </div>
+          </div>
+        <?php endforeach; ?>
+      </div>
+      <?php endif; ?>
+
+      <div class="card mb-3">
+        <div class="card-header d-flex justify-content-between align-items-center">
+          <h3 class="card-title mb-0">Revenue vs Expense Comparison</h3>
+          <?php if ($canExportData): ?>
+            <a href="<?= e(reports_export_url('modules/reports/expenses.php', $pageParams, 'revenue_expense')); ?>" class="btn btn-sm btn-outline-primary">CSV</a>
+          <?php endif; ?>
+        </div>
+        <div class="card-body">
+          <div class="row g-3">
+            <div class="col-md-3"><strong>Finalized Invoices:</strong> <?= number_format($finalizedInvoiceCount); ?></div>
+            <div class="col-md-3"><strong>Finalized Revenue:</strong> <?= e(format_currency($revenueTotal)); ?></div>
+            <div class="col-md-3"><strong>Net Expense:</strong> <?= e(format_currency($netExpense)); ?></div>
+            <div class="col-md-3"><strong>Net Profit:</strong> <?= e(format_currency($netProfit)); ?></div>
+          </div>
+          <?php if (!$invoiceTableAvailable): ?>
+            <p class="text-muted mt-2 mb-0">Revenue metrics are unavailable because the invoices table is missing.</p>
+          <?php endif; ?>
+        </div>
+      </div>
+
+      <div class="row g-3 mb-3">
+        <div class="col-lg-6">
+          <div class="card h-100">
+            <div class="card-header d-flex justify-content-between align-items-center">
+              <h3 class="card-title mb-0">Daily Expense Summary</h3>
+              <?php if ($canExportData): ?>
+                <a href="<?= e(reports_export_url('modules/reports/expenses.php', $pageParams, 'daily_summary')); ?>" class="btn btn-sm btn-outline-primary">CSV</a>
+              <?php endif; ?>
+            </div>
+            <div class="card-body p-0 table-responsive">
+              <table class="table table-sm table-striped mb-0">
+                <thead><tr><th>Date</th><th>Expense</th><th>Reversal</th><th>Net</th></tr></thead>
+                <tbody>
+                  <?php if (empty($dailyRows)): ?>
+                    <tr><td colspan="4" class="text-center text-muted py-4">No expense entries found in selected range.</td></tr>
+                  <?php else: foreach ($dailyRows as $row): ?>
+                    <tr>
+                      <td><?= e((string) ($row['expense_date'] ?? '')); ?></td>
+                      <td><?= e(format_currency((float) ($row['expense_total'] ?? 0))); ?></td>
+                      <td><?= e(format_currency((float) ($row['reversal_total'] ?? 0))); ?></td>
+                      <td><?= e(format_currency((float) ($row['net_total'] ?? 0))); ?></td>
+                    </tr>
+                  <?php endforeach; endif; ?>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <div class="col-lg-6">
+          <div class="card h-100">
+            <div class="card-header d-flex justify-content-between align-items-center">
+              <h3 class="card-title mb-0">Monthly Expense Report</h3>
+              <?php if ($canExportData): ?>
+                <a href="<?= e(reports_export_url('modules/reports/expenses.php', $pageParams, 'monthly_summary')); ?>" class="btn btn-sm btn-outline-secondary">CSV</a>
+              <?php endif; ?>
+            </div>
+            <div class="card-body p-0 table-responsive">
+              <table class="table table-sm table-striped mb-0">
+                <thead><tr><th>Month</th><th>Expense</th><th>Reversal</th><th>Net</th></tr></thead>
+                <tbody>
+                  <?php if (empty($monthlyRows)): ?>
+                    <tr><td colspan="4" class="text-center text-muted py-4">No monthly expense values in selected range.</td></tr>
+                  <?php else: foreach ($monthlyRows as $row): ?>
+                    <tr>
+                      <td><?= e((string) ($row['expense_month'] ?? '')); ?></td>
+                      <td><?= e(format_currency((float) ($row['expense_total'] ?? 0))); ?></td>
+                      <td><?= e(format_currency((float) ($row['reversal_total'] ?? 0))); ?></td>
+                      <td><?= e(format_currency((float) ($row['net_total'] ?? 0))); ?></td>
+                    </tr>
+                  <?php endforeach; endif; ?>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="row g-3 mb-3">
+        <div class="col-lg-6">
+          <div class="card h-100">
+            <div class="card-header d-flex justify-content-between align-items-center">
+              <h3 class="card-title mb-0">Category-wise Expense</h3>
+              <?php if ($canExportData): ?>
+                <a href="<?= e(reports_export_url('modules/reports/expenses.php', $pageParams, 'category_summary')); ?>" class="btn btn-sm btn-outline-primary">CSV</a>
+              <?php endif; ?>
+            </div>
+            <div class="card-body p-0 table-responsive">
+              <table class="table table-sm table-striped mb-0">
+                <thead><tr><th>Category</th><th>Expense</th><th>Reversal</th><th>Net</th></tr></thead>
+                <tbody>
+                  <?php if (empty($categoryRows)): ?>
+                    <tr><td colspan="4" class="text-center text-muted py-4">No category totals for selected range.</td></tr>
+                  <?php else: foreach ($categoryRows as $row): ?>
+                    <tr>
+                      <td><?= e((string) ($row['category_name'] ?? '')); ?></td>
+                      <td><?= e(format_currency((float) ($row['expense_total'] ?? 0))); ?></td>
+                      <td><?= e(format_currency((float) ($row['reversal_total'] ?? 0))); ?></td>
+                      <td><?= e(format_currency((float) ($row['net_total'] ?? 0))); ?></td>
+                    </tr>
+                  <?php endforeach; endif; ?>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <div class="col-lg-6">
+          <div class="card h-100">
+            <div class="card-header d-flex justify-content-between align-items-center">
+              <h3 class="card-title mb-0">Garage-wise Expense</h3>
+              <?php if ($canExportData): ?>
+                <a href="<?= e(reports_export_url('modules/reports/expenses.php', $pageParams, 'garage_summary')); ?>" class="btn btn-sm btn-outline-danger">CSV</a>
+              <?php endif; ?>
+            </div>
+            <div class="card-body p-0 table-responsive">
+              <table class="table table-sm table-striped mb-0">
+                <thead><tr><th>Garage</th><th>Expense</th><th>Reversal</th><th>Net</th></tr></thead>
+                <tbody>
+                  <?php if (empty($garageRows)): ?>
+                    <tr><td colspan="4" class="text-center text-muted py-4">No garage totals for selected range.</td></tr>
+                  <?php else: foreach ($garageRows as $row): ?>
+                    <tr>
+                      <td><?= e((string) ($row['garage_name'] ?? '')); ?></td>
+                      <td><?= e(format_currency((float) ($row['expense_total'] ?? 0))); ?></td>
+                      <td><?= e(format_currency((float) ($row['reversal_total'] ?? 0))); ?></td>
+                      <td><?= e(format_currency((float) ($row['net_total'] ?? 0))); ?></td>
+                    </tr>
+                  <?php endforeach; endif; ?>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+    <?php
+};
+
+if (isset($_GET['ajax']) && (string) $_GET['ajax'] === '1') {
+    header('Content-Type: text/html; charset=utf-8');
+    $renderReportBody(
+        $dailyRows,
+        $monthlyRows,
+        $categoryRows,
+        $garageRows,
+        $pageParams,
+        $canExportData,
+        $grossExpense,
+        $reversalTotal,
+        $netExpense,
+        $revenueTotal,
+        $finalizedInvoiceCount,
+        $netProfit,
+        $invoiceTableAvailable,
+        $monthlySummaryCards,
+        $topCategoryName,
+        $topCategoryNet
+    );
+    exit;
+}
+
 require_once __DIR__ . '/../../includes/header.php';
 require_once __DIR__ . '/../../includes/sidebar.php';
 ?>
@@ -311,7 +529,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       <div class="card card-primary mb-3">
         <div class="card-header"><h3 class="card-title">Filters</h3></div>
         <div class="card-body">
-          <form method="get" class="row g-2 align-items-end">
+          <form method="get" id="expense-filter-form" class="row g-2 align-items-end">
             <?php if ($allowAllGarages || count($garageIds) > 1): ?>
               <div class="col-md-3">
                 <label class="form-label">Garage Scope</label>
@@ -361,140 +579,42 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         </div>
       </div>
 
-      <div class="row g-3 mb-3">
-        <div class="col-md-3"><div class="info-box"><span class="info-box-icon text-bg-danger"><i class="bi bi-cash-stack"></i></span><div class="info-box-content"><span class="info-box-text">Gross Expense</span><span class="info-box-number"><?= e(format_currency($grossExpense)); ?></span></div></div></div>
-        <div class="col-md-3"><div class="info-box"><span class="info-box-icon text-bg-secondary"><i class="bi bi-arrow-counterclockwise"></i></span><div class="info-box-content"><span class="info-box-text">Reversal Total</span><span class="info-box-number"><?= e(format_currency($reversalTotal)); ?></span></div></div></div>
-        <div class="col-md-3"><div class="info-box"><span class="info-box-icon text-bg-warning"><i class="bi bi-wallet"></i></span><div class="info-box-content"><span class="info-box-text">Net Expense</span><span class="info-box-number"><?= e(format_currency($netExpense)); ?></span></div></div></div>
-        <div class="col-md-3"><div class="info-box"><span class="info-box-icon text-bg-success"><i class="bi bi-graph-up-arrow"></i></span><div class="info-box-content"><span class="info-box-text">Finalized Revenue</span><span class="info-box-number"><?= e(format_currency($revenueTotal)); ?></span></div></div></div>
-      </div>
-
-      <div class="card mb-3">
-        <div class="card-header d-flex justify-content-between align-items-center">
-          <h3 class="card-title mb-0">Revenue vs Expense Comparison</h3>
-          <a href="<?= e(reports_export_url('modules/reports/expenses.php', $pageParams, 'revenue_expense')); ?>" class="btn btn-sm btn-outline-primary">CSV</a>
-        </div>
-        <div class="card-body">
-          <div class="row g-3">
-            <div class="col-md-3"><strong>Finalized Invoices:</strong> <?= number_format($finalizedInvoiceCount); ?></div>
-            <div class="col-md-3"><strong>Finalized Revenue:</strong> <?= e(format_currency($revenueTotal)); ?></div>
-            <div class="col-md-3"><strong>Net Expense:</strong> <?= e(format_currency($netExpense)); ?></div>
-            <div class="col-md-3"><strong>Net Profit:</strong> <?= e(format_currency($netProfit)); ?></div>
-          </div>
-          <?php if (table_columns('invoices') === []): ?>
-            <p class="text-muted mt-2 mb-0">Revenue metrics are unavailable because the invoices table is missing.</p>
-          <?php endif; ?>
-        </div>
-      </div>
-
-      <div class="row g-3 mb-3">
-        <div class="col-lg-6">
-          <div class="card h-100">
-            <div class="card-header d-flex justify-content-between align-items-center">
-              <h3 class="card-title mb-0">Daily Expense Summary</h3>
-              <a href="<?= e(reports_export_url('modules/reports/expenses.php', $pageParams, 'daily_summary')); ?>" class="btn btn-sm btn-outline-primary">CSV</a>
-            </div>
-            <div class="card-body p-0 table-responsive">
-              <table class="table table-sm table-striped mb-0">
-                <thead><tr><th>Date</th><th>Expense</th><th>Reversal</th><th>Net</th></tr></thead>
-                <tbody>
-                  <?php if (empty($dailyRows)): ?>
-                    <tr><td colspan="4" class="text-center text-muted py-4">No expense entries found in selected range.</td></tr>
-                  <?php else: foreach ($dailyRows as $row): ?>
-                    <tr>
-                      <td><?= e((string) ($row['expense_date'] ?? '')); ?></td>
-                      <td><?= e(format_currency((float) ($row['expense_total'] ?? 0))); ?></td>
-                      <td><?= e(format_currency((float) ($row['reversal_total'] ?? 0))); ?></td>
-                      <td><?= e(format_currency((float) ($row['net_total'] ?? 0))); ?></td>
-                    </tr>
-                  <?php endforeach; endif; ?>
-                </tbody>
-              </table>
-            </div>
-          </div>
-        </div>
-
-        <div class="col-lg-6">
-          <div class="card h-100">
-            <div class="card-header d-flex justify-content-between align-items-center">
-              <h3 class="card-title mb-0">Monthly Expense Report</h3>
-              <a href="<?= e(reports_export_url('modules/reports/expenses.php', $pageParams, 'monthly_summary')); ?>" class="btn btn-sm btn-outline-secondary">CSV</a>
-            </div>
-            <div class="card-body p-0 table-responsive">
-              <table class="table table-sm table-striped mb-0">
-                <thead><tr><th>Month</th><th>Expense</th><th>Reversal</th><th>Net</th></tr></thead>
-                <tbody>
-                  <?php if (empty($monthlyRows)): ?>
-                    <tr><td colspan="4" class="text-center text-muted py-4">No monthly expense values in selected range.</td></tr>
-                  <?php else: foreach ($monthlyRows as $row): ?>
-                    <tr>
-                      <td><?= e((string) ($row['expense_month'] ?? '')); ?></td>
-                      <td><?= e(format_currency((float) ($row['expense_total'] ?? 0))); ?></td>
-                      <td><?= e(format_currency((float) ($row['reversal_total'] ?? 0))); ?></td>
-                      <td><?= e(format_currency((float) ($row['net_total'] ?? 0))); ?></td>
-                    </tr>
-                  <?php endforeach; endif; ?>
-                </tbody>
-              </table>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <div class="row g-3 mb-3">
-        <div class="col-lg-6">
-          <div class="card h-100">
-            <div class="card-header d-flex justify-content-between align-items-center">
-              <h3 class="card-title mb-0">Category-wise Expense</h3>
-              <a href="<?= e(reports_export_url('modules/reports/expenses.php', $pageParams, 'category_summary')); ?>" class="btn btn-sm btn-outline-primary">CSV</a>
-            </div>
-            <div class="card-body p-0 table-responsive">
-              <table class="table table-sm table-striped mb-0">
-                <thead><tr><th>Category</th><th>Expense</th><th>Reversal</th><th>Net</th></tr></thead>
-                <tbody>
-                  <?php if (empty($categoryRows)): ?>
-                    <tr><td colspan="4" class="text-center text-muted py-4">No category totals for selected range.</td></tr>
-                  <?php else: foreach ($categoryRows as $row): ?>
-                    <tr>
-                      <td><?= e((string) ($row['category_name'] ?? '')); ?></td>
-                      <td><?= e(format_currency((float) ($row['expense_total'] ?? 0))); ?></td>
-                      <td><?= e(format_currency((float) ($row['reversal_total'] ?? 0))); ?></td>
-                      <td><?= e(format_currency((float) ($row['net_total'] ?? 0))); ?></td>
-                    </tr>
-                  <?php endforeach; endif; ?>
-                </tbody>
-              </table>
-            </div>
-          </div>
-        </div>
-
-        <div class="col-lg-6">
-          <div class="card h-100">
-            <div class="card-header d-flex justify-content-between align-items-center">
-              <h3 class="card-title mb-0">Garage-wise Expense</h3>
-              <a href="<?= e(reports_export_url('modules/reports/expenses.php', $pageParams, 'garage_summary')); ?>" class="btn btn-sm btn-outline-danger">CSV</a>
-            </div>
-            <div class="card-body p-0 table-responsive">
-              <table class="table table-sm table-striped mb-0">
-                <thead><tr><th>Garage</th><th>Expense</th><th>Reversal</th><th>Net</th></tr></thead>
-                <tbody>
-                  <?php if (empty($garageRows)): ?>
-                    <tr><td colspan="4" class="text-center text-muted py-4">No garage totals for selected range.</td></tr>
-                  <?php else: foreach ($garageRows as $row): ?>
-                    <tr>
-                      <td><?= e((string) ($row['garage_name'] ?? '')); ?></td>
-                      <td><?= e(format_currency((float) ($row['expense_total'] ?? 0))); ?></td>
-                      <td><?= e(format_currency((float) ($row['reversal_total'] ?? 0))); ?></td>
-                      <td><?= e(format_currency((float) ($row['net_total'] ?? 0))); ?></td>
-                    </tr>
-                  <?php endforeach; endif; ?>
-                </tbody>
-              </table>
-            </div>
-          </div>
-        </div>
+      <div id="expense-report-content">
+        <?php $renderReportBody($dailyRows, $monthlyRows, $categoryRows, $garageRows, $pageParams, $canExportData, $grossExpense, $reversalTotal, $netExpense, $revenueTotal, $finalizedInvoiceCount, $netProfit, $invoiceTableAvailable, $monthlySummaryCards, $topCategoryName, $topCategoryNet); ?>
       </div>
     </div>
   </div>
 </main>
+
+<script>
+  (function () {
+    var form = document.getElementById('expense-filter-form');
+    var target = document.getElementById('expense-report-content');
+    if (!form || !target) {
+      return;
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      var params = new URLSearchParams(new FormData(form));
+      params.set('ajax', '1');
+
+      var url = form.getAttribute('action') || window.location.pathname;
+      target.classList.add('opacity-50');
+
+      fetch(url + '?' + params.toString(), { headers: { 'X-Requested-With': 'XMLHttpRequest' } })
+        .then(function (response) { return response.text(); })
+        .then(function (html) {
+          target.innerHTML = html;
+        })
+        .catch(function () {
+          target.innerHTML = '<div class="alert alert-danger">Unable to load expense report data. Please retry.</div>';
+        })
+        .finally(function () {
+          target.classList.remove('opacity-50');
+        });
+    });
+  })();
+</script>
 
 <?php require_once __DIR__ . '/../../includes/footer.php'; ?>

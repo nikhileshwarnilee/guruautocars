@@ -16,6 +16,12 @@ if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $fromDate)) {
 if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $toDate)) {
     $toDate = $today;
 }
+$selectedCategoryId = get_int('category_id');
+$entryTypeFilter = strtoupper(trim((string) ($_GET['entry_type'] ?? '')));
+if (!in_array($entryTypeFilter, ['', 'EXPENSE', 'REVERSAL'], true)) {
+    $entryTypeFilter = '';
+}
+$searchTerm = trim((string) ($_GET['q'] ?? ''));
 
 $canView = has_permission('expense.view') || has_permission('expense.manage');
 $canManage = has_permission('expense.manage');
@@ -25,6 +31,45 @@ if (!$canView) {
 
 $page_title = 'Expenses & Daily Cashflow';
 $active_menu = 'finance.expenses';
+
+function expense_source_bucket(?string $sourceType): string
+{
+    $value = strtoupper(trim((string) $sourceType));
+    if ($value === '' || $value === 'MANUAL_EXPENSE' || $value === 'MANUAL_EXPENSE_REV') {
+        return 'MANUAL';
+    }
+    if (str_starts_with($value, 'PAYROLL_')) {
+        return 'PAYROLL';
+    }
+    if (str_starts_with($value, 'PURCHASE_')) {
+        return 'PURCHASE';
+    }
+    if (str_starts_with($value, 'OUTSOURCED_')) {
+        return 'OUTSOURCE';
+    }
+
+    return 'SYSTEM';
+}
+
+function expense_source_label(?string $sourceType): string
+{
+    return match (expense_source_bucket($sourceType)) {
+        'MANUAL' => 'Manual Expense',
+        'PAYROLL' => 'Payroll Linked',
+        'PURCHASE' => 'Purchase Linked',
+        'OUTSOURCE' => 'Outsource Linked',
+        default => 'System Linked',
+    };
+}
+
+function expense_editable_entry(array $expense): bool
+{
+    if ((string) ($expense['entry_type'] ?? '') !== 'EXPENSE') {
+        return false;
+    }
+
+    return expense_source_bucket((string) ($expense['source_type'] ?? '')) === 'MANUAL';
+}
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     require_csrf();
@@ -267,6 +312,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             if ((string) ($expense['entry_type'] ?? '') !== 'EXPENSE') {
                 throw new RuntimeException('Only original expenses can be edited.');
             }
+            if (!expense_editable_entry($expense)) {
+                $sourceLabel = expense_source_label((string) ($expense['source_type'] ?? ''));
+                throw new RuntimeException($sourceLabel . ' entries cannot be edited directly. Use reversal from the source module.');
+            }
+
+            $reversalCheckStmt = $pdo->prepare('SELECT id FROM expenses WHERE reversed_expense_id = :id LIMIT 1');
+            $reversalCheckStmt->execute(['id' => $expenseId]);
+            if ($reversalCheckStmt->fetch()) {
+                throw new RuntimeException('Reversed entries cannot be edited.');
+            }
 
             $catStmt = $pdo->prepare('SELECT category_name FROM expense_categories WHERE id = :id AND company_id = :company_id AND garage_id = :garage_id');
             $catStmt->execute([
@@ -326,56 +381,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 
     if ($action === 'delete_expense') {
-        $expenseId = post_int('expense_id');
-        if ($expenseId <= 0) {
-            flash_set('expense_error', 'Invalid expense selected.', 'danger');
-            redirect('modules/expenses/index.php');
-        }
-
-        $pdo = db();
-        $pdo->beginTransaction();
-        try {
-            $expStmt = $pdo->prepare('SELECT id, entry_type FROM expenses WHERE id = :id AND company_id = :company_id AND garage_id = :garage_id FOR UPDATE');
-            $expStmt->execute([
-                'id' => $expenseId,
-                'company_id' => $companyId,
-                'garage_id' => $garageId,
-            ]);
-            $expense = $expStmt->fetch();
-            if (!$expense) {
-                throw new RuntimeException('Expense not found.');
-            }
-            if ((string) ($expense['entry_type'] ?? '') !== 'EXPENSE') {
-                throw new RuntimeException('Only original expenses can be deleted.');
-            }
-
-            $checkStmt = $pdo->prepare('SELECT id FROM expenses WHERE reversed_expense_id = :id LIMIT 1');
-            $checkStmt->execute(['id' => $expenseId]);
-            if ($checkStmt->fetch()) {
-                throw new RuntimeException('Expense already reversed; cannot delete.');
-            }
-
-            $deleteStmt = $pdo->prepare(
-                'UPDATE expenses
-                 SET entry_type = "DELETED",
-                     payment_mode = "VOID",
-                     notes = CONCAT(COALESCE(notes, ""), " | Deleted"),
-                     updated_by = :updated_by
-                 WHERE id = :id'
-            );
-            $deleteStmt->execute([
-                'updated_by' => $_SESSION['user_id'] ?? null,
-                'id' => $expenseId,
-            ]);
-
-            log_audit('expenses', 'delete', $expenseId, 'Expense deleted', ['entity' => 'expense']);
-            $pdo->commit();
-            flash_set('expense_success', 'Expense deleted.', 'success');
-        } catch (Throwable $exception) {
-            $pdo->rollBack();
-            flash_set('expense_error', $exception->getMessage(), 'danger');
-        }
-
+        flash_set('expense_error', 'Direct deletion is disabled. Reverse the expense entry instead.', 'danger');
         redirect('modules/expenses/index.php');
     }
 
@@ -404,6 +410,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
             if ((string) ($expense['entry_type'] ?? '') !== 'EXPENSE') {
                 throw new RuntimeException('Only original expenses can be reversed.');
+            }
+            if (!expense_editable_entry($expense)) {
+                $sourceLabel = expense_source_label((string) ($expense['source_type'] ?? ''));
+                throw new RuntimeException($sourceLabel . ' entries must be reversed from their source workflow.');
             }
 
             $checkStmt = $pdo->prepare('SELECT id FROM expenses WHERE reversed_expense_id = :id LIMIT 1');
@@ -449,73 +459,105 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 }
 
-$categoryStmt = db()->prepare(
-    'SELECT * FROM expense_categories
+$categoryAllStmt = db()->prepare(
+    'SELECT *
+     FROM expense_categories
      WHERE company_id = :company_id
        AND garage_id = :garage_id
-       AND status_code = "ACTIVE"
      ORDER BY category_name ASC'
 );
-$categoryStmt->execute([
+$categoryAllStmt->execute([
     'company_id' => $companyId,
     'garage_id' => $garageId,
 ]);
-$categories = $categoryStmt->fetchAll();
+$allCategories = $categoryAllStmt->fetchAll();
+$categories = array_values(array_filter(
+    $allCategories,
+    static fn (array $category): bool => (string) ($category['status_code'] ?? '') === 'ACTIVE'
+));
 
-$expenseStmt = db()->prepare(
-    'SELECT e.*, ec.category_name
+$expenseConditions = [
+    'e.company_id = :company_id',
+    'e.garage_id = :garage_id',
+    'e.entry_type <> "DELETED"',
+    'e.expense_date BETWEEN :from_date AND :to_date',
+];
+$expenseParams = [
+    'company_id' => $companyId,
+    'garage_id' => $garageId,
+    'from_date' => $fromDate,
+    'to_date' => $toDate,
+];
+if ($selectedCategoryId > 0) {
+    $expenseConditions[] = 'e.category_id = :category_id';
+    $expenseParams['category_id'] = $selectedCategoryId;
+}
+if ($entryTypeFilter !== '') {
+    $expenseConditions[] = 'e.entry_type = :entry_type';
+    $expenseParams['entry_type'] = $entryTypeFilter;
+}
+
+$expenseListSql = 'SELECT e.*, ec.category_name
      FROM expenses e
      LEFT JOIN expense_categories ec ON ec.id = e.category_id
-     WHERE e.company_id = :company_id
-       AND e.garage_id = :garage_id
-                 AND e.entry_type <> "DELETED"
-       AND e.expense_date BETWEEN :from_date AND :to_date
+     WHERE ' . implode(' AND ', $expenseConditions);
+$expenseListParams = $expenseParams;
+if ($searchTerm !== '') {
+    $expenseListSql .= ' AND (
+        COALESCE(ec.category_name, "") LIKE :search_term
+        OR COALESCE(e.paid_to, "") LIKE :search_term
+        OR COALESCE(e.notes, "") LIKE :search_term
+        OR COALESCE(e.source_type, "") LIKE :search_term
+    )';
+    $expenseListParams['search_term'] = '%' . $searchTerm . '%';
+}
+$expenseListSql .= '
      ORDER BY e.expense_date DESC, e.id DESC
-     LIMIT 50'
-);
-$expenseStmt->execute([
-    'company_id' => $companyId,
-    'garage_id' => $garageId,
-    'from_date' => $fromDate,
-    'to_date' => $toDate,
-]);
+     LIMIT 200';
+$expenseStmt = db()->prepare($expenseListSql);
+$expenseStmt->execute($expenseListParams);
 $expenses = $expenseStmt->fetchAll();
 
-$summaryStmt = db()->prepare(
-    'SELECT expense_date, SUM(amount) AS total
-     FROM expenses
-     WHERE company_id = :company_id
-       AND garage_id = :garage_id
-       AND expense_date BETWEEN :from_date AND :to_date
-       AND entry_type <> "DELETED"
-     GROUP BY expense_date
-     ORDER BY expense_date ASC'
+$statsStmt = db()->prepare(
+    'SELECT
+        COUNT(*) AS total_entries,
+        COALESCE(SUM(CASE WHEN e.entry_type = "EXPENSE" THEN e.amount ELSE 0 END), 0) AS gross_expense_total,
+        COALESCE(SUM(CASE WHEN e.entry_type = "REVERSAL" THEN ABS(e.amount) ELSE 0 END), 0) AS reversal_total,
+        COALESCE(SUM(e.amount), 0) AS net_expense_total
+     FROM expenses e
+     WHERE ' . implode(' AND ', $expenseConditions)
 );
-$summaryStmt->execute([
-    'company_id' => $companyId,
-    'garage_id' => $garageId,
-    'from_date' => $fromDate,
-    'to_date' => $toDate,
-]);
+$statsStmt->execute($expenseParams);
+$expenseStats = $statsStmt->fetch() ?: [
+    'total_entries' => 0,
+    'gross_expense_total' => 0,
+    'reversal_total' => 0,
+    'net_expense_total' => 0,
+];
+$totalEntries = (int) ($expenseStats['total_entries'] ?? 0);
+$grossExpenseTotal = round((float) ($expenseStats['gross_expense_total'] ?? 0), 2);
+$reversalTotal = round((float) ($expenseStats['reversal_total'] ?? 0), 2);
+$expenseTotal = round((float) ($expenseStats['net_expense_total'] ?? 0), 2);
+
+$summaryStmt = db()->prepare(
+    'SELECT e.expense_date, COALESCE(SUM(e.amount), 0) AS total
+     FROM expenses e
+     WHERE ' . implode(' AND ', $expenseConditions) . '
+     GROUP BY e.expense_date
+     ORDER BY e.expense_date ASC'
+);
+$summaryStmt->execute($expenseParams);
 $dailySummary = $summaryStmt->fetchAll();
 
 $categoryBreakStmt = db()->prepare(
-    'SELECT COALESCE(ec.category_name, "Uncategorized") AS category_name, SUM(e.amount) AS total
+    'SELECT COALESCE(ec.category_name, "Uncategorized") AS category_name, COALESCE(SUM(e.amount), 0) AS total
      FROM expenses e
      LEFT JOIN expense_categories ec ON ec.id = e.category_id
-     WHERE e.company_id = :company_id
-       AND e.garage_id = :garage_id
-       AND e.expense_date BETWEEN :from_date AND :to_date
-       AND e.entry_type <> "DELETED"
+     WHERE ' . implode(' AND ', $expenseConditions) . '
      GROUP BY category_name
      ORDER BY total DESC'
 );
-$categoryBreakStmt->execute([
-    'company_id' => $companyId,
-    'garage_id' => $garageId,
-    'from_date' => $fromDate,
-    'to_date' => $toDate,
-]);
+$categoryBreakStmt->execute($expenseParams);
 $categoryBreakdown = $categoryBreakStmt->fetchAll();
 
 $revenueTotal = 0.0;
@@ -526,7 +568,7 @@ if (table_columns('invoices') !== []) {
          WHERE company_id = :company_id
            AND garage_id = :garage_id
            AND invoice_status = "FINALIZED"
-            AND invoice_date BETWEEN :from_date AND :to_date'
+           AND invoice_date BETWEEN :from_date AND :to_date'
     );
     $revenueStmt->execute([
         'company_id' => $companyId,
@@ -537,224 +579,207 @@ if (table_columns('invoices') !== []) {
     $revenueTotal = round((float) ($revenueStmt->fetchColumn() ?? 0), 2);
 }
 
-$expenseTotalStmt = db()->prepare(
-    'SELECT SUM(amount) AS total
-     FROM expenses
-     WHERE company_id = :company_id
-       AND garage_id = :garage_id
-       AND expense_date BETWEEN :from_date AND :to_date
-       AND entry_type <> "DELETED"'
-);
-$expenseTotalStmt->execute([
-    'company_id' => $companyId,
-    'garage_id' => $garageId,
-    'from_date' => $fromDate,
-    'to_date' => $toDate,
-]);
-$expenseTotal = round((float) ($expenseTotalStmt->fetchColumn() ?? 0), 2);
+$reversedExpenseIds = [];
+foreach ($expenses as $expenseRow) {
+    $reversedId = (int) ($expenseRow['reversed_expense_id'] ?? 0);
+    if ($reversedId > 0) {
+        $reversedExpenseIds[$reversedId] = true;
+    }
+}
 
 include __DIR__ . '/../../includes/header.php';
 include __DIR__ . '/../../includes/sidebar.php';
 ?>
-<div class="content-wrapper">
-    <section class="content-header">
-        <div class="container-fluid">
-            <div class="row mb-2">
-                <div class="col-sm-6"><h1>Expenses</h1></div>
-                <div class="col-sm-6 text-right">
-                    <form class="form-inline" method="get" action="">
-                        <input type="date" name="from" value="<?= e($fromDate) ?>" class="form-control form-control-sm mr-2" />
-                        <input type="date" name="to" value="<?= e($toDate) ?>" class="form-control form-control-sm mr-2" />
-                        <button class="btn btn-sm btn-primary" type="submit">Filter</button>
-                    </form>
-                </div>
-            </div>
+<main class="app-main">
+  <div class="app-content-header">
+    <div class="container-fluid">
+      <div class="row">
+        <div class="col-sm-6"><h3 class="mb-0">Expense Module</h3></div>
+        <div class="col-sm-6">
+          <ol class="breadcrumb float-sm-end">
+            <li class="breadcrumb-item"><a href="<?= e(url('dashboard.php')); ?>">Home</a></li>
+            <li class="breadcrumb-item active">Expenses</li>
+          </ol>
         </div>
-    </section>
-    <section class="content">
-        <div class="container-fluid">
-            <div class="row">
+      </div>
+    </div>
+  </div>
+  <div class="app-content">
+    <div class="container-fluid">
+      <div class="row g-3 mb-3">
+        <div class="col-md-3"><div class="small-box text-bg-danger"><div class="inner"><h4><?= e(number_format($grossExpenseTotal, 2)); ?></h4><p>Gross Expense</p></div><span class="small-box-icon"><i class="bi bi-cash-stack"></i></span></div></div>
+        <div class="col-md-3"><div class="small-box text-bg-secondary"><div class="inner"><h4><?= e(number_format($reversalTotal, 2)); ?></h4><p>Reversal Total</p></div><span class="small-box-icon"><i class="bi bi-arrow-counterclockwise"></i></span></div></div>
+        <div class="col-md-3"><div class="small-box text-bg-warning"><div class="inner"><h4><?= e(number_format($expenseTotal, 2)); ?></h4><p>Net Expense</p></div><span class="small-box-icon"><i class="bi bi-wallet2"></i></span></div></div>
+        <div class="col-md-3"><div class="small-box text-bg-primary"><div class="inner"><h4><?= number_format($totalEntries); ?></h4><p>Ledger Entries</p></div><span class="small-box-icon"><i class="bi bi-journal-text"></i></span></div></div>
+      </div>
+      <div class="card card-primary mb-3">
+        <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
+          <h3 class="card-title mb-0">Filters</h3>
+          <div class="d-flex flex-wrap gap-2">
+            <?php if ($canManage): ?>
+              <button type="button" class="btn btn-sm btn-light" data-bs-toggle="modal" data-bs-target="#expenseCreateModal"><i class="bi bi-plus-circle me-1"></i>New Expense</button>
+              <button type="button" class="btn btn-sm btn-outline-light" data-bs-toggle="modal" data-bs-target="#categoryManageModal"><i class="bi bi-tags me-1"></i>Categories</button>
+            <?php endif; ?>
+            <a href="<?= e(url('modules/reports/expenses.php')); ?>" class="btn btn-sm btn-outline-light"><i class="bi bi-graph-up me-1"></i>Expense Reports</a>
+          </div>
+        </div>
+        <div class="card-body">
+          <form method="get" class="row g-2 align-items-end">
+            <div class="col-md-2"><label class="form-label">From</label><input type="date" name="from" value="<?= e($fromDate); ?>" class="form-control" required /></div>
+            <div class="col-md-2"><label class="form-label">To</label><input type="date" name="to" value="<?= e($toDate); ?>" class="form-control" required /></div>
+            <div class="col-md-3">
+              <label class="form-label">Category</label>
+              <select name="category_id" class="form-select">
+                <option value="0">All Categories</option>
+                <?php foreach ($allCategories as $category): ?>
+                  <option value="<?= (int) $category['id']; ?>" <?= (int) $category['id'] === $selectedCategoryId ? 'selected' : ''; ?>><?= e((string) $category['category_name']); ?></option>
+                <?php endforeach; ?>
+              </select>
+            </div>
+            <div class="col-md-2">
+              <label class="form-label">Entry Type</label>
+              <select name="entry_type" class="form-select">
+                <option value="" <?= $entryTypeFilter === '' ? 'selected' : ''; ?>>All</option>
+                <option value="EXPENSE" <?= $entryTypeFilter === 'EXPENSE' ? 'selected' : ''; ?>>Expense</option>
+                <option value="REVERSAL" <?= $entryTypeFilter === 'REVERSAL' ? 'selected' : ''; ?>>Reversal</option>
+              </select>
+            </div>
+            <div class="col-md-3"><label class="form-label">Search</label><input type="text" name="q" class="form-control" placeholder="Paid to / notes / source" value="<?= e($searchTerm); ?>" /></div>
+            <div class="col-12 d-flex gap-2">
+              <button type="submit" class="btn btn-primary">Apply</button>
+              <a href="<?= e(url('modules/expenses/index.php')); ?>" class="btn btn-outline-secondary">Reset</a>
+            </div>
+          </form>
+        </div>
+      </div>
+      <div class="row">
                 <div class="col-md-4">
-                    <div class="card card-outline card-success">
-                        <div class="card-header"><h3 class="card-title">Record Expense</h3></div>
+                    <div class="card card-outline card-primary mb-3">
+                        <div class="card-header"><h3 class="card-title">Financial Safety Rules</h3></div>
                         <div class="card-body">
-                            <?php if ($canManage): ?>
-                            <form method="post" class="ajax-form">
-                                <?= csrf_field(); ?>
-                                <input type="hidden" name="_action" value="record_expense" />
-                                <div class="form-group">
-                                    <label>Category</label>
-                                    <select name="category_id" class="form-control form-control-sm" required>
-                                        <option value="">Select category</option>
-                                        <?php foreach ($categories as $category): ?>
-                                            <option value="<?= (int) $category['id'] ?>"><?= e($category['category_name']) ?></option>
-                                        <?php endforeach; ?>
-                                    </select>
-                                </div>
-                                <div class="form-row">
-                                    <div class="form-group col-md-6">
-                                        <label>Amount</label>
-                                        <input type="number" step="0.01" name="amount" class="form-control form-control-sm" required />
-                                    </div>
-                                    <div class="form-group col-md-6">
-                                        <label>Date</label>
-                                        <input type="date" name="expense_date" value="<?= e($today) ?>" class="form-control form-control-sm" />
-                                    </div>
-                                </div>
-                                <div class="form-row">
-                                    <div class="form-group col-md-6">
-                                        <label>Payment Mode</label>
-                                        <select name="payment_mode" class="form-control form-control-sm">
-                                            <?php foreach (finance_payment_modes() as $mode): ?>
-                                                <option value="<?= e($mode) ?>"><?= e($mode) ?></option>
-                                            <?php endforeach; ?>
-                                        </select>
-                                    </div>
-                                    <div class="form-group col-md-6">
-                                        <label>Paid To</label>
-                                        <input type="text" name="paid_to" class="form-control form-control-sm" />
-                                    </div>
-                                </div>
-                                <div class="form-group">
-                                    <label>Notes</label>
-                                    <textarea name="notes" class="form-control form-control-sm" rows="2" placeholder="What is this expense for?"></textarea>
-                                </div>
-                                <button class="btn btn-sm btn-success" type="submit">Save Expense</button>
-                            </form>
-                            <?php else: ?>
-                                <p class="text-muted mb-0">You have view-only access.</p>
-                            <?php endif; ?>
+                            <ul class="mb-0 ps-3">
+                                <li>Direct deletion is disabled for expenses.</li>
+                                <li>Manual entries can be edited before reversal only.</li>
+                                <li>Payroll, Purchase, and Outsource linked entries must be reversed from source modules.</li>
+                                <li>Every edit and reversal is audit logged.</li>
+                            </ul>
                         </div>
                     </div>
-
-                    <div class="card card-outline card-primary">
-                        <div class="card-header"><h3 class="card-title">Categories</h3></div>
-                        <div class="card-body">
-                            <?php if ($canManage): ?>
-                            <form method="post" class="ajax-form mb-2">
-                                <?= csrf_field(); ?>
-                                <input type="hidden" name="_action" value="save_category" />
-                                <div class="input-group input-group-sm">
-                                    <input type="text" name="category_name" class="form-control" placeholder="New category" required />
-                                    <div class="input-group-append">
-                                        <button class="btn btn-primary" type="submit">Add</button>
-                                    </div>
-                                </div>
-                            </form>
-                            <?php endif; ?>
-                            <ul class="list-group list-group-sm">
-                                <?php foreach ($categories as $category): ?>
-                                    <li class="list-group-item">
-                                        <div class="d-flex justify-content-between align-items-center mb-1">
-                                            <strong><?= e($category['category_name']) ?></strong>
-                                            <span class="badge badge-light">Garage</span>
-                                        </div>
-                                        <?php if ($canManage): ?>
-                                        <form method="post" class="ajax-form d-flex flex-wrap align-items-center mb-1" style="gap: 6px;">
-                                            <?= csrf_field(); ?>
-                                            <input type="hidden" name="_action" value="update_category" />
-                                            <input type="hidden" name="category_id" value="<?= (int) $category['id'] ?>" />
-                                            <input type="text" name="category_name" value="<?= e($category['category_name']) ?>" class="form-control form-control-sm" style="max-width: 160px;" />
-                                            <select name="status_code" class="form-control form-control-sm" style="max-width: 120px;">
-                                                <option value="ACTIVE" <?= $category['status_code'] === 'ACTIVE' ? 'selected' : '' ?>>Active</option>
-                                                <option value="INACTIVE" <?= $category['status_code'] === 'INACTIVE' ? 'selected' : '' ?>>Inactive</option>
-                                            </select>
-                                            <button class="btn btn-xs btn-outline-primary" type="submit">Update</button>
-                                        </form>
-                                        <form method="post" class="ajax-form" onsubmit="return confirm('Delete this category?');">
-                                            <?= csrf_field(); ?>
-                                            <input type="hidden" name="_action" value="delete_category" />
-                                            <input type="hidden" name="category_id" value="<?= (int) $category['id'] ?>" />
-                                            <button class="btn btn-xs btn-outline-danger" type="submit">Delete</button>
-                                        </form>
-                                        <?php endif; ?>
-                                    </li>
-                                <?php endforeach; ?>
-                            </ul>
+                    <div class="card card-outline card-secondary">
+                        <div class="card-header"><h3 class="card-title">Active Categories</h3></div>
+                        <div class="card-body p-0 table-responsive">
+                            <table class="table table-sm table-striped mb-0">
+                                <thead><tr><th>Category</th><th>Status</th></tr></thead>
+                                <tbody>
+                                    <?php if (empty($allCategories)): ?>
+                                      <tr><td colspan="2" class="text-center text-muted py-3">No categories configured.</td></tr>
+                                    <?php else: foreach ($allCategories as $category): ?>
+                                      <tr>
+                                        <td><?= e((string) $category['category_name']) ?></td>
+                                        <td><span class="badge text-bg-<?= e(status_badge_class((string) $category['status_code'])) ?>"><?= e((string) $category['status_code']) ?></span></td>
+                                      </tr>
+                                    <?php endforeach; endif; ?>
+                                </tbody>
+                            </table>
                         </div>
                     </div>
                 </div>
 
                 <div class="col-md-8">
                     <div class="card card-outline card-info">
-                        <div class="card-header"><h3 class="card-title">Recent Expenses</h3></div>
-                        <div class="card-body table-responsive">
-                            <table class="table table-sm table-striped">
+                        <div class="card-header"><h3 class="card-title">Expense Ledger</h3></div>
+                        <div class="card-body table-responsive p-0">
+                            <table class="table table-sm table-striped mb-0">
                                 <thead>
                                   <tr>
                                     <th>Date</th>
                                     <th>Category</th>
+                                    <th>Source</th>
+                                    <th>Entry</th>
                                     <th>Amount</th>
                                     <th>Mode</th>
                                     <th>Paid To</th>
                                     <th>Notes</th>
-                                    <th>Status</th>
-                                    <th style="min-width: 260px;">Manage</th>
+                                    <th>Actions</th>
                                   </tr>
                                 </thead>
                                 <tbody>
-                                    <?php foreach ($expenses as $expense): ?>
-                                        <?php $entryType = (string) ($expense['entry_type'] ?? ''); ?>
+                                    <?php if (empty($expenses)): ?>
+                                      <tr><td colspan="9" class="text-center text-muted py-4">No expense entries found for selected filters.</td></tr>
+                                    <?php else: foreach ($expenses as $expense): ?>
+                                        <?php
+                                          $entryType = (string) ($expense['entry_type'] ?? '');
+                                          $expenseId = (int) ($expense['id'] ?? 0);
+                                          $sourceLabel = expense_source_label((string) ($expense['source_type'] ?? ''));
+                                          $isExpenseEntry = $entryType === 'EXPENSE';
+                                          $isReversed = isset($reversedExpenseIds[$expenseId]);
+                                          $isEditable = expense_editable_entry($expense) && !$isReversed;
+                                          $canReverse = $isEditable;
+                                          $actionHint = '';
+                                          if (!$isEditable) {
+                                            $actionHint = $isReversed ? 'Already reversed' : 'Use source module reversal';
+                                          }
+                                        ?>
                                         <tr>
-                                            <td><?= e($expense['expense_date']) ?></td>
-                                            <td><?= e($expense['category_name'] ?? 'Uncategorized') ?></td>
-                                            <td><?= format_currency((float) $expense['amount']) ?></td>
-                                            <td><?= e($expense['payment_mode']) ?></td>
-                                            <td><?= e($expense['paid_to'] ?? '') ?></td>
-                                            <td><?= e($expense['notes'] ?? '') ?></td>
+                                            <td><?= e((string) ($expense['expense_date'] ?? '')) ?></td>
+                                            <td><?= e((string) ($expense['category_name'] ?? 'Uncategorized')) ?></td>
+                                            <td><span class="badge text-bg-light border"><?= e($sourceLabel) ?></span></td>
                                             <td>
                                               <?php if ($entryType === 'EXPENSE'): ?>
-                                                <span class="badge badge-success">Expense</span>
+                                                <span class="badge text-bg-success">Expense</span>
                                               <?php elseif ($entryType === 'REVERSAL'): ?>
-                                                <span class="badge badge-secondary">Reversal</span>
+                                                <span class="badge text-bg-secondary">Reversal</span>
                                               <?php else: ?>
-                                                <span class="badge badge-dark"><?= e($entryType) ?></span>
+                                                <span class="badge text-bg-dark"><?= e($entryType) ?></span>
                                               <?php endif; ?>
                                             </td>
-                                            <td>
-                                                <?php if ($canManage && $entryType === 'EXPENSE'): ?>
-                                                <form method="post" class="ajax-form d-flex flex-wrap align-items-center mb-1" style="gap: 6px;">
-                                                    <?= csrf_field(); ?>
-                                                    <input type="hidden" name="_action" value="update_expense" />
-                                                    <input type="hidden" name="expense_id" value="<?= (int) $expense['id'] ?>" />
-                                                    <select name="category_id" class="form-control form-control-sm" style="max-width: 150px;">
-                                                        <option value="">Category</option>
-                                                        <?php foreach ($categories as $category): ?>
-                                                            <option value="<?= (int) $category['id'] ?>" <?= (int) $expense['category_id'] === (int) $category['id'] ? 'selected' : '' ?>><?= e($category['category_name']) ?></option>
-                                                        <?php endforeach; ?>
-                                                    </select>
-                                                    <input type="number" step="0.01" name="amount" value="<?= e($expense['amount']) ?>" class="form-control form-control-sm" style="max-width: 110px;" />
-                                                    <input type="date" name="expense_date" value="<?= e($expense['expense_date']) ?>" class="form-control form-control-sm" style="max-width: 140px;" />
-                                                    <select name="payment_mode" class="form-control form-control-sm" style="max-width: 130px;">
-                                                        <?php foreach (finance_payment_modes() as $mode): ?>
-                                                            <option value="<?= e($mode) ?>" <?= $expense['payment_mode'] === $mode ? 'selected' : '' ?>><?= e($mode) ?></option>
-                                                        <?php endforeach; ?>
-                                                    </select>
-                                                    <input type="text" name="paid_to" value="<?= e($expense['paid_to'] ?? '') ?>" class="form-control form-control-sm" placeholder="Paid to" style="max-width: 140px;" />
-                                                    <input type="text" name="notes" value="<?= e($expense['notes'] ?? '') ?>" class="form-control form-control-sm" placeholder="Notes" style="min-width: 160px;" />
-                                                    <button class="btn btn-xs btn-outline-primary" type="submit">Update</button>
-                                                </form>
-                                                <div class="d-flex flex-wrap" style="gap: 6px;">
-                                                  <form method="post" class="ajax-form d-inline">
-                                                      <?= csrf_field(); ?>
-                                                      <input type="hidden" name="_action" value="reverse_expense" />
-                                                      <input type="hidden" name="expense_id" value="<?= (int) $expense['id'] ?>" />
-                                                      <input type="hidden" name="reverse_reason" value="Reversed via expense screen" />
-                                                      <button class="btn btn-xs btn-outline-secondary" type="submit">Reverse</button>
-                                                  </form>
-                                                  <form method="post" class="ajax-form d-inline" onsubmit="return confirm('Delete this expense?');">
-                                                      <?= csrf_field(); ?>
-                                                      <input type="hidden" name="_action" value="delete_expense" />
-                                                      <input type="hidden" name="expense_id" value="<?= (int) $expense['id'] ?>" />
-                                                      <button class="btn btn-xs btn-outline-danger" type="submit">Delete</button>
-                                                  </form>
+                                            <td><?= e(format_currency((float) ($expense['amount'] ?? 0))) ?></td>
+                                            <td><?= e((string) ($expense['payment_mode'] ?? '')) ?></td>
+                                            <td><?= e((string) ($expense['paid_to'] ?? '')) ?></td>
+                                            <td><?= e((string) ($expense['notes'] ?? '')) ?></td>
+                                            <td class="text-nowrap">
+                                              <?php if ($canManage && $isExpenseEntry): ?>
+                                                <div class="dropdown">
+                                                  <button class="btn btn-sm btn-outline-secondary dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false">Action</button>
+                                                  <ul class="dropdown-menu dropdown-menu-end">
+                                                    <li>
+                                                      <button
+                                                        type="button"
+                                                        class="dropdown-item js-expense-edit-btn"
+                                                        data-bs-toggle="modal"
+                                                        data-bs-target="#expenseEditModal"
+                                                        data-expense-id="<?= $expenseId ?>"
+                                                        data-category-id="<?= (int) ($expense['category_id'] ?? 0) ?>"
+                                                        data-expense-date="<?= e((string) ($expense['expense_date'] ?? '')) ?>"
+                                                        data-amount="<?= e((string) ($expense['amount'] ?? '0')) ?>"
+                                                        data-payment-mode="<?= e((string) ($expense['payment_mode'] ?? 'CASH')) ?>"
+                                                        data-paid-to="<?= e((string) ($expense['paid_to'] ?? '')) ?>"
+                                                        data-notes="<?= e((string) ($expense['notes'] ?? '')) ?>"
+                                                        <?= $isEditable ? '' : 'disabled'; ?>
+                                                      >Edit Expense</button>
+                                                    </li>
+                                                    <li>
+                                                      <button
+                                                        type="button"
+                                                        class="dropdown-item js-expense-reverse-btn"
+                                                        data-bs-toggle="modal"
+                                                        data-bs-target="#expenseReverseModal"
+                                                        data-expense-id="<?= $expenseId ?>"
+                                                        data-expense-label="<?= e((string) ($expense['expense_date'] ?? '') . ' | ' . (string) ($expense['category_name'] ?? 'Uncategorized') . ' | ' . format_currency((float) ($expense['amount'] ?? 0))) ?>"
+                                                        <?= $canReverse ? '' : 'disabled'; ?>
+                                                      >Reverse Expense</button>
+                                                    </li>
+                                                  </ul>
                                                 </div>
-                                                <?php else: ?>
-                                                  <span class="text-muted small">-</span>
+                                                <?php if ($actionHint !== ''): ?>
+                                                  <div><small class="text-muted"><?= e($actionHint) ?></small></div>
                                                 <?php endif; ?>
+                                              <?php else: ?>
+                                                <span class="text-muted small">-</span>
+                                              <?php endif; ?>
                                             </td>
                                         </tr>
-                                    <?php endforeach; ?>
+                                    <?php endforeach; endif; ?>
                                 </tbody>
                             </table>
                         </div>
@@ -797,9 +822,9 @@ include __DIR__ . '/../../includes/sidebar.php';
                         <div class="card-header"><h3 class="card-title">Revenue vs Expense</h3></div>
                         <div class="card-body">
                             <div class="row">
-                                <div class="col-md-4"><strong>Revenue:</strong> <?= format_currency($revenueTotal) ?></div>
-                                <div class="col-md-4"><strong>Expenses:</strong> <?= format_currency($expenseTotal) ?></div>
-                                <div class="col-md-4"><strong>Net:</strong> <?= format_currency($revenueTotal - $expenseTotal) ?></div>
+                                <div class="col-md-4"><strong>Finalized Revenue:</strong> <?= e(format_currency($revenueTotal)) ?></div>
+                                <div class="col-md-4"><strong>Net Expense:</strong> <?= e(format_currency($expenseTotal)) ?></div>
+                                <div class="col-md-4"><strong>Net Margin:</strong> <?= e(format_currency($revenueTotal - $expenseTotal)) ?></div>
                             </div>
                             <?php if ($revenueTotal === 0.0 && table_columns('invoices') === []): ?>
                                 <p class="text-muted mb-0">Revenue data not available because invoices table is missing.</p>
@@ -808,7 +833,244 @@ include __DIR__ . '/../../includes/sidebar.php';
                     </div>
                 </div>
             </div>
+      </div>
+    </div>
+  </div>
+</main>
+
+<?php if ($canManage): ?>
+  <div class="modal fade" id="expenseCreateModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title">Record Expense</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
         </div>
-    </section>
-</div>
+        <form method="post" class="ajax-form">
+          <div class="modal-body">
+            <?= csrf_field(); ?>
+            <input type="hidden" name="_action" value="record_expense" />
+            <div class="mb-2">
+              <label class="form-label">Category</label>
+              <select name="category_id" class="form-select" required>
+                <option value="">Select category</option>
+                <?php foreach ($categories as $category): ?>
+                  <option value="<?= (int) $category['id'] ?>"><?= e((string) $category['category_name']) ?></option>
+                <?php endforeach; ?>
+              </select>
+            </div>
+            <div class="row g-2">
+              <div class="col-md-6">
+                <label class="form-label">Amount</label>
+                <input type="number" step="0.01" min="0.01" name="amount" class="form-control" required />
+              </div>
+              <div class="col-md-6">
+                <label class="form-label">Date</label>
+                <input type="date" name="expense_date" value="<?= e($today) ?>" class="form-control" required />
+              </div>
+            </div>
+            <div class="row g-2 mt-1">
+              <div class="col-md-6">
+                <label class="form-label">Payment Mode</label>
+                <select name="payment_mode" class="form-select">
+                  <?php foreach (finance_payment_modes() as $mode): ?>
+                    <option value="<?= e($mode) ?>"><?= e($mode) ?></option>
+                  <?php endforeach; ?>
+                </select>
+              </div>
+              <div class="col-md-6">
+                <label class="form-label">Paid To</label>
+                <input type="text" name="paid_to" class="form-control" maxlength="120" />
+              </div>
+            </div>
+            <div class="mt-2">
+              <label class="form-label">Notes</label>
+              <textarea name="notes" class="form-control" rows="2" maxlength="255"></textarea>
+            </div>
+          </div>
+          <div class="modal-footer">
+            <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Close</button>
+            <button type="submit" class="btn btn-primary">Save Expense</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal fade" id="expenseEditModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title">Edit Expense</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+        </div>
+        <form method="post" class="ajax-form">
+          <div class="modal-body">
+            <?= csrf_field(); ?>
+            <input type="hidden" name="_action" value="update_expense" />
+            <input type="hidden" name="expense_id" id="expense-edit-id" />
+            <div class="mb-2">
+              <label class="form-label">Category</label>
+              <select name="category_id" id="expense-edit-category" class="form-select" required>
+                <option value="">Select category</option>
+                <?php foreach ($categories as $category): ?>
+                  <option value="<?= (int) $category['id'] ?>"><?= e((string) $category['category_name']) ?></option>
+                <?php endforeach; ?>
+              </select>
+            </div>
+            <div class="row g-2">
+              <div class="col-md-6">
+                <label class="form-label">Amount</label>
+                <input type="number" step="0.01" min="0.01" name="amount" id="expense-edit-amount" class="form-control" required />
+              </div>
+              <div class="col-md-6">
+                <label class="form-label">Date</label>
+                <input type="date" name="expense_date" id="expense-edit-date" class="form-control" required />
+              </div>
+            </div>
+            <div class="row g-2 mt-1">
+              <div class="col-md-6">
+                <label class="form-label">Payment Mode</label>
+                <select name="payment_mode" id="expense-edit-mode" class="form-select">
+                  <?php foreach (finance_payment_modes() as $mode): ?>
+                    <option value="<?= e($mode) ?>"><?= e($mode) ?></option>
+                  <?php endforeach; ?>
+                </select>
+              </div>
+              <div class="col-md-6">
+                <label class="form-label">Paid To</label>
+                <input type="text" name="paid_to" id="expense-edit-paid-to" class="form-control" maxlength="120" />
+              </div>
+            </div>
+            <div class="mt-2">
+              <label class="form-label">Notes</label>
+              <textarea name="notes" id="expense-edit-notes" class="form-control" rows="2" maxlength="255"></textarea>
+            </div>
+            <small class="text-muted">Only manual entries can be edited. Linked entries must be reversed from source modules.</small>
+          </div>
+          <div class="modal-footer">
+            <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Close</button>
+            <button type="submit" class="btn btn-primary">Save Changes</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal fade" id="expenseReverseModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title">Reverse Expense</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+        </div>
+        <form method="post" class="ajax-form">
+          <div class="modal-body">
+            <?= csrf_field(); ?>
+            <input type="hidden" name="_action" value="reverse_expense" />
+            <input type="hidden" name="expense_id" id="expense-reverse-id" />
+            <div class="mb-2">
+              <label class="form-label">Expense</label>
+              <input type="text" class="form-control" id="expense-reverse-label" readonly />
+            </div>
+            <div class="mb-2">
+              <label class="form-label">Reversal Reason</label>
+              <input type="text" name="reverse_reason" class="form-control" maxlength="255" required />
+            </div>
+          </div>
+          <div class="modal-footer">
+            <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Close</button>
+            <button type="submit" class="btn btn-danger">Confirm Reversal</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal fade" id="categoryManageModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-lg">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title">Expense Categories</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+        </div>
+        <div class="modal-body">
+          <form method="post" class="ajax-form mb-3">
+            <?= csrf_field(); ?>
+            <input type="hidden" name="_action" value="save_category" />
+            <div class="input-group">
+              <input type="text" name="category_name" class="form-control" placeholder="New category name" required />
+              <button class="btn btn-primary" type="submit">Add Category</button>
+            </div>
+          </form>
+          <div class="table-responsive">
+            <table class="table table-sm table-striped mb-0">
+              <thead><tr><th>Category</th><th>Status</th><th>Actions</th></tr></thead>
+              <tbody>
+                <?php if (empty($allCategories)): ?>
+                  <tr><td colspan="3" class="text-center text-muted py-3">No categories configured.</td></tr>
+                <?php else: foreach ($allCategories as $category): ?>
+                  <tr>
+                    <td><?= e((string) $category['category_name']) ?></td>
+                    <td><span class="badge text-bg-<?= e(status_badge_class((string) $category['status_code'])) ?>"><?= e((string) $category['status_code']) ?></span></td>
+                    <td>
+                      <form method="post" class="ajax-form d-flex flex-wrap gap-1 align-items-center">
+                        <?= csrf_field(); ?>
+                        <input type="hidden" name="_action" value="update_category" />
+                        <input type="hidden" name="category_id" value="<?= (int) $category['id'] ?>" />
+                        <input type="text" name="category_name" value="<?= e((string) $category['category_name']) ?>" class="form-control form-control-sm" style="max-width: 200px;" required />
+                        <select name="status_code" class="form-select form-select-sm" style="max-width: 130px;">
+                          <option value="ACTIVE" <?= (string) $category['status_code'] === 'ACTIVE' ? 'selected' : ''; ?>>Active</option>
+                          <option value="INACTIVE" <?= (string) $category['status_code'] === 'INACTIVE' ? 'selected' : ''; ?>>Inactive</option>
+                        </select>
+                        <button type="submit" class="btn btn-sm btn-outline-primary">Update</button>
+                      </form>
+                      <form method="post" class="ajax-form mt-1" data-confirm="Inactivate this category?">
+                        <?= csrf_field(); ?>
+                        <input type="hidden" name="_action" value="delete_category" />
+                        <input type="hidden" name="category_id" value="<?= (int) $category['id'] ?>" />
+                        <button class="btn btn-sm btn-outline-danger" type="submit">Inactivate</button>
+                      </form>
+                    </td>
+                  </tr>
+                <?php endforeach; endif; ?>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+<?php endif; ?>
+
+<script>
+  (function () {
+    function setValue(id, value) {
+      var field = document.getElementById(id);
+      if (field) {
+        field.value = value || '';
+      }
+    }
+
+    document.addEventListener('click', function (event) {
+      var editTrigger = event.target.closest('.js-expense-edit-btn');
+      if (editTrigger && !editTrigger.disabled) {
+        setValue('expense-edit-id', editTrigger.getAttribute('data-expense-id'));
+        setValue('expense-edit-category', editTrigger.getAttribute('data-category-id'));
+        setValue('expense-edit-date', editTrigger.getAttribute('data-expense-date'));
+        setValue('expense-edit-amount', editTrigger.getAttribute('data-amount'));
+        setValue('expense-edit-mode', editTrigger.getAttribute('data-payment-mode'));
+        setValue('expense-edit-paid-to', editTrigger.getAttribute('data-paid-to'));
+        setValue('expense-edit-notes', editTrigger.getAttribute('data-notes'));
+      }
+
+      var reverseTrigger = event.target.closest('.js-expense-reverse-btn');
+      if (reverseTrigger && !reverseTrigger.disabled) {
+        setValue('expense-reverse-id', reverseTrigger.getAttribute('data-expense-id'));
+        setValue('expense-reverse-label', reverseTrigger.getAttribute('data-expense-label'));
+      }
+    });
+  })();
+</script>
+
 <?php include __DIR__ . '/../../includes/footer.php'; ?>

@@ -204,6 +204,17 @@ function payroll_sync_sheet_lock_state(PDO $pdo, int $sheetId, ?int $userId): bo
     return $isSettled;
 }
 
+function payroll_item_is_fully_paid(array $item): bool
+{
+    $netPayable = round((float) ($item['net_payable'] ?? 0), 2);
+    $paidAmount = round((float) ($item['paid_amount'] ?? 0), 2);
+    if ($netPayable <= 0.009) {
+        return true;
+    }
+
+    return $paidAmount + 0.009 >= $netPayable;
+}
+
 function payroll_apply_advance_deduction(PDO $pdo, int $userId, int $companyId, int $garageId, float $applyAmount): float
 {
     $remaining = max(0, round($applyAmount, 2));
@@ -331,10 +342,29 @@ function payroll_apply_loan_deduction(PDO $pdo, int $userId, int $companyId, int
     return round($applied, 2);
 }
 
+function payroll_master_form_return_path(): string
+{
+    $returnTo = trim((string) ($_POST['return_to'] ?? ''));
+    if ($returnTo === '') {
+        return 'modules/payroll/index.php';
+    }
+
+    if (preg_match('/^modules\/payroll\/(index|master_forms)\.php(?:\?.*)?$/', $returnTo) === 1) {
+        return $returnTo;
+    }
+
+    return 'modules/payroll/index.php';
+}
+
 $salaryMonth = trim((string) ($_GET['salary_month'] ?? date('Y-m')));
 if (!payroll_valid_month($salaryMonth)) {
     $salaryMonth = date('Y-m');
 }
+$itemStatusFilter = strtoupper(trim((string) ($_GET['item_status'] ?? '')));
+if (!in_array($itemStatusFilter, ['', 'PENDING', 'PARTIAL', 'PAID', 'LOCKED'], true)) {
+    $itemStatusFilter = '';
+}
+$staffSearch = trim((string) ($_GET['staff_q'] ?? ''));
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     require_csrf();
@@ -344,6 +374,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 
     $action = (string) ($_POST['_action'] ?? '');
+    $masterFormReturn = payroll_master_form_return_path();
 
     if ($action === 'save_structure') {
         $userId = post_int('user_id');
@@ -358,7 +389,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         if ($userId <= 0 || $baseAmount < 0) {
             flash_set('payroll_error', 'Select staff and enter base amount.', 'danger');
-            redirect('modules/payroll/index.php');
+            redirect($masterFormReturn);
         }
         if (!in_array($salaryType, ['MONTHLY', 'PER_DAY', 'PER_JOB'], true)) {
             $salaryType = 'MONTHLY';
@@ -367,7 +398,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $pdo = db();
         if (!payroll_staff_in_scope($pdo, $userId, $companyId, $garageId)) {
             flash_set('payroll_error', 'Selected staff is outside current garage scope.', 'danger');
-            redirect('modules/payroll/index.php');
+            redirect($masterFormReturn);
         }
 
         $existingStmt = $pdo->prepare(
@@ -448,14 +479,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             flash_set('payroll_success', 'Salary structure saved.', 'success');
         }
 
-        redirect('modules/payroll/index.php');
+        redirect($masterFormReturn);
     }
 
   if ($action === 'delete_structure') {
     $structureId = post_int('structure_id');
     if ($structureId <= 0) {
       flash_set('payroll_error', 'Invalid salary structure.', 'danger');
-      redirect('modules/payroll/index.php');
+      redirect($masterFormReturn);
     }
 
     $stmt = db()->prepare(
@@ -477,7 +508,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
       'garage_id' => $garageId,
     ]);
     flash_set('payroll_success', 'Salary structure removed.', 'success');
-    redirect('modules/payroll/index.php');
+    redirect($masterFormReturn);
   }
 
     if ($action === 'record_advance') {
@@ -488,13 +519,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         if ($userId <= 0 || $amount <= 0 || !preg_match('/^\d{4}-\d{2}-\d{2}$/', $advanceDate)) {
             flash_set('payroll_error', 'Valid staff, amount, and date are required for advance.', 'danger');
-            redirect('modules/payroll/index.php');
+            redirect($masterFormReturn);
         }
 
         $pdo = db();
         if (!payroll_staff_in_scope($pdo, $userId, $companyId, $garageId)) {
             flash_set('payroll_error', 'Selected staff is outside current garage scope.', 'danger');
-            redirect('modules/payroll/index.php');
+            redirect($masterFormReturn);
         }
 
         $insertStmt = $pdo->prepare(
@@ -523,7 +554,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             ],
         ]);
         flash_set('payroll_success', 'Advance recorded.', 'success');
-        redirect('modules/payroll/index.php');
+        redirect($masterFormReturn);
     }
 
       if ($action === 'update_advance') {
@@ -534,7 +565,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         if ($advanceId <= 0 || $amount <= 0 || !preg_match('/^\d{4}-\d{2}-\d{2}$/', $advanceDate)) {
           flash_set('payroll_error', 'Valid advance, amount, and date are required.', 'danger');
-          redirect('modules/payroll/index.php');
+          redirect($masterFormReturn);
         }
 
         $pdo = db();
@@ -597,14 +628,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
           flash_set('payroll_error', $exception->getMessage(), 'danger');
         }
 
-        redirect('modules/payroll/index.php');
+        redirect($masterFormReturn);
       }
 
       if ($action === 'delete_advance') {
         $advanceId = post_int('advance_id');
         if ($advanceId <= 0) {
           flash_set('payroll_error', 'Invalid advance selected.', 'danger');
-          redirect('modules/payroll/index.php');
+          redirect($masterFormReturn);
         }
 
         $pdo = db();
@@ -643,7 +674,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
           flash_set('payroll_error', $exception->getMessage(), 'danger');
         }
 
-        redirect('modules/payroll/index.php');
+        redirect($masterFormReturn);
       }
 
     if ($action === 'record_loan') {
@@ -655,13 +686,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         if ($userId <= 0 || $totalAmount <= 0 || !preg_match('/^\d{4}-\d{2}-\d{2}$/', $loanDate)) {
             flash_set('payroll_error', 'Valid staff, date, and loan amount are required.', 'danger');
-            redirect('modules/payroll/index.php');
+            redirect($masterFormReturn);
         }
 
         $pdo = db();
         if (!payroll_staff_in_scope($pdo, $userId, $companyId, $garageId)) {
             flash_set('payroll_error', 'Selected staff is outside current garage scope.', 'danger');
-            redirect('modules/payroll/index.php');
+            redirect($masterFormReturn);
         }
 
         $insertStmt = $pdo->prepare(
@@ -692,7 +723,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             ],
         ]);
         flash_set('payroll_success', 'Loan recorded for staff.', 'success');
-        redirect('modules/payroll/index.php');
+        redirect($masterFormReturn);
     }
 
       if ($action === 'update_loan') {
@@ -704,7 +735,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         if ($loanId <= 0 || $totalAmount <= 0 || !preg_match('/^\d{4}-\d{2}-\d{2}$/', $loanDate)) {
           flash_set('payroll_error', 'Valid loan, date, and amount are required.', 'danger');
-          redirect('modules/payroll/index.php');
+          redirect($masterFormReturn);
         }
 
         $pdo = db();
@@ -771,14 +802,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
           flash_set('payroll_error', $exception->getMessage(), 'danger');
         }
 
-        redirect('modules/payroll/index.php');
+        redirect($masterFormReturn);
       }
 
       if ($action === 'delete_loan') {
         $loanId = post_int('loan_id');
         if ($loanId <= 0) {
           flash_set('payroll_error', 'Invalid loan selected.', 'danger');
-          redirect('modules/payroll/index.php');
+          redirect($masterFormReturn);
         }
 
         $pdo = db();
@@ -815,7 +846,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
           flash_set('payroll_error', $exception->getMessage(), 'danger');
         }
 
-        redirect('modules/payroll/index.php');
+        redirect($masterFormReturn);
       }
 
     if ($action === 'loan_manual_payment') {
@@ -825,7 +856,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $notes = post_string('notes', 255);
         if ($loanId <= 0 || $amount <= 0 || !preg_match('/^\d{4}-\d{2}-\d{2}$/', $paymentDate)) {
             flash_set('payroll_error', 'Valid loan, amount, and date are required.', 'danger');
-            redirect('modules/payroll/index.php');
+            redirect($masterFormReturn);
         }
 
         $pdo = db();
@@ -897,7 +928,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             flash_set('payroll_error', $exception->getMessage(), 'danger');
         }
 
-        redirect('modules/payroll/index.php');
+        redirect($masterFormReturn);
     }
 
     if ($action === 'reverse_loan_payment') {
@@ -905,7 +936,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $reverseReason = post_string('reverse_reason', 255);
         if ($paymentId <= 0 || $reverseReason === '') {
             flash_set('payroll_error', 'Payment and reversal reason are required.', 'danger');
-            redirect('modules/payroll/index.php');
+            redirect($masterFormReturn);
         }
 
         $pdo = db();
@@ -1009,7 +1040,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             flash_set('payroll_error', $exception->getMessage(), 'danger');
         }
 
-        redirect('modules/payroll/index.php');
+        redirect($masterFormReturn);
     }
 
     if ($action === 'generate_sheet') {
@@ -1198,7 +1229,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         $pdo = db();
         $itemStmt = $pdo->prepare(
-            'SELECT psi.id, psi.sheet_id, pss.status
+            'SELECT psi.id, psi.sheet_id, psi.paid_amount, psi.net_payable, pss.status
              FROM payroll_salary_items psi
              INNER JOIN payroll_salary_sheets pss ON pss.id = psi.sheet_id
              WHERE psi.id = :id AND pss.company_id = :company_id AND pss.garage_id = :garage_id'
@@ -1215,6 +1246,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
         if ((string) ($item['status'] ?? '') === 'LOCKED') {
             flash_set('payroll_error', 'Locked sheet cannot be edited.', 'danger');
+            redirect('modules/payroll/index.php?salary_month=' . urlencode($salaryMonth));
+        }
+
+        $paidAmount = round((float) ($item['paid_amount'] ?? 0), 2);
+        if (payroll_item_is_fully_paid($item)) {
+            flash_set('payroll_error', 'Fully settled salary rows cannot be edited.', 'danger');
+            redirect('modules/payroll/index.php?salary_month=' . urlencode($salaryMonth));
+        }
+        if ($paidAmount > 0.009) {
+            flash_set('payroll_error', 'Partial salary payment exists. Reverse payments before editing salary amounts.', 'danger');
             redirect('modules/payroll/index.php?salary_month=' . urlencode($salaryMonth));
         }
 
@@ -1260,6 +1301,127 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             ],
         ]);
         flash_set('payroll_success', 'Salary row updated.', 'success');
+        redirect('modules/payroll/index.php?salary_month=' . urlencode($salaryMonth));
+    }
+
+    if ($action === 'reverse_salary_entry') {
+        $itemId = post_int('item_id');
+        $reverseReason = post_string('reverse_reason', 255);
+        if ($itemId <= 0 || $reverseReason === '') {
+            flash_set('payroll_error', 'Salary row and reversal reason are required.', 'danger');
+            redirect('modules/payroll/index.php?salary_month=' . urlencode($salaryMonth));
+        }
+
+        $pdo = db();
+        $pdo->beginTransaction();
+        try {
+            $itemStmt = $pdo->prepare(
+                'SELECT psi.*, pss.id AS sheet_id, pss.status AS sheet_status
+                 FROM payroll_salary_items psi
+                 INNER JOIN payroll_salary_sheets pss ON pss.id = psi.sheet_id
+                 WHERE psi.id = :id
+                   AND pss.company_id = :company_id
+                   AND pss.garage_id = :garage_id
+                 LIMIT 1
+                 FOR UPDATE'
+            );
+            $itemStmt->execute([
+                'id' => $itemId,
+                'company_id' => $companyId,
+                'garage_id' => $garageId,
+            ]);
+            $item = $itemStmt->fetch();
+            if (!$item) {
+                throw new RuntimeException('Salary row not found.');
+            }
+
+            if ((string) ($item['sheet_status'] ?? '') === 'LOCKED') {
+                throw new RuntimeException('Unlock by reversing payments before reversing this salary row.');
+            }
+
+            if (payroll_item_is_fully_paid($item)) {
+                throw new RuntimeException('Fully settled salary rows cannot be reversed directly.');
+            }
+
+            if (round((float) ($item['paid_amount'] ?? 0), 2) > 0.009) {
+                throw new RuntimeException('Reverse salary payments before reversing salary entry.');
+            }
+
+            if ((int) ($item['deductions_applied'] ?? 0) === 1) {
+                throw new RuntimeException('This row has applied deductions. Reverse linked deductions first.');
+            }
+
+            $activePaymentStmt = $pdo->prepare(
+                'SELECT COUNT(*)
+                 FROM payroll_salary_payments p
+                 LEFT JOIN payroll_salary_payments r ON r.reversed_payment_id = p.id
+                 WHERE p.salary_item_id = :salary_item_id
+                   AND p.entry_type = "PAYMENT"
+                   AND p.amount > 0
+                   AND r.id IS NULL'
+            );
+            $activePaymentStmt->execute(['salary_item_id' => $itemId]);
+            if ((int) ($activePaymentStmt->fetchColumn() ?? 0) > 0) {
+                throw new RuntimeException('Open payment history exists. Reverse those payments first.');
+            }
+
+            $existingNotes = trim((string) ($item['notes'] ?? ''));
+            $newNotes = 'Reversed salary entry: ' . $reverseReason;
+            if ($existingNotes !== '') {
+                $newNotes = $existingNotes . ' | ' . $newNotes;
+            }
+
+            $reverseStmt = $pdo->prepare(
+                'UPDATE payroll_salary_items
+                 SET base_amount = 0,
+                     commission_base = 0,
+                     commission_rate = 0,
+                     commission_amount = 0,
+                     overtime_hours = 0,
+                     overtime_rate = NULL,
+                     overtime_amount = 0,
+                     advance_deduction = 0,
+                     loan_deduction = 0,
+                     manual_deduction = 0,
+                     gross_amount = 0,
+                     net_payable = 0,
+                     paid_amount = 0,
+                     deductions_applied = 0,
+                     status = "PAID",
+                     notes = :notes
+                 WHERE id = :id'
+            );
+            $reverseStmt->execute([
+                'notes' => $newNotes,
+                'id' => $itemId,
+            ]);
+
+            $sheetSettled = payroll_sync_sheet_lock_state($pdo, (int) $item['sheet_id'], $_SESSION['user_id'] ?? null);
+            log_audit('payroll', 'salary_entry_reverse', $itemId, 'Reversed salary entry row', [
+                'entity' => 'payroll_salary_item',
+                'company_id' => $companyId,
+                'garage_id' => $garageId,
+                'before' => [
+                    'gross_amount' => (float) ($item['gross_amount'] ?? 0),
+                    'net_payable' => (float) ($item['net_payable'] ?? 0),
+                    'paid_amount' => (float) ($item['paid_amount'] ?? 0),
+                ],
+                'after' => [
+                    'gross_amount' => 0.0,
+                    'net_payable' => 0.0,
+                    'paid_amount' => 0.0,
+                    'reason' => $reverseReason,
+                    'sheet_settled_after_reversal' => $sheetSettled ? 1 : 0,
+                ],
+            ]);
+
+            $pdo->commit();
+            flash_set('payroll_success', 'Salary entry reversed successfully.', 'success');
+        } catch (Throwable $exception) {
+            $pdo->rollBack();
+            flash_set('payroll_error', $exception->getMessage(), 'danger');
+        }
+
         redirect('modules/payroll/index.php?salary_month=' . urlencode($salaryMonth));
     }
 
@@ -1681,14 +1843,25 @@ $currentSheet = $sheetStmt->fetch();
 $salaryItems = [];
 $salaryPayments = [];
 if ($currentSheet) {
+    $itemConditions = ['psi.sheet_id = :sheet_id'];
+    $itemParams = ['sheet_id' => (int) $currentSheet['id']];
+    if ($itemStatusFilter !== '') {
+        $itemConditions[] = 'psi.status = :status_filter';
+        $itemParams['status_filter'] = $itemStatusFilter;
+    }
+    if ($staffSearch !== '') {
+        $itemConditions[] = 'u.name LIKE :staff_search';
+        $itemParams['staff_search'] = '%' . $staffSearch . '%';
+    }
+
     $itemsStmt = db()->prepare(
         'SELECT psi.*, u.name
          FROM payroll_salary_items psi
          INNER JOIN users u ON u.id = psi.user_id
-         WHERE psi.sheet_id = :sheet_id
+         WHERE ' . implode(' AND ', $itemConditions) . '
          ORDER BY u.name ASC'
     );
-    $itemsStmt->execute(['sheet_id' => (int) $currentSheet['id']]);
+    $itemsStmt->execute($itemParams);
     $salaryItems = $itemsStmt->fetchAll();
 
     $paymentsStmt = db()->prepare(
@@ -1711,6 +1884,26 @@ foreach ($salaryPayments as $salaryPaymentRow) {
     }
 }
 
+$visiblePendingCount = 0;
+$visiblePartialCount = 0;
+$visiblePaidCount = 0;
+$visibleOutstanding = 0.0;
+foreach ($salaryItems as $itemRow) {
+    $status = strtoupper((string) ($itemRow['status'] ?? 'PENDING'));
+    $netPayable = round((float) ($itemRow['net_payable'] ?? 0), 2);
+    $paidAmount = round((float) ($itemRow['paid_amount'] ?? 0), 2);
+    $outstanding = max(0.0, round($netPayable - $paidAmount, 2));
+    $visibleOutstanding += $outstanding;
+    if ($status === 'PAID') {
+        $visiblePaidCount++;
+    } elseif ($status === 'PARTIAL') {
+        $visiblePartialCount++;
+    } else {
+        $visiblePendingCount++;
+    }
+}
+$visibleOutstanding = round($visibleOutstanding, 2);
+
 include __DIR__ . '/../../includes/header.php';
 include __DIR__ . '/../../includes/sidebar.php';
 ?>
@@ -1718,14 +1911,13 @@ include __DIR__ . '/../../includes/sidebar.php';
 <main class="app-main">
   <div class="app-content-header">
     <div class="container-fluid">
-      <div class="row align-items-center">
-        <div class="col-sm-6"><h3 class="mb-0">Payroll & Salary</h3></div>
-        <div class="col-sm-6 d-flex justify-content-end">
-          <form class="d-flex gap-2 align-items-center" method="get" action="">
-            <label class="form-label form-label-sm mb-0">Month</label>
-            <input type="month" name="salary_month" value="<?= e($salaryMonth) ?>" class="form-control form-control-sm" style="max-width: 160px;" />
-            <button class="btn btn-sm btn-primary" type="submit">Load</button>
-          </form>
+      <div class="row">
+        <div class="col-sm-6"><h3 class="mb-0">Payroll Module</h3></div>
+        <div class="col-sm-6">
+          <ol class="breadcrumb float-sm-end">
+            <li class="breadcrumb-item"><a href="<?= e(url('dashboard.php')); ?>">Home</a></li>
+            <li class="breadcrumb-item active">Payroll</li>
+          </ol>
         </div>
       </div>
     </div>
@@ -1733,520 +1925,625 @@ include __DIR__ . '/../../includes/sidebar.php';
 
   <div class="app-content">
     <div class="container-fluid">
+      <div class="row g-3 mb-3">
+        <div class="col-md-3">
+          <div class="small-box text-bg-primary">
+            <div class="inner"><h4><?= number_format((int) count($salaryItems)); ?></h4><p>Visible Salary Rows</p></div>
+            <span class="small-box-icon"><i class="bi bi-people"></i></span>
+          </div>
+        </div>
+        <div class="col-md-3">
+          <div class="small-box text-bg-warning">
+            <div class="inner"><h4><?= e(format_currency($visibleOutstanding)); ?></h4><p>Visible Outstanding</p></div>
+            <span class="small-box-icon"><i class="bi bi-hourglass-split"></i></span>
+          </div>
+        </div>
+        <div class="col-md-3">
+          <div class="small-box text-bg-success">
+            <div class="inner"><h4><?= number_format($visiblePaidCount); ?></h4><p>Paid Rows</p></div>
+            <span class="small-box-icon"><i class="bi bi-check2-circle"></i></span>
+          </div>
+        </div>
+        <div class="col-md-3">
+          <div class="small-box text-bg-secondary">
+            <div class="inner"><h4><?= number_format($visiblePendingCount + $visiblePartialCount); ?></h4><p>Pending + Partial</p></div>
+            <span class="small-box-icon"><i class="bi bi-list-check"></i></span>
+          </div>
+        </div>
+      </div>
+
+      <div class="card card-primary mb-3">
+        <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
+          <h3 class="card-title mb-0">Filters</h3>
+          <div class="d-flex flex-wrap gap-2">
+            <?php if ($canManage): ?>
+              <a href="<?= e(url('modules/payroll/master_forms.php')); ?>" class="btn btn-sm btn-light"><i class="bi bi-sliders2 me-1"></i>Payroll Setup</a>
+            <?php endif; ?>
+            <a href="<?= e(url('modules/reports/payroll.php?salary_month=' . urlencode($salaryMonth))); ?>" class="btn btn-sm btn-outline-light"><i class="bi bi-graph-up me-1"></i>Payroll Reports</a>
+          </div>
+        </div>
+        <div class="card-body">
+          <form method="get" class="row g-2 align-items-end">
+            <div class="col-md-3">
+              <label class="form-label">Salary Month</label>
+              <input type="month" name="salary_month" value="<?= e($salaryMonth) ?>" class="form-control" required />
+            </div>
+            <div class="col-md-3">
+              <label class="form-label">Row Status</label>
+              <select name="item_status" class="form-select">
+                <option value="" <?= $itemStatusFilter === '' ? 'selected' : ''; ?>>All</option>
+                <option value="PENDING" <?= $itemStatusFilter === 'PENDING' ? 'selected' : ''; ?>>Pending</option>
+                <option value="PARTIAL" <?= $itemStatusFilter === 'PARTIAL' ? 'selected' : ''; ?>>Partial</option>
+                <option value="PAID" <?= $itemStatusFilter === 'PAID' ? 'selected' : ''; ?>>Paid</option>
+              </select>
+            </div>
+            <div class="col-md-4">
+              <label class="form-label">Staff Search</label>
+              <input type="text" name="staff_q" value="<?= e($staffSearch) ?>" class="form-control" placeholder="Filter salary rows by staff name" />
+            </div>
+            <div class="col-md-2 d-flex gap-2">
+              <button class="btn btn-primary" type="submit">Apply</button>
+              <a href="<?= e(url('modules/payroll/index.php?salary_month=' . urlencode($salaryMonth))); ?>" class="btn btn-outline-secondary">Reset</a>
+            </div>
+          </form>
+        </div>
+      </div>
+
       <div class="row g-3">
-        <div class="col-xl-7">
-          <div class="card card-outline card-primary h-100">
-            <div class="card-header d-flex justify-content-between align-items-center">
-              <h3 class="card-title mb-0">Salary Structure</h3>
+        <div class="col-xl-8">
+          <div class="card card-outline card-info">
+            <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
+              <h3 class="card-title mb-0">Salary Sheet Ledger (<?= e($salaryMonth) ?>)</h3>
+              <?php if ($canManage): ?>
+                <form method="post" class="ajax-form d-flex gap-2 align-items-center">
+                  <?= csrf_field(); ?>
+                  <input type="hidden" name="_action" value="generate_sheet" />
+                  <input type="month" name="salary_month" value="<?= e($salaryMonth) ?>" class="form-control form-control-sm" style="max-width: 160px;" />
+                  <button class="btn btn-sm btn-info" type="submit">Generate / Sync</button>
+                </form>
+              <?php endif; ?>
             </div>
             <div class="card-body">
-              <?php if ($canManage): ?>
-              <form method="post" class="ajax-form mb-3">
-                <?= csrf_field(); ?>
-                <input type="hidden" name="_action" value="save_structure" />
-                <div class="row g-3">
-                  <div class="col-md-6">
-                    <label class="form-label">Staff</label>
-                    <select name="user_id" class="form-select form-select-sm" required>
-                      <option value="">Select Staff</option>
-                      <?php foreach ($staffList as $staff): ?>
-                        <option value="<?= (int) $staff['id'] ?>"><?= e($staff['name']) ?></option>
-                      <?php endforeach; ?>
-                    </select>
-                  </div>
-                  <div class="col-md-3">
-                    <label class="form-label">Salary Type</label>
-                    <select name="salary_type" class="form-select form-select-sm">
-                      <option value="MONTHLY">Monthly</option>
-                      <option value="PER_DAY">Per Day</option>
-                      <option value="PER_JOB">Per Job</option>
-                    </select>
-                  </div>
-                  <div class="col-md-3">
-                    <label class="form-label">Base Amount</label>
-                    <input type="number" step="0.01" name="base_amount" class="form-control form-control-sm" required />
-                  </div>
-                  <div class="col-md-3">
-                    <label class="form-label">Commission %</label>
-                    <input type="number" step="0.001" name="commission_rate" class="form-control form-control-sm" />
-                  </div>
-                  <div class="col-md-3">
-                    <label class="form-label">Overtime Rate</label>
-                    <input type="number" step="0.01" name="overtime_rate" class="form-control form-control-sm" />
-                  </div>
-                  <div class="col-md-3">
-                    <label class="form-label">Status</label>
-                    <select name="status_code" class="form-select form-select-sm">
-                      <option value="ACTIVE">Active</option>
-                      <option value="INACTIVE">Inactive</option>
-                    </select>
-                  </div>
-                  <div class="col-md-3 d-flex align-items-end">
-                    <button class="btn btn-sm btn-primary w-100" type="submit">Save Structure</button>
-                  </div>
+              <?php if ($currentSheet): ?>
+                <?php $sheetOutstanding = max(0.0, round((float) ($currentSheet['total_payable'] ?? 0) - (float) ($currentSheet['total_paid'] ?? 0), 2)); ?>
+                <div class="row g-2 mb-3">
+                  <div class="col-md-3"><strong>Status:</strong> <span class="badge text-bg-<?= e(status_badge_class((string) ($currentSheet['status'] ?? 'OPEN'))) ?>"><?= e((string) ($currentSheet['status'] ?? 'OPEN')) ?></span></div>
+                  <div class="col-md-3"><strong>Total Gross:</strong> <?= format_currency((float) ($currentSheet['total_gross'] ?? 0)) ?></div>
+                  <div class="col-md-3"><strong>Total Payable:</strong> <?= format_currency((float) ($currentSheet['total_payable'] ?? 0)) ?></div>
+                  <div class="col-md-3"><strong>Outstanding:</strong> <?= format_currency($sheetOutstanding) ?></div>
                 </div>
-              </form>
-              <?php endif; ?>
 
-              <div class="table-responsive">
-                <table class="table table-sm table-striped align-middle mb-0">
-                  <thead>
-                    <tr>
-                      <th>Staff</th>
-                      <th>Type</th>
-                      <th>Base</th>
-                      <th>Commission %</th>
-                      <th>Overtime</th>
-                      <th>Status</th>
-                      <th style="min-width: 240px;">Actions</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    <?php foreach ($structures as $structure): ?>
+                <?php if ($canManage && (string) ($currentSheet['status'] ?? '') !== 'LOCKED'): ?>
+                  <form method="post" class="ajax-form mb-3">
+                    <?= csrf_field(); ?>
+                    <input type="hidden" name="_action" value="lock_sheet" />
+                    <input type="hidden" name="sheet_id" value="<?= (int) ($currentSheet['id'] ?? 0) ?>" />
+                    <button class="btn btn-sm btn-danger" type="submit">Lock Sheet</button>
+                  </form>
+                <?php endif; ?>
+
+                <div class="table-responsive">
+                  <table class="table table-sm table-striped align-middle mb-0">
+                    <thead>
                       <tr>
-                        <td><?= e($structure['name']) ?></td>
-                        <td><?= e($structure['salary_type']) ?></td>
-                        <td><?= format_currency((float) $structure['base_amount']) ?></td>
-                        <td><?= e($structure['commission_rate']) ?></td>
-                        <td><?= e($structure['overtime_rate'] ?? '-') ?></td>
-                        <td><span class="badge text-bg-<?= e(status_badge_class((string) $structure['status_code'])) ?>"><?= record_status_label((string) $structure['status_code']) ?></span></td>
-                        <td>
-                          <?php if ($canManage): ?>
-                          <form method="post" class="ajax-form d-flex flex-wrap gap-1 align-items-center mb-1">
-                            <?= csrf_field(); ?>
-                            <input type="hidden" name="_action" value="save_structure" />
-                            <input type="hidden" name="user_id" value="<?= (int) $structure['user_id'] ?>" />
-                            <select name="salary_type" class="form-select form-select-sm" style="max-width: 110px;">
-                              <option value="MONTHLY" <?= $structure['salary_type'] === 'MONTHLY' ? 'selected' : '' ?>>Monthly</option>
-                              <option value="PER_DAY" <?= $structure['salary_type'] === 'PER_DAY' ? 'selected' : '' ?>>Per Day</option>
-                              <option value="PER_JOB" <?= $structure['salary_type'] === 'PER_JOB' ? 'selected' : '' ?>>Per Job</option>
-                            </select>
-                            <input type="number" step="0.01" name="base_amount" value="<?= e($structure['base_amount']) ?>" class="form-control form-control-sm" style="max-width: 110px;" />
-                            <input type="number" step="0.001" name="commission_rate" value="<?= e($structure['commission_rate']) ?>" class="form-control form-control-sm" style="max-width: 110px;" />
-                            <input type="number" step="0.01" name="overtime_rate" value="<?= e($structure['overtime_rate']) ?>" class="form-control form-control-sm" style="max-width: 110px;" />
-                            <select name="status_code" class="form-select form-select-sm" style="max-width: 110px;">
-                              <option value="ACTIVE" <?= $structure['status_code'] === 'ACTIVE' ? 'selected' : '' ?>>Active</option>
-                              <option value="INACTIVE" <?= $structure['status_code'] === 'INACTIVE' ? 'selected' : '' ?>>Inactive</option>
-                            </select>
-                            <button class="btn btn-xs btn-outline-primary" type="submit">Update</button>
-                          </form>
-                          <form method="post" class="ajax-form" onsubmit="return confirm('Delete this salary structure?');">
-                            <?= csrf_field(); ?>
-                            <input type="hidden" name="_action" value="delete_structure" />
-                            <input type="hidden" name="structure_id" value="<?= (int) $structure['id'] ?>" />
-                            <button class="btn btn-xs btn-outline-danger" type="submit">Delete</button>
-                          </form>
-                          <?php else: ?>
-                            <span class="text-muted small">-</span>
-                          <?php endif; ?>
-                        </td>
+                        <th>Staff</th>
+                        <th>Type</th>
+                        <th>Base</th>
+                        <th>Commission</th>
+                        <th>Overtime</th>
+                        <th>Deductions (Adv / Loan / Manual)</th>
+                        <th>Net</th>
+                        <th>Paid</th>
+                        <th>Status</th>
+                        <th style="min-width: 180px;">Actions</th>
                       </tr>
-                    <?php endforeach; ?>
-                  </tbody>
-                </table>
-              </div>
+                    </thead>
+                    <tbody>
+                      <?php if (empty($salaryItems)): ?>
+                        <tr><td colspan="10" class="text-center text-muted py-3">No salary rows found for selected filters.</td></tr>
+                      <?php else: ?>
+                        <?php foreach ($salaryItems as $item): ?>
+                          <?php
+                            $itemNetPayable = round((float) ($item['net_payable'] ?? 0), 2);
+                            $itemPaidAmount = round((float) ($item['paid_amount'] ?? 0), 2);
+                            $itemOutstanding = max(0.0, round($itemNetPayable - $itemPaidAmount, 2));
+                            $sheetLocked = (string) ($currentSheet['status'] ?? '') === 'LOCKED';
+                            $itemFullyPaid = payroll_item_is_fully_paid($item);
+                            $itemHasPartialPayment = $itemPaidAmount > 0.009;
+                            $canEditSalaryRow = $canManage && !$sheetLocked && !$itemFullyPaid && !$itemHasPartialPayment;
+                            $canRecordSalaryPayment = $canManage && !$sheetLocked && $itemOutstanding > 0.009;
+                            $canReverseSalaryRow = $canManage && !$sheetLocked && !$itemFullyPaid && !$itemHasPartialPayment;
+                            $salaryActionHint = '';
+                            if ($canManage) {
+                                if ($sheetLocked) {
+                                    $salaryActionHint = 'Sheet is locked after settlement.';
+                                } elseif ($itemFullyPaid) {
+                                    $salaryActionHint = 'Fully settled row.';
+                                } elseif ($itemHasPartialPayment) {
+                                    $salaryActionHint = 'Reverse salary payments before edit/reversal.';
+                                } elseif ($itemOutstanding <= 0.009) {
+                                    $salaryActionHint = 'No pending amount for payment.';
+                                }
+                            }
+                          ?>
+                          <tr>
+                            <td><?= e((string) ($item['name'] ?? '')) ?></td>
+                            <td><?= e((string) ($item['salary_type'] ?? '')) ?></td>
+                            <td><?= format_currency((float) ($item['base_amount'] ?? 0)) ?></td>
+                            <td><?= format_currency((float) ($item['commission_amount'] ?? 0)) ?></td>
+                            <td><?= format_currency((float) ($item['overtime_amount'] ?? 0)) ?></td>
+                            <td><?= format_currency((float) ($item['advance_deduction'] ?? 0)) ?> / <?= format_currency((float) ($item['loan_deduction'] ?? 0)) ?> / <?= format_currency((float) ($item['manual_deduction'] ?? 0)) ?></td>
+                            <td><?= format_currency($itemNetPayable) ?></td>
+                            <td><?= format_currency($itemPaidAmount) ?></td>
+                            <td><span class="badge text-bg-<?= e(status_badge_class((string) ($item['status'] ?? 'PENDING'))) ?>"><?= e((string) ($item['status'] ?? 'PENDING')) ?></span></td>
+                            <td class="text-nowrap">
+                              <?php if ($canManage): ?>
+                                <div class="dropdown">
+                                  <button class="btn btn-sm btn-outline-secondary dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false">Action</button>
+                                  <ul class="dropdown-menu dropdown-menu-end">
+                                    <li>
+                                      <button
+                                        type="button"
+                                        class="dropdown-item js-salary-edit-btn"
+                                        data-bs-toggle="modal"
+                                        data-bs-target="#salaryItemEditModal"
+                                        data-item-id="<?= (int) ($item['id'] ?? 0) ?>"
+                                        data-staff-name="<?= e((string) ($item['name'] ?? '')) ?>"
+                                        data-base-amount="<?= e((string) ($item['base_amount'] ?? '0')) ?>"
+                                        data-commission-base="<?= e((string) ($item['commission_base'] ?? '0')) ?>"
+                                        data-commission-rate="<?= e((string) ($item['commission_rate'] ?? '0')) ?>"
+                                        data-overtime-hours="<?= e((string) ($item['overtime_hours'] ?? '0')) ?>"
+                                        data-overtime-rate="<?= e((string) ($item['overtime_rate'] ?? '0')) ?>"
+                                        data-advance-deduction="<?= e((string) ($item['advance_deduction'] ?? '0')) ?>"
+                                        data-loan-deduction="<?= e((string) ($item['loan_deduction'] ?? '0')) ?>"
+                                        data-manual-deduction="<?= e((string) ($item['manual_deduction'] ?? '0')) ?>"
+                                        <?= $canEditSalaryRow ? '' : 'disabled'; ?>
+                                      >Edit Salary Row</button>
+                                    </li>
+                                    <li>
+                                      <button
+                                        type="button"
+                                        class="dropdown-item js-salary-pay-btn"
+                                        data-bs-toggle="modal"
+                                        data-bs-target="#salaryPaymentAddModal"
+                                        data-item-id="<?= (int) ($item['id'] ?? 0) ?>"
+                                        data-staff-name="<?= e((string) ($item['name'] ?? '')) ?>"
+                                        data-outstanding="<?= e((string) $itemOutstanding) ?>"
+                                        data-outstanding-label="<?= e(format_currency($itemOutstanding)) ?>"
+                                        <?= $canRecordSalaryPayment ? '' : 'disabled'; ?>
+                                      >Record Payment</button>
+                                    </li>
+                                    <li><hr class="dropdown-divider"></li>
+                                    <li>
+                                      <button
+                                        type="button"
+                                        class="dropdown-item text-danger js-salary-entry-reverse-btn"
+                                        data-bs-toggle="modal"
+                                        data-bs-target="#salaryEntryReverseModal"
+                                        data-item-id="<?= (int) ($item['id'] ?? 0) ?>"
+                                        data-item-label="<?= e((string) ($item['name'] ?? '') . ' | ' . format_currency($itemNetPayable)) ?>"
+                                        <?= $canReverseSalaryRow ? '' : 'disabled'; ?>
+                                      >Reverse Salary Entry</button>
+                                    </li>
+                                  </ul>
+                                </div>
+                                <?php if ($salaryActionHint !== ''): ?>
+                                  <div><small class="text-muted"><?= e($salaryActionHint) ?></small></div>
+                                <?php endif; ?>
+                              <?php else: ?>
+                                <span class="text-muted small">-</span>
+                              <?php endif; ?>
+                            </td>
+                          </tr>
+                        <?php endforeach; ?>
+                      <?php endif; ?>
+                    </tbody>
+                  </table>
+                </div>
+              <?php else: ?>
+                <p class="text-muted mb-0">No salary sheet exists for this month yet. Use Generate / Sync to create it.</p>
+              <?php endif; ?>
             </div>
           </div>
         </div>
 
-        <div class="col-xl-5">
-          <div class="card card-outline card-success mb-3">
-            <div class="card-header">
-              <h3 class="card-title mb-0">Advances</h3>
-            </div>
+        <div class="col-xl-4">
+          <div class="card card-outline card-secondary mb-3">
+            <div class="card-header"><h3 class="card-title mb-0">Financial Safety Rules</h3></div>
             <div class="card-body">
-              <?php if ($canManage): ?>
-              <form method="post" class="ajax-form mb-3">
-                <?= csrf_field(); ?>
-                <input type="hidden" name="_action" value="record_advance" />
-                <div class="row g-3 align-items-end">
-                  <div class="col-md-6">
-                    <label class="form-label">Staff</label>
-                    <select name="user_id" class="form-select form-select-sm" required>
-                      <option value="">Select</option>
-                      <?php foreach ($staffList as $staff): ?>
-                        <option value="<?= (int) $staff['id'] ?>"><?= e($staff['name']) ?></option>
-                      <?php endforeach; ?>
-                    </select>
-                  </div>
-                  <div class="col-md-3">
-                    <label class="form-label">Amount</label>
-                    <input type="number" step="0.01" name="amount" class="form-control form-control-sm" required />
-                  </div>
-                  <div class="col-md-3">
-                    <label class="form-label">Date</label>
-                    <input type="date" name="advance_date" value="<?= e($today) ?>" class="form-control form-control-sm" />
-                  </div>
-                  <div class="col-12">
-                    <input type="text" name="notes" class="form-control form-control-sm" placeholder="Notes" />
-                  </div>
-                  <div class="col-12 d-flex justify-content-end">
-                    <button class="btn btn-sm btn-success" type="submit">Add Advance</button>
-                  </div>
-                </div>
-              </form>
-              <?php endif; ?>
+              <ul class="mb-0 ps-3">
+                <li>Salary row edit is blocked after partial/full payment.</li>
+                <li>Reverse payment first, then edit/reverse salary entry.</li>
+                <li>Direct delete is blocked for salary and payment records.</li>
+                <li>All payroll changes are audit logged.</li>
+              </ul>
+            </div>
+          </div>
 
-              <div class="table-responsive">
-                <table class="table table-sm table-striped align-middle mb-0">
-                  <thead><tr><th>Staff</th><th>Date</th><th>Amount</th><th>Pending</th><th>Status</th><th style="min-width: 220px;">Actions</th></tr></thead>
-                  <tbody>
-                    <?php foreach ($advances as $advance): ?>
+          <div class="card card-outline card-primary mb-3">
+            <div class="card-header d-flex justify-content-between align-items-center">
+              <h3 class="card-title mb-0">Salary Structure Snapshot</h3>
+              <?php if ($canManage): ?><a href="<?= e(url('modules/payroll/master_forms.php#salary-structure')); ?>" class="btn btn-sm btn-outline-primary">Manage</a><?php endif; ?>
+            </div>
+            <div class="card-body p-0 table-responsive">
+              <table class="table table-sm table-striped mb-0">
+                <thead><tr><th>Staff</th><th>Type</th><th>Base</th></tr></thead>
+                <tbody>
+                  <?php if (empty($structures)): ?>
+                    <tr><td colspan="3" class="text-center text-muted py-3">No structures available.</td></tr>
+                  <?php else: ?>
+                    <?php foreach (array_slice($structures, 0, 8) as $structure): ?>
                       <tr>
-                        <td><?= e($advance['name']) ?></td>
-                        <td><?= e($advance['advance_date']) ?></td>
-                        <td><?= format_currency((float) $advance['amount']) ?></td>
-                        <td><?= format_currency((float) ($advance['pending'] ?? 0)) ?></td>
-                        <td><span class="badge text-bg-<?= e(status_badge_class((string) $advance['status'])) ?>"><?= e($advance['status']) ?></span></td>
-                        <td>
-                          <?php if ($canManage): ?>
-                          <form method="post" class="ajax-form d-flex flex-wrap gap-1 align-items-center mb-1">
-                            <?= csrf_field(); ?>
-                            <input type="hidden" name="_action" value="update_advance" />
-                            <input type="hidden" name="advance_id" value="<?= (int) $advance['id'] ?>" />
-                            <input type="number" step="0.01" name="amount" value="<?= e($advance['amount']) ?>" class="form-control form-control-sm" style="max-width: 110px;" />
-                            <input type="date" name="advance_date" value="<?= e($advance['advance_date']) ?>" class="form-control form-control-sm" style="max-width: 140px;" />
-                            <input type="text" name="notes" value="<?= e($advance['notes'] ?? '') ?>" class="form-control form-control-sm" placeholder="Notes" style="min-width: 140px;" />
-                            <button class="btn btn-xs btn-outline-primary" type="submit">Update</button>
-                          </form>
-                          <form method="post" class="ajax-form" onsubmit="return confirm('Delete this advance?');">
-                            <?= csrf_field(); ?>
-                            <input type="hidden" name="_action" value="delete_advance" />
-                            <input type="hidden" name="advance_id" value="<?= (int) $advance['id'] ?>" />
-                            <button class="btn btn-xs btn-outline-danger" type="submit">Delete</button>
-                          </form>
-                          <?php else: ?>
-                            <span class="text-muted small">-</span>
-                          <?php endif; ?>
-                        </td>
+                        <td><?= e((string) ($structure['name'] ?? '')) ?></td>
+                        <td><?= e((string) ($structure['salary_type'] ?? '')) ?></td>
+                        <td><?= format_currency((float) ($structure['base_amount'] ?? 0)) ?></td>
                       </tr>
                     <?php endforeach; ?>
-                  </tbody>
-                </table>
-              </div>
+                  <?php endif; ?>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="card card-outline card-success mb-3">
+            <div class="card-header d-flex justify-content-between align-items-center">
+              <h3 class="card-title mb-0">Advances Snapshot</h3>
+              <?php if ($canManage): ?><a href="<?= e(url('modules/payroll/master_forms.php#advances')); ?>" class="btn btn-sm btn-outline-success">Manage</a><?php endif; ?>
+            </div>
+            <div class="card-body p-0 table-responsive">
+              <table class="table table-sm table-striped mb-0">
+                <thead><tr><th>Staff</th><th>Pending</th><th>Status</th></tr></thead>
+                <tbody>
+                  <?php if (empty($advances)): ?>
+                    <tr><td colspan="3" class="text-center text-muted py-3">No advances found.</td></tr>
+                  <?php else: ?>
+                    <?php foreach (array_slice($advances, 0, 8) as $advance): ?>
+                      <tr>
+                        <td><?= e((string) ($advance['name'] ?? '')) ?></td>
+                        <td><?= format_currency((float) ($advance['pending'] ?? 0)) ?></td>
+                        <td><span class="badge text-bg-<?= e(status_badge_class((string) ($advance['status'] ?? 'OPEN'))) ?>"><?= e((string) ($advance['status'] ?? 'OPEN')) ?></span></td>
+                      </tr>
+                    <?php endforeach; ?>
+                  <?php endif; ?>
+                </tbody>
+              </table>
             </div>
           </div>
 
           <div class="card card-outline card-warning">
-            <div class="card-header">
-              <h3 class="card-title mb-0">Loans</h3>
+            <div class="card-header d-flex justify-content-between align-items-center">
+              <h3 class="card-title mb-0">Loans Snapshot</h3>
+              <?php if ($canManage): ?><a href="<?= e(url('modules/payroll/master_forms.php#loans')); ?>" class="btn btn-sm btn-outline-warning">Manage</a><?php endif; ?>
             </div>
-            <div class="card-body">
-              <?php if ($canManage): ?>
-              <form method="post" class="ajax-form mb-3">
-                <?= csrf_field(); ?>
-                <input type="hidden" name="_action" value="record_loan" />
-                <div class="row g-3 align-items-end">
-                  <div class="col-md-5">
-                    <label class="form-label">Staff</label>
-                    <select name="user_id" class="form-select form-select-sm" required>
-                      <option value="">Select</option>
-                      <?php foreach ($staffList as $staff): ?>
-                        <option value="<?= (int) $staff['id'] ?>"><?= e($staff['name']) ?></option>
-                      <?php endforeach; ?>
-                    </select>
-                  </div>
-                  <div class="col-md-3">
-                    <label class="form-label">Loan Amount</label>
-                    <input type="number" step="0.01" name="total_amount" class="form-control form-control-sm" required />
-                  </div>
-                  <div class="col-md-2">
-                    <label class="form-label">EMI</label>
-                    <input type="number" step="0.01" name="emi_amount" class="form-control form-control-sm" />
-                  </div>
-                  <div class="col-md-2">
-                    <label class="form-label">Date</label>
-                    <input type="date" name="loan_date" value="<?= e($today) ?>" class="form-control form-control-sm" />
-                  </div>
-                  <div class="col-12">
-                    <input type="text" name="notes" class="form-control form-control-sm" placeholder="Notes" />
-                  </div>
-                  <div class="col-12 d-flex justify-content-end">
-                    <button class="btn btn-sm btn-warning" type="submit">Save Loan</button>
-                  </div>
-                </div>
-              </form>
-              <?php endif; ?>
-
-              <div class="table-responsive">
-                <table class="table table-sm table-striped align-middle mb-0">
-                  <thead><tr><th>Staff</th><th>Date</th><th>Amount</th><th>Paid</th><th>Pending</th><th>EMI</th><th>Status</th><th style="min-width: 240px;">Actions</th></tr></thead>
-                  <tbody>
-                    <?php foreach ($loans as $loan): ?>
+            <div class="card-body p-0 table-responsive">
+              <table class="table table-sm table-striped mb-0">
+                <thead><tr><th>Staff</th><th>Pending</th><th>Status</th></tr></thead>
+                <tbody>
+                  <?php if (empty($loans)): ?>
+                    <tr><td colspan="3" class="text-center text-muted py-3">No loans found.</td></tr>
+                  <?php else: ?>
+                    <?php foreach (array_slice($loans, 0, 8) as $loan): ?>
                       <tr>
-                        <td><?= e($loan['name']) ?></td>
-                        <td><?= e($loan['loan_date']) ?></td>
-                        <td><?= format_currency((float) $loan['total_amount']) ?></td>
-                        <td><?= format_currency((float) $loan['paid_amount']) ?></td>
+                        <td><?= e((string) ($loan['name'] ?? '')) ?></td>
                         <td><?= format_currency((float) ($loan['pending'] ?? 0)) ?></td>
-                        <td><?= format_currency((float) $loan['emi_amount']) ?></td>
-                        <td><span class="badge text-bg-<?= e(status_badge_class((string) $loan['status'])) ?>"><?= e($loan['status']) ?></span></td>
-                        <td>
-                          <?php if ($canManage): ?>
-                          <form method="post" class="ajax-form d-flex flex-wrap gap-1 align-items-center mb-1">
-                            <?= csrf_field(); ?>
-                            <input type="hidden" name="_action" value="update_loan" />
-                            <input type="hidden" name="loan_id" value="<?= (int) $loan['id'] ?>" />
-                            <input type="number" step="0.01" name="total_amount" value="<?= e($loan['total_amount']) ?>" class="form-control form-control-sm" style="max-width: 110px;" />
-                            <input type="number" step="0.01" name="emi_amount" value="<?= e($loan['emi_amount']) ?>" class="form-control form-control-sm" style="max-width: 110px;" />
-                            <input type="date" name="loan_date" value="<?= e($loan['loan_date']) ?>" class="form-control form-control-sm" style="max-width: 140px;" />
-                            <input type="text" name="notes" value="<?= e($loan['notes'] ?? '') ?>" class="form-control form-control-sm" placeholder="Notes" style="min-width: 140px;" />
-                            <button class="btn btn-xs btn-outline-primary" type="submit">Update</button>
-                          </form>
-                          <form method="post" class="ajax-form" onsubmit="return confirm('Delete this loan?');">
-                            <?= csrf_field(); ?>
-                            <input type="hidden" name="_action" value="delete_loan" />
-                            <input type="hidden" name="loan_id" value="<?= (int) $loan['id'] ?>" />
-                            <button class="btn btn-xs btn-outline-danger" type="submit">Delete</button>
-                          </form>
-                          <?php else: ?>
-                            <span class="text-muted small">-</span>
-                          <?php endif; ?>
-                        </td>
+                        <td><span class="badge text-bg-<?= e(status_badge_class((string) ($loan['status'] ?? 'ACTIVE'))) ?>"><?= e((string) ($loan['status'] ?? 'ACTIVE')) ?></span></td>
                       </tr>
                     <?php endforeach; ?>
-                  </tbody>
-                </table>
-              </div>
-
-              <?php if ($canManage): ?>
-              <form method="post" class="ajax-form mt-3">
-                <?= csrf_field(); ?>
-                <input type="hidden" name="_action" value="loan_manual_payment" />
-                <div class="row g-3 align-items-end">
-                  <div class="col-md-6">
-                    <label class="form-label">Loan</label>
-                    <select name="loan_id" class="form-select form-select-sm" required>
-                      <option value="">Select loan</option>
-                      <?php foreach ($loans as $loan): ?>
-                        <option value="<?= (int) $loan['id'] ?>"><?= e($loan['name']) ?> - <?= format_currency((float) ($loan['pending'] ?? 0)) ?> pending</option>
-                      <?php endforeach; ?>
-                    </select>
-                  </div>
-                  <div class="col-md-3">
-                    <label class="form-label">Amount</label>
-                    <input type="number" step="0.01" name="amount" class="form-control form-control-sm" required />
-                  </div>
-                  <div class="col-md-3">
-                    <label class="form-label">Date</label>
-                    <input type="date" name="payment_date" value="<?= e($today) ?>" class="form-control form-control-sm" />
-                  </div>
-                  <div class="col-12">
-                    <input type="text" name="notes" class="form-control form-control-sm" placeholder="Reason / Notes" />
-                  </div>
-                  <div class="col-12 d-flex justify-content-end">
-                    <button class="btn btn-sm btn-outline-warning" type="submit">Add Payment</button>
-                  </div>
-                </div>
-              </form>
-              <?php endif; ?>
-
-              <div class="table-responsive mt-3">
-                <table class="table table-sm table-striped align-middle mb-0">
-                  <thead>
-                    <tr>
-                      <th>Date</th>
-                      <th>Staff</th>
-                      <th>Type</th>
-                      <th>Amount</th>
-                      <th>Notes</th>
-                      <th style="min-width: 140px;">Actions</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    <?php if (empty($loanPayments)): ?>
-                      <tr><td colspan="6" class="text-center text-muted py-3">No loan payment history.</td></tr>
-                    <?php else: ?>
-                      <?php foreach ($loanPayments as $payment): ?>
-                        <?php
-                          $entryType = (string) ($payment['entry_type'] ?? '');
-                          $paymentId = (int) ($payment['id'] ?? 0);
-                          $isReversed = isset($reversedLoanPaymentIds[$paymentId]);
-                        ?>
-                        <tr>
-                          <td><?= e((string) ($payment['payment_date'] ?? '')) ?></td>
-                          <td><?= e((string) ($payment['name'] ?? '')) ?></td>
-                          <td><?= e($entryType) ?></td>
-                          <td><?= format_currency((float) ($payment['amount'] ?? 0)) ?></td>
-                          <td><?= e((string) ($payment['notes'] ?? '')) ?></td>
-                          <td>
-                            <?php if ($canManage && $entryType === 'MANUAL' && !$isReversed): ?>
-                              <form method="post" class="ajax-form d-inline">
-                                <?= csrf_field(); ?>
-                                <input type="hidden" name="_action" value="reverse_loan_payment" />
-                                <input type="hidden" name="payment_id" value="<?= $paymentId ?>" />
-                                <input type="hidden" name="reverse_reason" value="Manual reversal from payroll screen" />
-                                <button class="btn btn-xs btn-outline-secondary" type="submit">Reverse</button>
-                              </form>
-                            <?php else: ?>
-                              <span class="text-muted small">-</span>
-                            <?php endif; ?>
-                          </td>
-                        </tr>
-                      <?php endforeach; ?>
-                    <?php endif; ?>
-                  </tbody>
-                </table>
-              </div>
+                  <?php endif; ?>
+                </tbody>
+              </table>
             </div>
           </div>
-        </div>
-      </div>
-
-      <div class="card card-outline card-info mt-2">
-        <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
-          <h3 class="card-title mb-0">Salary Sheet (<?= e($salaryMonth) ?>)</h3>
-          <?php if ($canManage): ?>
-          <form method="post" class="ajax-form d-flex gap-2 align-items-center">
-            <?= csrf_field(); ?>
-            <input type="hidden" name="_action" value="generate_sheet" />
-            <input type="month" name="salary_month" value="<?= e($salaryMonth) ?>" class="form-control form-control-sm" style="max-width: 160px;" />
-            <button class="btn btn-sm btn-info" type="submit">Generate / Sync</button>
-          </form>
-          <?php endif; ?>
-        </div>
-        <div class="card-body">
-          <?php if ($currentSheet): ?>
-            <div class="row g-3 mb-2">
-              <div class="col-md-3"><strong>Status:</strong> <span class="badge text-bg-<?= e(status_badge_class((string) $currentSheet['status'])) ?>"><?= e($currentSheet['status']) ?></span></div>
-              <div class="col-md-3"><strong>Total Gross:</strong> <?= format_currency((float) $currentSheet['total_gross']) ?></div>
-              <div class="col-md-3"><strong>Total Payable:</strong> <?= format_currency((float) $currentSheet['total_payable']) ?></div>
-              <div class="col-md-3"><strong>Total Paid:</strong> <?= format_currency((float) $currentSheet['total_paid']) ?></div>
-            </div>
-            <?php if ($canManage && (string) $currentSheet['status'] !== 'LOCKED'): ?>
-            <form method="post" class="ajax-form mb-2">
-              <?= csrf_field(); ?>
-              <input type="hidden" name="_action" value="lock_sheet" />
-              <input type="hidden" name="sheet_id" value="<?= (int) $currentSheet['id'] ?>" />
-              <button class="btn btn-sm btn-danger" type="submit">Lock Sheet</button>
-            </form>
-            <?php endif; ?>
-          <?php else: ?>
-            <p class="text-muted mb-0">Generate the sheet for this month to start payroll.</p>
-          <?php endif; ?>
-
-          <?php if ($currentSheet): ?>
-          <div class="table-responsive">
-            <table class="table table-sm table-bordered align-middle">
-              <thead class="table-light">
-                <tr>
-                  <th>Staff</th>
-                  <th>Type</th>
-                  <th>Base</th>
-                  <th>Commission</th>
-                  <th>Overtime</th>
-                  <th>Deductions (Adv / Loan / Manual)</th>
-                  <th>Net</th>
-                  <th>Paid</th>
-                  <th>Status</th>
-                  <th style="min-width: 240px;">Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                <?php foreach ($salaryItems as $item): ?>
-                  <tr>
-                    <td><?= e($item['name']) ?></td>
-                    <td><?= e($item['salary_type']) ?></td>
-                    <td><?= format_currency((float) $item['base_amount']) ?></td>
-                    <td><?= format_currency((float) $item['commission_amount']) ?></td>
-                    <td><?= format_currency((float) $item['overtime_amount']) ?></td>
-                    <td><?= format_currency((float) $item['advance_deduction']) ?> / <?= format_currency((float) $item['loan_deduction']) ?> / <?= format_currency((float) $item['manual_deduction']) ?></td>
-                    <td><?= format_currency((float) $item['net_payable']) ?></td>
-                    <td><?= format_currency((float) $item['paid_amount']) ?></td>
-                    <td><span class="badge text-bg-<?= e(status_badge_class((string) $item['status'])) ?>"><?= e($item['status']) ?></span></td>
-                    <td>
-                      <?php if ($canManage && (string) $currentSheet['status'] !== 'LOCKED'): ?>
-                      <form method="post" class="ajax-form mb-2">
-                        <?= csrf_field(); ?>
-                        <input type="hidden" name="_action" value="update_item" />
-                        <input type="hidden" name="item_id" value="<?= (int) $item['id'] ?>" />
-                        <div class="row g-2">
-                          <div class="col-4 col-md-2"><input type="number" step="0.01" name="base_amount" value="<?= e($item['base_amount']) ?>" class="form-control form-control-sm" placeholder="Base" /></div>
-                          <div class="col-4 col-md-2"><input type="number" step="0.01" name="commission_base" value="<?= e($item['commission_base']) ?>" class="form-control form-control-sm" placeholder="Comm Base" /></div>
-                          <div class="col-4 col-md-2"><input type="number" step="0.001" name="commission_rate" value="<?= e($item['commission_rate']) ?>" class="form-control form-control-sm" placeholder="%" /></div>
-                          <div class="col-4 col-md-2"><input type="number" step="0.01" name="overtime_hours" value="<?= e($item['overtime_hours']) ?>" class="form-control form-control-sm" placeholder="OT Hrs" /></div>
-                          <div class="col-4 col-md-2"><input type="number" step="0.01" name="overtime_rate" value="<?= e($item['overtime_rate']) ?>" class="form-control form-control-sm" placeholder="OT Rate" /></div>
-                          <div class="col-4 col-md-2 d-grid"><button class="btn btn-xs btn-outline-primary" type="submit">Update</button></div>
-                        </div>
-                        <div class="row g-2 mt-1">
-                          <div class="col-4 col-md-3"><input type="number" step="0.01" name="advance_deduction" value="<?= e($item['advance_deduction']) ?>" class="form-control form-control-sm" placeholder="Advance" /></div>
-                          <div class="col-4 col-md-3"><input type="number" step="0.01" name="loan_deduction" value="<?= e($item['loan_deduction']) ?>" class="form-control form-control-sm" placeholder="Loan" /></div>
-                          <div class="col-4 col-md-3"><input type="number" step="0.01" name="manual_deduction" value="<?= e($item['manual_deduction']) ?>" class="form-control form-control-sm" placeholder="Manual" /></div>
-                          <div class="col-12 col-md-3 d-grid"><button class="btn btn-xs btn-outline-secondary" type="submit">Save Deductions</button></div>
-                        </div>
-                      </form>
-
-                      <form method="post" class="ajax-form">
-                        <?= csrf_field(); ?>
-                        <input type="hidden" name="_action" value="add_salary_payment" />
-                        <input type="hidden" name="item_id" value="<?= (int) $item['id'] ?>" />
-                        <div class="row g-2 align-items-end">
-                          <div class="col-6 col-md-3"><input type="number" step="0.01" name="amount" class="form-control form-control-sm" placeholder="Amount" required /></div>
-                          <div class="col-6 col-md-3"><input type="date" name="payment_date" value="<?= e($today) ?>" class="form-control form-control-sm" /></div>
-                          <div class="col-6 col-md-3">
-                            <select name="payment_mode" class="form-select form-select-sm">
-                              <?php foreach (finance_payment_modes() as $mode): ?>
-                                <option value="<?= e($mode) ?>"><?= e($mode) ?></option>
-                              <?php endforeach; ?>
-                            </select>
-                          </div>
-                          <div class="col-6 col-md-3 d-grid"><button class="btn btn-xs btn-success" type="submit">Record Payment</button></div>
-                          <div class="col-12"><input type="text" name="notes" class="form-control form-control-sm" placeholder="Notes" /></div>
-                        </div>
-                      </form>
-                      <?php endif; ?>
-                    </td>
-                  </tr>
-                <?php endforeach; ?>
-              </tbody>
-            </table>
-          </div>
-          <?php endif; ?>
         </div>
       </div>
 
       <?php if ($currentSheet): ?>
-      <div class="card card-outline card-secondary mt-3">
-        <div class="card-header"><h3 class="card-title mb-0">Payment History</h3></div>
-        <div class="card-body table-responsive">
-          <table class="table table-sm table-striped align-middle mb-0">
-            <thead><tr><th>Date</th><th>Staff</th><th>Type</th><th>Amount</th><th>Mode</th><th>Notes</th><th style="min-width: 140px;">Actions</th></tr></thead>
-            <tbody>
-              <?php foreach ($salaryPayments as $payment): ?>
-                <?php
-                  $entryType = (string) ($payment['entry_type'] ?? '');
-                  $paymentId = (int) ($payment['id'] ?? 0);
-                  $isReversed = isset($reversedSalaryPaymentIds[$paymentId]);
-                ?>
+        <div class="card card-outline card-secondary mt-3">
+          <div class="card-header"><h3 class="card-title mb-0">Salary Payment History</h3></div>
+          <div class="card-body table-responsive p-0">
+            <table class="table table-sm table-striped mb-0">
+              <thead>
                 <tr>
-                  <td><?= e($payment['payment_date']) ?></td>
-                  <td><?= e($payment['name']) ?></td>
-                  <td><?= e($entryType) ?></td>
-                  <td><?= format_currency((float) $payment['amount']) ?></td>
-                  <td><?= e($payment['payment_mode']) ?></td>
-                  <td><?= e($payment['notes'] ?? '') ?></td>
-                  <td>
-                    <?php if ($canManage && $entryType === 'PAYMENT' && !$isReversed): ?>
-                      <form method="post" class="ajax-form d-inline">
-                        <?= csrf_field(); ?>
-                        <input type="hidden" name="_action" value="reverse_salary_payment" />
-                        <input type="hidden" name="payment_id" value="<?= $paymentId ?>" />
-                        <input type="hidden" name="reverse_reason" value="Payment reversal from payroll history" />
-                        <button class="btn btn-xs btn-outline-secondary" type="submit">Reverse</button>
-                      </form>
-                    <?php else: ?>
-                      <span class="text-muted small">-</span>
-                    <?php endif; ?>
-                  </td>
+                  <th>Date</th>
+                  <th>Staff</th>
+                  <th>Type</th>
+                  <th>Amount</th>
+                  <th>Mode</th>
+                  <th>Notes</th>
+                  <th style="min-width: 140px;">Actions</th>
                 </tr>
-              <?php endforeach; ?>
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                <?php if (empty($salaryPayments)): ?>
+                  <tr><td colspan="7" class="text-center text-muted py-3">No salary payment history.</td></tr>
+                <?php else: ?>
+                  <?php foreach ($salaryPayments as $payment): ?>
+                    <?php
+                      $entryType = (string) ($payment['entry_type'] ?? '');
+                      $paymentId = (int) ($payment['id'] ?? 0);
+                      $isReversed = isset($reversedSalaryPaymentIds[$paymentId]);
+                      $canReverseSalaryPayment = $canManage && $entryType === 'PAYMENT' && !$isReversed;
+                    ?>
+                    <tr>
+                      <td><?= e((string) ($payment['payment_date'] ?? '')) ?></td>
+                      <td><?= e((string) ($payment['name'] ?? '')) ?></td>
+                      <td><?= e($entryType) ?></td>
+                      <td><?= format_currency((float) ($payment['amount'] ?? 0)) ?></td>
+                      <td><?= e((string) ($payment['payment_mode'] ?? '')) ?></td>
+                      <td><?= e((string) ($payment['notes'] ?? '')) ?></td>
+                      <td class="text-nowrap">
+                        <?php if ($canManage): ?>
+                          <div class="dropdown">
+                            <button class="btn btn-sm btn-outline-secondary dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false">Action</button>
+                            <ul class="dropdown-menu dropdown-menu-end">
+                              <li>
+                                <button
+                                  type="button"
+                                  class="dropdown-item text-danger js-salary-payment-reverse-btn"
+                                  data-bs-toggle="modal"
+                                  data-bs-target="#salaryPaymentReverseModal"
+                                  data-payment-id="<?= $paymentId ?>"
+                                  data-payment-label="<?= e((string) ($payment['payment_date'] ?? '') . ' | ' . (string) ($payment['name'] ?? '') . ' | ' . format_currency((float) ($payment['amount'] ?? 0))) ?>"
+                                  <?= $canReverseSalaryPayment ? '' : 'disabled'; ?>
+                                >Reverse Payment</button>
+                              </li>
+                            </ul>
+                          </div>
+                          <?php if (!$canReverseSalaryPayment): ?>
+                            <div><small class="text-muted"><?= $isReversed ? 'Already reversed.' : 'Only manual PAYMENT rows can be reversed.'; ?></small></div>
+                          <?php endif; ?>
+                        <?php else: ?>
+                          <span class="text-muted small">-</span>
+                        <?php endif; ?>
+                      </td>
+                    </tr>
+                  <?php endforeach; ?>
+                <?php endif; ?>
+              </tbody>
+            </table>
+          </div>
         </div>
-      </div>
       <?php endif; ?>
     </div>
   </div>
 </main>
 
+<?php if ($canManage): ?>
+  <div class="modal fade" id="salaryItemEditModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-lg">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title">Edit Salary Row</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+        </div>
+        <form method="post" class="ajax-form">
+          <div class="modal-body">
+            <?= csrf_field(); ?>
+            <input type="hidden" name="_action" value="update_item" />
+            <input type="hidden" name="item_id" id="salary-item-edit-id" />
+            <div class="mb-2">
+              <label class="form-label">Staff</label>
+              <input type="text" class="form-control" id="salary-item-edit-staff" readonly />
+            </div>
+            <div class="row g-2">
+              <div class="col-md-4">
+                <label class="form-label">Base Amount</label>
+                <input type="number" step="0.01" min="0" name="base_amount" id="salary-item-edit-base" class="form-control" required />
+              </div>
+              <div class="col-md-4">
+                <label class="form-label">Commission Base</label>
+                <input type="number" step="0.01" min="0" name="commission_base" id="salary-item-edit-commission-base" class="form-control" />
+              </div>
+              <div class="col-md-4">
+                <label class="form-label">Commission %</label>
+                <input type="number" step="0.001" min="0" name="commission_rate" id="salary-item-edit-commission-rate" class="form-control" />
+              </div>
+            </div>
+            <div class="row g-2 mt-1">
+              <div class="col-md-6">
+                <label class="form-label">Overtime Hours</label>
+                <input type="number" step="0.01" min="0" name="overtime_hours" id="salary-item-edit-overtime-hours" class="form-control" />
+              </div>
+              <div class="col-md-6">
+                <label class="form-label">Overtime Rate</label>
+                <input type="number" step="0.01" min="0" name="overtime_rate" id="salary-item-edit-overtime-rate" class="form-control" />
+              </div>
+            </div>
+            <div class="row g-2 mt-1">
+              <div class="col-md-4">
+                <label class="form-label">Advance Deduction</label>
+                <input type="number" step="0.01" min="0" name="advance_deduction" id="salary-item-edit-advance" class="form-control" />
+              </div>
+              <div class="col-md-4">
+                <label class="form-label">Loan Deduction</label>
+                <input type="number" step="0.01" min="0" name="loan_deduction" id="salary-item-edit-loan" class="form-control" />
+              </div>
+              <div class="col-md-4">
+                <label class="form-label">Manual Deduction</label>
+                <input type="number" step="0.01" min="0" name="manual_deduction" id="salary-item-edit-manual" class="form-control" />
+              </div>
+            </div>
+            <small class="text-muted">Edit is blocked when partial/full payment exists. Reverse payments first if reconciliation already started.</small>
+          </div>
+          <div class="modal-footer">
+            <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Close</button>
+            <button type="submit" class="btn btn-primary">Save Salary Row</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal fade" id="salaryPaymentAddModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title">Record Salary Payment</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+        </div>
+        <form method="post" class="ajax-form">
+          <div class="modal-body">
+            <?= csrf_field(); ?>
+            <input type="hidden" name="_action" value="add_salary_payment" />
+            <input type="hidden" name="item_id" id="salary-pay-item-id" />
+            <div class="mb-2">
+              <label class="form-label">Staff</label>
+              <input type="text" id="salary-pay-staff" class="form-control" readonly />
+            </div>
+            <div class="mb-2">
+              <label class="form-label">Outstanding</label>
+              <input type="text" id="salary-pay-outstanding-label" class="form-control" readonly />
+            </div>
+            <div class="row g-2">
+              <div class="col-md-6">
+                <label class="form-label">Amount</label>
+                <input type="number" step="0.01" min="0.01" name="amount" id="salary-pay-amount" class="form-control" required />
+              </div>
+              <div class="col-md-6">
+                <label class="form-label">Date</label>
+                <input type="date" name="payment_date" value="<?= e($today) ?>" class="form-control" required />
+              </div>
+            </div>
+            <div class="row g-2 mt-1">
+              <div class="col-md-6">
+                <label class="form-label">Payment Mode</label>
+                <select name="payment_mode" class="form-select">
+                  <?php foreach (finance_payment_modes() as $mode): ?>
+                    <option value="<?= e($mode) ?>"><?= e($mode) ?></option>
+                  <?php endforeach; ?>
+                </select>
+              </div>
+              <div class="col-md-6">
+                <label class="form-label">Notes</label>
+                <input type="text" name="notes" class="form-control" maxlength="255" />
+              </div>
+            </div>
+          </div>
+          <div class="modal-footer">
+            <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Close</button>
+            <button type="submit" class="btn btn-success">Record Payment</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal fade" id="salaryEntryReverseModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title">Reverse Salary Entry</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+        </div>
+        <form method="post" class="ajax-form">
+          <div class="modal-body">
+            <?= csrf_field(); ?>
+            <input type="hidden" name="_action" value="reverse_salary_entry" />
+            <input type="hidden" name="item_id" id="salary-entry-reverse-id" />
+            <div class="mb-2">
+              <label class="form-label">Salary Row</label>
+              <input type="text" id="salary-entry-reverse-label" class="form-control" readonly />
+            </div>
+            <div class="mb-2">
+              <label class="form-label">Reversal Reason</label>
+              <input type="text" name="reverse_reason" class="form-control" maxlength="255" required />
+            </div>
+          </div>
+          <div class="modal-footer">
+            <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Close</button>
+            <button type="submit" class="btn btn-danger">Confirm Reversal</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal fade" id="salaryPaymentReverseModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title">Reverse Salary Payment</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+        </div>
+        <form method="post" class="ajax-form">
+          <div class="modal-body">
+            <?= csrf_field(); ?>
+            <input type="hidden" name="_action" value="reverse_salary_payment" />
+            <input type="hidden" name="payment_id" id="salary-payment-reverse-id" />
+            <div class="mb-2">
+              <label class="form-label">Payment Entry</label>
+              <input type="text" id="salary-payment-reverse-label" class="form-control" readonly />
+            </div>
+            <div class="mb-2">
+              <label class="form-label">Reversal Reason</label>
+              <input type="text" name="reverse_reason" class="form-control" maxlength="255" required />
+            </div>
+          </div>
+          <div class="modal-footer">
+            <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Close</button>
+            <button type="submit" class="btn btn-danger">Reverse Payment</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+<?php endif; ?>
+
+<script>
+  (function () {
+    function setValue(id, value) {
+      var field = document.getElementById(id);
+      if (field) {
+        field.value = value || '';
+      }
+    }
+
+    document.addEventListener('click', function (event) {
+      var editTrigger = event.target.closest('.js-salary-edit-btn');
+      if (editTrigger && !editTrigger.disabled) {
+        setValue('salary-item-edit-id', editTrigger.getAttribute('data-item-id'));
+        setValue('salary-item-edit-staff', editTrigger.getAttribute('data-staff-name'));
+        setValue('salary-item-edit-base', editTrigger.getAttribute('data-base-amount'));
+        setValue('salary-item-edit-commission-base', editTrigger.getAttribute('data-commission-base'));
+        setValue('salary-item-edit-commission-rate', editTrigger.getAttribute('data-commission-rate'));
+        setValue('salary-item-edit-overtime-hours', editTrigger.getAttribute('data-overtime-hours'));
+        setValue('salary-item-edit-overtime-rate', editTrigger.getAttribute('data-overtime-rate'));
+        setValue('salary-item-edit-advance', editTrigger.getAttribute('data-advance-deduction'));
+        setValue('salary-item-edit-loan', editTrigger.getAttribute('data-loan-deduction'));
+        setValue('salary-item-edit-manual', editTrigger.getAttribute('data-manual-deduction'));
+      }
+
+      var payTrigger = event.target.closest('.js-salary-pay-btn');
+      if (payTrigger && !payTrigger.disabled) {
+        var outstanding = payTrigger.getAttribute('data-outstanding') || '';
+        setValue('salary-pay-item-id', payTrigger.getAttribute('data-item-id'));
+        setValue('salary-pay-staff', payTrigger.getAttribute('data-staff-name'));
+        setValue('salary-pay-outstanding-label', payTrigger.getAttribute('data-outstanding-label'));
+        setValue('salary-pay-amount', outstanding);
+        var amountField = document.getElementById('salary-pay-amount');
+        if (amountField) {
+          if (outstanding !== '') {
+            amountField.setAttribute('max', outstanding);
+          } else {
+            amountField.removeAttribute('max');
+          }
+        }
+      }
+
+      var entryReverseTrigger = event.target.closest('.js-salary-entry-reverse-btn');
+      if (entryReverseTrigger && !entryReverseTrigger.disabled) {
+        setValue('salary-entry-reverse-id', entryReverseTrigger.getAttribute('data-item-id'));
+        setValue('salary-entry-reverse-label', entryReverseTrigger.getAttribute('data-item-label'));
+      }
+
+      var paymentReverseTrigger = event.target.closest('.js-salary-payment-reverse-btn');
+      if (paymentReverseTrigger && !paymentReverseTrigger.disabled) {
+        setValue('salary-payment-reverse-id', paymentReverseTrigger.getAttribute('data-payment-id'));
+        setValue('salary-payment-reverse-label', paymentReverseTrigger.getAttribute('data-payment-label'));
+      }
+    });
+  })();
+</script>
+
 <?php include __DIR__ . '/../../includes/footer.php'; ?>
+

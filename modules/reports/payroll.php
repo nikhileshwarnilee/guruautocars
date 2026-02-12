@@ -235,6 +235,20 @@ $loanOutstandingTotal = round($loanOutstandingTotal, 2);
 $totalPayable = round((float) ($sheetSummary['total_payable'] ?? 0), 2);
 $totalPaid = round((float) ($sheetSummary['total_paid'] ?? 0), 2);
 $totalOutstanding = max(0.0, round($totalPayable - $totalPaid, 2));
+$paidSalaryRowCount = 0;
+$partialSalaryRowCount = 0;
+$pendingSalaryRowCount = 0;
+foreach ($monthlySalaryRows as $salaryRow) {
+    $rowStatus = strtoupper((string) ($salaryRow['status'] ?? 'PENDING'));
+    if ($rowStatus === 'PAID') {
+        $paidSalaryRowCount++;
+    } elseif ($rowStatus === 'PARTIAL') {
+        $partialSalaryRowCount++;
+    } else {
+        $pendingSalaryRowCount++;
+    }
+}
+$unpaidSalaryRowCount = $partialSalaryRowCount + $pendingSalaryRowCount;
 
 $exportKey = trim((string) ($_GET['export'] ?? ''));
 if ($exportKey !== '') {
@@ -354,6 +368,232 @@ if ($exportKey !== '') {
     }
 }
 
+$renderReportBody = static function (
+    array $sheetSummary,
+    array $monthlySalaryRows,
+    array $staffPaymentHistory,
+    array $advanceLedgerRows,
+    array $loanOutstandingRows,
+    array $mechanicEarningsRows,
+    array $pageParams,
+    bool $canExportData,
+    float $totalPayable,
+    float $totalPaid,
+    float $totalOutstanding,
+    float $advanceOutstandingTotal,
+    float $loanOutstandingTotal,
+    int $paidSalaryRowCount,
+    int $partialSalaryRowCount,
+    int $pendingSalaryRowCount,
+    int $unpaidSalaryRowCount
+): void {
+    ?>
+      <div class="row g-3 mb-3">
+        <div class="col-md-3"><div class="info-box"><span class="info-box-icon text-bg-primary"><i class="bi bi-wallet2"></i></span><div class="info-box-content"><span class="info-box-text">Monthly Payable</span><span class="info-box-number"><?= e(format_currency($totalPayable)); ?></span></div></div></div>
+        <div class="col-md-3"><div class="info-box"><span class="info-box-icon text-bg-success"><i class="bi bi-check2-circle"></i></span><div class="info-box-content"><span class="info-box-text">Monthly Paid</span><span class="info-box-number"><?= e(format_currency($totalPaid)); ?></span></div></div></div>
+        <div class="col-md-3"><div class="info-box"><span class="info-box-icon text-bg-warning"><i class="bi bi-hourglass-split"></i></span><div class="info-box-content"><span class="info-box-text">Payroll Outstanding</span><span class="info-box-number"><?= e(format_currency($totalOutstanding)); ?></span></div></div></div>
+        <div class="col-md-3"><div class="info-box"><span class="info-box-icon text-bg-info"><i class="bi bi-journal-check"></i></span><div class="info-box-content"><span class="info-box-text">Salary Sheets</span><span class="info-box-number"><?= number_format((int) ($sheetSummary['sheet_count'] ?? 0)); ?></span></div></div></div>
+      </div>
+
+      <div class="row g-3 mb-3">
+        <div class="col-md-3"><div class="info-box"><span class="info-box-icon text-bg-secondary"><i class="bi bi-cash-coin"></i></span><div class="info-box-content"><span class="info-box-text">Advance Outstanding</span><span class="info-box-number"><?= e(format_currency($advanceOutstandingTotal)); ?></span></div></div></div>
+        <div class="col-md-3"><div class="info-box"><span class="info-box-icon text-bg-danger"><i class="bi bi-credit-card"></i></span><div class="info-box-content"><span class="info-box-text">Loan Outstanding</span><span class="info-box-number"><?= e(format_currency($loanOutstandingTotal)); ?></span></div></div></div>
+        <div class="col-md-3"><div class="info-box"><span class="info-box-icon text-bg-success"><i class="bi bi-person-check"></i></span><div class="info-box-content"><span class="info-box-text">Paid Rows</span><span class="info-box-number"><?= number_format($paidSalaryRowCount); ?></span></div></div></div>
+        <div class="col-md-3"><div class="info-box"><span class="info-box-icon text-bg-warning"><i class="bi bi-person-x"></i></span><div class="info-box-content"><span class="info-box-text">Unpaid Rows</span><span class="info-box-number"><?= number_format($unpaidSalaryRowCount); ?></span></div></div></div>
+      </div>
+
+      <div class="row g-3 mb-3">
+        <div class="col-md-6"><div class="alert alert-success mb-0"><strong>Paid:</strong> <?= number_format($paidSalaryRowCount); ?> rows fully settled.</div></div>
+        <div class="col-md-6"><div class="alert alert-warning mb-0"><strong>Unpaid:</strong> <?= number_format($pendingSalaryRowCount); ?> pending + <?= number_format($partialSalaryRowCount); ?> partial rows.</div></div>
+      </div>
+
+      <div class="card mb-3">
+        <div class="card-header d-flex justify-content-between align-items-center">
+          <h3 class="card-title mb-0">Monthly Salary Report</h3>
+          <?php if ($canExportData): ?>
+            <a href="<?= e(reports_export_url('modules/reports/payroll.php', $pageParams, 'monthly_salary')); ?>" class="btn btn-sm btn-outline-primary">CSV</a>
+          <?php endif; ?>
+        </div>
+        <div class="card-body p-0 table-responsive">
+          <table class="table table-sm table-striped mb-0">
+            <thead><tr><th>Garage</th><th>Staff</th><th>Type</th><th>Base</th><th>Commission</th><th>Overtime</th><th>Deductions</th><th>Net</th><th>Paid</th><th>Status</th></tr></thead>
+            <tbody>
+              <?php if (empty($monthlySalaryRows)): ?>
+                <tr><td colspan="10" class="text-center text-muted py-4">No salary sheet rows found for selected month.</td></tr>
+              <?php else: foreach ($monthlySalaryRows as $row): ?>
+                <?php $salaryStatus = strtoupper((string) ($row['status'] ?? 'PENDING')); ?>
+                <tr>
+                  <td><?= e((string) ($row['garage_name'] ?? '')); ?></td>
+                  <td><?= e((string) ($row['staff_name'] ?? '')); ?></td>
+                  <td><?= e((string) ($row['salary_type'] ?? '')); ?></td>
+                  <td><?= e(format_currency((float) ($row['base_amount'] ?? 0))); ?></td>
+                  <td><?= e(format_currency((float) ($row['commission_amount'] ?? 0))); ?></td>
+                  <td><?= e(format_currency((float) ($row['overtime_amount'] ?? 0))); ?></td>
+                  <td><?= e(format_currency((float) ($row['deduction_total'] ?? 0))); ?></td>
+                  <td><?= e(format_currency((float) ($row['net_payable'] ?? 0))); ?></td>
+                  <td><?= e(format_currency((float) ($row['paid_amount'] ?? 0))); ?></td>
+                  <td><span class="badge text-bg-<?= e(status_badge_class($salaryStatus)); ?>"><?= e($salaryStatus); ?></span></td>
+                </tr>
+              <?php endforeach; endif; ?>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="row g-3 mb-3">
+        <div class="col-lg-6">
+          <div class="card h-100">
+            <div class="card-header d-flex justify-content-between align-items-center">
+              <h3 class="card-title mb-0">Staff Payment History</h3>
+              <?php if ($canExportData): ?>
+                <a href="<?= e(reports_export_url('modules/reports/payroll.php', $pageParams, 'staff_payment_history')); ?>" class="btn btn-sm btn-outline-secondary">CSV</a>
+              <?php endif; ?>
+            </div>
+            <div class="card-body p-0 table-responsive">
+              <table class="table table-sm table-striped mb-0">
+                <thead><tr><th>Date</th><th>Month</th><th>Garage</th><th>Staff</th><th>Type</th><th>Amount</th><th>Mode</th></tr></thead>
+                <tbody>
+                  <?php if (empty($staffPaymentHistory)): ?>
+                    <tr><td colspan="7" class="text-center text-muted py-4">No salary payment records in selected range.</td></tr>
+                  <?php else: foreach ($staffPaymentHistory as $row): ?>
+                    <tr>
+                      <td><?= e((string) ($row['payment_date'] ?? '')); ?></td>
+                      <td><?= e((string) ($row['salary_month'] ?? '')); ?></td>
+                      <td><?= e((string) ($row['garage_name'] ?? '')); ?></td>
+                      <td><?= e((string) ($row['staff_name'] ?? '')); ?></td>
+                      <td><?= e((string) ($row['entry_type'] ?? '')); ?></td>
+                      <td><?= e(format_currency((float) ($row['amount'] ?? 0))); ?></td>
+                      <td><?= e((string) ($row['payment_mode'] ?? '')); ?></td>
+                    </tr>
+                  <?php endforeach; endif; ?>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <div class="col-lg-6">
+          <div class="card h-100">
+            <div class="card-header d-flex justify-content-between align-items-center">
+              <h3 class="card-title mb-0">Advance Ledger</h3>
+              <?php if ($canExportData): ?>
+                <a href="<?= e(reports_export_url('modules/reports/payroll.php', $pageParams, 'advance_ledger')); ?>" class="btn btn-sm btn-outline-primary">CSV</a>
+              <?php endif; ?>
+            </div>
+            <div class="card-body p-0 table-responsive">
+              <table class="table table-sm table-striped mb-0">
+                <thead><tr><th>Date</th><th>Garage</th><th>Staff</th><th>Advance</th><th>Applied</th><th>Pending</th><th>Status</th></tr></thead>
+                <tbody>
+                  <?php if (empty($advanceLedgerRows)): ?>
+                    <tr><td colspan="7" class="text-center text-muted py-4">No advance entries in selected range.</td></tr>
+                  <?php else: foreach ($advanceLedgerRows as $row): ?>
+                    <tr>
+                      <td><?= e((string) ($row['advance_date'] ?? '')); ?></td>
+                      <td><?= e((string) ($row['garage_name'] ?? '')); ?></td>
+                      <td><?= e((string) ($row['staff_name'] ?? '')); ?></td>
+                      <td><?= e(format_currency((float) ($row['amount'] ?? 0))); ?></td>
+                      <td><?= e(format_currency((float) ($row['applied_amount'] ?? 0))); ?></td>
+                      <td><?= e(format_currency((float) ($row['pending_amount'] ?? 0))); ?></td>
+                      <td><?= e((string) ($row['status'] ?? '')); ?></td>
+                    </tr>
+                  <?php endforeach; endif; ?>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="row g-3 mb-3">
+        <div class="col-lg-6">
+          <div class="card h-100">
+            <div class="card-header d-flex justify-content-between align-items-center">
+              <h3 class="card-title mb-0">Loan Outstanding Summary</h3>
+              <?php if ($canExportData): ?>
+                <a href="<?= e(reports_export_url('modules/reports/payroll.php', $pageParams, 'loan_outstanding')); ?>" class="btn btn-sm btn-outline-danger">CSV</a>
+              <?php endif; ?>
+            </div>
+            <div class="card-body p-0 table-responsive">
+              <table class="table table-sm table-striped mb-0">
+                <thead><tr><th>Loan Date</th><th>Garage</th><th>Staff</th><th>Total</th><th>Paid</th><th>Pending</th><th>EMI</th><th>Status</th></tr></thead>
+                <tbody>
+                  <?php if (empty($loanOutstandingRows)): ?>
+                    <tr><td colspan="8" class="text-center text-muted py-4">No loans found in selected scope.</td></tr>
+                  <?php else: foreach ($loanOutstandingRows as $row): ?>
+                    <tr>
+                      <td><?= e((string) ($row['loan_date'] ?? '')); ?></td>
+                      <td><?= e((string) ($row['garage_name'] ?? '')); ?></td>
+                      <td><?= e((string) ($row['staff_name'] ?? '')); ?></td>
+                      <td><?= e(format_currency((float) ($row['total_amount'] ?? 0))); ?></td>
+                      <td><?= e(format_currency((float) ($row['paid_amount'] ?? 0))); ?></td>
+                      <td><?= e(format_currency((float) ($row['pending_amount'] ?? 0))); ?></td>
+                      <td><?= e(format_currency((float) ($row['emi_amount'] ?? 0))); ?></td>
+                      <td><?= e((string) ($row['status'] ?? '')); ?></td>
+                    </tr>
+                  <?php endforeach; endif; ?>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <div class="col-lg-6">
+          <div class="card h-100">
+            <div class="card-header d-flex justify-content-between align-items-center">
+              <h3 class="card-title mb-0">Mechanic Earnings (Per Job Salary Type)</h3>
+              <?php if ($canExportData): ?>
+                <a href="<?= e(reports_export_url('modules/reports/payroll.php', $pageParams, 'mechanic_earnings')); ?>" class="btn btn-sm btn-outline-secondary">CSV</a>
+              <?php endif; ?>
+            </div>
+            <div class="card-body p-0 table-responsive">
+              <table class="table table-sm table-striped mb-0">
+                <thead><tr><th>Garage</th><th>Mechanic</th><th>Closed Jobs</th><th>Gross</th><th>Net</th><th>Paid</th></tr></thead>
+                <tbody>
+                  <?php if (empty($mechanicEarningsRows)): ?>
+                    <tr><td colspan="6" class="text-center text-muted py-4">No PER_JOB payroll rows found for selected month.</td></tr>
+                  <?php else: foreach ($mechanicEarningsRows as $row): ?>
+                    <tr>
+                      <td><?= e((string) ($row['garage_name'] ?? '')); ?></td>
+                      <td><?= e((string) ($row['staff_name'] ?? '')); ?></td>
+                      <td><?= number_format((int) ($row['closed_jobs'] ?? 0)); ?></td>
+                      <td><?= e(format_currency((float) ($row['gross_earnings'] ?? 0))); ?></td>
+                      <td><?= e(format_currency((float) ($row['net_earnings'] ?? 0))); ?></td>
+                      <td><?= e(format_currency((float) ($row['paid_earnings'] ?? 0))); ?></td>
+                    </tr>
+                  <?php endforeach; endif; ?>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+    <?php
+};
+
+if (isset($_GET['ajax']) && (string) $_GET['ajax'] === '1') {
+    header('Content-Type: text/html; charset=utf-8');
+    $renderReportBody(
+        $sheetSummary,
+        $monthlySalaryRows,
+        $staffPaymentHistory,
+        $advanceLedgerRows,
+        $loanOutstandingRows,
+        $mechanicEarningsRows,
+        $pageParams,
+        $canExportData,
+        $totalPayable,
+        $totalPaid,
+        $totalOutstanding,
+        $advanceOutstandingTotal,
+        $loanOutstandingTotal,
+        $paidSalaryRowCount,
+        $partialSalaryRowCount,
+        $pendingSalaryRowCount,
+        $unpaidSalaryRowCount
+    );
+    exit;
+}
+
 require_once __DIR__ . '/../../includes/header.php';
 require_once __DIR__ . '/../../includes/sidebar.php';
 ?>
@@ -392,7 +632,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       <div class="card card-primary mb-3">
         <div class="card-header"><h3 class="card-title">Filters</h3></div>
         <div class="card-body">
-          <form method="get" class="row g-2 align-items-end">
+          <form method="get" id="payroll-filter-form" class="row g-2 align-items-end">
             <?php if ($allowAllGarages || count($garageIds) > 1): ?>
               <div class="col-md-3">
                 <label class="form-label">Garage Scope</label>
@@ -446,169 +686,42 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         </div>
       </div>
 
-      <div class="row g-3 mb-3">
-        <div class="col-md-3"><div class="info-box"><span class="info-box-icon text-bg-primary"><i class="bi bi-wallet2"></i></span><div class="info-box-content"><span class="info-box-text">Monthly Payable</span><span class="info-box-number"><?= e(format_currency($totalPayable)); ?></span></div></div></div>
-        <div class="col-md-3"><div class="info-box"><span class="info-box-icon text-bg-success"><i class="bi bi-check2-circle"></i></span><div class="info-box-content"><span class="info-box-text">Monthly Paid</span><span class="info-box-number"><?= e(format_currency($totalPaid)); ?></span></div></div></div>
-        <div class="col-md-3"><div class="info-box"><span class="info-box-icon text-bg-warning"><i class="bi bi-hourglass-split"></i></span><div class="info-box-content"><span class="info-box-text">Payroll Outstanding</span><span class="info-box-number"><?= e(format_currency($totalOutstanding)); ?></span></div></div></div>
-        <div class="col-md-3"><div class="info-box"><span class="info-box-icon text-bg-info"><i class="bi bi-journal-check"></i></span><div class="info-box-content"><span class="info-box-text">Salary Sheets</span><span class="info-box-number"><?= number_format((int) ($sheetSummary['sheet_count'] ?? 0)); ?></span></div></div></div>
-      </div>
-
-      <div class="row g-3 mb-3">
-        <div class="col-md-6"><div class="info-box"><span class="info-box-icon text-bg-secondary"><i class="bi bi-cash-coin"></i></span><div class="info-box-content"><span class="info-box-text">Advance Outstanding</span><span class="info-box-number"><?= e(format_currency($advanceOutstandingTotal)); ?></span></div></div></div>
-        <div class="col-md-6"><div class="info-box"><span class="info-box-icon text-bg-danger"><i class="bi bi-credit-card"></i></span><div class="info-box-content"><span class="info-box-text">Loan Outstanding</span><span class="info-box-number"><?= e(format_currency($loanOutstandingTotal)); ?></span></div></div></div>
-      </div>
-
-      <div class="card mb-3">
-        <div class="card-header d-flex justify-content-between align-items-center">
-          <h3 class="card-title mb-0">Monthly Salary Report</h3>
-          <a href="<?= e(reports_export_url('modules/reports/payroll.php', $pageParams, 'monthly_salary')); ?>" class="btn btn-sm btn-outline-primary">CSV</a>
-        </div>
-        <div class="card-body p-0 table-responsive">
-          <table class="table table-sm table-striped mb-0">
-            <thead><tr><th>Garage</th><th>Staff</th><th>Type</th><th>Base</th><th>Commission</th><th>Overtime</th><th>Deductions</th><th>Net</th><th>Paid</th><th>Status</th></tr></thead>
-            <tbody>
-              <?php if (empty($monthlySalaryRows)): ?>
-                <tr><td colspan="10" class="text-center text-muted py-4">No salary sheet rows found for selected month.</td></tr>
-              <?php else: foreach ($monthlySalaryRows as $row): ?>
-                <tr>
-                  <td><?= e((string) ($row['garage_name'] ?? '')); ?></td>
-                  <td><?= e((string) ($row['staff_name'] ?? '')); ?></td>
-                  <td><?= e((string) ($row['salary_type'] ?? '')); ?></td>
-                  <td><?= e(format_currency((float) ($row['base_amount'] ?? 0))); ?></td>
-                  <td><?= e(format_currency((float) ($row['commission_amount'] ?? 0))); ?></td>
-                  <td><?= e(format_currency((float) ($row['overtime_amount'] ?? 0))); ?></td>
-                  <td><?= e(format_currency((float) ($row['deduction_total'] ?? 0))); ?></td>
-                  <td><?= e(format_currency((float) ($row['net_payable'] ?? 0))); ?></td>
-                  <td><?= e(format_currency((float) ($row['paid_amount'] ?? 0))); ?></td>
-                  <td><?= e((string) ($row['status'] ?? '')); ?></td>
-                </tr>
-              <?php endforeach; endif; ?>
-            </tbody>
-          </table>
-        </div>
-      </div>
-
-      <div class="row g-3 mb-3">
-        <div class="col-lg-6">
-          <div class="card h-100">
-            <div class="card-header d-flex justify-content-between align-items-center">
-              <h3 class="card-title mb-0">Staff Payment History</h3>
-              <a href="<?= e(reports_export_url('modules/reports/payroll.php', $pageParams, 'staff_payment_history')); ?>" class="btn btn-sm btn-outline-secondary">CSV</a>
-            </div>
-            <div class="card-body p-0 table-responsive">
-              <table class="table table-sm table-striped mb-0">
-                <thead><tr><th>Date</th><th>Month</th><th>Garage</th><th>Staff</th><th>Type</th><th>Amount</th><th>Mode</th></tr></thead>
-                <tbody>
-                  <?php if (empty($staffPaymentHistory)): ?>
-                    <tr><td colspan="7" class="text-center text-muted py-4">No salary payment records in selected range.</td></tr>
-                  <?php else: foreach ($staffPaymentHistory as $row): ?>
-                    <tr>
-                      <td><?= e((string) ($row['payment_date'] ?? '')); ?></td>
-                      <td><?= e((string) ($row['salary_month'] ?? '')); ?></td>
-                      <td><?= e((string) ($row['garage_name'] ?? '')); ?></td>
-                      <td><?= e((string) ($row['staff_name'] ?? '')); ?></td>
-                      <td><?= e((string) ($row['entry_type'] ?? '')); ?></td>
-                      <td><?= e(format_currency((float) ($row['amount'] ?? 0))); ?></td>
-                      <td><?= e((string) ($row['payment_mode'] ?? '')); ?></td>
-                    </tr>
-                  <?php endforeach; endif; ?>
-                </tbody>
-              </table>
-            </div>
-          </div>
-        </div>
-
-        <div class="col-lg-6">
-          <div class="card h-100">
-            <div class="card-header d-flex justify-content-between align-items-center">
-              <h3 class="card-title mb-0">Advance Ledger</h3>
-              <a href="<?= e(reports_export_url('modules/reports/payroll.php', $pageParams, 'advance_ledger')); ?>" class="btn btn-sm btn-outline-primary">CSV</a>
-            </div>
-            <div class="card-body p-0 table-responsive">
-              <table class="table table-sm table-striped mb-0">
-                <thead><tr><th>Date</th><th>Garage</th><th>Staff</th><th>Advance</th><th>Applied</th><th>Pending</th><th>Status</th></tr></thead>
-                <tbody>
-                  <?php if (empty($advanceLedgerRows)): ?>
-                    <tr><td colspan="7" class="text-center text-muted py-4">No advance entries in selected range.</td></tr>
-                  <?php else: foreach ($advanceLedgerRows as $row): ?>
-                    <tr>
-                      <td><?= e((string) ($row['advance_date'] ?? '')); ?></td>
-                      <td><?= e((string) ($row['garage_name'] ?? '')); ?></td>
-                      <td><?= e((string) ($row['staff_name'] ?? '')); ?></td>
-                      <td><?= e(format_currency((float) ($row['amount'] ?? 0))); ?></td>
-                      <td><?= e(format_currency((float) ($row['applied_amount'] ?? 0))); ?></td>
-                      <td><?= e(format_currency((float) ($row['pending_amount'] ?? 0))); ?></td>
-                      <td><?= e((string) ($row['status'] ?? '')); ?></td>
-                    </tr>
-                  <?php endforeach; endif; ?>
-                </tbody>
-              </table>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <div class="row g-3 mb-3">
-        <div class="col-lg-6">
-          <div class="card h-100">
-            <div class="card-header d-flex justify-content-between align-items-center">
-              <h3 class="card-title mb-0">Loan Outstanding Summary</h3>
-              <a href="<?= e(reports_export_url('modules/reports/payroll.php', $pageParams, 'loan_outstanding')); ?>" class="btn btn-sm btn-outline-danger">CSV</a>
-            </div>
-            <div class="card-body p-0 table-responsive">
-              <table class="table table-sm table-striped mb-0">
-                <thead><tr><th>Loan Date</th><th>Garage</th><th>Staff</th><th>Total</th><th>Paid</th><th>Pending</th><th>EMI</th><th>Status</th></tr></thead>
-                <tbody>
-                  <?php if (empty($loanOutstandingRows)): ?>
-                    <tr><td colspan="8" class="text-center text-muted py-4">No loans found in selected scope.</td></tr>
-                  <?php else: foreach ($loanOutstandingRows as $row): ?>
-                    <tr>
-                      <td><?= e((string) ($row['loan_date'] ?? '')); ?></td>
-                      <td><?= e((string) ($row['garage_name'] ?? '')); ?></td>
-                      <td><?= e((string) ($row['staff_name'] ?? '')); ?></td>
-                      <td><?= e(format_currency((float) ($row['total_amount'] ?? 0))); ?></td>
-                      <td><?= e(format_currency((float) ($row['paid_amount'] ?? 0))); ?></td>
-                      <td><?= e(format_currency((float) ($row['pending_amount'] ?? 0))); ?></td>
-                      <td><?= e(format_currency((float) ($row['emi_amount'] ?? 0))); ?></td>
-                      <td><?= e((string) ($row['status'] ?? '')); ?></td>
-                    </tr>
-                  <?php endforeach; endif; ?>
-                </tbody>
-              </table>
-            </div>
-          </div>
-        </div>
-
-        <div class="col-lg-6">
-          <div class="card h-100">
-            <div class="card-header d-flex justify-content-between align-items-center">
-              <h3 class="card-title mb-0">Mechanic Earnings (Per Job Salary Type)</h3>
-              <a href="<?= e(reports_export_url('modules/reports/payroll.php', $pageParams, 'mechanic_earnings')); ?>" class="btn btn-sm btn-outline-secondary">CSV</a>
-            </div>
-            <div class="card-body p-0 table-responsive">
-              <table class="table table-sm table-striped mb-0">
-                <thead><tr><th>Garage</th><th>Mechanic</th><th>Closed Jobs</th><th>Gross</th><th>Net</th><th>Paid</th></tr></thead>
-                <tbody>
-                  <?php if (empty($mechanicEarningsRows)): ?>
-                    <tr><td colspan="6" class="text-center text-muted py-4">No PER_JOB payroll rows found for selected month.</td></tr>
-                  <?php else: foreach ($mechanicEarningsRows as $row): ?>
-                    <tr>
-                      <td><?= e((string) ($row['garage_name'] ?? '')); ?></td>
-                      <td><?= e((string) ($row['staff_name'] ?? '')); ?></td>
-                      <td><?= number_format((int) ($row['closed_jobs'] ?? 0)); ?></td>
-                      <td><?= e(format_currency((float) ($row['gross_earnings'] ?? 0))); ?></td>
-                      <td><?= e(format_currency((float) ($row['net_earnings'] ?? 0))); ?></td>
-                      <td><?= e(format_currency((float) ($row['paid_earnings'] ?? 0))); ?></td>
-                    </tr>
-                  <?php endforeach; endif; ?>
-                </tbody>
-              </table>
-            </div>
-          </div>
-        </div>
+      <div id="payroll-report-content">
+        <?php $renderReportBody($sheetSummary, $monthlySalaryRows, $staffPaymentHistory, $advanceLedgerRows, $loanOutstandingRows, $mechanicEarningsRows, $pageParams, $canExportData, $totalPayable, $totalPaid, $totalOutstanding, $advanceOutstandingTotal, $loanOutstandingTotal, $paidSalaryRowCount, $partialSalaryRowCount, $pendingSalaryRowCount, $unpaidSalaryRowCount); ?>
       </div>
     </div>
   </div>
 </main>
+
+<script>
+  (function () {
+    var form = document.getElementById('payroll-filter-form');
+    var target = document.getElementById('payroll-report-content');
+    if (!form || !target) {
+      return;
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      var params = new URLSearchParams(new FormData(form));
+      params.set('ajax', '1');
+
+      var url = form.getAttribute('action') || window.location.pathname;
+      target.classList.add('opacity-50');
+
+      fetch(url + '?' + params.toString(), { headers: { 'X-Requested-With': 'XMLHttpRequest' } })
+        .then(function (response) { return response.text(); })
+        .then(function (html) {
+          target.innerHTML = html;
+        })
+        .catch(function () {
+          target.innerHTML = '<div class="alert alert-danger">Unable to load payroll report data. Please retry.</div>';
+        })
+        .finally(function () {
+          target.classList.remove('opacity-50');
+        });
+    });
+  })();
+</script>
 
 <?php require_once __DIR__ . '/../../includes/footer.php'; ?>
