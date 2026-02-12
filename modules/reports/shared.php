@@ -8,7 +8,7 @@ function reports_can_view(): bool
 
 function reports_can_view_financial(): bool
 {
-    return has_permission('reports.financial');
+    return has_permission('reports.financial') || has_permission('financial.reports') || has_permission('gst.reports');
 }
 
 function reports_require_access(): void
@@ -239,13 +239,22 @@ function reports_module_links(): array
         ],
     ];
 
-    if (has_permission('reports.financial')) {
+    if (reports_can_view_financial()) {
         array_splice($links, 3, 0, [[
             'menu_key' => 'reports.billing',
             'label' => 'Billing & GST',
             'icon' => 'bi bi-receipt',
             'path' => 'modules/reports/billing_gst.php',
         ]]);
+    }
+
+    if (has_permission('gst.reports') || has_permission('financial.reports')) {
+        $links[] = [
+            'menu_key' => 'reports.gst_compliance',
+            'label' => 'GST Compliance',
+            'icon' => 'bi bi-journal-text',
+            'path' => 'modules/reports/gst_compliance.php',
+        ];
     }
 
     return $links;

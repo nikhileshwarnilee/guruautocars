@@ -15,6 +15,8 @@ $userId = (int) ($_SESSION['user_id'] ?? 0);
 $canManage = has_permission('purchase.manage');
 $canFinalize = has_permission('purchase.finalize') || $canManage;
 $canExport = has_permission('export.data') || $canManage;
+$canPayPurchases = has_permission('purchase.payments') || $canManage;
+$canViewVendorPayables = has_permission('vendor.payments') || $canManage;
 
 function pur_decimal(mixed $raw, float $default = 0.0): float
 {
@@ -130,6 +132,55 @@ function pur_payment_badge_class(string $status): string
     };
 }
 
+function pur_payment_modes(): array
+{
+  return ['CASH', 'UPI', 'CARD', 'BANK_TRANSFER', 'CHEQUE', 'MIXED', 'ADJUSTMENT'];
+}
+
+function pur_payment_status_from_amounts(float $grandTotal, float $paidAmount): string
+{
+  if ($grandTotal <= 0) {
+    return 'PAID';
+  }
+
+  if ($paidAmount <= 0.009) {
+    return 'UNPAID';
+  }
+
+  if ($paidAmount + 0.009 >= $grandTotal) {
+    return 'PAID';
+  }
+
+  return 'PARTIAL';
+}
+
+function pur_fetch_purchase_for_update(PDO $pdo, int $purchaseId, int $companyId, int $garageId): ?array
+{
+  $stmt = $pdo->prepare(
+    'SELECT p.*,
+        COALESCE(pay.total_paid, 0) AS total_paid
+     FROM purchases p
+     LEFT JOIN (
+       SELECT purchase_id, SUM(amount) AS total_paid
+       FROM purchase_payments
+       GROUP BY purchase_id
+     ) pay ON pay.purchase_id = p.id
+     WHERE p.id = :id
+       AND p.company_id = :company_id
+       AND p.garage_id = :garage_id
+     LIMIT 1
+     FOR UPDATE'
+  );
+  $stmt->execute([
+    'id' => $purchaseId,
+    'company_id' => $companyId,
+    'garage_id' => $garageId,
+  ]);
+
+  $row = $stmt->fetch();
+  return $row ?: null;
+}
+
 function pur_purchase_badge_class(string $status): string
 {
     return match ($status) {
@@ -189,6 +240,7 @@ function pur_csv_download(string $filename, array $headers, array $rows, array $
 }
 
 $purchasesReady = table_columns('purchases') !== [] && table_columns('purchase_items') !== [];
+$purchasePaymentsReady = table_columns('purchase_payments') !== [];
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     require_csrf();
@@ -429,6 +481,25 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 ]);
             }
 
+              if ($purchasePaymentsReady && $paymentStatus === 'PAID' && $totals['grand'] > 0) {
+                $paymentStmt = $pdo->prepare(
+                  'INSERT INTO purchase_payments
+                    (purchase_id, company_id, garage_id, payment_date, entry_type, amount, payment_mode, reference_no, notes, created_by)
+                   VALUES
+                    (:purchase_id, :company_id, :garage_id, :payment_date, "PAYMENT", :amount, "ADJUSTMENT", :reference_no, :notes, :created_by)'
+                );
+                $paymentStmt->execute([
+                  'purchase_id' => $purchaseId,
+                  'company_id' => $companyId,
+                  'garage_id' => $activeGarageId,
+                  'payment_date' => $purchaseDate,
+                  'amount' => $totals['grand'],
+                  'reference_no' => 'ENTRY-' . $purchaseId,
+                  'notes' => 'Payment captured at purchase entry.',
+                  'created_by' => $userId,
+                ]);
+              }
+
             $pdo->commit();
             log_audit(
                 'purchases',
@@ -530,7 +601,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $pdo->beginTransaction();
         try {
             $purchaseLockStmt = $pdo->prepare(
-                'SELECT id, assignment_status, purchase_status, notes
+                'SELECT id, assignment_status, purchase_status, notes, grand_total
                  FROM purchases
                  WHERE id = :id
                    AND company_id = :company_id
@@ -587,6 +658,28 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'finalized_at' => $finalizedAt,
                 'id' => $purchaseId,
             ]);
+
+            if ($purchasePaymentsReady && $paymentStatus === 'PAID') {
+              $grandTotal = round((float) ($purchase['grand_total'] ?? 0), 2);
+              if ($grandTotal > 0) {
+                $paymentStmt = $pdo->prepare(
+                  'INSERT INTO purchase_payments
+                    (purchase_id, company_id, garage_id, payment_date, entry_type, amount, payment_mode, reference_no, notes, created_by)
+                   VALUES
+                    (:purchase_id, :company_id, :garage_id, :payment_date, "PAYMENT", :amount, "ADJUSTMENT", :reference_no, :notes, :created_by)'
+                );
+                $paymentStmt->execute([
+                  'purchase_id' => $purchaseId,
+                  'company_id' => $companyId,
+                  'garage_id' => $activeGarageId,
+                  'payment_date' => $purchaseDate,
+                  'amount' => $grandTotal,
+                  'reference_no' => 'ASSIGN-' . $purchaseId,
+                  'notes' => 'Payment captured during assignment.',
+                  'created_by' => $userId,
+                ]);
+              }
+            }
 
             $pdo->commit();
             log_audit(
@@ -702,6 +795,236 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         redirect('modules/purchases/index.php');
     }
+
+      if ($action === 'add_payment') {
+        if (!$canPayPurchases) {
+          flash_set('purchase_error', 'You do not have permission to record purchase payments.', 'danger');
+          redirect('modules/purchases/index.php');
+        }
+        if (!$purchasePaymentsReady) {
+          flash_set('purchase_error', 'Purchase payment tables are missing. Run database/financial_compliance_upgrade.sql first.', 'danger');
+          redirect('modules/purchases/index.php');
+        }
+
+        $purchaseId = post_int('purchase_id');
+        $paymentDate = trim((string) ($_POST['payment_date'] ?? date('Y-m-d')));
+        $amount = round(max(0, pur_decimal($_POST['amount'] ?? 0)), 2);
+        $paymentMode = strtoupper(trim((string) ($_POST['payment_mode'] ?? 'BANK_TRANSFER')));
+        $referenceNo = post_string('reference_no', 100);
+        $notes = post_string('notes', 255);
+
+        if ($purchaseId <= 0) {
+          flash_set('purchase_error', 'Invalid purchase selected for payment.', 'danger');
+          redirect('modules/purchases/index.php');
+        }
+        if (!pur_is_valid_date($paymentDate)) {
+          flash_set('purchase_error', 'Invalid payment date.', 'danger');
+          redirect('modules/purchases/index.php');
+        }
+        if ($amount <= 0) {
+          flash_set('purchase_error', 'Payment amount must be greater than zero.', 'danger');
+          redirect('modules/purchases/index.php');
+        }
+        if (!in_array($paymentMode, pur_payment_modes(), true)) {
+          flash_set('purchase_error', 'Invalid payment mode selected.', 'danger');
+          redirect('modules/purchases/index.php');
+        }
+
+        $pdo = db();
+        $pdo->beginTransaction();
+        try {
+          $purchase = pur_fetch_purchase_for_update($pdo, $purchaseId, $companyId, $activeGarageId);
+          if (!$purchase) {
+            throw new RuntimeException('Purchase not found for this garage.');
+          }
+          if ((string) ($purchase['purchase_status'] ?? '') !== 'FINALIZED') {
+            throw new RuntimeException('Only finalized purchases can be paid.');
+          }
+
+          $grandTotal = round((float) ($purchase['grand_total'] ?? 0), 2);
+          $paidAmount = round((float) ($purchase['total_paid'] ?? 0), 2);
+          $outstanding = round(max(0, $grandTotal - $paidAmount), 2);
+          if ($outstanding <= 0.009) {
+            throw new RuntimeException('No outstanding balance left for this purchase.');
+          }
+          if ($amount > $outstanding + 0.009) {
+            throw new RuntimeException('Payment amount exceeds outstanding balance.');
+          }
+
+          $insertStmt = $pdo->prepare(
+            'INSERT INTO purchase_payments
+              (purchase_id, company_id, garage_id, payment_date, entry_type, amount, payment_mode, reference_no, notes, created_by)
+             VALUES
+              (:purchase_id, :company_id, :garage_id, :payment_date, "PAYMENT", :amount, :payment_mode, :reference_no, :notes, :created_by)'
+          );
+          $insertStmt->execute([
+            'purchase_id' => $purchaseId,
+            'company_id' => $companyId,
+            'garage_id' => $activeGarageId,
+            'payment_date' => $paymentDate,
+            'amount' => $amount,
+            'payment_mode' => $paymentMode,
+            'reference_no' => $referenceNo !== '' ? $referenceNo : null,
+            'notes' => $notes !== '' ? $notes : null,
+            'created_by' => $userId > 0 ? $userId : null,
+          ]);
+          $paymentId = (int) $pdo->lastInsertId();
+
+          $newPaid = round($paidAmount + $amount, 2);
+          $nextStatus = pur_payment_status_from_amounts($grandTotal, $newPaid);
+
+          $updateStmt = $pdo->prepare(
+            'UPDATE purchases
+             SET payment_status = :payment_status
+             WHERE id = :id'
+          );
+          $updateStmt->execute([
+            'payment_status' => $nextStatus,
+            'id' => $purchaseId,
+          ]);
+
+          $pdo->commit();
+          log_audit('purchases', 'payment_add', $purchaseId, 'Recorded purchase payment #' . $paymentId, [
+            'entity' => 'purchase_payment',
+            'source' => 'UI',
+            'after' => [
+              'purchase_id' => $purchaseId,
+              'payment_id' => $paymentId,
+              'amount' => $amount,
+              'payment_mode' => $paymentMode,
+            ],
+          ]);
+          flash_set('purchase_success', 'Payment recorded successfully.', 'success');
+        } catch (Throwable $exception) {
+          $pdo->rollBack();
+          flash_set('purchase_error', $exception->getMessage(), 'danger');
+        }
+
+        redirect('modules/purchases/index.php?pay_purchase_id=' . (int) $purchaseId);
+      }
+
+      if ($action === 'reverse_payment') {
+        if (!$canPayPurchases) {
+          flash_set('purchase_error', 'You do not have permission to reverse purchase payments.', 'danger');
+          redirect('modules/purchases/index.php');
+        }
+        if (!$purchasePaymentsReady) {
+          flash_set('purchase_error', 'Purchase payment tables are missing. Run database/financial_compliance_upgrade.sql first.', 'danger');
+          redirect('modules/purchases/index.php');
+        }
+
+        $paymentId = post_int('payment_id');
+        $reverseReason = post_string('reverse_reason', 255);
+        if ($paymentId <= 0 || $reverseReason === '') {
+          flash_set('purchase_error', 'Payment and reversal reason are required.', 'danger');
+          redirect('modules/purchases/index.php');
+        }
+
+        $pdo = db();
+        $pdo->beginTransaction();
+        try {
+          $paymentStmt = $pdo->prepare(
+            'SELECT pp.*, p.grand_total, p.id AS purchase_id,
+                COALESCE(pay.total_paid, 0) AS total_paid
+             FROM purchase_payments pp
+             INNER JOIN purchases p ON p.id = pp.purchase_id
+             LEFT JOIN (
+              SELECT purchase_id, SUM(amount) AS total_paid
+              FROM purchase_payments
+              GROUP BY purchase_id
+             ) pay ON pay.purchase_id = p.id
+             WHERE pp.id = :id
+               AND p.company_id = :company_id
+               AND p.garage_id = :garage_id
+             LIMIT 1
+             FOR UPDATE'
+          );
+          $paymentStmt->execute([
+            'id' => $paymentId,
+            'company_id' => $companyId,
+            'garage_id' => $activeGarageId,
+          ]);
+          $payment = $paymentStmt->fetch();
+          if (!$payment) {
+            throw new RuntimeException('Payment entry not found.');
+          }
+          if ((string) ($payment['entry_type'] ?? '') !== 'PAYMENT') {
+            throw new RuntimeException('Only payment entries can be reversed.');
+          }
+          if ((float) ($payment['amount'] ?? 0) <= 0) {
+            throw new RuntimeException('Invalid payment amount for reversal.');
+          }
+
+          $checkStmt = $pdo->prepare(
+            'SELECT id
+             FROM purchase_payments
+             WHERE reversed_payment_id = :payment_id
+             LIMIT 1'
+          );
+          $checkStmt->execute(['payment_id' => $paymentId]);
+          if ($checkStmt->fetch()) {
+            throw new RuntimeException('This payment has already been reversed.');
+          }
+
+          $purchaseId = (int) ($payment['purchase_id'] ?? 0);
+          $paymentAmount = round((float) ($payment['amount'] ?? 0), 2);
+          $insertStmt = $pdo->prepare(
+            'INSERT INTO purchase_payments
+              (purchase_id, company_id, garage_id, payment_date, entry_type, amount, payment_mode, reference_no, notes, reversed_payment_id, created_by)
+             VALUES
+              (:purchase_id, :company_id, :garage_id, :payment_date, "REVERSAL", :amount, "ADJUSTMENT", :reference_no, :notes, :reversed_payment_id, :created_by)'
+          );
+          $insertStmt->execute([
+            'purchase_id' => $purchaseId,
+            'company_id' => $companyId,
+            'garage_id' => $activeGarageId,
+            'payment_date' => date('Y-m-d'),
+            'amount' => -$paymentAmount,
+            'reference_no' => 'REV-' . $paymentId,
+            'notes' => $reverseReason,
+            'reversed_payment_id' => $paymentId,
+            'created_by' => $userId > 0 ? $userId : null,
+          ]);
+          $reversalId = (int) $pdo->lastInsertId();
+
+          $purchase = pur_fetch_purchase_for_update($pdo, $purchaseId, $companyId, $activeGarageId);
+          if (!$purchase) {
+            throw new RuntimeException('Purchase not found after reversal.');
+          }
+
+          $grandTotal = round((float) ($purchase['grand_total'] ?? 0), 2);
+          $newPaid = round((float) ($purchase['total_paid'] ?? 0), 2);
+          $nextStatus = pur_payment_status_from_amounts($grandTotal, $newPaid);
+
+          $updateStmt = $pdo->prepare(
+            'UPDATE purchases
+             SET payment_status = :payment_status
+             WHERE id = :id'
+          );
+          $updateStmt->execute([
+            'payment_status' => $nextStatus,
+            'id' => $purchaseId,
+          ]);
+
+          $pdo->commit();
+          log_audit('purchases', 'payment_reverse', $purchaseId, 'Reversed purchase payment #' . $paymentId, [
+            'entity' => 'purchase_payment',
+            'source' => 'UI',
+            'after' => [
+              'purchase_id' => $purchaseId,
+              'payment_id' => $paymentId,
+              'reversal_id' => $reversalId,
+              'reversal_amount' => -$paymentAmount,
+            ],
+          ]);
+          flash_set('purchase_success', 'Payment reversed successfully.', 'success');
+        } catch (Throwable $exception) {
+          $pdo->rollBack();
+          flash_set('purchase_error', $exception->getMessage(), 'danger');
+        }
+
+        redirect('modules/purchases/index.php?pay_purchase_id=' . (int) post_int('purchase_id'));
+      }
 }
 
 $garageName = 'Garage #' . $activeGarageId;
@@ -760,6 +1083,7 @@ $invoiceFilter = trim((string) ($_GET['invoice'] ?? ''));
 $fromDate = trim((string) ($_GET['from'] ?? ''));
 $toDate = trim((string) ($_GET['to'] ?? ''));
 $assignPurchaseId = get_int('assign_purchase_id', 0);
+$payPurchaseId = get_int('pay_purchase_id', 0);
 
 $allowedPaymentStatuses = ['UNPAID', 'PARTIAL', 'PAID'];
 $allowedPurchaseStatuses = ['DRAFT', 'FINALIZED'];
@@ -832,45 +1156,107 @@ $summary = [
     'taxable_total' => 0,
     'gst_total' => 0,
     'grand_total' => 0,
+  'paid_total' => 0,
+  'outstanding_total' => 0,
 ];
 $topParts = [];
 $unassignedRows = [];
+$vendorOutstandingRows = [];
+$agingSummary = [
+  'bucket_0_30' => 0,
+  'bucket_31_60' => 0,
+  'bucket_61_90' => 0,
+  'bucket_90_plus' => 0,
+  'outstanding_total' => 0,
+];
+$paidUnpaidSummary = [
+  'paid_count' => 0,
+  'partial_count' => 0,
+  'unpaid_count' => 0,
+  'paid_total' => 0,
+  'partial_total' => 0,
+  'unpaid_total' => 0,
+];
 
 if ($purchasesReady) {
+  if ($purchasePaymentsReady) {
     $summaryStmt = db()->prepare(
-        'SELECT
-            COUNT(*) AS purchase_count,
-            COALESCE(SUM(CASE WHEN p.assignment_status = "UNASSIGNED" THEN 1 ELSE 0 END), 0) AS unassigned_count,
-            COALESCE(SUM(CASE WHEN p.purchase_status = "FINALIZED" THEN 1 ELSE 0 END), 0) AS finalized_count,
-            COALESCE(SUM(p.taxable_amount), 0) AS taxable_total,
-            COALESCE(SUM(p.gst_amount), 0) AS gst_total,
-            COALESCE(SUM(p.grand_total), 0) AS grand_total
-         FROM purchases p
-         WHERE ' . implode(' AND ', $purchaseWhere)
+      'SELECT
+        COUNT(*) AS purchase_count,
+        COALESCE(SUM(CASE WHEN p.assignment_status = "UNASSIGNED" THEN 1 ELSE 0 END), 0) AS unassigned_count,
+        COALESCE(SUM(CASE WHEN p.purchase_status = "FINALIZED" THEN 1 ELSE 0 END), 0) AS finalized_count,
+        COALESCE(SUM(p.taxable_amount), 0) AS taxable_total,
+        COALESCE(SUM(p.gst_amount), 0) AS gst_total,
+        COALESCE(SUM(p.grand_total), 0) AS grand_total,
+        COALESCE(SUM(COALESCE(pay.total_paid, 0)), 0) AS paid_total,
+        COALESCE(SUM(GREATEST(p.grand_total - COALESCE(pay.total_paid, 0), 0)), 0) AS outstanding_total
+       FROM purchases p
+       LEFT JOIN (
+        SELECT purchase_id, SUM(amount) AS total_paid
+        FROM purchase_payments
+        GROUP BY purchase_id
+       ) pay ON pay.purchase_id = p.id
+       WHERE ' . implode(' AND ', $purchaseWhere)
     );
     $summaryStmt->execute($purchaseParams);
     $summary = $summaryStmt->fetch() ?: $summary;
-
-    $listStmt = db()->prepare(
-        'SELECT p.*,
-                v.vendor_name,
-                u.name AS created_by_name,
-                fu.name AS finalized_by_name,
-                COALESCE(items.item_count, 0) AS item_count,
-                COALESCE(items.total_qty, 0) AS total_qty
-         FROM purchases p
-         LEFT JOIN vendors v ON v.id = p.vendor_id
-         LEFT JOIN users u ON u.id = p.created_by
-         LEFT JOIN users fu ON fu.id = p.finalized_by
-         LEFT JOIN (
-            SELECT purchase_id, COUNT(*) AS item_count, COALESCE(SUM(quantity), 0) AS total_qty
-            FROM purchase_items
-            GROUP BY purchase_id
-         ) items ON items.purchase_id = p.id
-         WHERE ' . implode(' AND ', $purchaseWhere) . '
-         ORDER BY p.id DESC
-         LIMIT 200'
+  } else {
+    $summaryStmt = db()->prepare(
+      'SELECT
+        COUNT(*) AS purchase_count,
+        COALESCE(SUM(CASE WHEN p.assignment_status = "UNASSIGNED" THEN 1 ELSE 0 END), 0) AS unassigned_count,
+        COALESCE(SUM(CASE WHEN p.purchase_status = "FINALIZED" THEN 1 ELSE 0 END), 0) AS finalized_count,
+        COALESCE(SUM(p.taxable_amount), 0) AS taxable_total,
+        COALESCE(SUM(p.gst_amount), 0) AS gst_total,
+        COALESCE(SUM(p.grand_total), 0) AS grand_total
+       FROM purchases p
+       WHERE ' . implode(' AND ', $purchaseWhere)
     );
+    $summaryStmt->execute($purchaseParams);
+    $summary = $summaryStmt->fetch() ?: $summary;
+  }
+
+     $listSql =
+        'SELECT p.*,
+             v.vendor_name,
+             u.name AS created_by_name,
+             fu.name AS finalized_by_name,
+             COALESCE(items.item_count, 0) AS item_count,
+             COALESCE(items.total_qty, 0) AS total_qty';
+
+     if ($purchasePaymentsReady) {
+        $listSql .= ',
+             COALESCE(pay.total_paid, 0) AS paid_total,
+             COALESCE(pay.payment_count, 0) AS payment_count,
+             GREATEST(p.grand_total - COALESCE(pay.total_paid, 0), 0) AS outstanding_total';
+     }
+
+     $listSql .= '
+        FROM purchases p
+        LEFT JOIN vendors v ON v.id = p.vendor_id
+        LEFT JOIN users u ON u.id = p.created_by
+        LEFT JOIN users fu ON fu.id = p.finalized_by
+        LEFT JOIN (
+          SELECT purchase_id, COUNT(*) AS item_count, COALESCE(SUM(quantity), 0) AS total_qty
+          FROM purchase_items
+          GROUP BY purchase_id
+        ) items ON items.purchase_id = p.id';
+
+     if ($purchasePaymentsReady) {
+        $listSql .= '
+        LEFT JOIN (
+          SELECT purchase_id, SUM(amount) AS total_paid, COUNT(*) AS payment_count
+          FROM purchase_payments
+          GROUP BY purchase_id
+        ) pay ON pay.purchase_id = p.id';
+     }
+
+     $listSql .= '
+        WHERE ' . implode(' AND ', $purchaseWhere) . '
+        ORDER BY p.id DESC
+        LIMIT 200';
+
+     $listStmt = db()->prepare($listSql);
     $listStmt->execute($purchaseParams);
     $purchases = $listStmt->fetchAll();
 
@@ -909,23 +1295,161 @@ if ($purchasesReady) {
     ]);
     $unassignedRows = $unassignedStmt->fetchAll();
 
-    $export = strtolower(trim((string) ($_GET['export'] ?? '')));
-    if ($export === 'csv') {
-        if (!$canExport) {
-            flash_set('purchase_error', 'You do not have permission to export purchase reports.', 'danger');
-            redirect('modules/purchases/index.php');
-        }
+    $payPurchase = null;
+    $paymentHistory = [];
+    if ($purchasePaymentsReady && $payPurchaseId > 0) {
+      $payStmt = db()->prepare(
+        'SELECT p.*, v.vendor_name,
+            COALESCE(pay.total_paid, 0) AS total_paid,
+            GREATEST(p.grand_total - COALESCE(pay.total_paid, 0), 0) AS outstanding_total
+         FROM purchases p
+         LEFT JOIN vendors v ON v.id = p.vendor_id
+         LEFT JOIN (
+          SELECT purchase_id, SUM(amount) AS total_paid
+          FROM purchase_payments
+          GROUP BY purchase_id
+         ) pay ON pay.purchase_id = p.id
+         WHERE p.id = :id
+           AND p.company_id = :company_id
+           AND p.garage_id = :garage_id
+         LIMIT 1'
+      );
+      $payStmt->execute([
+        'id' => $payPurchaseId,
+        'company_id' => $companyId,
+        'garage_id' => $activeGarageId,
+      ]);
+      $payPurchase = $payStmt->fetch() ?: null;
 
-        $exportStmt = db()->prepare(
+      if ($payPurchase) {
+        $historyStmt = db()->prepare(
+          'SELECT pp.id, pp.payment_date, pp.entry_type, pp.amount, pp.payment_mode, pp.reference_no, pp.notes, pp.reversed_payment_id,
+            u.name AS created_by_name,
+            r.id AS reversal_id
+           FROM purchase_payments pp
+           LEFT JOIN users u ON u.id = pp.created_by
+           LEFT JOIN purchase_payments r ON r.reversed_payment_id = pp.id
+           WHERE pp.purchase_id = :purchase_id
+           ORDER BY pp.id DESC'
+        );
+        $historyStmt->execute(['purchase_id' => (int) $payPurchase['id']]);
+        $paymentHistory = $historyStmt->fetchAll();
+      }
+    }
+
+    if ($purchasePaymentsReady && $canViewVendorPayables) {
+      $payableWhere = [
+        'p.company_id = :company_id',
+        'p.garage_id = :garage_id',
+        'p.purchase_status = "FINALIZED"',
+        'p.assignment_status = "ASSIGNED"',
+      ];
+      $payableParams = [
+        'company_id' => $companyId,
+        'garage_id' => $activeGarageId,
+      ];
+      if ($vendorFilter > 0) {
+        $payableWhere[] = 'p.vendor_id = :vendor_id';
+        $payableParams['vendor_id'] = $vendorFilter;
+      }
+      if ($fromDate !== '') {
+        $payableWhere[] = 'p.purchase_date >= :from_date';
+        $payableParams['from_date'] = $fromDate;
+      }
+      if ($toDate !== '') {
+        $payableWhere[] = 'p.purchase_date <= :to_date';
+        $payableParams['to_date'] = $toDate;
+      }
+
+      $vendorStmt = db()->prepare(
+        'SELECT v.id AS vendor_id,
+            COALESCE(v.vendor_name, "UNASSIGNED") AS vendor_name,
+            COALESCE(v.vendor_code, "-") AS vendor_code,
+            COUNT(p.id) AS purchase_count,
+            COALESCE(SUM(p.grand_total), 0) AS grand_total,
+            COALESCE(SUM(COALESCE(pay.total_paid, 0)), 0) AS paid_total,
+            COALESCE(SUM(GREATEST(p.grand_total - COALESCE(pay.total_paid, 0), 0)), 0) AS outstanding_total
+         FROM purchases p
+         LEFT JOIN vendors v ON v.id = p.vendor_id
+         LEFT JOIN (
+          SELECT purchase_id, SUM(amount) AS total_paid
+          FROM purchase_payments
+          GROUP BY purchase_id
+         ) pay ON pay.purchase_id = p.id
+         WHERE ' . implode(' AND ', $payableWhere) . '
+         GROUP BY v.id, v.vendor_name, v.vendor_code
+         HAVING outstanding_total > 0.01
+         ORDER BY outstanding_total DESC'
+      );
+      $vendorStmt->execute($payableParams);
+      $vendorOutstandingRows = $vendorStmt->fetchAll();
+
+      $agingStmt = db()->prepare(
+        'SELECT
+          COALESCE(SUM(CASE WHEN age_days BETWEEN 0 AND 30 THEN outstanding ELSE 0 END), 0) AS bucket_0_30,
+          COALESCE(SUM(CASE WHEN age_days BETWEEN 31 AND 60 THEN outstanding ELSE 0 END), 0) AS bucket_31_60,
+          COALESCE(SUM(CASE WHEN age_days BETWEEN 61 AND 90 THEN outstanding ELSE 0 END), 0) AS bucket_61_90,
+          COALESCE(SUM(CASE WHEN age_days > 90 THEN outstanding ELSE 0 END), 0) AS bucket_90_plus,
+          COALESCE(SUM(outstanding), 0) AS outstanding_total
+         FROM (
+          SELECT p.id,
+               DATEDIFF(CURDATE(), p.purchase_date) AS age_days,
+               GREATEST(p.grand_total - COALESCE(pay.total_paid, 0), 0) AS outstanding
+          FROM purchases p
+          LEFT JOIN (
+            SELECT purchase_id, SUM(amount) AS total_paid
+            FROM purchase_payments
+            GROUP BY purchase_id
+          ) pay ON pay.purchase_id = p.id
+          WHERE ' . implode(' AND ', $payableWhere) . '
+         ) aged
+         WHERE outstanding > 0.01'
+      );
+      $agingStmt->execute($payableParams);
+      $agingSummary = $agingStmt->fetch() ?: $agingSummary;
+
+      $paidUnpaidStmt = db()->prepare(
+        'SELECT
+          COALESCE(SUM(CASE WHEN paid_total + 0.009 >= grand_total THEN 1 ELSE 0 END), 0) AS paid_count,
+          COALESCE(SUM(CASE WHEN paid_total > 0.009 AND paid_total + 0.009 < grand_total THEN 1 ELSE 0 END), 0) AS partial_count,
+          COALESCE(SUM(CASE WHEN paid_total <= 0.009 THEN 1 ELSE 0 END), 0) AS unpaid_count,
+          COALESCE(SUM(CASE WHEN paid_total + 0.009 >= grand_total THEN grand_total ELSE 0 END), 0) AS paid_total,
+          COALESCE(SUM(CASE WHEN paid_total > 0.009 AND paid_total + 0.009 < grand_total THEN grand_total ELSE 0 END), 0) AS partial_total,
+          COALESCE(SUM(CASE WHEN paid_total <= 0.009 THEN grand_total ELSE 0 END), 0) AS unpaid_total
+         FROM (
+          SELECT p.id, p.grand_total, COALESCE(pay.total_paid, 0) AS paid_total
+          FROM purchases p
+          LEFT JOIN (
+            SELECT purchase_id, SUM(amount) AS total_paid
+            FROM purchase_payments
+            GROUP BY purchase_id
+          ) pay ON pay.purchase_id = p.id
+          WHERE ' . implode(' AND ', $payableWhere) . '
+         ) summary'
+      );
+      $paidUnpaidStmt->execute($payableParams);
+      $paidUnpaidSummary = $paidUnpaidStmt->fetch() ?: $paidUnpaidSummary;
+    }
+
+    $export = strtolower(trim((string) ($_GET['export'] ?? '')));
+    if ($export !== '') {
+      if (!$canExport) {
+        flash_set('purchase_error', 'You do not have permission to export purchase reports.', 'danger');
+        redirect('modules/purchases/index.php');
+      }
+
+      switch ($export) {
+        case 'csv':
+          $exportStmt = db()->prepare(
             'SELECT p.id AS purchase_id, p.purchase_date, p.purchase_source, p.assignment_status, p.purchase_status, p.payment_status,
-                    COALESCE(v.vendor_name, "UNASSIGNED") AS vendor_name,
-                    COALESCE(p.invoice_number, "-") AS invoice_number,
-                    pt.part_sku, pt.part_name,
-                    pi.quantity, pi.unit_cost, pi.gst_rate, pi.taxable_amount, pi.gst_amount, pi.total_amount,
-                    p.taxable_amount AS purchase_taxable_amount,
-                    p.gst_amount AS purchase_gst_amount,
-                    p.grand_total AS purchase_grand_total,
-                    u.name AS created_by_name
+                COALESCE(v.vendor_name, "UNASSIGNED") AS vendor_name,
+                COALESCE(p.invoice_number, "-") AS invoice_number,
+                pt.part_sku, pt.part_name,
+                pi.quantity, pi.unit_cost, pi.gst_rate, pi.taxable_amount, pi.gst_amount, pi.total_amount,
+                p.taxable_amount AS purchase_taxable_amount,
+                p.gst_amount AS purchase_gst_amount,
+                p.grand_total AS purchase_grand_total,
+                u.name AS created_by_name
              FROM purchases p
              LEFT JOIN vendors v ON v.id = p.vendor_id
              LEFT JOIN users u ON u.id = p.created_by
@@ -933,12 +1457,12 @@ if ($purchasesReady) {
              INNER JOIN parts pt ON pt.id = pi.part_id
              WHERE ' . implode(' AND ', $purchaseWhere) . '
              ORDER BY p.id DESC, pi.id ASC'
-        );
-        $exportStmt->execute($purchaseParams);
-        $exportRows = $exportStmt->fetchAll();
+          );
+          $exportStmt->execute($purchaseParams);
+          $exportRows = $exportStmt->fetchAll();
 
-        $filename = 'purchases_' . date('Ymd_His') . '.csv';
-        $headers = [
+          $filename = 'purchases_' . date('Ymd_His') . '.csv';
+          $headers = [
             'Purchase ID',
             'Purchase Date',
             'Source',
@@ -959,34 +1483,34 @@ if ($purchasesReady) {
             'Purchase GST',
             'Purchase Grand Total',
             'Created By',
-        ];
-        $rows = [];
-        foreach ($exportRows as $row) {
+          ];
+          $rows = [];
+          foreach ($exportRows as $row) {
             $rows[] = [
-                (int) ($row['purchase_id'] ?? 0),
-                (string) ($row['purchase_date'] ?? ''),
-                (string) ($row['purchase_source'] ?? ''),
-                (string) ($row['assignment_status'] ?? ''),
-                (string) ($row['purchase_status'] ?? ''),
-                (string) ($row['payment_status'] ?? ''),
-                (string) ($row['vendor_name'] ?? ''),
-                (string) ($row['invoice_number'] ?? ''),
-                (string) ($row['part_sku'] ?? ''),
-                (string) ($row['part_name'] ?? ''),
-                number_format((float) ($row['quantity'] ?? 0), 2, '.', ''),
-                number_format((float) ($row['unit_cost'] ?? 0), 2, '.', ''),
-                number_format((float) ($row['gst_rate'] ?? 0), 2, '.', ''),
-                number_format((float) ($row['taxable_amount'] ?? 0), 2, '.', ''),
-                number_format((float) ($row['gst_amount'] ?? 0), 2, '.', ''),
-                number_format((float) ($row['total_amount'] ?? 0), 2, '.', ''),
-                number_format((float) ($row['purchase_taxable_amount'] ?? 0), 2, '.', ''),
-                number_format((float) ($row['purchase_gst_amount'] ?? 0), 2, '.', ''),
-                number_format((float) ($row['purchase_grand_total'] ?? 0), 2, '.', ''),
-                (string) ($row['created_by_name'] ?? ''),
+              (int) ($row['purchase_id'] ?? 0),
+              (string) ($row['purchase_date'] ?? ''),
+              (string) ($row['purchase_source'] ?? ''),
+              (string) ($row['assignment_status'] ?? ''),
+              (string) ($row['purchase_status'] ?? ''),
+              (string) ($row['payment_status'] ?? ''),
+              (string) ($row['vendor_name'] ?? ''),
+              (string) ($row['invoice_number'] ?? ''),
+              (string) ($row['part_sku'] ?? ''),
+              (string) ($row['part_name'] ?? ''),
+              number_format((float) ($row['quantity'] ?? 0), 2, '.', ''),
+              number_format((float) ($row['unit_cost'] ?? 0), 2, '.', ''),
+              number_format((float) ($row['gst_rate'] ?? 0), 2, '.', ''),
+              number_format((float) ($row['taxable_amount'] ?? 0), 2, '.', ''),
+              number_format((float) ($row['gst_amount'] ?? 0), 2, '.', ''),
+              number_format((float) ($row['total_amount'] ?? 0), 2, '.', ''),
+              number_format((float) ($row['purchase_taxable_amount'] ?? 0), 2, '.', ''),
+              number_format((float) ($row['purchase_gst_amount'] ?? 0), 2, '.', ''),
+              number_format((float) ($row['purchase_grand_total'] ?? 0), 2, '.', ''),
+              (string) ($row['created_by_name'] ?? ''),
             ];
-        }
+          }
 
-        pur_csv_download($filename, $headers, $rows, [
+          pur_csv_download($filename, $headers, $rows, [
             'garage_id' => $activeGarageId,
             'vendor_id' => $vendorFilter > 0 ? $vendorFilter : null,
             'payment_status' => $paymentFilter !== '' ? $paymentFilter : null,
@@ -996,13 +1520,75 @@ if ($purchasesReady) {
             'invoice' => $invoiceFilter !== '' ? $invoiceFilter : null,
             'from' => $fromDate !== '' ? $fromDate : null,
             'to' => $toDate !== '' ? $toDate : null,
-        ]);
+          ]);
+
+        case 'vendor_outstanding':
+          if (!$purchasePaymentsReady || !$canViewVendorPayables) {
+            flash_set('purchase_error', 'Vendor payable export is not available.', 'danger');
+            redirect('modules/purchases/index.php');
+          }
+          $rows = array_map(static fn (array $row): array => [
+            (string) ($row['vendor_name'] ?? ''),
+            (string) ($row['vendor_code'] ?? ''),
+            (int) ($row['purchase_count'] ?? 0),
+            (float) ($row['grand_total'] ?? 0),
+            (float) ($row['paid_total'] ?? 0),
+            (float) ($row['outstanding_total'] ?? 0),
+          ], $vendorOutstandingRows);
+          pur_csv_download('purchase_vendor_outstanding_' . date('Ymd_His') . '.csv', ['Vendor', 'Code', 'Purchases', 'Total', 'Paid', 'Outstanding'], $rows, [
+            'garage_id' => $activeGarageId,
+            'from' => $fromDate !== '' ? $fromDate : null,
+            'to' => $toDate !== '' ? $toDate : null,
+          ]);
+
+        case 'aging_summary':
+          if (!$purchasePaymentsReady || !$canViewVendorPayables) {
+            flash_set('purchase_error', 'Vendor aging export is not available.', 'danger');
+            redirect('modules/purchases/index.php');
+          }
+          $rows = [[
+            (float) ($agingSummary['bucket_0_30'] ?? 0),
+            (float) ($agingSummary['bucket_31_60'] ?? 0),
+            (float) ($agingSummary['bucket_61_90'] ?? 0),
+            (float) ($agingSummary['bucket_90_plus'] ?? 0),
+            (float) ($agingSummary['outstanding_total'] ?? 0),
+          ]];
+          pur_csv_download('purchase_aging_summary_' . date('Ymd_His') . '.csv', ['0-30 Days', '31-60 Days', '61-90 Days', '90+ Days', 'Total Outstanding'], $rows, [
+            'garage_id' => $activeGarageId,
+            'from' => $fromDate !== '' ? $fromDate : null,
+            'to' => $toDate !== '' ? $toDate : null,
+          ]);
+
+        case 'paid_unpaid':
+          if (!$purchasePaymentsReady || !$canViewVendorPayables) {
+            flash_set('purchase_error', 'Paid vs unpaid export is not available.', 'danger');
+            redirect('modules/purchases/index.php');
+          }
+          $rows = [[
+            (int) ($paidUnpaidSummary['paid_count'] ?? 0),
+            (int) ($paidUnpaidSummary['partial_count'] ?? 0),
+            (int) ($paidUnpaidSummary['unpaid_count'] ?? 0),
+            (float) ($paidUnpaidSummary['paid_total'] ?? 0),
+            (float) ($paidUnpaidSummary['partial_total'] ?? 0),
+            (float) ($paidUnpaidSummary['unpaid_total'] ?? 0),
+          ]];
+          pur_csv_download('purchase_paid_unpaid_' . date('Ymd_His') . '.csv', ['Paid Count', 'Partial Count', 'Unpaid Count', 'Paid Total', 'Partial Total', 'Unpaid Total'], $rows, [
+            'garage_id' => $activeGarageId,
+            'from' => $fromDate !== '' ? $fromDate : null,
+            'to' => $toDate !== '' ? $toDate : null,
+          ]);
+
+        default:
+          flash_set('purchase_error', 'Unknown export requested.', 'warning');
+          redirect('modules/purchases/index.php');
+      }
     }
 }
 
 $createToken = pur_issue_action_token('create_purchase');
 $assignToken = pur_issue_action_token('assign_unassigned');
 $finalizeToken = pur_issue_action_token('finalize_purchase');
+$paymentModes = pur_payment_modes();
 
 require_once __DIR__ . '/../../includes/header.php';
 require_once __DIR__ . '/../../includes/sidebar.php';
@@ -1211,6 +1797,150 @@ require_once __DIR__ . '/../../includes/sidebar.php';
           <?php endif; ?>
         </div>
 
+        <?php if ($purchasePaymentsReady): ?>
+          <div class="row g-3 mb-3">
+            <div class="col-md-6">
+              <div class="small-box text-bg-success">
+                <div class="inner">
+                  <h4><?= e(number_format((float) ($summary['paid_total'] ?? 0), 2)); ?></h4>
+                  <p>Total Paid</p>
+                </div>
+                <span class="small-box-icon"><i class="bi bi-cash-coin"></i></span>
+              </div>
+            </div>
+            <div class="col-md-6">
+              <div class="small-box text-bg-danger">
+                <div class="inner">
+                  <h4><?= e(number_format((float) ($summary['outstanding_total'] ?? 0), 2)); ?></h4>
+                  <p>Outstanding Payables</p>
+                </div>
+                <span class="small-box-icon"><i class="bi bi-exclamation-circle"></i></span>
+              </div>
+            </div>
+          </div>
+        <?php endif; ?>
+
+        <?php if ($purchasePaymentsReady && $canPayPurchases && $payPurchase): ?>
+          <div class="card mb-3">
+            <div class="card-header"><h3 class="card-title">Purchase Payments</h3></div>
+            <div class="card-body">
+              <div class="row g-2 mb-3">
+                <div class="col-md-2"><strong>Purchase ID:</strong> #<?= (int) ($payPurchase['id'] ?? 0); ?></div>
+                <div class="col-md-3"><strong>Vendor:</strong> <?= e((string) ($payPurchase['vendor_name'] ?? 'UNASSIGNED')); ?></div>
+                <div class="col-md-2"><strong>Invoice:</strong> <?= e((string) ($payPurchase['invoice_number'] ?? '-')); ?></div>
+                <div class="col-md-2"><strong>Date:</strong> <?= e((string) ($payPurchase['purchase_date'] ?? '-')); ?></div>
+                <div class="col-md-3"><strong>Status:</strong> <?= e((string) ($payPurchase['purchase_status'] ?? '-')); ?></div>
+              </div>
+              <div class="row g-2 mb-3">
+                <div class="col-md-3"><strong>Grand Total:</strong> <?= e(format_currency((float) ($payPurchase['grand_total'] ?? 0))); ?></div>
+                <div class="col-md-3"><strong>Paid:</strong> <?= e(format_currency((float) ($payPurchase['total_paid'] ?? 0))); ?></div>
+                <div class="col-md-3"><strong>Outstanding:</strong> <?= e(format_currency((float) ($payPurchase['outstanding_total'] ?? 0))); ?></div>
+                <div class="col-md-3">
+                  <a href="<?= e(url('modules/purchases/index.php')); ?>" class="btn btn-sm btn-outline-secondary">Close</a>
+                </div>
+              </div>
+
+              <?php if ($canPayPurchases && (string) ($payPurchase['purchase_status'] ?? '') === 'FINALIZED' && (float) ($payPurchase['outstanding_total'] ?? 0) > 0.009): ?>
+                <form method="post" class="row g-2 align-items-end mb-4">
+                  <?= csrf_field(); ?>
+                  <input type="hidden" name="_action" value="add_payment">
+                  <input type="hidden" name="purchase_id" value="<?= (int) ($payPurchase['id'] ?? 0); ?>">
+
+                  <div class="col-md-2">
+                    <label class="form-label">Payment Date</label>
+                    <input type="date" name="payment_date" class="form-control" value="<?= e(date('Y-m-d')); ?>" required>
+                  </div>
+                  <div class="col-md-2">
+                    <label class="form-label">Amount</label>
+                    <input type="number" name="amount" class="form-control" step="0.01" min="0" required>
+                  </div>
+                  <div class="col-md-2">
+                    <label class="form-label">Mode</label>
+                    <select name="payment_mode" class="form-select" required>
+                      <?php foreach ($paymentModes as $mode): ?>
+                        <option value="<?= e($mode); ?>"><?= e($mode); ?></option>
+                      <?php endforeach; ?>
+                    </select>
+                  </div>
+                  <div class="col-md-3">
+                    <label class="form-label">Reference</label>
+                    <input type="text" name="reference_no" class="form-control" maxlength="100" placeholder="Cheque/UTR/Ref">
+                  </div>
+                  <div class="col-md-3">
+                    <label class="form-label">Notes</label>
+                    <input type="text" name="notes" class="form-control" maxlength="255" placeholder="Payment note">
+                  </div>
+                  <div class="col-12">
+                    <button type="submit" class="btn btn-primary">Record Payment</button>
+                  </div>
+                </form>
+              <?php elseif ((string) ($payPurchase['purchase_status'] ?? '') !== 'FINALIZED'): ?>
+                <div class="alert alert-warning">Only finalized purchases can receive payments.</div>
+              <?php else: ?>
+                <div class="alert alert-success">No outstanding balance on this purchase.</div>
+              <?php endif; ?>
+
+              <div class="table-responsive">
+                <table class="table table-sm table-striped mb-0">
+                  <thead>
+                    <tr>
+                      <th>ID</th>
+                      <th>Date</th>
+                      <th>Type</th>
+                      <th>Amount</th>
+                      <th>Mode</th>
+                      <th>Reference</th>
+                      <th>Notes</th>
+                      <th>Created By</th>
+                      <th>Action</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <?php if (empty($paymentHistory)): ?>
+                      <tr><td colspan="9" class="text-center text-muted py-4">No payment history yet.</td></tr>
+                    <?php else: ?>
+                      <?php foreach ($paymentHistory as $payment): ?>
+                        <?php
+                          $entryType = (string) ($payment['entry_type'] ?? 'PAYMENT');
+                          $canReverse = $canPayPurchases && $entryType === 'PAYMENT' && (int) ($payment['reversal_id'] ?? 0) === 0;
+                        ?>
+                        <tr>
+                          <td>#<?= (int) ($payment['id'] ?? 0); ?></td>
+                          <td><?= e((string) ($payment['payment_date'] ?? '-')); ?></td>
+                          <td><?= e($entryType); ?></td>
+                          <td><?= e(format_currency((float) ($payment['amount'] ?? 0))); ?></td>
+                          <td><?= e((string) ($payment['payment_mode'] ?? '-')); ?></td>
+                          <td><?= e((string) ($payment['reference_no'] ?? '-')); ?></td>
+                          <td><?= e((string) ($payment['notes'] ?? '-')); ?></td>
+                          <td><?= e((string) ($payment['created_by_name'] ?? '-')); ?></td>
+                          <td>
+                            <?php if ($canReverse): ?>
+                              <form method="post" class="d-flex gap-2 align-items-center">
+                                <?= csrf_field(); ?>
+                                <input type="hidden" name="_action" value="reverse_payment">
+                                <input type="hidden" name="payment_id" value="<?= (int) ($payment['id'] ?? 0); ?>">
+                                <input type="hidden" name="purchase_id" value="<?= (int) ($payPurchase['id'] ?? 0); ?>">
+                                <input type="text" name="reverse_reason" class="form-control form-control-sm" maxlength="255" placeholder="Reversal reason" required>
+                                <button type="submit" class="btn btn-sm btn-outline-danger">Reverse</button>
+                              </form>
+                            <?php else: ?>
+                              <span class="text-muted">-</span>
+                            <?php endif; ?>
+                          </td>
+                        </tr>
+                      <?php endforeach; ?>
+                    <?php endif; ?>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        <?php elseif ($purchasePaymentsReady && $payPurchaseId > 0 && !$canPayPurchases): ?>
+          <div class="alert alert-warning">Purchase payment access requires `purchase.payments` permission.</div>
+        <?php elseif ($purchasePaymentsReady && $payPurchaseId > 0): ?>
+          <div class="alert alert-warning">Selected purchase not found for this garage.</div>
+        <?php endif; ?>
+
         <div class="card mb-3">
           <div class="card-header"><h3 class="card-title">Purchase Filters & Reports</h3></div>
           <form method="get">
@@ -1346,6 +2076,103 @@ require_once __DIR__ . '/../../includes/sidebar.php';
           </div>
         </div>
 
+        <?php if ($purchasePaymentsReady && $canViewVendorPayables): ?>
+          <div class="card mb-3">
+            <div class="card-header d-flex justify-content-between align-items-center">
+              <h3 class="card-title mb-0">Vendor Payables Summary</h3>
+              <?php if ($canExport): ?>
+                <?php
+                  $exportParams = $_GET;
+                  $exportParams['export'] = 'vendor_outstanding';
+                ?>
+                <a href="<?= e(url('modules/purchases/index.php?' . http_build_query($exportParams))); ?>" class="btn btn-sm btn-outline-primary">Vendor Outstanding CSV</a>
+              <?php endif; ?>
+            </div>
+            <div class="card-body table-responsive p-0">
+              <table class="table table-sm table-striped mb-0">
+                <thead>
+                  <tr>
+                    <th>Vendor</th>
+                    <th>Code</th>
+                    <th>Purchases</th>
+                    <th>Total</th>
+                    <th>Paid</th>
+                    <th>Outstanding</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <?php if (empty($vendorOutstandingRows)): ?>
+                    <tr><td colspan="6" class="text-center text-muted py-4">No outstanding vendor balances in selected range.</td></tr>
+                  <?php else: ?>
+                    <?php foreach ($vendorOutstandingRows as $row): ?>
+                      <tr>
+                        <td><?= e((string) ($row['vendor_name'] ?? '')); ?></td>
+                        <td><?= e((string) ($row['vendor_code'] ?? '')); ?></td>
+                        <td><?= (int) ($row['purchase_count'] ?? 0); ?></td>
+                        <td><?= e(format_currency((float) ($row['grand_total'] ?? 0))); ?></td>
+                        <td><?= e(format_currency((float) ($row['paid_total'] ?? 0))); ?></td>
+                        <td><strong><?= e(format_currency((float) ($row['outstanding_total'] ?? 0))); ?></strong></td>
+                      </tr>
+                    <?php endforeach; ?>
+                  <?php endif; ?>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="row g-3 mb-3">
+            <div class="col-lg-6">
+              <div class="card">
+                <div class="card-header d-flex justify-content-between align-items-center">
+                  <h3 class="card-title mb-0">Aging Summary</h3>
+                  <?php if ($canExport): ?>
+                    <?php
+                      $exportParams = $_GET;
+                      $exportParams['export'] = 'aging_summary';
+                    ?>
+                    <a href="<?= e(url('modules/purchases/index.php?' . http_build_query($exportParams))); ?>" class="btn btn-sm btn-outline-secondary">Aging CSV</a>
+                  <?php endif; ?>
+                </div>
+                <div class="card-body">
+                  <div class="row g-2">
+                    <div class="col-6"><strong>0-30 Days:</strong> <?= e(format_currency((float) ($agingSummary['bucket_0_30'] ?? 0))); ?></div>
+                    <div class="col-6"><strong>31-60 Days:</strong> <?= e(format_currency((float) ($agingSummary['bucket_31_60'] ?? 0))); ?></div>
+                    <div class="col-6"><strong>61-90 Days:</strong> <?= e(format_currency((float) ($agingSummary['bucket_61_90'] ?? 0))); ?></div>
+                    <div class="col-6"><strong>90+ Days:</strong> <?= e(format_currency((float) ($agingSummary['bucket_90_plus'] ?? 0))); ?></div>
+                    <div class="col-12"><strong>Total Outstanding:</strong> <?= e(format_currency((float) ($agingSummary['outstanding_total'] ?? 0))); ?></div>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div class="col-lg-6">
+              <div class="card">
+                <div class="card-header d-flex justify-content-between align-items-center">
+                  <h3 class="card-title mb-0">Paid vs Unpaid</h3>
+                  <?php if ($canExport): ?>
+                    <?php
+                      $exportParams = $_GET;
+                      $exportParams['export'] = 'paid_unpaid';
+                    ?>
+                    <a href="<?= e(url('modules/purchases/index.php?' . http_build_query($exportParams))); ?>" class="btn btn-sm btn-outline-secondary">Paid/Unpaid CSV</a>
+                  <?php endif; ?>
+                </div>
+                <div class="card-body">
+                  <div class="row g-2">
+                    <div class="col-6"><strong>Paid Purchases:</strong> <?= (int) ($paidUnpaidSummary['paid_count'] ?? 0); ?></div>
+                    <div class="col-6"><strong>Paid Total:</strong> <?= e(format_currency((float) ($paidUnpaidSummary['paid_total'] ?? 0))); ?></div>
+                    <div class="col-6"><strong>Partial Purchases:</strong> <?= (int) ($paidUnpaidSummary['partial_count'] ?? 0); ?></div>
+                    <div class="col-6"><strong>Partial Total:</strong> <?= e(format_currency((float) ($paidUnpaidSummary['partial_total'] ?? 0))); ?></div>
+                    <div class="col-6"><strong>Unpaid Purchases:</strong> <?= (int) ($paidUnpaidSummary['unpaid_count'] ?? 0); ?></div>
+                    <div class="col-6"><strong>Unpaid Total:</strong> <?= e(format_currency((float) ($paidUnpaidSummary['unpaid_total'] ?? 0))); ?></div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        <?php elseif ($purchasePaymentsReady && !$canViewVendorPayables): ?>
+          <div class="alert alert-warning">Vendor payable summaries require `vendor.payments` permission.</div>
+        <?php endif; ?>
+
         <div class="card mb-3">
           <div class="card-header"><h3 class="card-title">Purchase List</h3></div>
           <div class="card-body table-responsive p-0">
@@ -1365,12 +2192,16 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                   <th>Taxable</th>
                   <th>GST</th>
                   <th>Grand</th>
+                  <?php if ($purchasePaymentsReady): ?>
+                    <th>Paid</th>
+                    <th>Outstanding</th>
+                  <?php endif; ?>
                   <th>Actions</th>
                 </tr>
               </thead>
               <tbody>
                 <?php if (empty($purchases)): ?>
-                  <tr><td colspan="14" class="text-center text-muted py-4">No purchases found for selected filters.</td></tr>
+                  <tr><td colspan="<?= $purchasePaymentsReady ? 16 : 14; ?>" class="text-center text-muted py-4">No purchases found for selected filters.</td></tr>
                 <?php else: ?>
                   <?php foreach ($purchases as $purchase): ?>
                     <?php
@@ -1404,6 +2235,10 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                       <td><?= e(number_format((float) ($purchase['taxable_amount'] ?? 0), 2)); ?></td>
                       <td><?= e(number_format((float) ($purchase['gst_amount'] ?? 0), 2)); ?></td>
                       <td><strong><?= e(number_format((float) ($purchase['grand_total'] ?? 0), 2)); ?></strong></td>
+                      <?php if ($purchasePaymentsReady): ?>
+                        <td><?= e(number_format((float) ($purchase['paid_total'] ?? 0), 2)); ?></td>
+                        <td><strong><?= e(number_format((float) ($purchase['outstanding_total'] ?? 0), 2)); ?></strong></td>
+                      <?php endif; ?>
                       <td class="text-nowrap">
                         <?php if ($isUnassigned && $canManage): ?>
                           <a class="btn btn-sm btn-outline-warning" href="<?= e(url('modules/purchases/index.php?assign_purchase_id=' . $purchaseId)); ?>">Assign</a>
@@ -1416,6 +2251,9 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                             <input type="hidden" name="purchase_id" value="<?= (int) $purchaseId; ?>">
                             <button type="submit" class="btn btn-sm btn-outline-success">Finalize</button>
                           </form>
+                        <?php endif; ?>
+                        <?php if ($purchasePaymentsReady && $canPayPurchases): ?>
+                          <a class="btn btn-sm btn-outline-primary" href="<?= e(url('modules/purchases/index.php?pay_purchase_id=' . $purchaseId)); ?>">Payments</a>
                         <?php endif; ?>
                       </td>
                     </tr>

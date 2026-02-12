@@ -309,11 +309,19 @@ $isReportsOpen = is_menu_group_open('reports', $activeMenu);
                   <p>Inventory Reports</p>
                 </a>
               </li>
-              <?php if (has_permission('reports.financial')): ?>
+              <?php if (has_permission('reports.financial') || has_permission('financial.reports') || has_permission('gst.reports')): ?>
                 <li class="nav-item">
                   <a href="<?= e(url('modules/reports/billing_gst.php')); ?>" class="nav-link <?= e(is_active_menu('reports.billing', $activeMenu)); ?>">
                     <i class="nav-icon bi bi-circle"></i>
                     <p>Billing & GST</p>
+                  </a>
+                </li>
+              <?php endif; ?>
+              <?php if (has_permission('gst.reports') || has_permission('financial.reports')): ?>
+                <li class="nav-item">
+                  <a href="<?= e(url('modules/reports/gst_compliance.php')); ?>" class="nav-link <?= e(is_active_menu('reports.gst_compliance', $activeMenu)); ?>">
+                    <i class="nav-icon bi bi-circle"></i>
+                    <p>GST Compliance</p>
                   </a>
                 </li>
               <?php endif; ?>
