@@ -221,32 +221,39 @@ function ow_sync_job_labor_payable(PDO $pdo, int $workId, int $companyId, int $g
     $paidAt = $payableStatus === 'PAID' ? date('Y-m-d H:i:s') : null;
     $paidBy = $payableStatus === 'PAID' ? ($actorUserId > 0 ? $actorUserId : null) : null;
 
-    $update = $pdo->prepare(
-        'UPDATE job_labor jl
-         INNER JOIN outsourced_works ow ON ow.job_labor_id = jl.id
-         SET jl.outsource_vendor_id = :vendor_id,
+    $updateSet = 'jl.outsource_vendor_id = :vendor_id,
              jl.outsource_partner_name = :partner_name,
              jl.outsource_cost = :outsource_cost,
-             jl.outsource_expected_return_date = :expected_return_date,
              jl.outsource_payable_status = :payable_status,
              jl.outsource_paid_at = :paid_at,
-             jl.outsource_paid_by = :paid_by
-         WHERE ow.id = :work_id
-           AND ow.company_id = :company_id
-           AND ow.garage_id = :garage_id'
-    );
-    $update->execute([
+             jl.outsource_paid_by = :paid_by';
+    $params = [
         'vendor_id' => (int) ($row['vendor_id'] ?? 0) > 0 ? (int) $row['vendor_id'] : null,
         'partner_name' => trim((string) ($row['partner_name'] ?? '')) !== '' ? trim((string) $row['partner_name']) : null,
         'outsource_cost' => $agreedCost,
-        'expected_return_date' => !empty($row['expected_return_date']) ? (string) $row['expected_return_date'] : null,
         'payable_status' => $payableStatus,
         'paid_at' => $paidAt,
         'paid_by' => $paidBy,
         'work_id' => $workId,
         'company_id' => $companyId,
         'garage_id' => $garageId,
-    ]);
+    ];
+
+    if (in_array('outsource_expected_return_date', table_columns('job_labor'), true)) {
+        $updateSet .= ',
+             jl.outsource_expected_return_date = :expected_return_date';
+        $params['expected_return_date'] = !empty($row['expected_return_date']) ? (string) $row['expected_return_date'] : null;
+    }
+
+    $update = $pdo->prepare(
+        'UPDATE job_labor jl
+         INNER JOIN outsourced_works ow ON ow.job_labor_id = jl.id
+         SET ' . $updateSet . '
+         WHERE ow.id = :work_id
+           AND ow.company_id = :company_id
+           AND ow.garage_id = :garage_id'
+    );
+    $update->execute($params);
 }
 
 $outsourcedReady = table_columns('outsourced_works') !== [] && table_columns('outsourced_work_payments') !== [];

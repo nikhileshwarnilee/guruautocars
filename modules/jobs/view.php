@@ -2467,6 +2467,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
     var laborVendorSelect = document.getElementById('add-labor-vendor');
     var laborPartnerInput = document.getElementById('add-labor-partner');
     var laborCostInput = document.getElementById('add-labor-cost');
+    var laborExpectedReturnInput = document.getElementById('add-labor-expected-return');
     var laborOutsourceHint = document.getElementById('add-labor-outsourced-hint');
 
     function getSelectedVendorName(select) {
@@ -2480,7 +2481,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       return (option.getAttribute('data-vendor-name') || '').trim();
     }
 
-    function toggleOutsourceFields(executionSelect, vendorSelect, partnerInput, costInput, hintNode, locked) {
+    function toggleOutsourceFields(executionSelect, vendorSelect, partnerInput, costInput, expectedReturnInput, hintNode, locked) {
       if (!executionSelect || !vendorSelect || !partnerInput || !costInput) {
         return;
       }
@@ -2490,11 +2491,18 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       partnerInput.disabled = !!locked || !outsourced;
       costInput.disabled = !!locked || !outsourced;
       costInput.required = outsourced;
+      if (expectedReturnInput) {
+        expectedReturnInput.disabled = !!locked || !outsourced;
+        expectedReturnInput.required = false;
+      }
 
       if (!outsourced) {
         vendorSelect.value = '0';
         partnerInput.value = '';
         costInput.value = '0';
+        if (expectedReturnInput) {
+          expectedReturnInput.value = '';
+        }
         if (hintNode) {
           hintNode.textContent = '';
         }
@@ -2561,7 +2569,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         });
         if (laborExecutionSelect && laborVendorSelect && laborPartnerInput && laborCostInput) {
           laborExecutionSelect.addEventListener('change', function () {
-            toggleOutsourceFields(laborExecutionSelect, laborVendorSelect, laborPartnerInput, laborCostInput, laborOutsourceHint, false);
+            toggleOutsourceFields(laborExecutionSelect, laborVendorSelect, laborPartnerInput, laborCostInput, laborExpectedReturnInput, laborOutsourceHint, false);
           });
           laborVendorSelect.addEventListener('change', function () {
             if (laborExecutionSelect.value === 'OUTSOURCED' && laborPartnerInput.value.trim() === '') {
@@ -2578,6 +2586,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         laborVendorSelect,
         laborPartnerInput,
         laborCostInput,
+        laborExpectedReturnInput,
         laborOutsourceHint,
         laborInputsLocked
       );
@@ -2595,13 +2604,14 @@ require_once __DIR__ . '/../../includes/sidebar.php';
           var editVendorSelect = formNode.querySelector('.js-labor-vendor');
           var editPartnerInput = formNode.querySelector('.js-labor-partner');
           var editCostInput = formNode.querySelector('.js-labor-cost');
+          var editExpectedReturnInput = formNode.querySelector('.js-labor-expected-return');
           var editHint = formNode.querySelector('.js-labor-outsource-hint');
           if (!editExecutionSelect || !editVendorSelect || !editPartnerInput || !editCostInput) {
             return;
           }
 
           function syncEditOutsourceFields() {
-            toggleOutsourceFields(editExecutionSelect, editVendorSelect, editPartnerInput, editCostInput, editHint, false);
+            toggleOutsourceFields(editExecutionSelect, editVendorSelect, editPartnerInput, editCostInput, editExpectedReturnInput, editHint, false);
           }
 
           editExecutionSelect.addEventListener('change', syncEditOutsourceFields);
