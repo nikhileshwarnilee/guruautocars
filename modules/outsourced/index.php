@@ -659,6 +659,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'garage_id' => $garageId,
             ]);
 
+            finance_record_expense_for_outsourced_payment(
+              $paymentId,
+              $workId,
+              $companyId,
+              $garageId,
+              $amount,
+              $paymentDate,
+              $paymentMode,
+              $notes,
+              false,
+              $userId
+            );
+
             ow_append_history(
                 $workId,
                 'PAYMENT_ADD',
@@ -756,6 +769,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
             $workId = (int) ($payment['work_id'] ?? 0);
             $paymentAmount = round((float) ($payment['amount'] ?? 0), 2);
+            $reversalDate = date('Y-m-d');
             $insertStmt = $pdo->prepare(
                 'INSERT INTO outsourced_work_payments
                   (outsourced_work_id, company_id, garage_id, payment_date, entry_type, amount, payment_mode, reference_no, notes, reversed_payment_id, created_by)
@@ -766,7 +780,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'outsourced_work_id' => $workId,
                 'company_id' => $companyId,
                 'garage_id' => $garageId,
-                'payment_date' => date('Y-m-d'),
+              'payment_date' => $reversalDate,
                 'amount' => -$paymentAmount,
                 'reference_no' => 'REV-' . $paymentId,
                 'notes' => $reverseReason,
@@ -805,6 +819,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'company_id' => $companyId,
                 'garage_id' => $garageId,
             ]);
+
+            finance_record_expense_for_outsourced_payment(
+              $reversalId,
+              $workId,
+              $companyId,
+              $garageId,
+              $paymentAmount,
+              $reversalDate,
+              'ADJUSTMENT',
+              $reverseReason,
+              true,
+              $userId
+            );
 
             ow_append_history(
                 $workId,

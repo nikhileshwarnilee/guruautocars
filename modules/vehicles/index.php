@@ -669,18 +669,12 @@ if ($vehicleAttributeEnabled) {
 
 $historyCountExpr = '(SELECT COUNT(*) FROM vehicle_history h WHERE h.vehicle_id = v.id)';
 if ($jobOdometerEnabled) {
-    $historyCountExpr =
-        '(SELECT COUNT(*) FROM (
-            SELECT vh.id AS entry_id
-            FROM vehicle_history vh
-            WHERE vh.vehicle_id = v.id
-            UNION ALL
-            SELECT jc.id AS entry_id
-            FROM job_cards jc
-            WHERE jc.vehicle_id = v.id
-              AND jc.company_id = v.company_id
-              AND jc.status_code <> "DELETED"
-        ) hx)';
+  $historyCountExpr =
+    '(
+      (SELECT COUNT(*) FROM vehicle_history vh WHERE vh.vehicle_id = v.id)
+      +
+      (SELECT COUNT(*) FROM job_cards jc WHERE jc.vehicle_id = v.id AND jc.company_id = v.company_id AND jc.status_code <> "DELETED")
+    )';
 }
 
 $vehicleSql =

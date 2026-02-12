@@ -19,6 +19,7 @@ if (session_status() !== PHP_SESSION_ACTIVE) {
 require_once __DIR__ . '/db.php';
 require_once __DIR__ . '/helpers.php';
 require_once __DIR__ . '/auth.php';
+require_once __DIR__ . '/finance.php';
 require_once __DIR__ . '/analytics.php';
 
 if (is_logged_in() && ($_POST['_action'] ?? '') === 'switch_garage') {

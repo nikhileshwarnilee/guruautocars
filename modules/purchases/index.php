@@ -883,6 +883,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'id' => $purchaseId,
           ]);
 
+          finance_record_expense_for_purchase_payment(
+            $paymentId,
+            $purchaseId,
+            $companyId,
+            $activeGarageId,
+            $amount,
+            $paymentDate,
+            $paymentMode,
+            $notes,
+            false,
+            $userId
+          );
+
           $pdo->commit();
           log_audit('purchases', 'payment_add', $purchaseId, 'Recorded purchase payment #' . $paymentId, [
             'entity' => 'purchase_payment',
@@ -968,6 +981,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
           $purchaseId = (int) ($payment['purchase_id'] ?? 0);
           $paymentAmount = round((float) ($payment['amount'] ?? 0), 2);
+          $reversalDate = date('Y-m-d');
           $insertStmt = $pdo->prepare(
             'INSERT INTO purchase_payments
               (purchase_id, company_id, garage_id, payment_date, entry_type, amount, payment_mode, reference_no, notes, reversed_payment_id, created_by)
@@ -978,7 +992,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'purchase_id' => $purchaseId,
             'company_id' => $companyId,
             'garage_id' => $activeGarageId,
-            'payment_date' => date('Y-m-d'),
+            'payment_date' => $reversalDate,
             'amount' => -$paymentAmount,
             'reference_no' => 'REV-' . $paymentId,
             'notes' => $reverseReason,
@@ -1005,6 +1019,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'payment_status' => $nextStatus,
             'id' => $purchaseId,
           ]);
+
+          finance_record_expense_for_purchase_payment(
+            $reversalId,
+            $purchaseId,
+            $companyId,
+            $activeGarageId,
+            $paymentAmount,
+            $reversalDate,
+            'ADJUSTMENT',
+            $reverseReason,
+            true,
+            $userId
+          );
 
           $pdo->commit();
           log_audit('purchases', 'payment_reverse', $purchaseId, 'Reversed purchase payment #' . $paymentId, [

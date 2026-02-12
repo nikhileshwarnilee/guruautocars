@@ -7,6 +7,7 @@ $isOrganizationOpen = is_menu_group_open('organization.', $activeMenu) || is_men
 $isPeopleOpen = is_menu_group_open('people.', $activeMenu);
 $isServicePartsOpen = is_menu_group_open('services.', $activeMenu) || is_menu_group_open('inventory.', $activeMenu) || is_menu_group_open('vendors.', $activeMenu) || is_menu_group_open('purchases.', $activeMenu) || is_menu_group_open('outsourced.', $activeMenu);
 $isVisOpen = is_menu_group_open('vis.', $activeMenu);
+$isFinanceOpen = is_menu_group_open('finance.', $activeMenu);
 $isReportsOpen = is_menu_group_open('reports', $activeMenu);
 ?>
 <aside class="app-sidebar bg-body-secondary shadow" data-bs-theme="dark">
@@ -278,6 +279,36 @@ $isReportsOpen = is_menu_group_open('reports', $activeMenu);
               <i class="nav-icon bi bi-receipt"></i>
               <p>Billing</p>
             </a>
+          </li>
+        <?php endif; ?>
+
+        <?php if (has_permission('payroll.view') || has_permission('expense.view')): ?>
+          <li class="nav-item <?= $isFinanceOpen ? 'menu-open' : ''; ?>">
+            <a href="#" class="nav-link <?= $isFinanceOpen ? 'active' : ''; ?>">
+              <i class="nav-icon bi bi-cash-coin"></i>
+              <p>
+                Finance
+                <i class="nav-arrow bi bi-chevron-right"></i>
+              </p>
+            </a>
+            <ul class="nav nav-treeview">
+              <?php if (has_permission('payroll.view')): ?>
+                <li class="nav-item">
+                  <a href="<?= e(url('modules/payroll/index.php')); ?>" class="nav-link <?= e(is_active_menu('finance.payroll', $activeMenu)); ?>">
+                    <i class="nav-icon bi bi-circle"></i>
+                    <p>Payroll & Salary</p>
+                  </a>
+                </li>
+              <?php endif; ?>
+              <?php if (has_permission('expense.view')): ?>
+                <li class="nav-item">
+                  <a href="<?= e(url('modules/expenses/index.php')); ?>" class="nav-link <?= e(is_active_menu('finance.expenses', $activeMenu)); ?>">
+                    <i class="nav-icon bi bi-circle"></i>
+                    <p>Expenses</p>
+                  </a>
+                </li>
+              <?php endif; ?>
+            </ul>
           </li>
         <?php endif; ?>
 
