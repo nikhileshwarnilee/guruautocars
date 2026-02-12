@@ -39,6 +39,21 @@ SET is_reversed = 1
 WHERE reversed_payment_id IS NOT NULL
   AND (is_reversed IS NULL OR is_reversed = 0);
 
+UPDATE outsourced_works ow
+LEFT JOIN job_cards jc ON jc.id = ow.job_card_id
+SET ow.status_code = 'INACTIVE',
+    ow.deleted_at = COALESCE(ow.deleted_at, NOW()),
+    ow.notes = LEFT(
+        CONCAT(
+            COALESCE(ow.notes, ''),
+            CASE WHEN COALESCE(ow.notes, '') = '' THEN '' ELSE ' | ' END,
+            'Auto-disabled by reversal hardening: orphaned/deleted job linkage'
+        ),
+        255
+    )
+WHERE ow.status_code = 'ACTIVE'
+  AND (jc.id IS NULL OR jc.status_code = 'DELETED');
+
 INSERT INTO permissions (perm_key, perm_name, status_code)
 SELECT 'purchase.delete', 'Soft delete purchases with reversal checks', 'ACTIVE'
 WHERE NOT EXISTS (
@@ -58,4 +73,3 @@ WHERE r.role_key IN ('super_admin', 'garage_owner', 'manager', 'accountant')
   );
 
 COMMIT;
-

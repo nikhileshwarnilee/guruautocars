@@ -1904,17 +1904,10 @@ require_once __DIR__ . '/../../includes/sidebar.php';
           <?php if (($canEdit || $canClose) && normalize_status_code((string) ($job['status_code'] ?? 'ACTIVE')) !== 'DELETED'): ?>
             <div class="card card-outline card-danger">
               <div class="card-header"><h3 class="card-title">Soft Delete Job Card</h3></div>
-              <form method="post" data-confirm="Soft delete this job card? It will be hidden from normal job lists.">
-                <div class="card-body">
-                  <?= csrf_field(); ?>
-                  <input type="hidden" name="_action" value="soft_delete">
-                  <label class="form-label">Audit Note (Required)</label>
-                  <textarea name="delete_note" class="form-control" rows="2" required></textarea>
-                </div>
-                <div class="card-footer">
-                  <button type="submit" class="btn btn-outline-danger">Soft Delete</button>
-                </div>
-              </form>
+              <div class="card-body">
+                <p class="text-muted mb-3">Delete is allowed only after dependency reversals are complete. The system will block unsafe cascades and show a reversal path.</p>
+                <button type="button" class="btn btn-outline-danger" data-bs-toggle="modal" data-bs-target="#jobDeleteModal">Soft Delete</button>
+              </div>
             </div>
           <?php endif; ?>
 
@@ -2518,6 +2511,38 @@ require_once __DIR__ . '/../../includes/sidebar.php';
     </div>
   </div>
 </main>
+
+<?php if (($canEdit || $canClose) && normalize_status_code((string) ($job['status_code'] ?? 'ACTIVE')) !== 'DELETED'): ?>
+<div class="modal fade" id="jobDeleteModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <form method="post">
+        <div class="modal-header bg-danger-subtle">
+          <h5 class="modal-title">Soft Delete Job Card</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+        </div>
+        <div class="modal-body">
+          <?= csrf_field(); ?>
+          <input type="hidden" name="_action" value="soft_delete">
+          <div class="mb-3">
+            <label class="form-label">Job Reference</label>
+            <input type="text" class="form-control" readonly value="<?= e((string) ($job['job_number'] ?? ('#' . $jobId))); ?>">
+          </div>
+          <div class="mb-0">
+            <label class="form-label">Audit Note (Required)</label>
+            <textarea name="delete_note" class="form-control" rows="3" maxlength="255" required></textarea>
+            <small class="text-muted">If invoice, payment, inventory, or outsourced dependencies exist, deletion will be blocked with reversal steps.</small>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Close</button>
+          <button type="submit" class="btn btn-danger">Confirm Soft Delete</button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+<?php endif; ?>
 
 <script>
   (function () {

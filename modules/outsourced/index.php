@@ -889,6 +889,7 @@ if ($outsourcedReady) {
         'ow.company_id = :company_id',
         'ow.garage_id = :garage_id',
         'ow.status_code = "ACTIVE"',
+        'jc.status_code <> "DELETED"',
         'DATE(ow.created_at) BETWEEN :from_date AND :to_date',
     ];
     $baseParams = [
@@ -979,6 +980,7 @@ if ($outsourcedReady) {
          WHERE ow.company_id = :company_id
            AND ow.garage_id = :garage_id
            AND ow.status_code = "ACTIVE"
+           AND jc.status_code <> "DELETED"
            AND DATE(ow.created_at) BETWEEN :from_date AND :to_date
            AND GREATEST(ow.agreed_cost - COALESCE(pay.total_paid, 0), 0) > 0.01
          ORDER BY outstanding_amount DESC, ow.expected_return_date ASC, ow.id DESC
@@ -1046,6 +1048,7 @@ if ($outsourcedReady) {
          WHERE ow.company_id = :company_id
            AND ow.garage_id = :garage_id
            AND ow.status_code = "ACTIVE"
+           AND jc.status_code <> "DELETED"
            AND DATE(ow.created_at) BETWEEN :from_date AND :to_date
          GROUP BY jc.id, jc.job_number, c.full_name, v.registration_no
          ORDER BY agreed_total DESC, outsourced_lines DESC
@@ -1098,6 +1101,7 @@ if ($outsourcedReady) {
          LEFT JOIN vehicles v ON v.id = jc.vehicle_id
          WHERE jc.company_id = :company_id
            AND jc.garage_id = :garage_id
+           AND jc.status_code <> "DELETED"
          ORDER BY oc.outsourced_cost DESC, jc.id DESC
          LIMIT 250'
     );
@@ -1121,6 +1125,7 @@ if ($outsourcedReady) {
          WHERE ow.company_id = :company_id
            AND ow.garage_id = :garage_id
            AND ow.status_code = "ACTIVE"
+           AND jc.status_code <> "DELETED"
            AND p.payment_date BETWEEN :from_date AND :to_date
          ORDER BY p.payment_date DESC, p.id DESC
          LIMIT 200'
@@ -1145,6 +1150,7 @@ if ($outsourcedReady) {
          WHERE ow.company_id = :company_id
            AND ow.garage_id = :garage_id
            AND ow.status_code = "ACTIVE"
+           AND jc.status_code <> "DELETED"
            AND p.entry_type = "PAYMENT"
            AND p.amount > 0
            AND r.id IS NULL
@@ -1173,6 +1179,7 @@ if ($outsourcedReady) {
          WHERE ow.company_id = :company_id
            AND ow.garage_id = :garage_id
            AND ow.status_code = "ACTIVE"
+           AND jc.status_code <> "DELETED"
            AND ow.current_status IN ("PAYABLE", "PAID")
            AND GREATEST(ow.agreed_cost - COALESCE(pay.total_paid, 0), 0) > 0.01
          ORDER BY outstanding_amount DESC, ow.id DESC
