@@ -1348,76 +1348,6 @@ function initSearchableSelects() {
 
   initInlineContext(inlineContexts.customer);
   initInlineContext(inlineContexts.vehicle);
-  initSelectTypingCapture();
-
-  function initSelectTypingCapture() {
-    if (!document.body || document.body.getAttribute('data-gac-select-typing-init') === '1') {
-      return;
-    }
-    document.body.setAttribute('data-gac-select-typing-init', '1');
-
-    document.addEventListener('keydown', function (event) {
-      if (!event) {
-        return;
-      }
-
-      var select = null;
-      if (event.target && event.target.tagName === 'SELECT') {
-        select = event.target;
-      } else if (document.activeElement && document.activeElement.tagName === 'SELECT') {
-        select = document.activeElement;
-      }
-      if (!select || select.getAttribute('data-searchable-enhanced') !== '1') {
-        return;
-      }
-
-      var state = select.gacSearchableState || null;
-      if (!state) {
-        return;
-      }
-
-      handleSelectTypingKey(state, event);
-    }, true);
-  }
-
-  function handleSelectTypingKey(state, event) {
-    if (!state || !state.select) {
-      return;
-    }
-
-    var select = state.select;
-    if (select.disabled || event.altKey || event.ctrlKey || event.metaKey) {
-      return;
-    }
-
-    var key = String(event.key || '');
-    if (key === 'Escape') {
-      clearTypedPreview(state);
-      return;
-    }
-
-    if (key === 'Backspace') {
-      if (state.typeBuffer !== '') {
-        state.typeBuffer = state.typeBuffer.slice(0, -1);
-        state.typeTimestamp = Date.now();
-        renderTypedPreview(state);
-        event.preventDefault();
-      }
-      return;
-    }
-
-    if (key.length !== 1) {
-      return;
-    }
-
-    var now = Date.now();
-    if (now - state.typeTimestamp > 900) {
-      state.typeBuffer = '';
-    }
-    state.typeTimestamp = now;
-    state.typeBuffer += key;
-    renderTypedPreview(state);
-  }
 
   function createInlineContext(config) {
     var modalElement = document.getElementById(config.modalId);
@@ -1545,11 +1475,22 @@ function initSearchableSelects() {
       continue;
     }
 
-    enhanceSelect(select);
+    try {
+      enhanceSelect(select);
+    } catch (error) {
+      // Keep page usable even if one malformed select fails enhancement.
+      if (window.console && typeof window.console.error === 'function') {
+        window.console.error('Searchable select enhancement failed', error);
+      }
+    }
   }
 
   function shouldEnhanceSelect(select) {
     if (!select || select.getAttribute('data-searchable-enhanced') === '1') {
+      return false;
+    }
+
+    if (select.multiple || (select.size && select.size > 1)) {
       return false;
     }
 
@@ -1565,19 +1506,41 @@ function initSearchableSelects() {
     var isCustomerSelect = selectName === 'customer_id';
     var isInlineVehicleSelect = selectName === 'vehicle_id' && select.getAttribute('data-inline-vehicle') === '1';
     var wrapper = document.createElement('div');
-    wrapper.className = 'gac-searchable-select';
-    var typingPreview = document.createElement('span');
-    typingPreview.className = 'gac-select-typing-preview d-none';
-    typingPreview.setAttribute('aria-hidden', 'true');
+    wrapper.className = 'gac-searchable-select gac-searchable-combobox';
+    var input = document.createElement('input');
+    input.type = 'text';
+    input.className = select.classList.contains('form-select-sm') ? 'form-control form-control-sm gac-combobox-input' : 'form-control gac-combobox-input';
+    input.autocomplete = 'off';
+    input.setAttribute('role', 'combobox');
+    input.setAttribute('aria-autocomplete', 'list');
+    input.setAttribute('aria-expanded', 'false');
+    var placeholderOption = select.options && select.options.length > 0 ? select.options[0] : null;
+    var placeholderText = '';
+    if (placeholderOption && String(placeholderOption.value || '') === '') {
+      placeholderText = collapseWhitespace(placeholderOption.textContent || '').trim();
+    }
+    input.placeholder = placeholderText !== '' ? placeholderText : 'Type to search...';
+    var menu = document.createElement('div');
+    menu.className = 'gac-combobox-menu d-none';
+    menu.setAttribute('role', 'listbox');
+
     select.parentNode.insertBefore(wrapper, select);
+    wrapper.appendChild(input);
+    wrapper.appendChild(menu);
     wrapper.appendChild(select);
-    wrapper.appendChild(typingPreview);
     select.setAttribute('data-searchable-enhanced', '1');
+    select.classList.add('gac-native-select-proxy');
+    select.setAttribute('tabindex', '-1');
+    select.setAttribute('aria-hidden', 'true');
+    if (select.disabled) {
+      input.disabled = true;
+    }
 
     var state = {
       select: select,
-      input: null,
-      preview: typingPreview,
+      input: input,
+      menu: menu,
+      wrapper: wrapper,
       isCustomerSelect: isCustomerSelect,
       isInlineVehicleSelect: isInlineVehicleSelect,
       inlineKind: '',
@@ -1585,9 +1548,10 @@ function initSearchableSelects() {
       linkedCustomerSelect: null,
       indexedOptions: [],
       lastCommittedValue: select.value || '',
-      typeBuffer: '',
-      typeTimestamp: 0,
-      previewTimer: null
+      highlightedIndex: -1,
+      filteredEntries: [],
+      closingTimer: null,
+      placeholderText: input.placeholder
     };
 
     if (isCustomerSelect && !select.disabled) {
@@ -1601,36 +1565,325 @@ function initSearchableSelects() {
 
     refreshIndexedOptions(state);
     applyOptionVisibility(state);
+    syncInputWithSelection(state);
+    renderComboboxMenu(state, '');
 
-    select.addEventListener('blur', function () {
-      clearTypedPreview(state);
+    input.addEventListener('focus', function () {
+      renderComboboxMenu(state, input.value || '');
+      openComboboxMenu(state);
+    });
+
+    input.addEventListener('input', function () {
+      renderComboboxMenu(state, input.value || '');
+      openComboboxMenu(state);
+    });
+
+    input.addEventListener('keydown', function (event) {
+      if (event.key === 'ArrowDown') {
+        event.preventDefault();
+        if (!state.filteredEntries || state.filteredEntries.length === 0) {
+          renderComboboxMenu(state, input.value || '');
+        }
+        openComboboxMenu(state);
+        moveHighlightedOption(state, 1);
+        return;
+      }
+
+      if (event.key === 'ArrowUp') {
+        event.preventDefault();
+        if (!state.filteredEntries || state.filteredEntries.length === 0) {
+          renderComboboxMenu(state, input.value || '');
+        }
+        openComboboxMenu(state);
+        moveHighlightedOption(state, -1);
+        return;
+      }
+
+      if (event.key === 'Enter') {
+        if (!state.isMenuOpen) {
+          return;
+        }
+        event.preventDefault();
+        var highlighted = getHighlightedEntry(state);
+        if (!highlighted) {
+          return;
+        }
+        commitEntrySelection(state, highlighted, collapseWhitespace(input.value || '').trim());
+        return;
+      }
+
+      if (event.key === 'Escape') {
+        closeComboboxMenu(state);
+        syncInputWithSelection(state);
+      }
+    });
+
+    input.addEventListener('blur', function () {
+      if (state.closingTimer) {
+        window.clearTimeout(state.closingTimer);
+      }
+      state.closingTimer = window.setTimeout(function () {
+        closeComboboxMenu(state);
+        syncInputWithSelection(state);
+      }, 120);
+    });
+
+    menu.addEventListener('mousedown', function (event) {
+      event.preventDefault();
+    });
+
+    menu.addEventListener('click', function (event) {
+      var target = event.target;
+      if (!target) {
+        return;
+      }
+      var optionNode = target.closest('[data-combobox-index]');
+      if (!optionNode) {
+        return;
+      }
+      var index = parseInt(optionNode.getAttribute('data-combobox-index') || '-1', 10);
+      if (!isFinite(index) || index < 0 || index >= state.filteredEntries.length) {
+        return;
+      }
+      var selectedEntry = state.filteredEntries[index];
+      commitEntrySelection(state, selectedEntry, collapseWhitespace(input.value || '').trim());
+      input.focus();
     });
 
     select.addEventListener('change', function () {
-      var currentTypedQuery = collapseWhitespace(state.typeBuffer || '').trim();
+      var currentTypedQuery = collapseWhitespace(input.value || '').trim();
       if (state.inlineOption && state.inlineKind === 'customer' && select.value === inlineContexts.customer.addValue) {
         select.value = state.lastCommittedValue;
         openInlineCustomerModal(state, currentTypedQuery);
-        clearTypedPreview(state);
+        syncInputWithSelection(state);
+        closeComboboxMenu(state);
         return;
       }
       if (state.inlineOption && state.inlineKind === 'vehicle' && select.value === inlineContexts.vehicle.addValue) {
         select.value = state.lastCommittedValue;
         openInlineVehicleModal(state, currentTypedQuery);
-        clearTypedPreview(state);
+        syncInputWithSelection(state);
+        closeComboboxMenu(state);
         return;
       }
 
       state.lastCommittedValue = select.value || '';
-      scheduleTypedPreviewClear(state, 700);
+      syncInputWithSelection(state);
+      renderComboboxMenu(state, input.value || '');
     });
 
     select.gacSearchableRefresh = function () {
+      var preserveTypedQuery = document.activeElement === input;
+      var typedQuery = preserveTypedQuery ? (input.value || '') : '';
       refreshIndexedOptions(state);
       applyOptionVisibility(state);
-      clearTypedPreview(state);
+      if (!preserveTypedQuery) {
+        syncInputWithSelection(state);
+      }
+      renderComboboxMenu(state, preserveTypedQuery ? typedQuery : (input.value || ''));
+      if (preserveTypedQuery) {
+        openComboboxMenu(state);
+      }
     };
     select.gacSearchableState = state;
+
+    document.addEventListener('click', function (event) {
+      if (!state.wrapper || !event.target || state.wrapper.contains(event.target)) {
+        return;
+      }
+      closeComboboxMenu(state);
+      syncInputWithSelection(state);
+    });
+  }
+
+  function renderComboboxMenu(state, query) {
+    if (!state || !state.menu) {
+      return;
+    }
+
+    var normalizedQuery = normalizeSearchTerm(query || '');
+    state.filteredEntries = collectMatchingEntries(state, normalizedQuery, query || '');
+    if (!state.filteredEntries || state.filteredEntries.length === 0) {
+      state.highlightedIndex = -1;
+      state.menu.innerHTML = '<div class="gac-combobox-empty">No matches found.</div>';
+      return;
+    }
+
+    var selectedIndex = -1;
+    for (var index = 0; index < state.filteredEntries.length; index++) {
+      if (state.filteredEntries[index].option.value === state.select.value) {
+        selectedIndex = index;
+        break;
+      }
+    }
+    state.highlightedIndex = selectedIndex >= 0 ? selectedIndex : 0;
+
+    var html = '';
+    for (var entryIndex = 0; entryIndex < state.filteredEntries.length; entryIndex++) {
+      var entry = state.filteredEntries[entryIndex];
+      var option = entry.option;
+      var isActive = entryIndex === state.highlightedIndex;
+      var isSelected = option.value === state.select.value;
+      var itemClass = 'gac-combobox-item';
+      if (isActive) {
+        itemClass += ' active';
+      }
+      if (isSelected) {
+        itemClass += ' selected';
+      }
+      html += '<button type="button" class="' + itemClass + '" data-combobox-index="' + entryIndex + '" role="option" aria-selected="' + (isSelected ? 'true' : 'false') + '">' + escapeHtml(option.textContent || '') + '</button>';
+    }
+    state.menu.innerHTML = html;
+  }
+
+  function collectMatchingEntries(state, normalizedQuery, rawQuery) {
+    var matches = [];
+    var inlineEntry = null;
+    var visibleNonInline = 0;
+
+    for (var i = 0; i < state.indexedOptions.length; i++) {
+      var entry = state.indexedOptions[i];
+      var option = entry.option;
+      if (option.hidden || option.disabled) {
+        continue;
+      }
+
+      var isInlineOption = option.getAttribute('data-inline-customer-option') === '1'
+        || option.getAttribute('data-inline-vehicle-option') === '1';
+      if (isInlineOption) {
+        inlineEntry = entry;
+        continue;
+      }
+
+      if (normalizedQuery !== '' && entry.normalizedText.indexOf(normalizedQuery) === -1) {
+        continue;
+      }
+
+      matches.push(entry);
+      if (option.value !== '') {
+        visibleNonInline++;
+      }
+    }
+
+    if (inlineEntry && normalizedQuery !== '' && visibleNonInline === 0) {
+      var compactQuery = collapseWhitespace(rawQuery || '').trim();
+      if (compactQuery.length > 42) {
+        compactQuery = compactQuery.slice(0, 42) + '...';
+      }
+      if (state.inlineKind === 'vehicle') {
+        inlineEntry.option.textContent = compactQuery !== ''
+          ? '+ Add New Vehicle "' + compactQuery + '"'
+          : '+ Add New Vehicle';
+      } else {
+        inlineEntry.option.textContent = compactQuery !== ''
+          ? '+ Add New Customer "' + compactQuery + '"'
+          : '+ Add New Customer';
+      }
+      matches.push(inlineEntry);
+    } else if (inlineEntry) {
+      if (state.inlineKind === 'vehicle') {
+        inlineEntry.option.textContent = '+ Add New Vehicle';
+      } else {
+        inlineEntry.option.textContent = '+ Add New Customer';
+      }
+    }
+
+    return matches;
+  }
+
+  function moveHighlightedOption(state, direction) {
+    if (!state || !state.filteredEntries || state.filteredEntries.length === 0) {
+      return;
+    }
+    var length = state.filteredEntries.length;
+    var nextIndex = state.highlightedIndex;
+    if (!isFinite(nextIndex) || nextIndex < 0) {
+      nextIndex = 0;
+    } else {
+      nextIndex = (nextIndex + direction + length) % length;
+    }
+    state.highlightedIndex = nextIndex;
+    updateHighlightedOption(state);
+  }
+
+  function updateHighlightedOption(state) {
+    if (!state || !state.menu) {
+      return;
+    }
+    var items = state.menu.querySelectorAll('[data-combobox-index]');
+    for (var i = 0; i < items.length; i++) {
+      var node = items[i];
+      var isActive = i === state.highlightedIndex;
+      node.classList.toggle('active', isActive);
+      if (isActive && typeof node.scrollIntoView === 'function') {
+        node.scrollIntoView({ block: 'nearest' });
+      }
+    }
+  }
+
+  function getHighlightedEntry(state) {
+    if (!state || !state.filteredEntries || state.filteredEntries.length === 0) {
+      return null;
+    }
+    if (state.highlightedIndex < 0 || state.highlightedIndex >= state.filteredEntries.length) {
+      return state.filteredEntries[0];
+    }
+    return state.filteredEntries[state.highlightedIndex];
+  }
+
+  function commitEntrySelection(state, entry, typedQuery) {
+    if (!state || !entry || !entry.option) {
+      return;
+    }
+    state.select.value = entry.option.value;
+    state.select.dispatchEvent(new Event('change', { bubbles: true }));
+    closeComboboxMenu(state);
+
+    if (state.select.value === state.lastCommittedValue && entry.option.value !== state.lastCommittedValue) {
+      // Inline create path keeps old value; preserve typed query in input until modal opens.
+      state.input.value = typedQuery || '';
+      return;
+    }
+
+    syncInputWithSelection(state);
+  }
+
+  function syncInputWithSelection(state) {
+    if (!state || !state.select || !state.input) {
+      return;
+    }
+    var selected = state.select.options[state.select.selectedIndex];
+    if (!selected || selected.value === '') {
+      state.input.value = '';
+      var fallbackPlaceholder = state.placeholderText || 'Type to search...';
+      state.input.placeholder = fallbackPlaceholder;
+      return;
+    }
+    state.input.placeholder = state.placeholderText || 'Type to search...';
+    state.input.value = collapseWhitespace(selected.textContent || '').trim();
+  }
+
+  function openComboboxMenu(state) {
+    if (!state || !state.menu || !state.input || state.input.disabled) {
+      return;
+    }
+    state.menu.classList.remove('d-none');
+    state.input.setAttribute('aria-expanded', 'true');
+    state.isMenuOpen = true;
+  }
+
+  function closeComboboxMenu(state) {
+    if (!state || !state.menu || !state.input) {
+      return;
+    }
+    state.menu.classList.add('d-none');
+    state.input.setAttribute('aria-expanded', 'false');
+    state.isMenuOpen = false;
+    state.highlightedIndex = -1;
+    if (state.closingTimer) {
+      window.clearTimeout(state.closingTimer);
+      state.closingTimer = null;
+    }
   }
 
   function ensureInlineCustomerOption(select, value) {
@@ -1720,51 +1973,6 @@ function initSearchableSelects() {
       var keepVisible = externalVisible || option.selected;
       option.hidden = !keepVisible;
     }
-  }
-
-  function renderTypedPreview(state) {
-    if (!state || !state.preview) {
-      return;
-    }
-    var query = collapseWhitespace(state.typeBuffer || '').trim();
-    if (query === '') {
-      state.preview.textContent = '';
-      state.preview.classList.add('d-none');
-      return;
-    }
-    state.preview.textContent = 'Search: ' + query;
-    state.preview.classList.remove('d-none');
-    scheduleTypedPreviewClear(state, 1400);
-  }
-
-  function scheduleTypedPreviewClear(state, delayMs) {
-    if (!state) {
-      return;
-    }
-    if (state.previewTimer) {
-      window.clearTimeout(state.previewTimer);
-      state.previewTimer = null;
-    }
-    state.previewTimer = window.setTimeout(function () {
-      clearTypedPreview(state);
-    }, Math.max(250, parseInt(String(delayMs || '0'), 10) || 0));
-  }
-
-  function clearTypedPreview(state) {
-    if (!state) {
-      return;
-    }
-    state.typeBuffer = '';
-    state.typeTimestamp = 0;
-    if (state.previewTimer) {
-      window.clearTimeout(state.previewTimer);
-      state.previewTimer = null;
-    }
-    if (!state.preview) {
-      return;
-    }
-    state.preview.textContent = '';
-    state.preview.classList.add('d-none');
   }
 
   function openInlineCustomerModal(component, query) {
@@ -1869,9 +2077,13 @@ function initSearchableSelects() {
     component.lastCommittedValue = idValue;
     refreshIndexedOptions(component);
     applyOptionVisibility(component);
+    syncInputWithSelection(component);
+    renderComboboxMenu(component, component.input ? (component.input.value || '') : '');
 
     component.select.dispatchEvent(new Event('change', { bubbles: true }));
-    component.select.focus();
+    if (component.input) {
+      component.input.focus();
+    }
   }
 
   function upsertLinkedCustomerOption(select, customer) {
@@ -1964,9 +2176,13 @@ function initSearchableSelects() {
     component.lastCommittedValue = idValue;
     refreshIndexedOptions(component);
     applyOptionVisibility(component);
+    syncInputWithSelection(component);
+    renderComboboxMenu(component, component.input ? (component.input.value || '') : '');
 
     component.select.dispatchEvent(new Event('change', { bubbles: true }));
-    component.select.focus();
+    if (component.input) {
+      component.input.focus();
+    }
   }
 }
 

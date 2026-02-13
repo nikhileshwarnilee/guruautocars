@@ -2802,7 +2802,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       if (!wrapper) {
         return null;
       }
-      return wrapper.querySelector('.gac-search-input');
+      return wrapper.querySelector('.gac-combobox-input');
     }
 
     function updatePartModeButtons(activeMode) {

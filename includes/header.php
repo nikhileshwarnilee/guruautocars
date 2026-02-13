@@ -22,7 +22,11 @@ $globalVehicleSearchEnabled = $user !== null && has_permission('vehicle.view');
 $globalVehicleSearchApiUrl = $globalVehicleSearchEnabled ? url('modules/vehicles/search_api.php') : '';
 $headerCompanyId = (int) ($user['company_id'] ?? active_company_id());
 $headerCompanyLogoUrl = $headerCompanyId > 0 ? company_logo_url($headerCompanyId, active_garage_id()) : null;
-$appCssVersion = (string) @filemtime(__DIR__ . '/../assets/css/app.css');
+$appCssPath = __DIR__ . '/../assets/css/app.css';
+$appCssVersion = (string) @md5_file($appCssPath);
+if ($appCssVersion === '') {
+    $appCssVersion = (string) @filemtime($appCssPath);
+}
 if ($appCssVersion === '') {
     $appCssVersion = (string) time();
 }

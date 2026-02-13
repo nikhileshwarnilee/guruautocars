@@ -1,5 +1,9 @@
 <?php
-$appJsVersion = (string) @filemtime(__DIR__ . '/../assets/js/app.js');
+$appJsPath = __DIR__ . '/../assets/js/app.js';
+$appJsVersion = (string) @md5_file($appJsPath);
+if ($appJsVersion === '') {
+    $appJsVersion = (string) @filemtime($appJsPath);
+}
 if ($appJsVersion === '') {
     $appJsVersion = (string) time();
 }
