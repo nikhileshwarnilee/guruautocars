@@ -145,7 +145,7 @@ if ($garageId <= 0) {
     $garageId = $activeGarageId;
 }
 
-$partName = trim((string) ($_GET['part_name'] ?? ''));
+$partName = trim((string) ($_GET['part_name'] ?? ($_GET['table_search'] ?? '')));
 $categoryId = get_int('category_id', 0);
 $vendorId = get_int('vendor_id', 0);
 $stockLevel = strtoupper(trim((string) ($_GET['stock_level'] ?? '')));
@@ -165,6 +165,10 @@ if (!inv_parts_api_is_valid_date($lastMovementTo)) {
 if ($lastMovementFrom !== '' && $lastMovementTo !== '' && strcmp($lastMovementFrom, $lastMovementTo) > 0) {
     [$lastMovementFrom, $lastMovementTo] = [$lastMovementTo, $lastMovementFrom];
 }
+
+$pagination = resolve_pagination_request(10, 100);
+$page = (int) $pagination['page'];
+$perPage = (int) $pagination['per_page'];
 
 $whereParts = [
     'p.company_id = :company_id',
@@ -210,18 +214,14 @@ if ($lastMovementTo !== '') {
 }
 
 try {
-    $partsSql =
-        'SELECT p.id, p.part_name, p.part_sku, p.hsn_code, p.unit, p.selling_price, p.gst_rate, p.min_stock,
-                pc.category_name,
-                v.vendor_name,
-                COALESCE(gi.quantity, 0) AS stock_qty,
-                lm.last_movement_at,
-                CASE
-                    WHEN COALESCE(gi.quantity, 0) <= 0 THEN "OUT"
-                    WHEN COALESCE(gi.quantity, 0) <= p.min_stock THEN "LOW"
-                    ELSE "OK"
-                END AS stock_state
-         FROM parts p
+    $stockStateExpr =
+        'CASE
+            WHEN COALESCE(gi.quantity, 0) <= 0 THEN "OUT"
+            WHEN COALESCE(gi.quantity, 0) <= p.min_stock THEN "LOW"
+            ELSE "OK"
+         END';
+    $partsFromSql =
+        'FROM parts p
          LEFT JOIN part_categories pc ON pc.id = p.category_id
          LEFT JOIN vendors v ON v.id = p.vendor_id
          LEFT JOIN garage_inventory gi
@@ -234,15 +234,39 @@ try {
             GROUP BY part_id, garage_id
          ) lm ON lm.part_id = p.id
             AND lm.garage_id = :movement_garage_id
-         WHERE ' . implode(' AND ', $whereParts) . '
+         WHERE ' . implode(' AND ', $whereParts);
+
+    $statsSql =
+        'SELECT COUNT(*) AS tracked_parts,
+                SUM(CASE WHEN COALESCE(gi.quantity, 0) <= 0 THEN 1 ELSE 0 END) AS out_of_stock_parts,
+                SUM(CASE WHEN COALESCE(gi.quantity, 0) > 0 AND COALESCE(gi.quantity, 0) <= p.min_stock THEN 1 ELSE 0 END) AS low_stock_parts
+         ' . $partsFromSql;
+    $statsStmt = db()->prepare($statsSql);
+    $statsStmt->execute($params);
+    $statsRow = $statsStmt->fetch() ?: [];
+
+    $totalRows = (int) ($statsRow['tracked_parts'] ?? 0);
+    $paginationMeta = pagination_payload($totalRows, $page, $perPage);
+    $page = (int) $paginationMeta['page'];
+    $perPage = (int) $paginationMeta['per_page'];
+    $offset = max(0, ($page - 1) * $perPage);
+
+    $partsSql =
+        'SELECT p.id, p.part_name, p.part_sku, p.hsn_code, p.unit, p.selling_price, p.gst_rate, p.min_stock,
+                pc.category_name,
+                v.vendor_name,
+                COALESCE(gi.quantity, 0) AS stock_qty,
+                lm.last_movement_at,
+                ' . $stockStateExpr . ' AS stock_state
+         ' . $partsFromSql . '
          ORDER BY p.part_name ASC
-         LIMIT 1000';
+         LIMIT ' . $perPage . ' OFFSET ' . $offset;
 
     $partsStmt = db()->prepare($partsSql);
     $partsStmt->execute($params);
     $parts = $partsStmt->fetchAll();
-    $outOfStockParts = count(array_filter($parts, static fn (array $part): bool => (string) ($part['stock_state'] ?? 'OK') === 'OUT'));
-    $lowStockParts = count(array_filter($parts, static fn (array $part): bool => (string) ($part['stock_state'] ?? 'OK') === 'LOW'));
+    $outOfStockParts = (int) ($statsRow['out_of_stock_parts'] ?? 0);
+    $lowStockParts = (int) ($statsRow['low_stock_parts'] ?? 0);
 
     $garageLabel = 'Garage #' . $garageId;
     if (isset($garageLookup[$garageId])) {
@@ -253,9 +277,11 @@ try {
 
     echo json_encode([
         'ok' => true,
-        'rows_count' => count($parts),
+        'rows_count' => $totalRows,
+        'page_rows_count' => count($parts),
+        'pagination' => $paginationMeta,
         'stats' => [
-            'tracked_parts' => count($parts),
+            'tracked_parts' => $totalRows,
             'out_of_stock_parts' => $outOfStockParts,
             'low_stock_parts' => $lowStockParts,
         ],

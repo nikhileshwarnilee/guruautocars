@@ -3,12 +3,14 @@ document.addEventListener('DOMContentLoaded', function () {
 });
 
 function gacBoot() {
+  initFlashNotifications();
   bindConfirmForms();
   initAjaxFormEngine();
   initGlobalVehicleSearch();
   initSearchableSelects();
   initVehicleAttributeSelectors();
   initMasterInsightsFilters();
+  initStandardizedTables();
 }
 
 function bindConfirmForms() {
@@ -322,7 +324,15 @@ function clearFormStatus(form) {
 
 function showFormStatus(form, message, type) {
   var statusMessage = String(message || '').trim();
-  if (!form || statusMessage === '') {
+  if (statusMessage === '') {
+    return;
+  }
+
+  if (renderFlashMessages([{ message: statusMessage, type: type || 'info' }])) {
+    return;
+  }
+
+  if (!form) {
     return;
   }
 
@@ -455,30 +465,80 @@ function normalizeFlashMessages(rawMessages) {
   return normalized;
 }
 
+function initFlashNotifications() {
+  var dataNode = document.getElementById('gac-initial-flash-data');
+  if (!dataNode || dataNode.getAttribute('data-gac-consumed') === '1') {
+    return;
+  }
+
+  dataNode.setAttribute('data-gac-consumed', '1');
+  var payload = [];
+  try {
+    payload = JSON.parse(dataNode.textContent || '[]');
+  } catch (error) {
+    payload = [];
+  }
+
+  if (payload && payload.length > 0) {
+    renderFlashMessages(payload);
+  }
+}
+
 function renderFlashMessages(messages) {
-  var container = document.getElementById('gac-flash-container');
+  var container = resolveFlashContainer();
   if (!container) {
     return false;
   }
 
   var normalizedMessages = normalizeFlashMessages(messages);
-  container.innerHTML = '';
-
   if (normalizedMessages.length === 0) {
-    container.classList.add('d-none');
     return true;
   }
 
-  container.classList.remove('d-none');
   for (var index = 0; index < normalizedMessages.length; index++) {
     var message = normalizedMessages[index];
-    var alert = document.createElement('div');
-    alert.className = 'alert alert-' + normalizeAlertType(message.type) + ' alert-dismissible fade show';
-    alert.setAttribute('role', 'alert');
-    alert.innerHTML = escapeHtml(message.message) + '<button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>';
-    container.appendChild(alert);
+    var toast = document.createElement('div');
+    var alertType = normalizeAlertType(message.type);
+    var toastBgClass = alertType === 'danger' ? 'text-bg-danger' : ('text-bg-' + alertType);
+    toast.className = 'toast ' + toastBgClass + ' border-0';
+    toast.setAttribute('role', 'alert');
+    toast.setAttribute('aria-live', 'assertive');
+    toast.setAttribute('aria-atomic', 'true');
+    toast.setAttribute('data-bs-delay', '4500');
+    toast.setAttribute('data-bs-autohide', 'true');
+    toast.innerHTML =
+      '<div class="d-flex">' +
+        '<div class="toast-body">' + escapeHtml(message.message) + '</div>' +
+        '<button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast" aria-label="Close"></button>' +
+      '</div>';
+    container.appendChild(toast);
+
+    if (window.bootstrap && window.bootstrap.Toast) {
+      var toastInstance = window.bootstrap.Toast.getOrCreateInstance(toast);
+      toast.addEventListener('hidden.bs.toast', function () {
+        if (this && this.parentNode) {
+          this.parentNode.removeChild(this);
+        }
+      });
+      toastInstance.show();
+    } else {
+      window.setTimeout(function (node) {
+        if (node && node.parentNode) {
+          node.parentNode.removeChild(node);
+        }
+      }, 4500, toast);
+    }
   }
   return true;
+}
+
+function resolveFlashContainer() {
+  var container = document.getElementById('gac-flash-container');
+  if (!container) {
+    return null;
+  }
+  container.classList.add('gac-toast-stack');
+  return container;
 }
 
 function navigateWithinApp(url, flashMessages) {
@@ -597,6 +657,9 @@ function isSameDestinationUrl(left, right) {
 
 function normalizeAlertType(type) {
   var value = String(type || '').trim().toLowerCase();
+  if (value === 'error') {
+    value = 'danger';
+  }
   if (value === 'success' || value === 'danger' || value === 'warning' || value === 'info') {
     return value;
   }
@@ -2203,22 +2266,40 @@ function initMasterInsightsFilters() {
       return;
     }
 
-    root.setAttribute('data-master-insights-init', '1');
+    var table = resolveTableFromBody(tableBody);
+    if (!table) {
+      return;
+    }
 
+    root.setAttribute('data-master-insights-init', '1');
+    var scaffold = ensureTableScaffold(table);
+    var paginationUi = ensureMasterPaginationUi(scaffold.container);
+    var paginationSummaryNode = paginationUi.querySelector('[data-master-page-summary="1"]');
+    var paginationListNode = paginationUi.querySelector('[data-master-page-list="1"]');
     var errorBox = root.querySelector('[data-master-insights-error="1"]');
     var resultCountNode = root.querySelector('[data-master-results-count="1"]');
     var statNodes = root.querySelectorAll('[data-stat-value]');
     var requestSequence = 0;
+    var page = 1;
+    var perPage = 10;
+
     var debouncedRefresh = debounce(function () {
+      page = 1;
       requestAndRender();
     }, 220);
 
     form.addEventListener('submit', function (event) {
       event.preventDefault();
+      page = 1;
       requestAndRender();
     });
 
-    form.addEventListener('change', function () {
+    form.addEventListener('change', function (event) {
+      var target = event.target || null;
+      var fieldName = target ? (target.getAttribute('name') || '').trim() : '';
+      if (fieldName !== 'page' && fieldName !== 'per_page') {
+        page = 1;
+      }
       requestAndRender();
     });
 
@@ -2243,15 +2324,34 @@ function initMasterInsightsFilters() {
       resetButton.addEventListener('click', function (event) {
         event.preventDefault();
         form.reset();
+        page = 1;
         requestAndRender();
       });
     }
 
     root.addEventListener('gac:vehicle-attributes-ready', function () {
+      page = 1;
       requestAndRender();
     });
 
     requestAndRender();
+
+    function ensureMasterPaginationUi(tableContainer) {
+      var existing = root.querySelector('[data-master-pagination="1"]');
+      if (existing) {
+        return existing;
+      }
+
+      var paginationNode = document.createElement('div');
+      paginationNode.className = 'gac-table-pagination';
+      paginationNode.setAttribute('data-master-pagination', '1');
+      paginationNode.innerHTML =
+        '<small class="gac-table-summary" data-master-page-summary="1"></small>' +
+        '<ul class="pagination pagination-sm mb-0" data-master-page-list="1"></ul>';
+
+      tableContainer.insertAdjacentElement('afterend', paginationNode);
+      return paginationNode;
+    }
 
     function clearError() {
       if (!errorBox) {
@@ -2285,30 +2385,6 @@ function initMasterInsightsFilters() {
       return params;
     }
 
-    function detectColumnCount() {
-      var configured = parseInt(tableBody.getAttribute('data-table-colspan') || '0', 10);
-      if (configured > 0) {
-        return configured;
-      }
-
-      var table = tableBody;
-      while (table && table.tagName !== 'TABLE') {
-        table = table.parentElement;
-      }
-      if (!table) {
-        return 1;
-      }
-
-      var headers = table.querySelectorAll('thead th');
-      return headers && headers.length > 0 ? headers.length : 1;
-    }
-
-    function renderInfoRow(message, cssClass) {
-      var colCount = detectColumnCount();
-      var rowClass = cssClass || 'text-muted';
-      tableBody.innerHTML = '<tr><td colspan="' + colCount + '" class="text-center ' + rowClass + ' py-4">' + message + '</td></tr>';
-    }
-
     function updateStats(stats) {
       if (!stats || typeof stats !== 'object') {
         return;
@@ -2326,9 +2402,13 @@ function initMasterInsightsFilters() {
     function requestAndRender() {
       var currentSequence = ++requestSequence;
       clearError();
-      renderInfoRow('Loading filtered data...', 'text-muted');
+      renderTableInfoRow(tableBody, 'Loading filtered data...', 'text-muted', table);
 
       var params = serializeForm(form);
+      params.set('page', String(page));
+      params.set('per_page', String(perPage));
+      params.set('_ts', String(Date.now()));
+
       var requestUrl = endpoint;
       if (params.toString() !== '') {
         requestUrl += (endpoint.indexOf('?') >= 0 ? '&' : '?') + params.toString();
@@ -2340,15 +2420,9 @@ function initMasterInsightsFilters() {
       })
         .then(function (response) {
           return response.text().then(function (text) {
-            var payload = null;
-            try {
-              payload = JSON.parse(text);
-            } catch (error) {
-              payload = null;
-            }
             return {
               ok: response.ok,
-              payload: payload
+              payload: safeParseJson(text)
             };
           });
         })
@@ -2360,21 +2434,59 @@ function initMasterInsightsFilters() {
           var payload = result.payload || {};
           if (!result.ok || !payload.ok) {
             showError(payload.message || 'Unable to load filtered data.');
-            renderInfoRow('Unable to load records.', 'text-danger');
+            renderTableInfoRow(tableBody, 'Unable to load records.', 'text-danger', table);
+            updateTablePaginationUi(paginationSummaryNode, paginationListNode, 0, 1, perPage, 1, function () {});
             return;
           }
 
           if (typeof payload.table_rows_html === 'string' && payload.table_rows_html !== '') {
             tableBody.innerHTML = payload.table_rows_html;
           } else {
-            renderInfoRow('No records found.', 'text-muted');
+            renderTableInfoRow(tableBody, 'No records found.', 'text-muted', table);
           }
 
-          if (resultCountNode && Object.prototype.hasOwnProperty.call(payload, 'rows_count')) {
-            resultCountNode.textContent = String(payload.rows_count);
+          var paginationPayload = payload.pagination && typeof payload.pagination === 'object'
+            ? payload.pagination
+            : {};
+          var totalRecords = parseInt(paginationPayload.total_records || payload.rows_count || '0', 10);
+          if (!isFinite(totalRecords) || totalRecords < 0) {
+            totalRecords = 0;
+          }
+
+          var nextPerPage = parseInt(paginationPayload.per_page || String(perPage), 10);
+          if (!isFinite(nextPerPage) || nextPerPage <= 0) {
+            nextPerPage = 10;
+          }
+
+          var totalPages = parseInt(paginationPayload.total_pages || '0', 10);
+          if (!isFinite(totalPages) || totalPages <= 0) {
+            totalPages = Math.max(1, Math.ceil(totalRecords / nextPerPage));
+          }
+
+          var nextPage = parseInt(paginationPayload.page || String(page), 10);
+          if (!isFinite(nextPage) || nextPage <= 0) {
+            nextPage = 1;
+          }
+          if (nextPage > totalPages) {
+            nextPage = totalPages;
+          }
+
+          page = nextPage;
+          perPage = nextPerPage;
+
+          if (resultCountNode) {
+            resultCountNode.textContent = String(totalRecords);
           }
 
           updateStats(payload.stats || {});
+          updateTablePaginationUi(paginationSummaryNode, paginationListNode, totalRecords, page, perPage, totalPages, function (nextPageValue) {
+            if (nextPageValue === page) {
+              return;
+            }
+            page = nextPageValue;
+            requestAndRender();
+          });
+          applyTableDecorators(table);
           bindConfirmForms();
         })
         .catch(function () {
@@ -2382,10 +2494,461 @@ function initMasterInsightsFilters() {
             return;
           }
           showError('Unable to load filtered data.');
-          renderInfoRow('Unable to load records.', 'text-danger');
+          renderTableInfoRow(tableBody, 'Unable to load records.', 'text-danger', table);
+          updateTablePaginationUi(paginationSummaryNode, paginationListNode, 0, 1, perPage, 1, function () {});
         });
     }
   }
+}
+
+function initStandardizedTables() {
+  var tables = document.querySelectorAll('.app-content table.table');
+  if (!tables || tables.length === 0) {
+    return;
+  }
+
+  for (var i = 0; i < tables.length; i++) {
+    var table = tables[i];
+    if (!shouldEnhanceTable(table)) {
+      continue;
+    }
+
+    var scaffold = ensureTableScaffold(table);
+    applyTableDecorators(table);
+
+    if (isMasterInsightsTable(table)) {
+      table.setAttribute('data-gac-table-init', '1');
+      continue;
+    }
+
+    if (table.getAttribute('data-gac-table-init') === '1') {
+      continue;
+    }
+
+    initLocalTableController(table, scaffold);
+    table.setAttribute('data-gac-table-init', '1');
+  }
+}
+
+function shouldEnhanceTable(table) {
+  if (!table || table.getAttribute('data-gac-table-skip') === '1') {
+    return false;
+  }
+  if (table.id === 'purchase-item-table' || table.id === 'purchase-edit-item-table') {
+    return false;
+  }
+  if (!table.tBodies || table.tBodies.length === 0) {
+    return false;
+  }
+  if (table.querySelector('tbody input[type="text"], tbody input[type="number"], tbody input[type="date"], tbody input[type="datetime-local"], tbody input[type="time"], tbody input[type="email"], tbody input[type="search"], tbody input[type="url"], tbody input[type="tel"], tbody input[type="password"], tbody select, tbody textarea')) {
+    return false;
+  }
+  return true;
+}
+
+function isMasterInsightsTable(table) {
+  return !!table.querySelector('tbody[data-master-table-body="1"]');
+}
+
+function ensureTableScaffold(table) {
+  var container = ensureTableResponsiveContainer(table);
+  var rowsCount = table.tBodies && table.tBodies.length > 0 ? table.tBodies[0].rows.length : 0;
+  container.classList.add('gac-table-responsive');
+  if (rowsCount > 10) {
+    container.classList.add('gac-table-scroll-y');
+  }
+  table.classList.add('gac-data-table');
+  ensureTableCardTitleStyle(table);
+
+  return {
+    container: container,
+    host: container.parentElement || container
+  };
+}
+
+function ensureTableResponsiveContainer(table) {
+  var container = table.closest('.table-responsive');
+  if (container && container.contains(table)) {
+    return container;
+  }
+
+  var wrapper = document.createElement('div');
+  wrapper.className = 'table-responsive';
+  if (table.parentNode) {
+    table.parentNode.insertBefore(wrapper, table);
+  }
+  wrapper.appendChild(table);
+  return wrapper;
+}
+
+function ensureTableCardTitleStyle(table) {
+  var card = table.closest('.card');
+  if (!card) {
+    return;
+  }
+  var title = card.querySelector('.card-header .card-title');
+  if (!title) {
+    return;
+  }
+  title.classList.add('fw-bold');
+}
+
+function initLocalTableController(table, scaffold) {
+  var tableBody = table.tBodies[0];
+  if (!tableBody) {
+    return;
+  }
+
+  var allRows = [];
+  for (var idx = 0; idx < tableBody.rows.length; idx++) {
+    var row = tableBody.rows[idx];
+    if (!row || !row.cells || row.cells.length === 0) {
+      continue;
+    }
+    if (row.cells.length === 1 && parseInt(row.cells[0].getAttribute('colspan') || '1', 10) > 1) {
+      continue;
+    }
+    allRows.push(row);
+  }
+
+  var toolbar = document.createElement('div');
+  toolbar.className = 'gac-table-toolbar';
+  toolbar.innerHTML =
+    '<div class="input-group input-group-sm gac-table-search">' +
+      '<span class="input-group-text"><i class="bi bi-search"></i></span>' +
+      '<input type="search" class="form-control" placeholder="Search table..." aria-label="Search table rows">' +
+    '</div>' +
+    '<small class="gac-table-summary" data-gac-table-summary="1"></small>';
+  scaffold.container.insertAdjacentElement('beforebegin', toolbar);
+
+  var paginationNode = document.createElement('div');
+  paginationNode.className = 'gac-table-pagination';
+  paginationNode.innerHTML =
+    '<small class="gac-table-summary" data-gac-table-pagination-summary="1"></small>' +
+    '<ul class="pagination pagination-sm mb-0" data-gac-table-pagination-list="1"></ul>';
+  scaffold.container.insertAdjacentElement('afterend', paginationNode);
+
+  var searchInput = toolbar.querySelector('input[type="search"]');
+  var toolbarSummaryNode = toolbar.querySelector('[data-gac-table-summary="1"]');
+  var paginationSummaryNode = paginationNode.querySelector('[data-gac-table-pagination-summary="1"]');
+  var paginationListNode = paginationNode.querySelector('[data-gac-table-pagination-list="1"]');
+
+  var state = {
+    page: 1,
+    perPage: 10,
+    search: ''
+  };
+
+  var debouncedSearch = debounce(function () {
+    state.search = normalizeSearchTerm(searchInput ? searchInput.value : '');
+    state.page = 1;
+    render();
+  }, 180);
+
+  if (searchInput) {
+    searchInput.addEventListener('input', debouncedSearch);
+  }
+
+  render();
+
+  function render() {
+    var filteredRows = [];
+    var searchTerm = state.search;
+
+    for (var rowIndex = 0; rowIndex < allRows.length; rowIndex++) {
+      var sourceRow = allRows[rowIndex];
+      if (!sourceRow) {
+        continue;
+      }
+      if (searchTerm !== '' && rowToSearchText(sourceRow).indexOf(searchTerm) === -1) {
+        continue;
+      }
+      filteredRows.push(sourceRow);
+    }
+
+    var totalRecords = filteredRows.length;
+    var totalPages = Math.max(1, Math.ceil(totalRecords / state.perPage));
+    if (state.page > totalPages) {
+      state.page = totalPages;
+    }
+
+    var startIndex = (state.page - 1) * state.perPage;
+    var endIndex = Math.min(startIndex + state.perPage, totalRecords);
+    var visibleRows = filteredRows.slice(startIndex, endIndex);
+
+    tableBody.innerHTML = '';
+    if (visibleRows.length === 0) {
+      var emptyMessage = searchTerm === '' ? 'No records found.' : 'No matching records found.';
+      renderTableInfoRow(tableBody, emptyMessage, 'text-muted', table);
+    } else {
+      for (var visibleIndex = 0; visibleIndex < visibleRows.length; visibleIndex++) {
+        tableBody.appendChild(visibleRows[visibleIndex]);
+      }
+    }
+
+    if (toolbarSummaryNode) {
+      toolbarSummaryNode.textContent = buildTableSummaryText(totalRecords, state.page, state.perPage);
+    }
+    updateTablePaginationUi(paginationSummaryNode, paginationListNode, totalRecords, state.page, state.perPage, totalPages, function (nextPageValue) {
+      state.page = nextPageValue;
+      render();
+    });
+
+    applyTableDecorators(table);
+    bindConfirmForms();
+  }
+}
+
+function resolveTableFromBody(tableBody) {
+  if (!tableBody) {
+    return null;
+  }
+
+  var node = tableBody;
+  while (node && node.tagName !== 'TABLE') {
+    node = node.parentElement;
+  }
+  return node && node.tagName === 'TABLE' ? node : null;
+}
+
+function renderTableInfoRow(tableBody, message, cssClass, table) {
+  if (!tableBody) {
+    return;
+  }
+  var colCount = detectTableColumnCount(tableBody, table);
+  var rowClass = cssClass || 'text-muted';
+  tableBody.innerHTML = '<tr data-gac-info-row="1"><td colspan="' + colCount + '" class="text-center ' + rowClass + ' py-4 gac-table-info-row">' + escapeHtml(message) + '</td></tr>';
+}
+
+function detectTableColumnCount(tableBody, table) {
+  if (!tableBody) {
+    return 1;
+  }
+
+  var configured = parseInt(tableBody.getAttribute('data-table-colspan') || '0', 10);
+  if (configured > 0) {
+    return configured;
+  }
+
+  var resolvedTable = table || resolveTableFromBody(tableBody);
+  if (!resolvedTable) {
+    return 1;
+  }
+
+  var headers = resolvedTable.querySelectorAll('thead th');
+  return headers && headers.length > 0 ? headers.length : 1;
+}
+
+function rowToSearchText(row) {
+  if (!row) {
+    return '';
+  }
+  return normalizeSearchTerm(row.textContent || '');
+}
+
+function applyTableDecorators(table) {
+  if (!table) {
+    return;
+  }
+
+  var headerCells = table.querySelectorAll('thead th');
+  if (!headerCells || headerCells.length === 0 || !table.tBodies || table.tBodies.length === 0) {
+    return;
+  }
+
+  var keyColumns = {};
+  var numberColumns = {};
+  var statusColumns = {};
+
+  for (var index = 0; index < headerCells.length; index++) {
+    var headerLabel = normalizeSearchTerm(headerCells[index].textContent || '');
+    if (headerLabel === '') {
+      continue;
+    }
+
+    if (/(invoice|job|customer|vehicle|registration|payment status|amount|reference|ref no|number|part name|part sku|sku)/.test(headerLabel)) {
+      keyColumns[index] = true;
+    }
+    if (/(qty|quantity|amount|price|rate|cost|tax|gst|stock|balance|total|paid|due|km|count|salary|emi|deduction|net|gross|hours|percent|%|id)/.test(headerLabel)) {
+      numberColumns[index] = true;
+    }
+    if (/(status|state|payment)/.test(headerLabel)) {
+      statusColumns[index] = true;
+    }
+  }
+
+  for (var bodyIndex = 0; bodyIndex < table.tBodies.length; bodyIndex++) {
+    var body = table.tBodies[bodyIndex];
+    for (var rowIndex = 0; rowIndex < body.rows.length; rowIndex++) {
+      var row = body.rows[rowIndex];
+      if (!row || row.getAttribute('data-gac-info-row') === '1') {
+        continue;
+      }
+
+      for (var colIndex = 0; colIndex < row.cells.length; colIndex++) {
+        var cell = row.cells[colIndex];
+        if (!cell) {
+          continue;
+        }
+        cell.classList.remove('gac-cell-key', 'gac-cell-number');
+
+        if (keyColumns[colIndex]) {
+          cell.classList.add('gac-cell-key');
+        }
+        if (numberColumns[colIndex]) {
+          cell.classList.add('gac-cell-number');
+        }
+        if (statusColumns[colIndex]) {
+          decorateStatusCell(cell);
+        }
+      }
+    }
+  }
+}
+
+function decorateStatusCell(cell) {
+  if (!cell || cell.querySelector('.badge, .btn, form, a, input, select, textarea')) {
+    return;
+  }
+
+  var rawText = collapseWhitespace(cell.textContent || '').trim();
+  if (rawText === '') {
+    return;
+  }
+
+  var normalizedText = rawText.toUpperCase();
+  var badgeClass = resolveStatusBadgeClass(normalizedText);
+  if (badgeClass === '') {
+    return;
+  }
+
+  cell.textContent = '';
+  var badge = document.createElement('span');
+  badge.className = 'badge text-bg-' + badgeClass;
+  badge.textContent = formatStatusLabel(rawText);
+  cell.appendChild(badge);
+}
+
+function resolveStatusBadgeClass(value) {
+  var normalized = String(value || '').trim().toUpperCase();
+  if (normalized === '') {
+    return '';
+  }
+
+  if (normalized === 'ACTIVE' || normalized === 'PAID' || normalized === 'SUCCESS' || normalized === 'COMPLETED') {
+    return 'success';
+  }
+  if (normalized === 'PENDING' || normalized === 'DUE' || normalized === 'LOW' || normalized === 'OPEN') {
+    return 'warning';
+  }
+  if (normalized === 'CANCELLED' || normalized === 'CANCELED' || normalized === 'DELETED' || normalized === 'FAILED' || normalized === 'OUT OF STOCK' || normalized === 'OUT') {
+    return 'danger';
+  }
+  if (normalized === 'CLOSED' || normalized === 'INACTIVE' || normalized === 'DRAFT') {
+    return 'secondary';
+  }
+
+  return '';
+}
+
+function formatStatusLabel(value) {
+  var words = String(value || '')
+    .replace(/[_-]+/g, ' ')
+    .trim()
+    .split(/\s+/);
+
+  if (!words || words.length === 0) {
+    return '';
+  }
+
+  for (var i = 0; i < words.length; i++) {
+    var word = words[i];
+    words[i] = word.charAt(0).toUpperCase() + word.slice(1).toLowerCase();
+  }
+  return words.join(' ');
+}
+
+function buildTableSummaryText(totalRecords, page, perPage) {
+  if (!isFinite(totalRecords) || totalRecords <= 0) {
+    return 'Showing 0 of 0';
+  }
+
+  var start = (page - 1) * perPage + 1;
+  var end = Math.min(start + perPage - 1, totalRecords);
+  return 'Showing ' + start + '-' + end + ' of ' + totalRecords;
+}
+
+function updateTablePaginationUi(summaryNode, listNode, totalRecords, page, perPage, totalPages, onPageClick) {
+  if (summaryNode) {
+    summaryNode.textContent = buildTableSummaryText(totalRecords, page, perPage);
+  }
+  if (!listNode) {
+    return;
+  }
+
+  listNode.innerHTML = '';
+  if (totalPages <= 1) {
+    listNode.appendChild(buildPageControlItem('Prev', 1, false, true, onPageClick));
+    listNode.appendChild(buildPageControlItem('1', 1, true, true, onPageClick));
+    listNode.appendChild(buildPageControlItem('Next', 1, false, true, onPageClick));
+    return;
+  }
+
+  listNode.appendChild(buildPageControlItem('Prev', page - 1, false, page <= 1, onPageClick));
+
+  var windowStart = Math.max(1, page - 2);
+  var windowEnd = Math.min(totalPages, page + 2);
+
+  if (windowStart > 1) {
+    listNode.appendChild(buildPageControlItem('1', 1, page === 1, false, onPageClick));
+    if (windowStart > 2) {
+      listNode.appendChild(buildEllipsisPageItem());
+    }
+  }
+
+  for (var number = windowStart; number <= windowEnd; number++) {
+    listNode.appendChild(buildPageControlItem(String(number), number, number === page, false, onPageClick));
+  }
+
+  if (windowEnd < totalPages) {
+    if (windowEnd < totalPages - 1) {
+      listNode.appendChild(buildEllipsisPageItem());
+    }
+    listNode.appendChild(buildPageControlItem(String(totalPages), totalPages, page === totalPages, false, onPageClick));
+  }
+
+  listNode.appendChild(buildPageControlItem('Next', page + 1, false, page >= totalPages, onPageClick));
+}
+
+function buildPageControlItem(label, pageValue, isActive, isDisabled, onPageClick) {
+  var item = document.createElement('li');
+  item.className = 'page-item' + (isActive ? ' active' : '') + (isDisabled ? ' disabled' : '');
+
+  var button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'page-link';
+  button.textContent = label;
+  button.disabled = !!isDisabled;
+  if (!isDisabled) {
+    button.addEventListener('click', function () {
+      if (typeof onPageClick === 'function') {
+        onPageClick(pageValue);
+      }
+    });
+  }
+  item.appendChild(button);
+
+  return item;
+}
+
+function buildEllipsisPageItem() {
+  var item = document.createElement('li');
+  item.className = 'page-item disabled';
+  var span = document.createElement('span');
+  span.className = 'page-link';
+  span.textContent = '...';
+  item.appendChild(span);
+  return item;
 }
 
 function gacRefreshSearchableSelect(select) {

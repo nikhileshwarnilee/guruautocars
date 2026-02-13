@@ -1131,6 +1131,7 @@ $parts = $partsStockStmt->fetchAll();
 $partsTrackedCount = count($parts);
 $partsOutCount = count(array_filter($parts, static fn (array $part): bool => (string) ($part['stock_state'] ?? 'OK') === 'OUT'));
 $partsLowCount = count(array_filter($parts, static fn (array $part): bool => (string) ($part['stock_state'] ?? 'OK') === 'LOW'));
+$partsTablePreview = array_slice($parts, 0, 10);
 
 $tempStatusFilter = strtoupper(trim((string) ($_GET['temp_status'] ?? '')));
 $allowedTempStatusFilter = ['OPEN', 'RETURNED', 'PURCHASED', 'CONSUMED'];
@@ -2036,10 +2037,10 @@ require_once __DIR__ . '/../../includes/sidebar.php';
               </tr>
             </thead>
             <tbody data-master-table-body="1" data-table-colspan="12">
-              <?php if (empty($parts)): ?>
+              <?php if (empty($partsTablePreview)): ?>
                 <tr><td colspan="12" class="text-center text-muted py-4">No parts configured.</td></tr>
               <?php else: ?>
-                <?php foreach ($parts as $part): ?>
+                <?php foreach ($partsTablePreview as $part): ?>
                   <?php
                     $state = (string) ($part['stock_state'] ?? 'OK');
                     $badgeClass = $state === 'OUT' ? 'danger' : ($state === 'LOW' ? 'warning' : 'success');

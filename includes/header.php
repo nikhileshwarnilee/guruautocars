@@ -126,11 +126,15 @@ $globalVehicleSearchApiUrl = $globalVehicleSearchEnabled ? url('modules/vehicles
         </div>
       </nav>
       <?php $normalizedFlashMessages = flash_messages_normalize($flashMessages); ?>
-      <div id="gac-flash-container" class="container-fluid mt-3 <?= empty($normalizedFlashMessages) ? 'd-none' : ''; ?>" aria-live="polite">
-        <?php foreach ($normalizedFlashMessages as $flash): ?>
-          <div class="alert alert-<?= e((string) $flash['type']); ?> alert-dismissible fade show" role="alert">
-            <?= e((string) ($flash['message'] ?? '')); ?>
-            <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
-          </div>
-        <?php endforeach; ?>
+      <div id="gac-flash-container" class="gac-toast-stack position-fixed top-0 end-0 p-3" aria-live="polite" aria-atomic="true">
+        <script type="application/json" id="gac-initial-flash-data"><?=
+            json_encode(
+                $normalizedFlashMessages,
+                JSON_UNESCAPED_UNICODE
+                | JSON_HEX_TAG
+                | JSON_HEX_AMP
+                | JSON_HEX_APOS
+                | JSON_HEX_QUOT
+            );
+        ?></script>
       </div>

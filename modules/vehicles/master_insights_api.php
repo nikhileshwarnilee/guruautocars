@@ -103,7 +103,7 @@ $vehicleAttributeEnabled = vehicle_masters_enabled() && vehicle_master_link_colu
 $jobCardColumns = table_columns('job_cards');
 $jobOdometerEnabled = in_array('odometer_km', $jobCardColumns, true);
 
-$search = trim((string) ($_GET['q'] ?? ''));
+$search = trim((string) ($_GET['q'] ?? ($_GET['table_search'] ?? '')));
 $statusFilter = strtoupper(trim((string) ($_GET['status'] ?? '')));
 $allowedStatuses = ['ACTIVE', 'INACTIVE', 'DELETED', 'ALL'];
 if (!in_array($statusFilter, $allowedStatuses, true)) {
@@ -134,6 +134,10 @@ if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $lastServiceTo)) {
 if ($lastServiceFrom !== '' && $lastServiceTo !== '' && strcmp($lastServiceFrom, $lastServiceTo) > 0) {
     [$lastServiceFrom, $lastServiceTo] = [$lastServiceTo, $lastServiceFrom];
 }
+
+$pagination = resolve_pagination_request(10, 100);
+$page = (int) $pagination['page'];
+$perPage = (int) $pagination['per_page'];
 
 $jobSummarySql =
     'SELECT jc.vehicle_id,
@@ -230,6 +234,11 @@ try {
     $statsStmt = db()->prepare($statsSql);
     $statsStmt->execute($params);
     $statsRow = $statsStmt->fetch() ?: [];
+    $totalRows = (int) ($statsRow['total_vehicles'] ?? 0);
+    $paginationMeta = pagination_payload($totalRows, $page, $perPage);
+    $page = (int) $paginationMeta['page'];
+    $perPage = (int) $paginationMeta['per_page'];
+    $offset = max(0, ($page - 1) * $perPage);
 
     $listSql =
         'SELECT v.*, c.full_name AS customer_name, c.phone AS customer_phone,
@@ -246,7 +255,7 @@ try {
          LEFT JOIN vis_brands vb ON vb.id = vm.brand_id
          WHERE ' . implode(' AND ', $whereParts) . '
          ORDER BY v.id DESC
-         LIMIT 500';
+         LIMIT ' . $perPage . ' OFFSET ' . $offset;
 
     $listStmt = db()->prepare($listSql);
     $listStmt->execute($params);
@@ -259,7 +268,9 @@ try {
             'vehicles_with_active_jobs' => (int) ($statsRow['vehicles_with_active_jobs'] ?? 0),
             'recently_serviced_vehicles' => (int) ($statsRow['recently_serviced_vehicles'] ?? 0),
         ],
-        'rows_count' => count($rows),
+        'rows_count' => $totalRows,
+        'page_rows_count' => count($rows),
+        'pagination' => $paginationMeta,
         'table_rows_html' => vehicle_master_render_rows($rows, $canManage),
     ], JSON_UNESCAPED_UNICODE);
 } catch (Throwable $exception) {

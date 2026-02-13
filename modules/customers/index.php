@@ -260,7 +260,16 @@ $listSql =
             (SELECT COUNT(*) FROM customer_history h WHERE h.customer_id = c.id) AS history_count
      FROM customers c
      WHERE ' . implode(' AND ', $whereParts) . '
-     ORDER BY c.id DESC';
+     ORDER BY c.id DESC
+     LIMIT 10';
+
+$totalCustomersSql =
+    'SELECT COUNT(*)
+     FROM customers c
+     WHERE ' . implode(' AND ', $whereParts);
+$totalCustomersStmt = db()->prepare($totalCustomersSql);
+$totalCustomersStmt->execute($params);
+$totalCustomers = (int) ($totalCustomersStmt->fetchColumn() ?: 0);
 
 $customerStmt = db()->prepare($listSql);
 $customerStmt->execute($params);
@@ -365,7 +374,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         <div class="col-md-3 col-sm-6">
           <div class="small-box text-bg-primary mb-0">
             <div class="inner">
-              <h3 data-stat-value="total_customers"><?= count($customers); ?></h3>
+              <h3 data-stat-value="total_customers"><?= (int) $totalCustomers; ?></h3>
               <p>Total Customers</p>
             </div>
             <div class="small-box-icon"><i class="bi bi-people-fill"></i></div>
@@ -403,7 +412,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       <div class="card" data-master-insights-root="customers" data-master-insights-endpoint="<?= e($customerInsightsApiUrl); ?>">
         <div class="card-header d-flex justify-content-between align-items-center">
           <h3 class="card-title mb-0">Customer List</h3>
-          <span class="badge text-bg-light border" data-master-results-count="1"><?= count($customers); ?></span>
+          <span class="badge text-bg-light border" data-master-results-count="1"><?= (int) $totalCustomers; ?></span>
         </div>
         <div class="card-body border-bottom">
           <form method="get" class="row g-2 align-items-end" data-master-filter-form="1">

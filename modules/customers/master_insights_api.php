@@ -93,7 +93,7 @@ function customer_master_render_rows(array $customers, bool $canManage): string
 $companyId = active_company_id();
 $canManage = has_permission('customer.manage');
 
-$search = trim((string) ($_GET['q'] ?? ''));
+$search = trim((string) ($_GET['q'] ?? ($_GET['table_search'] ?? '')));
 $statusFilter = strtoupper(trim((string) ($_GET['status'] ?? '')));
 $allowedStatuses = ['ACTIVE', 'INACTIVE', 'DELETED', 'ALL'];
 if (!in_array($statusFilter, $allowedStatuses, true)) {
@@ -125,6 +125,10 @@ if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $toDate)) {
 if ($fromDate !== '' && $toDate !== '' && strcmp($fromDate, $toDate) > 0) {
     [$fromDate, $toDate] = [$toDate, $fromDate];
 }
+
+$pagination = resolve_pagination_request(10, 100);
+$page = (int) $pagination['page'];
+$perPage = (int) $pagination['per_page'];
 
 $jobSummarySql =
     'SELECT jc.customer_id,
@@ -194,6 +198,11 @@ try {
     $statsStmt = db()->prepare($statsSql);
     $statsStmt->execute($params);
     $statsRow = $statsStmt->fetch() ?: [];
+    $totalRows = (int) ($statsRow['total_customers'] ?? 0);
+    $paginationMeta = pagination_payload($totalRows, $page, $perPage);
+    $page = (int) $paginationMeta['page'];
+    $perPage = (int) $paginationMeta['per_page'];
+    $offset = max(0, ($page - 1) * $perPage);
 
     $listSql =
         'SELECT c.*,
@@ -206,7 +215,7 @@ try {
          LEFT JOIN (' . $jobSummarySql . ') js ON js.customer_id = c.id
          WHERE ' . implode(' AND ', $whereParts) . '
          ORDER BY c.id DESC
-         LIMIT 500';
+         LIMIT ' . $perPage . ' OFFSET ' . $offset;
 
     $listStmt = db()->prepare($listSql);
     $listStmt->execute($params);
@@ -220,7 +229,9 @@ try {
             'repeat_customers' => (int) ($statsRow['repeat_customers'] ?? 0),
             'customers_with_open_jobs' => (int) ($statsRow['customers_with_open_jobs'] ?? 0),
         ],
-        'rows_count' => count($rows),
+        'rows_count' => $totalRows,
+        'page_rows_count' => count($rows),
+        'pagination' => $paginationMeta,
         'table_rows_html' => customer_master_render_rows($rows, $canManage),
     ], JSON_UNESCAPED_UNICODE);
 } catch (Throwable $exception) {

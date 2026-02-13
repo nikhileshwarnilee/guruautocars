@@ -688,7 +688,17 @@ $vehicleSql =
      LEFT JOIN vis_models vm ON vm.id = vv.model_id
      LEFT JOIN vis_brands vb ON vb.id = vm.brand_id
      WHERE ' . implode(' AND ', $whereParts) . '
-     ORDER BY v.id DESC';
+     ORDER BY v.id DESC
+     LIMIT 10';
+
+$totalVehiclesSql =
+    'SELECT COUNT(*)
+     FROM vehicles v
+     INNER JOIN customers c ON c.id = v.customer_id
+     WHERE ' . implode(' AND ', $whereParts);
+$totalVehiclesStmt = db()->prepare($totalVehiclesSql);
+$totalVehiclesStmt->execute($params);
+$totalVehicles = (int) ($totalVehiclesStmt->fetchColumn() ?: 0);
 
 $vehiclesStmt = db()->prepare($vehicleSql);
 $vehiclesStmt->execute($params);
@@ -893,7 +903,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         <div class="col-md-4 col-sm-6">
           <div class="small-box text-bg-primary mb-0">
             <div class="inner">
-              <h3 data-stat-value="total_vehicles"><?= count($vehicles); ?></h3>
+              <h3 data-stat-value="total_vehicles"><?= (int) $totalVehicles; ?></h3>
               <p>Total Vehicles</p>
             </div>
             <div class="small-box-icon"><i class="bi bi-car-front-fill"></i></div>
@@ -922,7 +932,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       <div class="card" data-master-insights-root="vehicles" data-master-insights-endpoint="<?= e($vehicleInsightsApiUrl); ?>">
         <div class="card-header d-flex justify-content-between align-items-center">
           <h3 class="card-title mb-0">Vehicle List</h3>
-          <span class="badge text-bg-light border" data-master-results-count="1"><?= count($vehicles); ?></span>
+          <span class="badge text-bg-light border" data-master-results-count="1"><?= (int) $totalVehicles; ?></span>
         </div>
         <div class="card-body border-bottom">
           <form method="get" class="row g-2 align-items-end" data-master-filter-form="1">

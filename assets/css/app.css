@@ -16,6 +16,10 @@
   vertical-align: middle;
 }
 
+.card-title {
+  font-weight: 700;
+}
+
 .erp-stat-number {
   font-size: 1.35rem;
   font-weight: 700;
@@ -42,6 +46,86 @@
 
 .gac-form-status {
   margin-bottom: 0.85rem;
+}
+
+.gac-toast-stack {
+  z-index: 1085;
+  width: min(26rem, calc(100vw - 1.5rem));
+  pointer-events: none;
+}
+
+.gac-toast-stack .toast {
+  pointer-events: auto;
+  opacity: 1;
+  box-shadow: 0 0.5rem 1rem rgba(0, 0, 0, 0.15);
+}
+
+.gac-toast-stack .toast + .toast {
+  margin-top: 0.5rem;
+}
+
+.gac-table-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.65rem;
+  padding: 0.65rem 0.85rem;
+  border-bottom: 1px solid rgba(33, 37, 41, 0.1);
+  background: #fff;
+}
+
+.gac-table-search {
+  min-width: 16rem;
+  max-width: 22rem;
+}
+
+.gac-table-summary {
+  color: #6c757d;
+  font-size: 0.85rem;
+}
+
+.gac-table-responsive {
+  overflow-x: auto;
+}
+
+.gac-table-scroll-y {
+  max-height: 27rem;
+  overflow-y: auto;
+}
+
+.gac-table-pagination {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.65rem 0.85rem;
+  border-top: 1px solid rgba(33, 37, 41, 0.1);
+  background: #fff;
+}
+
+.gac-data-table > :not(caption) > * > * {
+  padding: 0.58rem 0.72rem;
+}
+
+.gac-data-table thead th {
+  font-weight: 700;
+  background: #f8f9fa;
+  white-space: nowrap;
+}
+
+.gac-cell-key {
+  font-weight: 600;
+}
+
+.gac-cell-number {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.gac-table-info-row {
+  font-size: 0.92rem;
 }
 
 .gac-form-loading {
@@ -95,5 +179,16 @@
     flex: 1 0 100%;
     max-width: none;
     margin: 0.1rem 0 0;
+  }
+
+  .gac-table-toolbar,
+  .gac-table-pagination {
+    padding-left: 0.7rem;
+    padding-right: 0.7rem;
+  }
+
+  .gac-table-search {
+    min-width: 100%;
+    max-width: none;
   }
 }

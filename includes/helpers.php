@@ -176,6 +176,42 @@ function get_int(string $key, int $default = 0): int
     return filter_var($value, FILTER_VALIDATE_INT) !== false ? (int) $value : $default;
 }
 
+function resolve_pagination_request(int $defaultPerPage = 10, int $maxPerPage = 100): array
+{
+    $defaultPerPage = max(1, $defaultPerPage);
+    $maxPerPage = max($defaultPerPage, $maxPerPage);
+
+    $page = max(1, get_int('page', 1));
+    $perPage = get_int('per_page', $defaultPerPage);
+    if ($perPage <= 0) {
+        $perPage = $defaultPerPage;
+    }
+    $perPage = min($maxPerPage, max(1, $perPage));
+
+    return [
+        'page' => $page,
+        'per_page' => $perPage,
+        'offset' => ($page - 1) * $perPage,
+    ];
+}
+
+function pagination_payload(int $totalRecords, int $page, int $perPage): array
+{
+    $totalRecords = max(0, $totalRecords);
+    $perPage = max(1, $perPage);
+    $totalPages = max(1, (int) ceil($totalRecords / $perPage));
+    $page = min(max(1, $page), $totalPages);
+
+    return [
+        'page' => $page,
+        'per_page' => $perPage,
+        'total_records' => $totalRecords,
+        'total_pages' => $totalPages,
+        'has_prev' => $page > 1,
+        'has_next' => $page < $totalPages,
+    ];
+}
+
 function post_int(string $key, int $default = 0): int
 {
     $value = $_POST[$key] ?? $default;
