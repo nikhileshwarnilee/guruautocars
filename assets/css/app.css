@@ -168,6 +168,30 @@
   text-align: left;
 }
 
+.sidebar-menu > .nav-item > .nav-link.active {
+  font-weight: 600;
+  background: rgba(13, 110, 253, 0.22);
+}
+
+.sidebar-menu .nav-treeview > .nav-item > .nav-link.active {
+  font-weight: 700;
+  background: rgba(13, 110, 253, 0.34);
+  border-left: 3px solid rgba(255, 255, 255, 0.75);
+}
+
+.sidebar-menu .nav-treeview .nav-treeview > .nav-item > .nav-link.active {
+  background: rgba(13, 110, 253, 0.44);
+}
+
+.sidebar-menu .nav-header {
+  letter-spacing: 0.04em;
+  font-weight: 700;
+}
+
+.gac-auto-breadcrumb {
+  margin-bottom: 0;
+}
+
 @media (max-width: 991.98px) {
   .app-header .container-fluid {
     flex-wrap: wrap;

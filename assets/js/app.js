@@ -3,6 +3,8 @@ document.addEventListener('DOMContentLoaded', function () {
 });
 
 function gacBoot() {
+  initSidebarStatePersistence();
+  ensurePageBreadcrumbs();
   initFlashNotifications();
   bindConfirmForms();
   initAjaxFormEngine();
@@ -11,6 +13,251 @@ function gacBoot() {
   initVehicleAttributeSelectors();
   initMasterInsightsFilters();
   initStandardizedTables();
+}
+
+function initSidebarStatePersistence() {
+  if (!document.body || document.body.getAttribute('data-gac-sidebar-state-init') === '1') {
+    return;
+  }
+  document.body.setAttribute('data-gac-sidebar-state-init', '1');
+
+  var storageKey = 'gac.sidebar.collapsed';
+  applyStoredSidebarState(storageKey);
+  persistSidebarState(storageKey);
+
+  document.addEventListener('click', function (event) {
+    var target = event.target;
+    if (!target || typeof target.closest !== 'function') {
+      return;
+    }
+
+    var sidebarToggle = target.closest('[data-lte-toggle=\"sidebar\"]');
+    if (!sidebarToggle) {
+      return;
+    }
+
+    window.setTimeout(function () {
+      persistSidebarState(storageKey);
+    }, 140);
+  });
+
+  if (typeof MutationObserver === 'function') {
+    var classObserver = new MutationObserver(function (mutations) {
+      for (var index = 0; index < mutations.length; index++) {
+        if (mutations[index].attributeName === 'class') {
+          persistSidebarState(storageKey);
+          break;
+        }
+      }
+    });
+    classObserver.observe(document.body, { attributes: true, attributeFilter: ['class'] });
+  }
+}
+
+function applyStoredSidebarState(storageKey) {
+  if (!document.body) {
+    return;
+  }
+
+  try {
+    if (!window.localStorage) {
+      return;
+    }
+
+    if (window.localStorage.getItem(storageKey) === '1') {
+      document.body.classList.add('sidebar-collapse');
+      document.body.classList.remove('sidebar-open');
+    }
+  } catch (error) {
+    // Ignore storage permission errors.
+  }
+}
+
+function persistSidebarState(storageKey) {
+  if (!document.body) {
+    return;
+  }
+
+  try {
+    if (!window.localStorage) {
+      return;
+    }
+
+    var isCollapsed = document.body.classList.contains('sidebar-collapse');
+    window.localStorage.setItem(storageKey, isCollapsed ? '1' : '0');
+  } catch (error) {
+    // Ignore storage permission errors.
+  }
+}
+
+function ensurePageBreadcrumbs() {
+  var contentHeaders = document.querySelectorAll('.app-main .app-content-header');
+  if (!contentHeaders || contentHeaders.length === 0) {
+    return;
+  }
+
+  for (var headerIndex = 0; headerIndex < contentHeaders.length; headerIndex++) {
+    var contentHeader = contentHeaders[headerIndex];
+    if (!contentHeader || contentHeader.querySelector('.breadcrumb')) {
+      continue;
+    }
+
+    var breadcrumbTrail = resolveBreadcrumbTrail();
+    if (!breadcrumbTrail || breadcrumbTrail.length === 0) {
+      continue;
+    }
+
+    var headerRow = contentHeader.querySelector('.row');
+    if (!headerRow) {
+      continue;
+    }
+
+    var breadcrumbHost = resolveBreadcrumbHost(headerRow);
+    if (!breadcrumbHost) {
+      continue;
+    }
+
+    var breadcrumbList = document.createElement('ol');
+    breadcrumbList.className = 'breadcrumb float-sm-end gac-auto-breadcrumb';
+    if (breadcrumbHost.children && breadcrumbHost.children.length > 0) {
+      breadcrumbList.classList.add('mb-2');
+    }
+
+    for (var itemIndex = 0; itemIndex < breadcrumbTrail.length; itemIndex++) {
+      var crumb = breadcrumbTrail[itemIndex];
+      if (!crumb || !crumb.label) {
+        continue;
+      }
+
+      var listItem = document.createElement('li');
+      var isActive = itemIndex === breadcrumbTrail.length - 1 || !crumb.href;
+      listItem.className = isActive ? 'breadcrumb-item active' : 'breadcrumb-item';
+
+      if (isActive) {
+        listItem.setAttribute('aria-current', 'page');
+        listItem.textContent = crumb.label;
+      } else {
+        var link = document.createElement('a');
+        link.href = crumb.href;
+        link.textContent = crumb.label;
+        listItem.appendChild(link);
+      }
+      breadcrumbList.appendChild(listItem);
+    }
+
+    if (breadcrumbHost.firstChild) {
+      breadcrumbHost.insertBefore(breadcrumbList, breadcrumbHost.firstChild);
+    } else {
+      breadcrumbHost.appendChild(breadcrumbList);
+    }
+  }
+}
+
+function resolveBreadcrumbHost(headerRow) {
+  if (!headerRow) {
+    return null;
+  }
+
+  var columns = [];
+  for (var childIndex = 0; childIndex < headerRow.children.length; childIndex++) {
+    var child = headerRow.children[childIndex];
+    if (!child || !child.className) {
+      continue;
+    }
+    if (/(^|\\s)col-/.test(String(child.className))) {
+      columns.push(child);
+    }
+  }
+  if (columns.length === 0) {
+    return null;
+  }
+
+  var host = null;
+  if (columns.length === 1) {
+    host = document.createElement('div');
+    host.className = 'col-sm-6 text-sm-end';
+    headerRow.appendChild(host);
+    return host;
+  }
+
+  host = columns[columns.length - 1];
+  host.classList.add('text-sm-end');
+  return host;
+}
+
+function resolveBreadcrumbTrail() {
+  var activeMenu = '';
+  var pageTitle = '';
+  var dashboardUrl = 'dashboard.php';
+
+  if (document.body) {
+    activeMenu = String(document.body.getAttribute('data-active-menu') || '').trim();
+    pageTitle = String(document.body.getAttribute('data-page-title') || '').trim();
+    var configuredDashboardUrl = String(document.body.getAttribute('data-dashboard-url') || '').trim();
+    if (configuredDashboardUrl !== '') {
+      dashboardUrl = configuredDashboardUrl;
+    }
+  }
+
+  var map = buildBreadcrumbMap(dashboardUrl);
+  if (activeMenu !== '' && Object.prototype.hasOwnProperty.call(map, activeMenu)) {
+    return map[activeMenu];
+  }
+
+  if (pageTitle === '') {
+    var heading = document.querySelector('.app-content-header h1, .app-content-header h2, .app-content-header h3');
+    pageTitle = heading ? collapseWhitespace(heading.textContent || '').trim() : '';
+  }
+  if (pageTitle === '') {
+    pageTitle = 'Page';
+  }
+
+  return [{ label: 'Home', href: dashboardUrl }, { label: pageTitle }];
+}
+
+function buildBreadcrumbMap(dashboardUrl) {
+  var home = { label: 'Home', href: dashboardUrl };
+
+  return {
+    'dashboard': [home, { label: 'Dashboard' }],
+    'jobs': [home, { label: 'Operations' }, { label: 'Job Cards' }],
+    'estimates': [home, { label: 'Operations' }, { label: 'Estimates' }],
+    'outsourced.index': [home, { label: 'Operations' }, { label: 'Outsourced Works' }],
+    'inventory': [home, { label: 'Operations' }, { label: 'Stock Movements' }],
+    'billing': [home, { label: 'Sales' }, { label: 'Billing / Invoices' }],
+    'customers': [home, { label: 'Sales' }, { label: 'Customer Master' }],
+    'vehicles': [home, { label: 'Sales' }, { label: 'Vehicle Master' }],
+    'inventory.parts_master': [home, { label: 'Inventory' }, { label: 'Parts / Item Master' }],
+    'inventory.categories': [home, { label: 'Inventory' }, { label: 'Part Category Master' }],
+    'purchases.index': [home, { label: 'Inventory' }, { label: 'Purchases' }],
+    'vendors.master': [home, { label: 'Inventory' }, { label: 'Vendor / Supplier Master' }],
+    'finance.payroll': [home, { label: 'Finance' }, { label: 'Payroll & Salary' }],
+    'finance.expenses': [home, { label: 'Finance' }, { label: 'Expenses' }],
+    'reports.gst_compliance': [home, { label: 'Finance' }, { label: 'GST Compliance' }],
+    'reports': [home, { label: 'Reports' }, { label: 'Overview' }],
+    'reports.jobs': [home, { label: 'Reports' }, { label: 'Job Reports' }],
+    'reports.inventory': [home, { label: 'Reports' }, { label: 'Inventory Reports' }],
+    'reports.billing': [home, { label: 'Reports' }, { label: 'Billing & GST' }],
+    'reports.payroll': [home, { label: 'Reports' }, { label: 'Payroll Reports' }],
+    'reports.expenses': [home, { label: 'Reports' }, { label: 'Expense Reports' }],
+    'reports.outsourced': [home, { label: 'Reports' }, { label: 'Outsourced Labour' }],
+    'reports.customers': [home, { label: 'Reports' }, { label: 'Customer Reports' }],
+    'reports.vehicles': [home, { label: 'Reports' }, { label: 'Vehicle Reports' }],
+    'organization.companies': [home, { label: 'Administration' }, { label: 'Organization & System' }, { label: 'Company Master' }],
+    'organization.garages': [home, { label: 'Administration' }, { label: 'Organization & System' }, { label: 'Garage / Branch Master' }],
+    'system.financial_years': [home, { label: 'Administration' }, { label: 'Organization & System' }, { label: 'Financial Year' }],
+    'system.settings': [home, { label: 'Administration' }, { label: 'Organization & System' }, { label: 'System Settings' }],
+    'system.audit': [home, { label: 'Administration' }, { label: 'Organization & System' }, { label: 'Audit Logs' }],
+    'system.exports': [home, { label: 'Administration' }, { label: 'Organization & System' }, { label: 'Data Exports' }],
+    'system.backup': [home, { label: 'Administration' }, { label: 'Organization & System' }, { label: 'Backup & Recovery' }],
+    'people.roles': [home, { label: 'Administration' }, { label: 'Role Master' }],
+    'people.permissions': [home, { label: 'Administration' }, { label: 'Permission Management' }],
+    'people.staff': [home, { label: 'Administration' }, { label: 'Staff Master' }],
+    'services.categories': [home, { label: 'Administration' }, { label: 'Service Category Master' }],
+    'services.master': [home, { label: 'Administration' }, { label: 'Service / Labour Master' }],
+    'vis.catalog': [home, { label: 'Administration' }, { label: 'VIS Vehicle Catalog' }],
+    'vis.compatibility': [home, { label: 'Administration' }, { label: 'VIS Compatibility Mapping' }]
+  };
 }
 
 function bindConfirmForms() {
@@ -605,9 +852,33 @@ function replaceAppWrapperFromHtml(html) {
   if (parsedDocument.title && parsedDocument.title.trim() !== '') {
     document.title = parsedDocument.title.trim();
   }
+  syncBodyDataAttributes(parsedDocument);
 
   executeScriptsInContainer(currentWrapper);
   return true;
+}
+
+function syncBodyDataAttributes(parsedDocument) {
+  if (!parsedDocument || !parsedDocument.body || !document.body) {
+    return;
+  }
+
+  var attributeNames = [
+    'data-inline-customer-form-url',
+    'data-active-menu',
+    'data-page-title',
+    'data-dashboard-url'
+  ];
+
+  for (var index = 0; index < attributeNames.length; index++) {
+    var attributeName = attributeNames[index];
+    var attributeValue = parsedDocument.body.getAttribute(attributeName);
+    if (attributeValue === null) {
+      document.body.removeAttribute(attributeName);
+    } else {
+      document.body.setAttribute(attributeName, attributeValue);
+    }
+  }
 }
 
 function executeScriptsInContainer(container) {

@@ -768,14 +768,24 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             Vehicle: <?= e((string) $estimate['registration_no']); ?>
           </small>
         </div>
-        <div class="col-sm-4 text-sm-end">
-          <a href="<?= e(url('modules/estimates/index.php')); ?>" class="btn btn-outline-secondary btn-sm">Back to Estimates</a>
-          <?php if ($canPrint): ?>
-            <a href="<?= e(url('modules/estimates/print_estimate.php?id=' . $estimateId)); ?>" class="btn btn-outline-primary btn-sm" target="_blank">Print</a>
-          <?php endif; ?>
-          <?php if ((int) ($estimate['converted_job_card_id'] ?? 0) > 0): ?>
-            <a href="<?= e(url('modules/jobs/view.php?id=' . (int) $estimate['converted_job_card_id'])); ?>" class="btn btn-success btn-sm">Open Job</a>
-          <?php endif; ?>
+        <div class="col-sm-4">
+          <div class="d-flex flex-column align-items-sm-end gap-2">
+            <ol class="breadcrumb mb-0">
+              <li class="breadcrumb-item"><a href="<?= e(url('dashboard.php')); ?>">Home</a></li>
+              <li class="breadcrumb-item">Operations</li>
+              <li class="breadcrumb-item"><a href="<?= e(url('modules/estimates/index.php')); ?>">Estimates</a></li>
+              <li class="breadcrumb-item active">Details</li>
+            </ol>
+            <div class="d-flex flex-wrap justify-content-sm-end gap-1">
+              <a href="<?= e(url('modules/estimates/index.php')); ?>" class="btn btn-outline-secondary btn-sm">Back to Estimates</a>
+              <?php if ($canPrint): ?>
+                <a href="<?= e(url('modules/estimates/print_estimate.php?id=' . $estimateId)); ?>" class="btn btn-outline-primary btn-sm" target="_blank">Print</a>
+              <?php endif; ?>
+              <?php if ((int) ($estimate['converted_job_card_id'] ?? 0) > 0): ?>
+                <a href="<?= e(url('modules/jobs/view.php?id=' . (int) $estimate['converted_job_card_id'])); ?>" class="btn btn-success btn-sm">Open Job</a>
+              <?php endif; ?>
+            </div>
+          </div>
         </div>
       </div>
     </div>

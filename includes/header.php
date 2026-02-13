@@ -35,7 +35,22 @@ $globalVehicleSearchApiUrl = $globalVehicleSearchEnabled ? url('modules/vehicles
   <body
     class="layout-fixed sidebar-expand-lg bg-body-tertiary"
     data-inline-customer-form-url="<?= e(url('modules/customers/inline_form.php')); ?>"
+    data-active-menu="<?= e($activeMenu); ?>"
+    data-page-title="<?= e($pageTitle); ?>"
+    data-dashboard-url="<?= e(url('dashboard.php')); ?>"
   >
+    <script>
+      (function () {
+        try {
+          if (window.localStorage && window.localStorage.getItem('gac.sidebar.collapsed') === '1') {
+            document.body.classList.add('sidebar-collapse');
+            document.body.classList.remove('sidebar-open');
+          }
+        } catch (error) {
+          // Ignore storage unavailability.
+        }
+      })();
+    </script>
     <div class="app-wrapper">
       <nav class="app-header navbar navbar-expand bg-body">
         <div class="container-fluid">

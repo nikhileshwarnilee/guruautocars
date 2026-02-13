@@ -1758,18 +1758,28 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             Vehicle: <?= e((string) $job['registration_no']); ?>
           </small>
         </div>
-        <div class="col-sm-4 text-sm-end">
-          <a href="<?= e(url('modules/jobs/index.php')); ?>" class="btn btn-outline-secondary btn-sm">Back to Jobs</a>
-          <?php if ((int) ($job['estimate_id'] ?? 0) > 0): ?>
-            <a href="<?= e(url('modules/estimates/view.php?id=' . (int) $job['estimate_id'])); ?>" class="btn btn-info btn-sm">
-              Source Estimate
-            </a>
-          <?php endif; ?>
-          <?php if ($invoice): ?>
-            <a href="<?= e(url('modules/billing/print_invoice.php?id=' . (int) $invoice['id'])); ?>" class="btn btn-success btn-sm" target="_blank">
-              Invoice <?= e((string) $invoice['invoice_number']); ?> (<?= e((string) ($invoice['invoice_status'] ?? '')); ?>)
-            </a>
-          <?php endif; ?>
+        <div class="col-sm-4">
+          <div class="d-flex flex-column align-items-sm-end gap-2">
+            <ol class="breadcrumb mb-0">
+              <li class="breadcrumb-item"><a href="<?= e(url('dashboard.php')); ?>">Home</a></li>
+              <li class="breadcrumb-item">Operations</li>
+              <li class="breadcrumb-item"><a href="<?= e(url('modules/jobs/index.php')); ?>">Job Cards</a></li>
+              <li class="breadcrumb-item active">Details</li>
+            </ol>
+            <div class="d-flex flex-wrap justify-content-sm-end gap-1">
+              <a href="<?= e(url('modules/jobs/index.php')); ?>" class="btn btn-outline-secondary btn-sm">Back to Jobs</a>
+              <?php if ((int) ($job['estimate_id'] ?? 0) > 0): ?>
+                <a href="<?= e(url('modules/estimates/view.php?id=' . (int) $job['estimate_id'])); ?>" class="btn btn-info btn-sm">
+                  Source Estimate
+                </a>
+              <?php endif; ?>
+              <?php if ($invoice): ?>
+                <a href="<?= e(url('modules/billing/print_invoice.php?id=' . (int) $invoice['id'])); ?>" class="btn btn-success btn-sm" target="_blank">
+                  Invoice <?= e((string) $invoice['invoice_number']); ?> (<?= e((string) ($invoice['invoice_status'] ?? '')); ?>)
+                </a>
+              <?php endif; ?>
+            </div>
+          </div>
         </div>
       </div>
     </div>
