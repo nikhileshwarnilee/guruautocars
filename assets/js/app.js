@@ -2780,53 +2780,68 @@ function initStandardizedTables() {
 
   for (var i = 0; i < tables.length; i++) {
     var table = tables[i];
-    if (!shouldEnhanceTable(table)) {
+    var enhancementMode = resolveTableEnhancementMode(table);
+    if (enhancementMode === 'skip') {
       continue;
     }
 
-    var scaffold = ensureTableScaffold(table);
+    var scaffold = ensureTableScaffold(table, enhancementMode);
     applyTableDecorators(table);
 
-    if (isMasterInsightsTable(table)) {
+    if (enhancementMode === 'local') {
+      if (table.getAttribute('data-gac-table-init') === '1') {
+        continue;
+      }
+
+      initLocalTableController(table, scaffold);
       table.setAttribute('data-gac-table-init', '1');
       continue;
     }
 
-    if (table.getAttribute('data-gac-table-init') === '1') {
+    if (table.getAttribute('data-gac-table-search-only-init') === '1') {
       continue;
     }
 
-    initLocalTableController(table, scaffold);
-    table.setAttribute('data-gac-table-init', '1');
+    initSearchOnlyTableController(table, scaffold);
+    table.setAttribute('data-gac-table-search-only-init', '1');
   }
 }
 
-function shouldEnhanceTable(table) {
+function resolveTableEnhancementMode(table) {
   if (!table || table.getAttribute('data-gac-table-skip') === '1') {
-    return false;
-  }
-  if (table.id === 'purchase-item-table' || table.id === 'purchase-edit-item-table') {
-    return false;
+    return 'skip';
   }
   if (!table.tBodies || table.tBodies.length === 0) {
-    return false;
+    return 'skip';
   }
-  if (table.querySelector('tbody input[type="text"], tbody input[type="number"], tbody input[type="date"], tbody input[type="datetime-local"], tbody input[type="time"], tbody input[type="email"], tbody input[type="search"], tbody input[type="url"], tbody input[type="tel"], tbody input[type="password"], tbody select, tbody textarea')) {
-    return false;
+
+  if (isMasterInsightsTable(table) || hasTableBodyControls(table)) {
+    return 'search-only';
   }
-  return true;
+
+  return 'local';
 }
 
 function isMasterInsightsTable(table) {
   return !!table.querySelector('tbody[data-master-table-body="1"]');
 }
 
-function ensureTableScaffold(table) {
+function hasTableBodyControls(table) {
+  if (!table) {
+    return false;
+  }
+
+  return !!table.querySelector('tbody input:not([type="hidden"]), tbody select, tbody textarea');
+}
+
+function ensureTableScaffold(table, mode) {
   var container = ensureTableResponsiveContainer(table);
   var rowsCount = table.tBodies && table.tBodies.length > 0 ? table.tBodies[0].rows.length : 0;
   container.classList.add('gac-table-responsive');
-  if (rowsCount > 10) {
+  if (mode === 'search-only' || rowsCount > 10) {
     container.classList.add('gac-table-scroll-y');
+  } else {
+    container.classList.remove('gac-table-scroll-y');
   }
   table.classList.add('gac-data-table');
   ensureTableCardTitleStyle(table);
@@ -2970,6 +2985,121 @@ function initLocalTableController(table, scaffold) {
   }
 }
 
+function initSearchOnlyTableController(table, scaffold) {
+  var tableBody = table.tBodies[0];
+  if (!tableBody) {
+    return;
+  }
+
+  var toolbar = document.createElement('div');
+  toolbar.className = 'gac-table-toolbar';
+  toolbar.innerHTML =
+    '<div class="input-group input-group-sm gac-table-search">' +
+      '<span class="input-group-text"><i class="bi bi-search"></i></span>' +
+      '<input type="search" class="form-control" placeholder="Search table..." aria-label="Search table rows">' +
+    '</div>' +
+    '<small class="gac-table-summary" data-gac-table-summary="1"></small>';
+  scaffold.container.insertAdjacentElement('beforebegin', toolbar);
+
+  var searchInput = toolbar.querySelector('input[type="search"]');
+  var summaryNode = toolbar.querySelector('[data-gac-table-summary="1"]');
+  var emptyStateRow = null;
+  var supportsEmptyInfoRow = !hasTableBodyControls(table);
+
+  var debouncedSearch = debounce(function () {
+    render();
+  }, 180);
+
+  if (searchInput) {
+    searchInput.addEventListener('input', debouncedSearch);
+  }
+
+  if (typeof MutationObserver === 'function') {
+    var observer = new MutationObserver(function (mutations) {
+      for (var mutationIndex = 0; mutationIndex < mutations.length; mutationIndex++) {
+        if (mutations[mutationIndex].type !== 'childList') {
+          continue;
+        }
+        debouncedSearch();
+        return;
+      }
+    });
+    observer.observe(tableBody, { childList: true });
+  }
+
+  render();
+
+  function collectRows() {
+    var rows = [];
+    for (var rowIndex = 0; rowIndex < tableBody.rows.length; rowIndex++) {
+      var row = tableBody.rows[rowIndex];
+      if (!row || !row.cells || row.cells.length === 0) {
+        continue;
+      }
+      if (row.getAttribute('data-gac-info-row') === '1' || row.getAttribute('data-gac-search-empty-row') === '1') {
+        continue;
+      }
+      if (row.cells.length === 1 && parseInt(row.cells[0].getAttribute('colspan') || '1', 10) > 1) {
+        continue;
+      }
+      rows.push(row);
+    }
+    return rows;
+  }
+
+  function render() {
+    var rows = collectRows();
+    var searchTerm = normalizeSearchTerm(searchInput ? searchInput.value : '');
+    var visibleCount = 0;
+
+    for (var rowIndex = 0; rowIndex < rows.length; rowIndex++) {
+      var row = rows[rowIndex];
+      var matches = searchTerm === '' || rowToSearchText(row).indexOf(searchTerm) >= 0;
+      row.style.display = matches ? '' : 'none';
+      if (matches) {
+        visibleCount++;
+      }
+    }
+
+    if (rows.length > 10) {
+      scaffold.container.classList.add('gac-table-scroll-y');
+    } else if (!hasTableBodyControls(table) && !isMasterInsightsTable(table)) {
+      scaffold.container.classList.remove('gac-table-scroll-y');
+    }
+
+    if (supportsEmptyInfoRow && rows.length > 0 && visibleCount === 0) {
+      if (!emptyStateRow || !emptyStateRow.parentNode) {
+        emptyStateRow = document.createElement('tr');
+        emptyStateRow.setAttribute('data-gac-info-row', '1');
+        emptyStateRow.setAttribute('data-gac-search-empty-row', '1');
+        emptyStateRow.innerHTML = '<td colspan="' + detectTableColumnCount(tableBody, table) + '" class="text-center text-muted py-4 gac-table-info-row">No matching records found.</td>';
+        tableBody.appendChild(emptyStateRow);
+      }
+    } else if (emptyStateRow && emptyStateRow.parentNode) {
+      emptyStateRow.parentNode.removeChild(emptyStateRow);
+    }
+
+    if (summaryNode) {
+      summaryNode.textContent = buildSearchOnlySummaryText(rows.length, visibleCount, searchTerm);
+    }
+
+    applyTableDecorators(table);
+    bindConfirmForms();
+  }
+}
+
+function buildSearchOnlySummaryText(totalRecords, visibleRecords, searchTerm) {
+  if (!isFinite(totalRecords) || totalRecords <= 0) {
+    return 'Showing 0 of 0';
+  }
+
+  if (searchTerm === '') {
+    return 'Total ' + totalRecords + (totalRecords === 1 ? ' row' : ' rows');
+  }
+
+  return 'Showing ' + visibleRecords + ' of ' + totalRecords;
+}
+
 function resolveTableFromBody(tableBody) {
   if (!tableBody) {
     return null;
@@ -3014,7 +3144,48 @@ function rowToSearchText(row) {
   if (!row) {
     return '';
   }
-  return normalizeSearchTerm(row.textContent || '');
+
+  var rowControls = row.querySelectorAll('input, select, textarea');
+  if (!rowControls || rowControls.length === 0) {
+    return normalizeSearchTerm(row.textContent || '');
+  }
+
+  var values = [];
+  for (var index = 0; index < rowControls.length; index++) {
+    var control = rowControls[index];
+    if (!control) {
+      continue;
+    }
+
+    if (control.tagName === 'SELECT') {
+      if (control.selectedIndex >= 0 && control.options && control.options.length > control.selectedIndex) {
+        var optionText = collapseWhitespace(control.options[control.selectedIndex].textContent || '').trim();
+        if (optionText !== '') {
+          values.push(optionText);
+        }
+      }
+      continue;
+    }
+
+    var inputType = String(control.getAttribute('type') || '').trim().toLowerCase();
+    if (inputType === 'hidden') {
+      continue;
+    }
+
+    var fieldValue = collapseWhitespace(String(control.value || '')).trim();
+    if (fieldValue !== '') {
+      values.push(fieldValue);
+    }
+  }
+
+  var clone = row.cloneNode(true);
+  var cloneControls = clone.querySelectorAll('input, select, textarea, button');
+  for (var cloneIndex = 0; cloneIndex < cloneControls.length; cloneIndex++) {
+    cloneControls[cloneIndex].remove();
+  }
+
+  values.unshift(clone.textContent || '');
+  return normalizeSearchTerm(values.join(' '));
 }
 
 function applyTableDecorators(table) {
