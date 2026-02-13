@@ -429,14 +429,14 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       <div class="card">
         <div class="card-header"><h3 class="card-title">Garage List</h3></div>
         <div class="card-body table-responsive p-0">
-          <table class="table table-striped mb-0">
+          <table class="table table-striped table-hover align-middle mb-0">
             <thead>
               <tr>
                 <th>ID</th>
                 <th>Garage</th>
                 <th>Code</th>
                 <th>Location</th>
-                <th>Phone</th>
+                <th>Contact</th>
                 <th>Status</th>
                 <th>Actions</th>
               </tr>
@@ -446,36 +446,60 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                 <tr><td colspan="7" class="text-center text-muted py-4">No garages found.</td></tr>
               <?php else: ?>
                 <?php foreach ($garages as $garage): ?>
+                  <?php
+                    $garageCode = trim((string) ($garage['code'] ?? ''));
+                    $city = trim((string) ($garage['city'] ?? ''));
+                    $state = trim((string) ($garage['state'] ?? ''));
+                    $phone = trim((string) ($garage['phone'] ?? ''));
+                    $email = trim((string) ($garage['email'] ?? ''));
+                    $locationParts = array_values(array_filter([$city, $state], static fn (string $value): bool => $value !== ''));
+                    $locationLabel = $locationParts !== [] ? implode(', ', $locationParts) : '-';
+                    $garageStatusCode = normalize_status_code((string) ($garage['status_code'] ?? 'ACTIVE'));
+                  ?>
                   <tr>
                     <td><?= (int) $garage['id']; ?></td>
-                    <td><?= e((string) $garage['name']); ?><br><small class="text-muted"><?= e((string) ($garage['company_name'] ?? '')); ?></small></td>
-                    <td><code><?= e((string) $garage['code']); ?></code></td>
-                    <td><?= e((string) (($garage['city'] ?? '-') . ', ' . ($garage['state'] ?? '-'))); ?></td>
-                    <td><?= e((string) ($garage['phone'] ?? '-')); ?></td>
-                    <td><span class="badge text-bg-<?= e(status_badge_class((string) $garage['status_code'])); ?>"><?= e(record_status_label((string) $garage['status_code'])); ?></span></td>
-                    <td class="d-flex gap-1">
+                    <td>
+                      <div class="fw-semibold"><?= e((string) ($garage['name'] ?? '')); ?></div>
+                      <small class="text-muted"><?= e((string) ($garage['company_name'] ?? '')); ?></small>
+                    </td>
+                    <td>
+                      <span class="badge text-bg-light border font-monospace"><?= e($garageCode !== '' ? $garageCode : '-'); ?></span>
+                    </td>
+                    <td><?= e($locationLabel); ?></td>
+                    <td>
+                      <div><?= e($phone !== '' ? $phone : '-'); ?></div>
+                      <?php if ($email !== ''): ?>
+                        <small class="text-muted"><?= e($email); ?></small>
+                      <?php endif; ?>
+                    </td>
+                    <td>
+                      <span class="badge text-bg-<?= e(status_badge_class($garageStatusCode)); ?>"><?= e(record_status_label($garageStatusCode)); ?></span>
+                    </td>
+                    <td class="text-nowrap">
                       <?php if ($canManage): ?>
-                        <a class="btn btn-sm btn-outline-primary" href="<?= e(url('modules/organization/garages.php?company_id=' . $selectedCompanyId . '&edit_id=' . (int) $garage['id'])); ?>">Edit</a>
-                        <?php if ((string) $garage['status_code'] !== 'DELETED'): ?>
-                          <form method="post" class="d-inline" data-confirm="Change garage status?">
-                            <?= csrf_field(); ?>
-                            <input type="hidden" name="_action" value="change_status" />
-                            <input type="hidden" name="company_id" value="<?= (int) $selectedCompanyId; ?>" />
-                            <input type="hidden" name="garage_id" value="<?= (int) $garage['id']; ?>" />
-                            <input type="hidden" name="next_status" value="<?= e(((string) $garage['status_code'] === 'ACTIVE') ? 'INACTIVE' : 'ACTIVE'); ?>" />
-                            <button type="submit" class="btn btn-sm btn-outline-secondary"><?= ((string) $garage['status_code'] === 'ACTIVE') ? 'Inactivate' : 'Activate'; ?></button>
-                          </form>
-                        <?php endif; ?>
-                        <?php if ($isSuperAdmin && (string) $garage['status_code'] !== 'DELETED'): ?>
-                          <form method="post" class="d-inline" data-confirm="Soft delete this garage?">
-                            <?= csrf_field(); ?>
-                            <input type="hidden" name="_action" value="change_status" />
-                            <input type="hidden" name="company_id" value="<?= (int) $selectedCompanyId; ?>" />
-                            <input type="hidden" name="garage_id" value="<?= (int) $garage['id']; ?>" />
-                            <input type="hidden" name="next_status" value="DELETED" />
-                            <button type="submit" class="btn btn-sm btn-outline-danger">Soft Delete</button>
-                          </form>
-                        <?php endif; ?>
+                        <div class="d-flex flex-wrap gap-1 justify-content-end">
+                          <a class="btn btn-sm btn-outline-primary" href="<?= e(url('modules/organization/garages.php?company_id=' . $selectedCompanyId . '&edit_id=' . (int) $garage['id'])); ?>">Edit</a>
+                          <?php if ($garageStatusCode !== 'DELETED'): ?>
+                            <form method="post" class="d-inline" data-confirm="Change garage status?">
+                              <?= csrf_field(); ?>
+                              <input type="hidden" name="_action" value="change_status" />
+                              <input type="hidden" name="company_id" value="<?= (int) $selectedCompanyId; ?>" />
+                              <input type="hidden" name="garage_id" value="<?= (int) $garage['id']; ?>" />
+                              <input type="hidden" name="next_status" value="<?= e($garageStatusCode === 'ACTIVE' ? 'INACTIVE' : 'ACTIVE'); ?>" />
+                              <button type="submit" class="btn btn-sm btn-outline-secondary"><?= $garageStatusCode === 'ACTIVE' ? 'Inactivate' : 'Activate'; ?></button>
+                            </form>
+                          <?php endif; ?>
+                          <?php if ($isSuperAdmin && $garageStatusCode !== 'DELETED'): ?>
+                            <form method="post" class="d-inline" data-confirm="Soft delete this garage?">
+                              <?= csrf_field(); ?>
+                              <input type="hidden" name="_action" value="change_status" />
+                              <input type="hidden" name="company_id" value="<?= (int) $selectedCompanyId; ?>" />
+                              <input type="hidden" name="garage_id" value="<?= (int) $garage['id']; ?>" />
+                              <input type="hidden" name="next_status" value="DELETED" />
+                              <button type="submit" class="btn btn-sm btn-outline-danger">Soft Delete</button>
+                            </form>
+                          <?php endif; ?>
+                        </div>
                       <?php endif; ?>
                     </td>
                   </tr>

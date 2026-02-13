@@ -15,6 +15,7 @@ $userId = (int) ($_SESSION['user_id'] ?? 0);
 $canCreate = has_permission('job.create') || has_permission('job.manage');
 $canEdit = has_permission('job.edit') || has_permission('job.update') || has_permission('job.manage');
 $canAssign = has_permission('job.assign') || has_permission('job.manage');
+$canInlineVehicleCreate = has_permission('vehicle.view') && has_permission('vehicle.manage');
 $jobCardColumns = table_columns('job_cards');
 $jobOdometerEnabled = in_array('odometer_km', $jobCardColumns, true);
 $odometerEditableStatuses = ['OPEN', 'IN_PROGRESS'];
@@ -75,6 +76,25 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 redirect('modules/jobs/index.php');
             }
             $odometerKm = (int) $parsedOdometer;
+        }
+        if ($customerId > 0 && $vehicleId <= 0) {
+            $autoVehicleStmt = db()->prepare(
+                'SELECT id
+                 FROM vehicles
+                 WHERE company_id = :company_id
+                   AND customer_id = :customer_id
+                   AND status_code = "ACTIVE"
+                 ORDER BY id ASC
+                 LIMIT 2'
+            );
+            $autoVehicleStmt->execute([
+                'company_id' => $companyId,
+                'customer_id' => $customerId,
+            ]);
+            $autoVehicleRows = $autoVehicleStmt->fetchAll();
+            if (count($autoVehicleRows) === 1) {
+                $vehicleId = (int) ($autoVehicleRows[0]['id'] ?? 0);
+            }
         }
         if ($customerId <= 0 || $vehicleId <= 0 || $complaint === '') {
             flash_set('job_error', 'Customer, vehicle and complaint are required.', 'danger');
@@ -440,7 +460,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 
         <div class="col-md-3">
           <label class="form-label">Vehicle</label>
-          <select id="job-vehicle-select" name="vehicle_id" class="form-select" required <?= $editJob ? 'disabled' : ''; ?>>
+          <select id="job-vehicle-select" name="vehicle_id" class="form-select" required <?= $editJob ? 'disabled' : ''; ?> <?= (!$editJob && $canInlineVehicleCreate) ? 'data-inline-vehicle="1"' : ''; ?>>
             <option value="">Select Vehicle</option>
             <?php foreach ($vehicles as $vehicle): ?>
               <?php
@@ -627,20 +647,30 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       renderOdometerHint('Last recorded odometer: ' + formatKm(odometerMeta.value) + ' KM' + sourceText + '.');
     }
 
-    function enforceVehicleOwnerMatch() {
-      if (!customerSelect || customerSelect.disabled || vehicleSelect.disabled) {
-        return;
+    function customerVehicleOptions(customerId) {
+      var normalizedCustomerId = String(customerId || '').trim();
+      var matches = [];
+      if (normalizedCustomerId === '') {
+        return matches;
       }
 
-      var selectedVehicleId = (vehicleSelect.value || '').trim();
-      if (selectedVehicleId === '') {
-        renderOwnerHint('');
-        return;
+      for (var i = 0; i < vehicleSelect.options.length; i++) {
+        var option = vehicleSelect.options[i];
+        if (!option || option.value === '') {
+          continue;
+        }
+
+        var optionCustomerId = (option.getAttribute('data-customer-id') || '').trim();
+        if (optionCustomerId === normalizedCustomerId) {
+          matches.push(option);
+        }
       }
 
-      var ownerCustomerId = selectedVehicleCustomerId();
-      if (ownerCustomerId === '' || (customerSelect.value || '') === ownerCustomerId) {
-        renderOwnerHint('Owner auto-filled from selected vehicle to prevent mismatches.');
+      return matches;
+    }
+
+    function clearVehicleSelection() {
+      if ((vehicleSelect.value || '').trim() === '') {
         return;
       }
 
@@ -648,9 +678,62 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       if (typeof gacRefreshSearchableSelect === 'function') {
         gacRefreshSearchableSelect(vehicleSelect);
       }
-      renderOwnerHint('Vehicle selection was cleared because it does not belong to the selected customer.');
       syncOdometerFromVehicle(true);
       load('');
+    }
+
+    function enforceVehicleOwnerMatch() {
+      if (!customerSelect || customerSelect.disabled || vehicleSelect.disabled) {
+        return;
+      }
+
+      var selectedCustomerId = (customerSelect.value || '').trim();
+      var selectedVehicleId = (vehicleSelect.value || '').trim();
+      var matchingVehicles = customerVehicleOptions(selectedCustomerId);
+
+      if (selectedCustomerId === '') {
+        if (selectedVehicleId !== '') {
+          clearVehicleSelection();
+        }
+        renderOwnerHint('');
+        return;
+      }
+
+      if (matchingVehicles.length === 1) {
+        var onlyVehicle = matchingVehicles[0];
+        if (selectedVehicleId !== onlyVehicle.value) {
+          vehicleSelect.value = onlyVehicle.value;
+          if (typeof gacRefreshSearchableSelect === 'function') {
+            gacRefreshSearchableSelect(vehicleSelect);
+          }
+          renderOwnerHint('Vehicle auto-selected because this customer has only one vehicle.');
+          vehicleSelect.dispatchEvent(new Event('change', { bubbles: true }));
+          return;
+        }
+
+        renderOwnerHint('Vehicle auto-selected because this customer has only one vehicle.');
+        return;
+      }
+
+      if (matchingVehicles.length === 0) {
+        clearVehicleSelection();
+        renderOwnerHint('No vehicle found for selected customer. Search vehicle number and choose + Add New Vehicle to add now.');
+        return;
+      }
+
+      if (selectedVehicleId === '') {
+        renderOwnerHint('Multiple vehicles found for selected customer. Please select vehicle manually.');
+        return;
+      }
+
+      var ownerCustomerId = selectedVehicleCustomerId();
+      if (ownerCustomerId !== '' && ownerCustomerId === selectedCustomerId) {
+        renderOwnerHint('Multiple vehicles found for selected customer. Please confirm selected vehicle.');
+        return;
+      }
+
+      clearVehicleSelection();
+      renderOwnerHint('Vehicle selection was cleared because it does not belong to the selected customer.');
     }
 
     function render(data) {
@@ -681,6 +764,9 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       load(vehicleSelect.value);
     } else {
       syncOdometerFromVehicle(false);
+    }
+    if (customerSelect) {
+      enforceVehicleOwnerMatch();
     }
   })();
 </script>

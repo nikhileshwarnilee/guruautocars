@@ -122,23 +122,26 @@ function reports_build_scope_context(bool $includeVehicleFilters = false): array
     $fyStart = (string) ($selectedFy['start_date'] ?? date('Y-04-01'));
     $fyEnd = (string) ($selectedFy['end_date'] ?? date('Y-03-31', strtotime('+1 year')));
     $today = date('Y-m-d');
-
     $defaultToDate = $today <= $fyEnd ? $today : $fyEnd;
     if ($defaultToDate < $fyStart) {
         $defaultToDate = $fyStart;
     }
 
-    $fromDate = analytics_parse_iso_date($_GET['from'] ?? null, $fyStart);
-    $toDate = analytics_parse_iso_date($_GET['to'] ?? null, $defaultToDate);
-    if ($fromDate < $fyStart) {
-        $fromDate = $fyStart;
-    }
-    if ($toDate > $fyEnd) {
-        $toDate = $fyEnd;
-    }
-    if ($toDate < $fromDate) {
-        $toDate = $fromDate;
-    }
+    $dateFilter = date_filter_resolve_request([
+        'company_id' => $companyId,
+        'garage_id' => $selectedGarageId,
+        'range_start' => $fyStart,
+        'range_end' => $defaultToDate,
+        'yearly_start' => $fyStart,
+        'session_namespace' => 'reports',
+        'request_mode' => $_GET['date_mode'] ?? null,
+        'request_from' => $_GET['from'] ?? null,
+        'request_to' => $_GET['to'] ?? null,
+    ]);
+    $dateMode = (string) ($dateFilter['mode'] ?? 'monthly');
+    $defaultDateMode = (string) ($dateFilter['default_mode'] ?? 'monthly');
+    $fromDate = (string) ($dateFilter['from_date'] ?? $fyStart);
+    $toDate = (string) ($dateFilter['to_date'] ?? $defaultToDate);
 
     $fromDateTime = $fromDate . ' 00:00:00';
     $toDateTime = $toDate . ' 23:59:59';
@@ -160,6 +163,7 @@ function reports_build_scope_context(bool $includeVehicleFilters = false): array
     $baseParams = [
         'garage_id' => $selectedGarageId,
         'fy_id' => $selectedFyId,
+        'date_mode' => $dateMode,
         'from' => $fromDate,
         'to' => $toDate,
     ];
@@ -188,6 +192,11 @@ function reports_build_scope_context(bool $includeVehicleFilters = false): array
         'fy_label' => $fyLabel,
         'fy_start' => $fyStart,
         'fy_end' => $fyEnd,
+        'date_range_start' => $fyStart,
+        'date_range_end' => $defaultToDate,
+        'date_mode' => $dateMode,
+        'default_date_mode' => $defaultDateMode,
+        'date_mode_options' => date_filter_modes(),
         'from_date' => $fromDate,
         'to_date' => $toDate,
         'from_datetime' => $fromDateTime,

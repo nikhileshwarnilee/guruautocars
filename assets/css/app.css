@@ -9,6 +9,10 @@
   float: none;
   margin-left: 0;
   margin-right: 0.5rem;
+  object-fit: contain;
+  background: #fff;
+  border-radius: 0.2rem;
+  padding: 0.1rem;
 }
 
 .table td,
@@ -30,14 +34,26 @@
   font-size: 0.85rem;
 }
 
-.gac-searchable-select .gac-search-input {
-  margin-bottom: 0.35rem;
+.gac-searchable-select {
+  position: relative;
 }
 
-.gac-searchable-select .gac-search-hint {
+.gac-searchable-select .gac-select-typing-preview {
+  position: absolute;
+  top: 50%;
+  right: 2rem;
+  z-index: 3;
+  transform: translateY(-50%);
+  max-width: 42%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.72rem;
   color: #6c757d;
-  font-size: 0.78rem;
-  margin-top: 0.25rem;
+  pointer-events: none;
+  background: rgba(255, 255, 255, 0.88);
+  border-radius: 0.15rem;
+  padding: 0 0.2rem;
 }
 
 .gac-inline-form-alert {

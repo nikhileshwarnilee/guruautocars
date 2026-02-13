@@ -10,6 +10,7 @@ function gacBoot() {
   initAjaxFormEngine();
   initGlobalVehicleSearch();
   initSearchableSelects();
+  initDateFilterForms();
   initVehicleAttributeSelectors();
   initMasterInsightsFilters();
   initStandardizedTables();
@@ -1303,76 +1304,173 @@ function initGlobalVehicleSearch() {
 }
 
 function initSearchableSelects() {
-  var searchableNames = {
-    customer_id: true,
-    vehicle_id: true,
-    part_id: true,
-    service_id: true,
-    vendor_id: true,
-    'assigned_user_ids[]': true,
-    user_id: true,
-    staff_id: true,
-    job_card_id: true,
-    invoice_id: true,
-    brand_id: true,
-    model_id: true,
-    variant_id: true,
-    model_year_id: true,
-    color_id: true,
-    vehicle_filter_customer_id: true,
-    vehicle_filter_brand_id: true,
-    vehicle_filter_model_id: true,
-    vehicle_filter_variant_id: true,
-    vehicle_filter_model_year_id: true,
-    vehicle_filter_color_id: true,
-    report_brand_id: true,
-    report_model_id: true,
-    report_variant_id: true,
-    report_model_year_id: true,
-    report_color_id: true,
-    job_vehicle_brand_id: true,
-    job_vehicle_model_id: true,
-    job_vehicle_variant_id: true,
-    job_vehicle_model_year_id: true,
-    job_vehicle_color_id: true,
-    vehicle_combo_selector: true,
-    vehicle_filter_combo_selector: true,
-    job_vehicle_combo_selector: true,
-    report_vehicle_combo_selector: true,
-    estimate_vehicle_combo_selector: true
-  };
-  var inlineAddValue = '__inline_add_customer__';
+  var inlineCustomerAddValue = '__inline_add_customer__';
+  var inlineVehicleAddValue = '__inline_add_vehicle__';
   var inlineCustomerFormUrl = document.body
     ? (document.body.getAttribute('data-inline-customer-form-url') || '')
     : '';
+  var inlineVehicleFormUrl = document.body
+    ? (document.body.getAttribute('data-inline-vehicle-form-url') || '')
+    : '';
 
-  var modalElement = document.getElementById('inline-customer-modal');
-  var modalBody = document.getElementById('inline-customer-modal-body');
-  var modalInstance = null;
-  var activeInlineCustomerComponent = null;
+  var inlineContexts = {
+    customer: createInlineContext({
+      kind: 'customer',
+      addValue: inlineCustomerAddValue,
+      formUrl: inlineCustomerFormUrl,
+      formAttribute: 'data-inline-customer-form',
+      errorAttribute: 'data-inline-customer-error',
+      modalId: 'inline-customer-modal',
+      modalBodyId: 'inline-customer-modal-body',
+      loadingHtml: '<div class="text-muted">Loading customer form...</div>',
+      loadErrorHtml: '<div class="alert alert-danger mb-0">Unable to load customer form.</div>',
+      missingUrlError: 'Customer create URL is missing.',
+      submitError: 'Unable to create customer. Please check inputs and retry.',
+      networkError: 'Network error while creating customer.',
+      focusSelector: 'input[name="full_name"]'
+    }),
+    vehicle: createInlineContext({
+      kind: 'vehicle',
+      addValue: inlineVehicleAddValue,
+      formUrl: inlineVehicleFormUrl,
+      formAttribute: 'data-inline-vehicle-form',
+      errorAttribute: 'data-inline-vehicle-error',
+      modalId: 'inline-vehicle-modal',
+      modalBodyId: 'inline-vehicle-modal-body',
+      loadingHtml: '<div class="text-muted">Loading vehicle form...</div>',
+      loadErrorHtml: '<div class="alert alert-danger mb-0">Unable to load vehicle form.</div>',
+      missingUrlError: 'Vehicle create URL is missing.',
+      submitError: 'Unable to create vehicle. Please check inputs and retry.',
+      networkError: 'Network error while creating vehicle.',
+      focusSelector: 'input[name="registration_no"]'
+    })
+  };
 
-  if (window.bootstrap && window.bootstrap.Modal && modalElement) {
-    modalInstance = window.bootstrap.Modal.getOrCreateInstance(modalElement);
-    modalElement.addEventListener('hidden.bs.modal', function () {
-      if (modalBody) {
-        modalBody.innerHTML = '<div class="text-muted">Loading customer form...</div>';
+  initInlineContext(inlineContexts.customer);
+  initInlineContext(inlineContexts.vehicle);
+  initSelectTypingCapture();
+
+  function initSelectTypingCapture() {
+    if (!document.body || document.body.getAttribute('data-gac-select-typing-init') === '1') {
+      return;
+    }
+    document.body.setAttribute('data-gac-select-typing-init', '1');
+
+    document.addEventListener('keydown', function (event) {
+      if (!event) {
+        return;
       }
-      activeInlineCustomerComponent = null;
-    });
+
+      var select = null;
+      if (event.target && event.target.tagName === 'SELECT') {
+        select = event.target;
+      } else if (document.activeElement && document.activeElement.tagName === 'SELECT') {
+        select = document.activeElement;
+      }
+      if (!select || select.getAttribute('data-searchable-enhanced') !== '1') {
+        return;
+      }
+
+      var state = select.gacSearchableState || null;
+      if (!state) {
+        return;
+      }
+
+      handleSelectTypingKey(state, event);
+    }, true);
   }
 
-  if (modalBody) {
-    modalBody.addEventListener('submit', function (event) {
+  function handleSelectTypingKey(state, event) {
+    if (!state || !state.select) {
+      return;
+    }
+
+    var select = state.select;
+    if (select.disabled || event.altKey || event.ctrlKey || event.metaKey) {
+      return;
+    }
+
+    var key = String(event.key || '');
+    if (key === 'Escape') {
+      clearTypedPreview(state);
+      return;
+    }
+
+    if (key === 'Backspace') {
+      if (state.typeBuffer !== '') {
+        state.typeBuffer = state.typeBuffer.slice(0, -1);
+        state.typeTimestamp = Date.now();
+        renderTypedPreview(state);
+        event.preventDefault();
+      }
+      return;
+    }
+
+    if (key.length !== 1) {
+      return;
+    }
+
+    var now = Date.now();
+    if (now - state.typeTimestamp > 900) {
+      state.typeBuffer = '';
+    }
+    state.typeTimestamp = now;
+    state.typeBuffer += key;
+    renderTypedPreview(state);
+  }
+
+  function createInlineContext(config) {
+    var modalElement = document.getElementById(config.modalId);
+    var modalBody = document.getElementById(config.modalBodyId);
+    return {
+      kind: config.kind,
+      addValue: config.addValue,
+      formUrl: config.formUrl,
+      formAttribute: config.formAttribute,
+      errorAttribute: config.errorAttribute,
+      modalElement: modalElement,
+      modalBody: modalBody,
+      modalInstance: null,
+      activeComponent: null,
+      loadingHtml: config.loadingHtml,
+      loadErrorHtml: config.loadErrorHtml,
+      missingUrlError: config.missingUrlError,
+      submitError: config.submitError,
+      networkError: config.networkError,
+      focusSelector: config.focusSelector
+    };
+  }
+
+  function initInlineContext(context) {
+    if (!context) {
+      return;
+    }
+
+    if (window.bootstrap && window.bootstrap.Modal && context.modalElement) {
+      context.modalInstance = window.bootstrap.Modal.getOrCreateInstance(context.modalElement);
+      context.modalElement.addEventListener('hidden.bs.modal', function () {
+        if (context.modalBody) {
+          context.modalBody.innerHTML = context.loadingHtml;
+        }
+        context.activeComponent = null;
+      });
+    }
+
+    if (!context.modalBody) {
+      return;
+    }
+
+    context.modalBody.addEventListener('submit', function (event) {
       var form = event.target;
       if (!form || form.tagName !== 'FORM') {
         return;
       }
-      if (form.getAttribute('data-inline-customer-form') !== '1') {
+      if (form.getAttribute(context.formAttribute) !== '1') {
         return;
       }
 
       event.preventDefault();
-      clearInlineFormError(form);
+      clearInlineFormError(form, context.errorAttribute);
 
       var submitButton = form.querySelector('button[type="submit"]');
       if (submitButton) {
@@ -1381,7 +1479,7 @@ function initSearchableSelects() {
 
       var actionUrl = form.getAttribute('action') || '';
       if (actionUrl === '') {
-        renderInlineFormError(form, 'Customer create URL is missing.');
+        renderInlineFormError(form, context.missingUrlError, context.errorAttribute);
         if (submitButton) {
           submitButton.disabled = false;
         }
@@ -1408,24 +1506,29 @@ function initSearchableSelects() {
         .then(function (result) {
           var payload = result.payload || {};
           if (!result.ok || !payload.ok) {
-            renderInlineFormError(
-              form,
-              payload.message || 'Unable to create customer. Please check inputs and retry.'
-            );
+            renderInlineFormError(form, payload.message || context.submitError, context.errorAttribute);
             return;
           }
 
-          if (!activeInlineCustomerComponent) {
+          if (!context.activeComponent) {
             return;
           }
 
-          upsertCustomerOption(activeInlineCustomerComponent, payload.customer || {});
-          if (modalInstance) {
-            modalInstance.hide();
+          if (context.kind === 'customer') {
+            upsertCustomerOption(context.activeComponent, payload.customer || {});
+          } else if (context.kind === 'vehicle') {
+            if (context.activeComponent.linkedCustomerSelect && payload.customer) {
+              upsertLinkedCustomerOption(context.activeComponent.linkedCustomerSelect, payload.customer);
+            }
+            upsertVehicleOption(context.activeComponent, payload.vehicle || {});
+          }
+
+          if (context.modalInstance) {
+            context.modalInstance.hide();
           }
         })
         .catch(function () {
-          renderInlineFormError(form, 'Network error while creating customer.');
+          renderInlineFormError(form, context.networkError, context.errorAttribute);
         })
         .then(function () {
           if (submitButton) {
@@ -1439,11 +1542,6 @@ function initSearchableSelects() {
   for (var index = 0; index < allSelects.length; index++) {
     var select = allSelects[index];
     if (!shouldEnhanceSelect(select)) {
-      continue;
-    }
-
-    var selectName = (select.getAttribute('name') || '').trim();
-    if (!searchableNames[selectName]) {
       continue;
     }
 
@@ -1465,99 +1563,72 @@ function initSearchableSelects() {
   function enhanceSelect(select) {
     var selectName = (select.getAttribute('name') || '').trim();
     var isCustomerSelect = selectName === 'customer_id';
+    var isInlineVehicleSelect = selectName === 'vehicle_id' && select.getAttribute('data-inline-vehicle') === '1';
     var wrapper = document.createElement('div');
     wrapper.className = 'gac-searchable-select';
-
-    var searchInput = document.createElement('input');
-    searchInput.type = 'search';
-    searchInput.className = 'form-control form-control-sm gac-search-input';
-    searchInput.placeholder = 'Search...';
-    searchInput.autocomplete = 'off';
-    searchInput.setAttribute('aria-label', 'Search dropdown options');
-    if (select.disabled) {
-      searchInput.disabled = true;
-    }
-
-    var hint = document.createElement('div');
-    hint.className = 'gac-search-hint';
-
+    var typingPreview = document.createElement('span');
+    typingPreview.className = 'gac-select-typing-preview d-none';
+    typingPreview.setAttribute('aria-hidden', 'true');
     select.parentNode.insertBefore(wrapper, select);
-    wrapper.appendChild(searchInput);
     wrapper.appendChild(select);
-    wrapper.appendChild(hint);
+    wrapper.appendChild(typingPreview);
     select.setAttribute('data-searchable-enhanced', '1');
 
     var state = {
       select: select,
-      input: searchInput,
-      hint: hint,
+      input: null,
+      preview: typingPreview,
       isCustomerSelect: isCustomerSelect,
+      isInlineVehicleSelect: isInlineVehicleSelect,
+      inlineKind: '',
       inlineOption: null,
+      linkedCustomerSelect: null,
       indexedOptions: [],
-      lastCommittedValue: select.value || ''
+      lastCommittedValue: select.value || '',
+      typeBuffer: '',
+      typeTimestamp: 0,
+      previewTimer: null
     };
 
     if (isCustomerSelect && !select.disabled) {
-      state.inlineOption = ensureInlineCustomerOption(select, inlineAddValue);
+      state.inlineKind = 'customer';
+      state.inlineOption = ensureInlineCustomerOption(select, inlineContexts.customer.addValue);
+    } else if (isInlineVehicleSelect && !select.disabled) {
+      state.inlineKind = 'vehicle';
+      state.inlineOption = ensureInlineVehicleOption(select, inlineContexts.vehicle.addValue);
+      state.linkedCustomerSelect = findLinkedCustomerSelect(select);
     }
 
     refreshIndexedOptions(state);
-    applySearchFilter(state, '');
+    applyOptionVisibility(state);
 
-    var debouncedFilter = debounce(function () {
-      applySearchFilter(state, state.input.value || '');
-    }, 120);
-
-    searchInput.addEventListener('input', debouncedFilter);
-    searchInput.addEventListener('keydown', function (event) {
-      if (event.key === 'ArrowDown') {
-        event.preventDefault();
-        select.focus();
-        return;
-      }
-
-      if (event.key === 'Escape') {
-        if (searchInput.value !== '') {
-          event.preventDefault();
-          searchInput.value = '';
-          applySearchFilter(state, '');
-        }
-        return;
-      }
-
-      if (event.key !== 'Enter') {
-        return;
-      }
-
-      event.preventDefault();
-      if (state.isCustomerSelect && state.inlineOption && !state.inlineOption.hidden) {
-        openInlineCustomerModal(state, (searchInput.value || '').trim());
-        return;
-      }
-
-      var firstVisible = firstVisibleOption(state);
-      if (!firstVisible) {
-        return;
-      }
-
-      select.value = firstVisible.value;
-      state.lastCommittedValue = firstVisible.value;
-      select.dispatchEvent(new Event('change', { bubbles: true }));
+    select.addEventListener('blur', function () {
+      clearTypedPreview(state);
     });
 
     select.addEventListener('change', function () {
-      if (state.inlineOption && select.value === inlineAddValue) {
+      var currentTypedQuery = collapseWhitespace(state.typeBuffer || '').trim();
+      if (state.inlineOption && state.inlineKind === 'customer' && select.value === inlineContexts.customer.addValue) {
         select.value = state.lastCommittedValue;
-        openInlineCustomerModal(state, (searchInput.value || '').trim());
+        openInlineCustomerModal(state, currentTypedQuery);
+        clearTypedPreview(state);
+        return;
+      }
+      if (state.inlineOption && state.inlineKind === 'vehicle' && select.value === inlineContexts.vehicle.addValue) {
+        select.value = state.lastCommittedValue;
+        openInlineVehicleModal(state, currentTypedQuery);
+        clearTypedPreview(state);
         return;
       }
 
       state.lastCommittedValue = select.value || '';
+      scheduleTypedPreviewClear(state, 700);
     });
 
     select.gacSearchableRefresh = function () {
       refreshIndexedOptions(state);
-      applySearchFilter(state, state.input.value || '');
+      applyOptionVisibility(state);
+      clearTypedPreview(state);
     };
     select.gacSearchableState = state;
   }
@@ -1565,7 +1636,7 @@ function initSearchableSelects() {
   function ensureInlineCustomerOption(select, value) {
     for (var i = 0; i < select.options.length; i++) {
       if (select.options[i].value === value) {
-        select.options[i].hidden = true;
+        select.options[i].hidden = false;
         select.options[i].setAttribute('data-inline-customer-option', '1');
         return select.options[i];
       }
@@ -1573,11 +1644,48 @@ function initSearchableSelects() {
 
     var option = document.createElement('option');
     option.value = value;
-    option.hidden = true;
+    option.hidden = false;
     option.setAttribute('data-inline-customer-option', '1');
     option.textContent = '+ Add New Customer';
     select.appendChild(option);
     return option;
+  }
+
+  function ensureInlineVehicleOption(select, value) {
+    for (var i = 0; i < select.options.length; i++) {
+      if (select.options[i].value === value) {
+        select.options[i].hidden = false;
+        select.options[i].setAttribute('data-inline-vehicle-option', '1');
+        return select.options[i];
+      }
+    }
+
+    var option = document.createElement('option');
+    option.value = value;
+    option.hidden = false;
+    option.setAttribute('data-inline-vehicle-option', '1');
+    option.textContent = '+ Add New Vehicle';
+    select.appendChild(option);
+    return option;
+  }
+
+  function findLinkedCustomerSelect(select) {
+    if (!select || !select.form) {
+      return null;
+    }
+
+    var form = select.form;
+    var jobCustomer = form.querySelector('#job-customer-select');
+    if (jobCustomer && jobCustomer.tagName === 'SELECT') {
+      return jobCustomer;
+    }
+
+    var customerSelect = form.querySelector('select[name="customer_id"]');
+    if (customerSelect && customerSelect.tagName === 'SELECT') {
+      return customerSelect;
+    }
+
+    return null;
   }
 
   function refreshIndexedOptions(state) {
@@ -1591,82 +1699,113 @@ function initSearchableSelects() {
     }
   }
 
-  function applySearchFilter(state, rawQuery) {
-    var normalizedQuery = normalizeSearchTerm(rawQuery || '');
-    var visibleMatches = 0;
-
+  function applyOptionVisibility(state) {
     for (var i = 0; i < state.indexedOptions.length; i++) {
       var entry = state.indexedOptions[i];
       var option = entry.option;
-      var isInlineCustomerOption = option.getAttribute('data-inline-customer-option') === '1';
-      if (isInlineCustomerOption) {
+      var isInlineOption = option.getAttribute('data-inline-customer-option') === '1'
+        || option.getAttribute('data-inline-vehicle-option') === '1';
+      if (isInlineOption) {
+        option.hidden = false;
         continue;
       }
 
       var isPlaceholder = option.value === '';
-      var termMatch = normalizedQuery === '' || entry.normalizedText.indexOf(normalizedQuery) !== -1;
-      var keepVisible = termMatch || option.selected;
-
-      if (normalizedQuery !== '' && isPlaceholder) {
-        keepVisible = false;
+      if (isPlaceholder) {
+        option.hidden = false;
+        continue;
       }
 
-      if (option.hidden === keepVisible) {
-        option.hidden = !keepVisible;
-      }
-
-      if (!isPlaceholder && termMatch) {
-        visibleMatches++;
-      }
-    }
-
-    if (state.isCustomerSelect && state.inlineOption) {
-      var shouldShowInlineOption = normalizedQuery !== '' && visibleMatches === 0;
-      state.inlineOption.hidden = !shouldShowInlineOption;
-      if (shouldShowInlineOption) {
-        var compactQuery = collapseWhitespace(rawQuery || '').trim();
-        if (compactQuery.length > 42) {
-          compactQuery = compactQuery.slice(0, 42) + '...';
-        }
-        state.inlineOption.textContent = compactQuery !== ''
-          ? '+ Add New Customer "' + compactQuery + '"'
-          : '+ Add New Customer';
-        state.hint.textContent = 'No exact match found. Choose + Add New Customer.';
-      } else {
-        state.hint.textContent = '';
-      }
-    } else {
-      state.hint.textContent = '';
+      var externalVisible = option.getAttribute('data-gac-filter-visible') !== '0';
+      var keepVisible = externalVisible || option.selected;
+      option.hidden = !keepVisible;
     }
   }
 
-  function firstVisibleOption(state) {
-    for (var i = 0; i < state.select.options.length; i++) {
-      var option = state.select.options[i];
-      if (option.hidden) {
-        continue;
-      }
-      if (option.value === '' || option.getAttribute('data-inline-customer-option') === '1') {
-        continue;
-      }
-      return option;
+  function renderTypedPreview(state) {
+    if (!state || !state.preview) {
+      return;
     }
-    return null;
+    var query = collapseWhitespace(state.typeBuffer || '').trim();
+    if (query === '') {
+      state.preview.textContent = '';
+      state.preview.classList.add('d-none');
+      return;
+    }
+    state.preview.textContent = 'Search: ' + query;
+    state.preview.classList.remove('d-none');
+    scheduleTypedPreviewClear(state, 1400);
+  }
+
+  function scheduleTypedPreviewClear(state, delayMs) {
+    if (!state) {
+      return;
+    }
+    if (state.previewTimer) {
+      window.clearTimeout(state.previewTimer);
+      state.previewTimer = null;
+    }
+    state.previewTimer = window.setTimeout(function () {
+      clearTypedPreview(state);
+    }, Math.max(250, parseInt(String(delayMs || '0'), 10) || 0));
+  }
+
+  function clearTypedPreview(state) {
+    if (!state) {
+      return;
+    }
+    state.typeBuffer = '';
+    state.typeTimestamp = 0;
+    if (state.previewTimer) {
+      window.clearTimeout(state.previewTimer);
+      state.previewTimer = null;
+    }
+    if (!state.preview) {
+      return;
+    }
+    state.preview.textContent = '';
+    state.preview.classList.add('d-none');
   }
 
   function openInlineCustomerModal(component, query) {
-    if (!modalInstance || !modalBody || !inlineCustomerFormUrl) {
+    openInlineModal(inlineContexts.customer, component, query, null);
+  }
+
+  function openInlineVehicleModal(component, query) {
+    var extraParams = [];
+    var linkedCustomerSelect = component ? component.linkedCustomerSelect : null;
+    var linkedCustomerId = linkedCustomerSelect ? String(linkedCustomerSelect.value || '').trim() : '';
+    if (linkedCustomerId !== '') {
+      extraParams.push({ key: 'customer_id', value: linkedCustomerId });
+    }
+    openInlineModal(inlineContexts.vehicle, component, query, extraParams);
+  }
+
+  function openInlineModal(context, component, query, extraParams) {
+    if (!context || !context.modalInstance || !context.modalBody || !context.formUrl) {
       return;
     }
 
-    activeInlineCustomerComponent = component;
-    modalBody.innerHTML = '<div class="text-muted">Loading customer form...</div>';
-    modalInstance.show();
+    context.activeComponent = component;
+    context.modalBody.innerHTML = context.loadingHtml;
+    context.modalInstance.show();
 
-    var requestUrl = inlineCustomerFormUrl;
+    var requestUrl = context.formUrl;
     var trimmedQuery = (query || '').trim();
     if (trimmedQuery !== '') {
       requestUrl += (requestUrl.indexOf('?') >= 0 ? '&' : '?') + 'q=' + encodeURIComponent(trimmedQuery);
+    }
+
+    if (Array.isArray(extraParams)) {
+      for (var i = 0; i < extraParams.length; i++) {
+        var item = extraParams[i] || {};
+        var key = String(item.key || '').trim();
+        var value = String(item.value || '').trim();
+        if (key === '' || value === '') {
+          continue;
+        }
+        requestUrl += (requestUrl.indexOf('?') >= 0 ? '&' : '?') + encodeURIComponent(key) + '=' + encodeURIComponent(value);
+      }
     }
 
     fetch(requestUrl, {
@@ -1679,18 +1818,20 @@ function initSearchableSelects() {
         });
       })
       .then(function (result) {
-        modalBody.innerHTML = result.html || '<div class="alert alert-danger mb-0">Unable to load customer form.</div>';
+        context.modalBody.innerHTML = result.html || context.loadErrorHtml;
 
-        var nameInput = modalBody.querySelector('input[name="full_name"]');
-        if (nameInput) {
-          nameInput.focus();
-          if ((nameInput.value || '').trim() !== '') {
-            nameInput.select();
+        if (context.focusSelector) {
+          var focusInput = context.modalBody.querySelector(context.focusSelector);
+          if (focusInput) {
+            focusInput.focus();
+            if ((focusInput.value || '').trim() !== '') {
+              focusInput.select();
+            }
           }
         }
       })
       .catch(function () {
-        modalBody.innerHTML = '<div class="alert alert-danger mb-0">Unable to load customer form.</div>';
+        context.modalBody.innerHTML = context.loadErrorHtml;
       });
   }
 
@@ -1727,11 +1868,308 @@ function initSearchableSelects() {
     component.select.value = idValue;
     component.lastCommittedValue = idValue;
     refreshIndexedOptions(component);
-    component.input.value = '';
-    applySearchFilter(component, '');
+    applyOptionVisibility(component);
 
     component.select.dispatchEvent(new Event('change', { bubbles: true }));
     component.select.focus();
+  }
+
+  function upsertLinkedCustomerOption(select, customer) {
+    if (!select || !customer) {
+      return;
+    }
+
+    var idValue = String(customer.id || '').trim();
+    if (idValue === '' || idValue === '0') {
+      return;
+    }
+
+    var label = String(customer.label || '').trim();
+    if (label === '') {
+      var fullName = String(customer.full_name || '').trim();
+      var phone = String(customer.phone || '').trim();
+      label = phone !== '' ? (fullName + ' (' + phone + ')') : fullName;
+    }
+
+    var option = null;
+    for (var i = 0; i < select.options.length; i++) {
+      if (select.options[i].value === idValue) {
+        option = select.options[i];
+        break;
+      }
+    }
+
+    if (!option) {
+      option = document.createElement('option');
+      option.value = idValue;
+      select.appendChild(option);
+    }
+
+    option.textContent = label;
+    option.hidden = false;
+
+    select.value = idValue;
+    if (typeof gacRefreshSearchableSelect === 'function') {
+      gacRefreshSearchableSelect(select);
+    }
+    select.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
+  function upsertVehicleOption(component, vehicle) {
+    if (!component || !vehicle) {
+      return;
+    }
+
+    var idValue = String(vehicle.id || '').trim();
+    if (idValue === '' || idValue === '0') {
+      return;
+    }
+
+    var registrationNo = String(vehicle.registration_no || '').trim();
+    var brand = String(vehicle.brand || '').trim();
+    var model = String(vehicle.model || '').trim();
+    var label = String(vehicle.label || '').trim();
+    if (label === '') {
+      label = registrationNo;
+      if (brand !== '' || model !== '') {
+        label += ' - ' + collapseWhitespace((brand + ' ' + model).trim());
+      }
+    }
+
+    var option = null;
+    for (var i = 0; i < component.select.options.length; i++) {
+      if (component.select.options[i].value === idValue) {
+        option = component.select.options[i];
+        break;
+      }
+    }
+
+    if (!option) {
+      option = document.createElement('option');
+      option.value = idValue;
+      component.select.appendChild(option);
+    }
+
+    option.textContent = label;
+    option.hidden = false;
+
+    var customerId = String(vehicle.customer_id || '').trim();
+    if (customerId !== '') {
+      option.setAttribute('data-customer-id', customerId);
+    }
+    option.setAttribute('data-last-odometer', '');
+    option.setAttribute('data-last-odometer-source', '');
+
+    component.select.value = idValue;
+    component.lastCommittedValue = idValue;
+    refreshIndexedOptions(component);
+    applyOptionVisibility(component);
+
+    component.select.dispatchEvent(new Event('change', { bubbles: true }));
+    component.select.focus();
+  }
+}
+
+function initDateFilterForms() {
+  var forms = document.querySelectorAll('form[data-date-filter-form="1"]');
+  if (!forms || forms.length === 0) {
+    return;
+  }
+
+  for (var index = 0; index < forms.length; index++) {
+    var form = forms[index];
+    if (!form || form.getAttribute('data-date-filter-init') === '1') {
+      continue;
+    }
+    form.setAttribute('data-date-filter-init', '1');
+
+    var modeSelect = form.querySelector('select[name="date_mode"]');
+    var fromInput = form.querySelector('input[name="from"]');
+    var toInput = form.querySelector('input[name="to"]');
+    if (!modeSelect || !fromInput || !toInput) {
+      continue;
+    }
+
+    var fromValue = normalizeIsoDate(fromInput.value || '');
+    var toValue = normalizeIsoDate(toInput.value || '');
+    var todayIso = isoToday();
+    var rangeStart = normalizeIsoDate(form.getAttribute('data-date-range-start') || '') || fromValue || toValue || todayIso;
+    var rangeEnd = normalizeIsoDate(form.getAttribute('data-date-range-end') || '') || toValue || fromValue || todayIso;
+    if (rangeEnd < rangeStart) {
+      rangeEnd = rangeStart;
+    }
+
+    var yearlyStart = normalizeIsoDate(form.getAttribute('data-date-yearly-start') || '');
+    if (!yearlyStart || yearlyStart < rangeStart || yearlyStart > rangeEnd) {
+      yearlyStart = rangeStart;
+    }
+
+    fromInput.min = rangeStart;
+    fromInput.max = rangeEnd;
+    toInput.min = rangeStart;
+    toInput.max = rangeEnd;
+
+    function normalizeMode(value) {
+      var normalized = String(value || '').trim().toLowerCase();
+      return (normalized === 'daily' || normalized === 'weekly' || normalized === 'monthly' || normalized === 'yearly' || normalized === 'custom')
+        ? normalized
+        : 'custom';
+    }
+
+    function clampDate(value) {
+      var iso = normalizeIsoDate(value || '') || rangeStart;
+      if (iso < rangeStart) {
+        return rangeStart;
+      }
+      if (iso > rangeEnd) {
+        return rangeEnd;
+      }
+      return iso;
+    }
+
+    function setRangeForMode(mode) {
+      var normalizedMode = normalizeMode(mode);
+      if (normalizedMode === 'custom') {
+        return {
+          from: clampDate(fromInput.value || ''),
+          to: clampDate(toInput.value || '')
+        };
+      }
+
+      var boundedToday = clampDate(todayIso);
+      var from = rangeStart;
+      var to = boundedToday;
+
+      if (normalizedMode === 'daily') {
+        from = boundedToday;
+        to = boundedToday;
+      } else if (normalizedMode === 'weekly') {
+        from = clampDate(shiftIsoDate(boundedToday, -6));
+        to = boundedToday;
+      } else if (normalizedMode === 'monthly') {
+        from = clampDate(monthStartIso(boundedToday));
+        to = boundedToday;
+      } else if (normalizedMode === 'yearly') {
+        from = clampDate(yearlyStart || yearStartIso(boundedToday));
+        to = boundedToday;
+      }
+
+      if (to < from) {
+        to = from;
+      }
+
+      return { from: from, to: to };
+    }
+
+    function syncInputBounds() {
+      var nextFrom = clampDate(fromInput.value || '');
+      var nextTo = clampDate(toInput.value || '');
+      if (nextTo < nextFrom) {
+        nextTo = nextFrom;
+      }
+      fromInput.value = nextFrom;
+      toInput.value = nextTo;
+    }
+
+    function applyCurrentMode() {
+      var mode = normalizeMode(modeSelect.value || '');
+      if (mode === 'custom') {
+        syncInputBounds();
+        return;
+      }
+      var range = setRangeForMode(mode);
+      fromInput.value = range.from;
+      toInput.value = range.to;
+    }
+
+    modeSelect.addEventListener('change', function () {
+      applyCurrentMode();
+    });
+
+    fromInput.addEventListener('input', function () {
+      if (normalizeMode(modeSelect.value || '') !== 'custom') {
+        modeSelect.value = 'custom';
+      }
+      syncInputBounds();
+    });
+
+    toInput.addEventListener('input', function () {
+      if (normalizeMode(modeSelect.value || '') !== 'custom') {
+        modeSelect.value = 'custom';
+      }
+      syncInputBounds();
+    });
+
+    applyCurrentMode();
+  }
+
+  function normalizeIsoDate(value) {
+    var iso = String(value || '').trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(iso)) {
+      return '';
+    }
+    var parsed = parseIsoDate(iso);
+    return parsed ? toIsoDate(parsed) : '';
+  }
+
+  function parseIsoDate(iso) {
+    var pieces = String(iso || '').split('-');
+    if (pieces.length !== 3) {
+      return null;
+    }
+    var year = parseInt(pieces[0], 10);
+    var month = parseInt(pieces[1], 10);
+    var day = parseInt(pieces[2], 10);
+    if (!isFinite(year) || !isFinite(month) || !isFinite(day)) {
+      return null;
+    }
+    var date = new Date(Date.UTC(year, month - 1, day));
+    if (
+      date.getUTCFullYear() !== year
+      || date.getUTCMonth() !== month - 1
+      || date.getUTCDate() !== day
+    ) {
+      return null;
+    }
+    return date;
+  }
+
+  function toIsoDate(date) {
+    var year = String(date.getUTCFullYear());
+    var month = String(date.getUTCMonth() + 1).padStart(2, '0');
+    var day = String(date.getUTCDate()).padStart(2, '0');
+    return year + '-' + month + '-' + day;
+  }
+
+  function isoToday() {
+    return toIsoDate(new Date());
+  }
+
+  function shiftIsoDate(iso, days) {
+    var date = parseIsoDate(iso);
+    if (!date) {
+      return isoToday();
+    }
+    date.setUTCDate(date.getUTCDate() + (parseInt(String(days || '0'), 10) || 0));
+    return toIsoDate(date);
+  }
+
+  function monthStartIso(iso) {
+    var date = parseIsoDate(iso);
+    if (!date) {
+      return isoToday();
+    }
+    date.setUTCDate(1);
+    return toIsoDate(date);
+  }
+
+  function yearStartIso(iso) {
+    var date = parseIsoDate(iso);
+    if (!date) {
+      return isoToday();
+    }
+    date.setUTCMonth(0, 1);
+    return toIsoDate(date);
   }
 }
 
@@ -3403,6 +3841,22 @@ function gacRefreshSearchableSelect(select) {
   }
 }
 
+function gacSearchableSelectState(select) {
+  if (!select || typeof select !== 'object') {
+    return null;
+  }
+
+  return select.gacSearchableState || null;
+}
+
+function gacSearchableSelectInput(select) {
+  var state = gacSearchableSelectState(select);
+  if (!state || !state.input) {
+    return null;
+  }
+  return state.input;
+}
+
 function normalizeSearchTerm(value) {
   return collapseWhitespace(String(value || ''))
     .toLowerCase()
@@ -3425,18 +3879,37 @@ function debounce(callback, waitMs) {
   };
 }
 
-function clearInlineFormError(form) {
-  var errorNode = form.querySelector('[data-inline-customer-error="1"]');
+function clearInlineFormError(form, errorAttribute) {
+  if (!form) {
+    return;
+  }
+
+  var attr = String(errorAttribute || 'data-inline-form-error').trim();
+  if (attr === '') {
+    attr = 'data-inline-form-error';
+  }
+
+  var errorNode = form.querySelector('[' + attr + '="1"]');
   if (errorNode) {
     errorNode.remove();
   }
 }
 
-function renderInlineFormError(form, message) {
-  var errorNode = form.querySelector('[data-inline-customer-error="1"]');
+function renderInlineFormError(form, message, errorAttribute) {
+  if (!form) {
+    return;
+  }
+
+  var attr = String(errorAttribute || 'data-inline-form-error').trim();
+  if (attr === '') {
+    attr = 'data-inline-form-error';
+  }
+
+  var selector = '[' + attr + '="1"]';
+  var errorNode = form.querySelector(selector);
   if (!errorNode) {
     errorNode = document.createElement('div');
-    errorNode.setAttribute('data-inline-customer-error', '1');
+    errorNode.setAttribute(attr, '1');
     errorNode.className = 'alert alert-danger gac-inline-form-alert';
     form.insertBefore(errorNode, form.firstChild);
   }

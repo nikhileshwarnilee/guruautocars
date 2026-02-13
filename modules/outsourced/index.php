@@ -259,21 +259,48 @@ function ow_sync_job_labor_payable(PDO $pdo, int $workId, int $companyId, int $g
 $outsourcedReady = table_columns('outsourced_works') !== [] && table_columns('outsourced_work_payments') !== [];
 
 $today = date('Y-m-d');
-$defaultFrom = date('Y-m-01');
-
-$fromDate = trim((string) ($_GET['from'] ?? $defaultFrom));
-if (!ow_is_valid_date($fromDate)) {
-    $fromDate = $defaultFrom;
+$outsourceRangeStart = date('Y-m-01', strtotime($today));
+$outsourceRangeEnd = $today;
+if ($outsourcedReady) {
+    $outsourceBoundsStmt = db()->prepare(
+        'SELECT MIN(DATE(created_at)) AS min_date, MAX(DATE(created_at)) AS max_date
+         FROM outsourced_works
+         WHERE company_id = :company_id
+           AND garage_id = :garage_id
+           AND status_code = "ACTIVE"'
+    );
+    $outsourceBoundsStmt->execute([
+        'company_id' => $companyId,
+        'garage_id' => $garageId,
+    ]);
+    $outsourceBounds = $outsourceBoundsStmt->fetch() ?: [];
+    if (date_filter_is_valid_iso((string) ($outsourceBounds['min_date'] ?? ''))) {
+        $outsourceRangeStart = (string) $outsourceBounds['min_date'];
+    }
+    if (date_filter_is_valid_iso((string) ($outsourceBounds['max_date'] ?? ''))) {
+        $boundMax = (string) $outsourceBounds['max_date'];
+        $outsourceRangeEnd = $boundMax > $today ? $boundMax : $today;
+    }
+}
+if ($outsourceRangeEnd < $outsourceRangeStart) {
+    $outsourceRangeStart = $outsourceRangeEnd;
 }
 
-$toDate = trim((string) ($_GET['to'] ?? $today));
-if (!ow_is_valid_date($toDate)) {
-    $toDate = $today;
-}
-
-if ($toDate < $fromDate) {
-    $toDate = $fromDate;
-}
+$outsourceDateFilter = date_filter_resolve_request([
+    'company_id' => $companyId,
+    'garage_id' => $garageId,
+    'range_start' => $outsourceRangeStart,
+    'range_end' => $outsourceRangeEnd,
+    'yearly_start' => date('Y-01-01', strtotime($outsourceRangeEnd)),
+    'session_namespace' => 'outsourced_index',
+    'request_mode' => $_GET['date_mode'] ?? null,
+    'request_from' => $_GET['from'] ?? null,
+    'request_to' => $_GET['to'] ?? null,
+]);
+$dateMode = (string) ($outsourceDateFilter['mode'] ?? 'monthly');
+$dateModeOptions = date_filter_modes();
+$fromDate = (string) ($outsourceDateFilter['from_date'] ?? $outsourceRangeStart);
+$toDate = (string) ($outsourceDateFilter['to_date'] ?? $outsourceRangeEnd);
 
 $searchQuery = trim((string) ($_GET['q'] ?? ''));
 $vendorFilter = get_int('vendor_id', 0);
@@ -1225,6 +1252,7 @@ if ($outsourcedReady) {
 
         $filterSummary = [
             'garage_id' => $garageId,
+            'date_mode' => $dateMode,
             'from_date' => $fromDate,
             'to_date' => $toDate,
             'vendor_id' => $vendorFilter > 0 ? $vendorFilter : null,
@@ -1329,6 +1357,7 @@ $profitOutsourceMargin = $profitOutsourcedBilled - $profitOutsourceCost;
 $profitOverallLaborMargin = ($profitInhouseBilled + $profitOutsourcedBilled) - $profitOutsourceCost;
 
 $baseParams = [
+    'date_mode' => $dateMode,
     'from' => $fromDate,
     'to' => $toDate,
     'q' => $searchQuery !== '' ? $searchQuery : null,
@@ -1405,7 +1434,24 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         <div class="card card-primary mb-3">
           <div class="card-header"><h3 class="card-title">Filters</h3></div>
           <div class="card-body">
-            <form method="get" class="row g-2 align-items-end">
+            <form
+              method="get"
+              class="row g-2 align-items-end"
+              data-date-filter-form="1"
+              data-date-range-start="<?= e($outsourceRangeStart); ?>"
+              data-date-range-end="<?= e($outsourceRangeEnd); ?>"
+              data-date-yearly-start="<?= e(date('Y-01-01', strtotime($outsourceRangeEnd))); ?>"
+            >
+              <div class="col-md-2">
+                <label class="form-label">Date Mode</label>
+                <select name="date_mode" class="form-select">
+                  <?php foreach ($dateModeOptions as $modeValue => $modeLabel): ?>
+                    <option value="<?= e((string) $modeValue); ?>" <?= $dateMode === $modeValue ? 'selected' : ''; ?>>
+                      <?= e((string) $modeLabel); ?>
+                    </option>
+                  <?php endforeach; ?>
+                </select>
+              </div>
               <div class="col-md-2">
                 <label class="form-label">From</label>
                 <input type="date" name="from" class="form-control" value="<?= e($fromDate); ?>" required />

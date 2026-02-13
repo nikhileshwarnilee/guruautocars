@@ -9,6 +9,7 @@ $page_title = 'System Settings';
 $active_menu = 'system.settings';
 $canManage = has_permission('settings.manage');
 $companyId = active_company_id();
+$dateModeOptions = date_filter_modes();
 
 $garagesStmt = db()->prepare(
     'SELECT id, name, code
@@ -29,6 +30,36 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 
     $action = (string) ($_POST['_action'] ?? '');
+
+    if ($action === 'update_default_date_filter_mode') {
+        $selectedMode = date_filter_normalize_mode((string) ($_POST['default_date_filter_mode'] ?? 'monthly'), 'monthly');
+        $settingId = system_setting_upsert_value(
+            $companyId,
+            null,
+            'REPORTS',
+            'default_date_filter_mode',
+            $selectedMode,
+            'STRING',
+            'ACTIVE',
+            (int) ($_SESSION['user_id'] ?? 0)
+        );
+
+        if ($settingId > 0) {
+            log_audit('system_settings', 'update', $settingId, 'Updated default date filter mode to ' . $selectedMode, [
+                'entity' => 'setting',
+                'company_id' => $companyId,
+                'metadata' => [
+                    'setting_key' => 'default_date_filter_mode',
+                    'setting_group' => 'REPORTS',
+                ],
+            ]);
+            flash_set('settings_success', 'Default date filter mode updated.', 'success');
+        } else {
+            flash_set('settings_error', 'Unable to update default date filter mode right now.', 'danger');
+        }
+
+        redirect('modules/system/settings.php');
+    }
 
     if ($action === 'create') {
         $settingGroup = strtoupper(post_string('setting_group', 80));
@@ -176,6 +207,7 @@ $settingsStmt = db()->prepare(
 );
 $settingsStmt->execute(['company_id' => $companyId]);
 $settings = $settingsStmt->fetchAll();
+$defaultDateFilterMode = date_filter_normalize_mode(system_setting_get_value($companyId, 0, 'default_date_filter_mode', 'monthly'), 'monthly');
 
 require_once __DIR__ . '/../../includes/header.php';
 require_once __DIR__ . '/../../includes/sidebar.php';
@@ -199,6 +231,34 @@ require_once __DIR__ . '/../../includes/sidebar.php';
   <div class="app-content">
     <div class="container-fluid">
       <?php if ($canManage): ?>
+        <div class="card card-outline card-info">
+          <div class="card-header"><h3 class="card-title">Global Date Filter Default</h3></div>
+          <form method="post">
+            <div class="card-body row g-3 align-items-end">
+              <?= csrf_field(); ?>
+              <input type="hidden" name="_action" value="update_default_date_filter_mode" />
+              <div class="col-md-4">
+                <label class="form-label">Default Date Filter Mode</label>
+                <select name="default_date_filter_mode" class="form-select" required>
+                  <?php foreach ($dateModeOptions as $modeValue => $modeLabel): ?>
+                    <option value="<?= e((string) $modeValue); ?>" <?= $defaultDateFilterMode === $modeValue ? 'selected' : ''; ?>>
+                      <?= e((string) $modeLabel); ?>
+                    </option>
+                  <?php endforeach; ?>
+                </select>
+              </div>
+              <div class="col-md-8">
+                <div class="text-muted">
+                  Applied across dashboard and report filters on load. Users can still override per session with custom ranges.
+                </div>
+              </div>
+            </div>
+            <div class="card-footer">
+              <button type="submit" class="btn btn-info">Save Date Filter Default</button>
+            </div>
+          </form>
+        </div>
+
         <div class="card card-primary">
           <div class="card-header"><h3 class="card-title"><?= $editSetting ? 'Edit Setting' : 'Add Setting'; ?></h3></div>
           <form method="post">

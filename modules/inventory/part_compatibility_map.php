@@ -311,11 +311,6 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                   <input type="hidden" name="part_id" value="<?= (int) $part['id']; ?>" />
 
                   <div class="mb-2">
-                    <label for="variant-search" class="form-label">Search Variant</label>
-                    <input id="variant-search" type="text" class="form-control" placeholder="Filter by brand / model / variant" />
-                  </div>
-
-                  <div class="mb-2">
                     <label for="variant-select" class="form-label">Vehicle Variants (Multiple)</label>
                     <select id="variant-select" name="variant_ids[]" class="form-select" multiple size="16" <?= $canManage ? '' : 'disabled'; ?>>
                       <?php foreach ($variants as $variant): ?>
@@ -392,23 +387,5 @@ require_once __DIR__ . '/../../includes/sidebar.php';
     </div>
   </div>
 </main>
-
-<script>
-  (function () {
-    var searchInput = document.getElementById('variant-search');
-    var selectNode = document.getElementById('variant-select');
-    if (!searchInput || !selectNode) {
-      return;
-    }
-
-    searchInput.addEventListener('input', function () {
-      var query = searchInput.value.trim().toLowerCase();
-      Array.prototype.forEach.call(selectNode.options, function (option) {
-        var haystack = (option.getAttribute('data-search') || option.text || '').toLowerCase();
-        option.hidden = query !== '' && haystack.indexOf(query) === -1;
-      });
-    });
-  })();
-</script>
 
 <?php require_once __DIR__ . '/../../includes/footer.php'; ?>

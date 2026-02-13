@@ -7,15 +7,43 @@ require_login();
 $companyId = active_company_id();
 $garageId = active_garage_id();
 $today = date('Y-m-d');
-$defaultFrom = date('Y-m-d', strtotime('-30 days'));
-$fromDate = trim((string) ($_GET['from'] ?? $defaultFrom));
-$toDate = trim((string) ($_GET['to'] ?? $today));
-if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $fromDate)) {
-    $fromDate = $defaultFrom;
+$expenseBoundsStmt = db()->prepare(
+    'SELECT MIN(expense_date) AS min_date, MAX(expense_date) AS max_date
+     FROM expenses
+     WHERE company_id = :company_id
+       AND garage_id = :garage_id'
+);
+$expenseBoundsStmt->execute([
+    'company_id' => $companyId,
+    'garage_id' => $garageId,
+]);
+$expenseBounds = $expenseBoundsStmt->fetch() ?: [];
+$expenseRangeStart = date_filter_is_valid_iso((string) ($expenseBounds['min_date'] ?? ''))
+    ? (string) $expenseBounds['min_date']
+    : date('Y-m-01', strtotime($today));
+$expenseRangeEndCandidate = date_filter_is_valid_iso((string) ($expenseBounds['max_date'] ?? ''))
+    ? (string) $expenseBounds['max_date']
+    : $today;
+$expenseRangeEnd = $expenseRangeEndCandidate > $today ? $expenseRangeEndCandidate : $today;
+if ($expenseRangeEnd < $expenseRangeStart) {
+    $expenseRangeStart = $expenseRangeEnd;
 }
-if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $toDate)) {
-    $toDate = $today;
-}
+
+$expenseDateFilter = date_filter_resolve_request([
+    'company_id' => $companyId,
+    'garage_id' => $garageId,
+    'range_start' => $expenseRangeStart,
+    'range_end' => $expenseRangeEnd,
+    'yearly_start' => date('Y-01-01', strtotime($expenseRangeEnd)),
+    'session_namespace' => 'expenses_index',
+    'request_mode' => $_GET['date_mode'] ?? null,
+    'request_from' => $_GET['from'] ?? null,
+    'request_to' => $_GET['to'] ?? null,
+]);
+$dateMode = (string) ($expenseDateFilter['mode'] ?? 'monthly');
+$dateModeOptions = date_filter_modes();
+$fromDate = (string) ($expenseDateFilter['from_date'] ?? $expenseRangeStart);
+$toDate = (string) ($expenseDateFilter['to_date'] ?? $expenseRangeEnd);
 $selectedCategoryId = get_int('category_id');
 $entryTypeFilter = strtoupper(trim((string) ($_GET['entry_type'] ?? '')));
 if (!in_array($entryTypeFilter, ['', 'EXPENSE', 'REVERSAL'], true)) {
@@ -624,7 +652,24 @@ include __DIR__ . '/../../includes/sidebar.php';
           </div>
         </div>
         <div class="card-body">
-          <form method="get" class="row g-2 align-items-end">
+          <form
+            method="get"
+            class="row g-2 align-items-end"
+            data-date-filter-form="1"
+            data-date-range-start="<?= e($expenseRangeStart); ?>"
+            data-date-range-end="<?= e($expenseRangeEnd); ?>"
+            data-date-yearly-start="<?= e(date('Y-01-01', strtotime($expenseRangeEnd))); ?>"
+          >
+            <div class="col-md-2">
+              <label class="form-label">Date Mode</label>
+              <select name="date_mode" class="form-select">
+                <?php foreach ($dateModeOptions as $modeValue => $modeLabel): ?>
+                  <option value="<?= e((string) $modeValue); ?>" <?= $dateMode === $modeValue ? 'selected' : ''; ?>>
+                    <?= e((string) $modeLabel); ?>
+                  </option>
+                <?php endforeach; ?>
+              </select>
+            </div>
             <div class="col-md-2"><label class="form-label">From</label><input type="date" name="from" value="<?= e($fromDate); ?>" class="form-control" required /></div>
             <div class="col-md-2"><label class="form-label">To</label><input type="date" name="to" value="<?= e($toDate); ?>" class="form-control" required /></div>
             <div class="col-md-3">

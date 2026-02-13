@@ -116,6 +116,7 @@ foreach ($payments as $payment) {
 $outstanding = max(0.0, (float) $invoice['grand_total'] - $paidAmount);
 $invoiceStatus = (string) ($invoice['invoice_status'] ?? 'FINALIZED');
 $paymentStatus = (string) ($invoice['payment_status'] ?? 'UNPAID');
+$companyLogoUrl = company_logo_url((int) ($invoice['company_id'] ?? $companyId), $garageId);
 ?>
 <!doctype html>
 <html lang="en">
@@ -125,24 +126,51 @@ $paymentStatus = (string) ($invoice['payment_status'] ?? 'UNPAID');
     <title>Invoice <?= e((string) $invoice['invoice_number']); ?></title>
     <link rel="stylesheet" href="<?= e(url('assets/css/adminlte.min.css')); ?>" />
     <style>
+      @page {
+        size: A4;
+        margin: 12mm;
+      }
+
       @media print {
         .no-print {
           display: none !important;
+        }
+
+        body {
+          padding: 0;
+          background: #fff;
+        }
+
+        .print-sheet {
+          box-shadow: none !important;
+          border: 0 !important;
         }
       }
 
       body {
         padding: 20px;
+        background: #f4f6f9;
       }
 
       .invoice-title {
         font-size: 1.3rem;
         font-weight: 700;
       }
+
+      .print-sheet {
+        max-width: 210mm;
+        margin: 0 auto;
+      }
+
+      .brand-logo {
+        max-height: 56px;
+        max-width: 180px;
+        width: auto;
+      }
     </style>
   </head>
   <body>
-    <div class="container-fluid">
+    <div class="container-fluid print-sheet">
       <div class="d-flex justify-content-between mb-3 no-print">
         <a href="<?= e(url('modules/billing/index.php')); ?>" class="btn btn-outline-secondary btn-sm">Back</a>
         <button onclick="window.print()" class="btn btn-primary btn-sm">Print / Save PDF</button>
@@ -152,6 +180,9 @@ $paymentStatus = (string) ($invoice['payment_status'] ?? 'UNPAID');
         <div class="card-body">
           <div class="row mb-3">
             <div class="col-8">
+              <?php if ($companyLogoUrl !== null): ?>
+                <div class="mb-2"><img src="<?= e($companyLogoUrl); ?>" alt="Company Logo" class="brand-logo" /></div>
+              <?php endif; ?>
               <div class="invoice-title"><?= e((string) $companyName); ?></div>
               <div><?= e((string) ($companyAddress ?? '')); ?>, <?= e((string) ($companyCity ?? '')); ?>, <?= e((string) ($companyState ?? '')); ?></div>
               <div>GSTIN: <?= e((string) ($companyGstin ?? '-')); ?></div>

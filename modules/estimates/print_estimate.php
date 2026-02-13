@@ -86,6 +86,7 @@ foreach ($partLines as $line) {
     $partsTotal += (float) ($line['total_amount'] ?? 0);
 }
 $grandTotal = round($serviceTotal + $partsTotal, 2);
+$companyLogoUrl = company_logo_url((int) ($estimate['company_id'] ?? $companyId), $garageId);
 ?>
 <!doctype html>
 <html lang="en">
@@ -95,24 +96,51 @@ $grandTotal = round($serviceTotal + $partsTotal, 2);
     <title>Estimate <?= e((string) $estimate['estimate_number']); ?></title>
     <link rel="stylesheet" href="<?= e(url('assets/css/adminlte.min.css')); ?>" />
     <style>
+      @page {
+        size: A4;
+        margin: 12mm;
+      }
+
       @media print {
         .no-print {
           display: none !important;
+        }
+
+        body {
+          padding: 0;
+          background: #fff;
+        }
+
+        .print-sheet {
+          box-shadow: none !important;
+          border: 0 !important;
         }
       }
 
       body {
         padding: 20px;
+        background: #f4f6f9;
       }
 
       .title {
         font-size: 1.3rem;
         font-weight: 700;
       }
+
+      .print-sheet {
+        max-width: 210mm;
+        margin: 0 auto;
+      }
+
+      .brand-logo {
+        max-height: 56px;
+        max-width: 180px;
+        width: auto;
+      }
     </style>
   </head>
   <body>
-    <div class="container-fluid">
+    <div class="container-fluid print-sheet">
       <div class="d-flex justify-content-between mb-3 no-print">
         <a href="<?= e(url('modules/estimates/view.php?id=' . $estimateId)); ?>" class="btn btn-outline-secondary btn-sm">Back</a>
         <button onclick="window.print()" class="btn btn-primary btn-sm">Print / Save PDF</button>
@@ -122,6 +150,9 @@ $grandTotal = round($serviceTotal + $partsTotal, 2);
         <div class="card-body">
           <div class="row mb-3">
             <div class="col-8">
+              <?php if ($companyLogoUrl !== null): ?>
+                <div class="mb-2"><img src="<?= e($companyLogoUrl); ?>" alt="Company Logo" class="brand-logo" /></div>
+              <?php endif; ?>
               <div class="title"><?= e((string) $estimate['company_name']); ?></div>
               <div><?= e((string) ($estimate['company_address'] ?? '')); ?>, <?= e((string) ($estimate['company_city'] ?? '')); ?>, <?= e((string) ($estimate['company_state'] ?? '')); ?></div>
               <div>GSTIN: <?= e((string) ($estimate['company_gstin'] ?? '-')); ?></div>

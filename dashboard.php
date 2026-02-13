@@ -65,31 +65,32 @@ if ($mtdStart < $fyStart) {
     $mtdStart = $fyStart;
 }
 
-$dashboardChartDefaultTo = $todayBounded;
-$dashboardChartDefaultFrom = date('Y-m-d', strtotime($dashboardChartDefaultTo . ' -29 days'));
-if ($dashboardChartDefaultFrom < $fyStart) {
-    $dashboardChartDefaultFrom = $fyStart;
+$dashboardDateFilter = date_filter_resolve_request([
+    'company_id' => $companyId,
+    'garage_id' => $selectedGarageId,
+    'range_start' => $fyStart,
+    'range_end' => $fyEnd,
+    'yearly_start' => $fyStart,
+    'session_namespace' => 'dashboard_charts',
+    'request_mode' => $_GET['date_mode'] ?? null,
+    'request_from' => $_GET['from'] ?? null,
+    'request_to' => $_GET['to'] ?? null,
+]);
+$dashboardDateMode = (string) ($dashboardDateFilter['mode'] ?? 'monthly');
+$dashboardDateModeOptions = date_filter_modes();
+$dashboardChartDefaultFrom = (string) ($dashboardDateFilter['from_date'] ?? $todayBounded);
+$dashboardChartDefaultTo = (string) ($dashboardDateFilter['to_date'] ?? $todayBounded);
+$dashboardTrendMode = strtolower(trim((string) ($_GET['trend_mode'] ?? 'daily')));
+if (!in_array($dashboardTrendMode, ['daily', 'monthly'], true)) {
+    $dashboardTrendMode = 'daily';
 }
 
 $canViewFinancial = has_permission('reports.financial');
 
 if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'charts') {
-    $chartFrom = analytics_parse_iso_date($_GET['from'] ?? null, $dashboardChartDefaultFrom);
-    $chartTo = analytics_parse_iso_date($_GET['to'] ?? null, $dashboardChartDefaultTo);
-    if ($chartFrom < $fyStart) {
-        $chartFrom = $fyStart;
-    }
-    if ($chartTo > $fyEnd) {
-        $chartTo = $fyEnd;
-    }
-    if ($chartTo < $chartFrom) {
-        $chartTo = $chartFrom;
-    }
-
-    $trendMode = strtolower(trim((string) ($_GET['trend_mode'] ?? 'daily')));
-    if (!in_array($trendMode, ['daily', 'monthly'], true)) {
-        $trendMode = 'daily';
-    }
+    $chartFrom = (string) ($dashboardDateFilter['from_date'] ?? $dashboardChartDefaultFrom);
+    $chartTo = (string) ($dashboardDateFilter['to_date'] ?? $dashboardChartDefaultTo);
+    $trendMode = $dashboardTrendMode;
 
     $dailyTrendStart = date('Y-m-d', strtotime($chartTo . ' -29 days'));
     if ($dailyTrendStart < $fyStart) {
@@ -446,6 +447,7 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'charts') {
         'ok' => true,
         'from' => $chartFrom,
         'to' => $chartTo,
+        'date_mode' => $dashboardDateMode,
         'trend_mode' => $trendMode,
         'can_view_financial' => $canViewFinancial,
         'charts' => $chartPayload,
@@ -759,20 +761,37 @@ require_once __DIR__ . '/includes/sidebar.php';
           <h3 class="card-title mb-0">Visualization Layer (Trusted Aggregates)</h3>
         </div>
         <div class="card-body">
-          <form id="dashboard-chart-filter-form" class="row g-2 align-items-end mb-3">
-            <div class="col-md-3">
+          <form
+            id="dashboard-chart-filter-form"
+            class="row g-2 align-items-end mb-3"
+            data-date-filter-form="1"
+            data-date-range-start="<?= e($fyStart); ?>"
+            data-date-range-end="<?= e($fyEnd); ?>"
+            data-date-yearly-start="<?= e($fyStart); ?>"
+          >
+            <div class="col-md-2">
+              <label class="form-label">Date Mode</label>
+              <select name="date_mode" class="form-select">
+                <?php foreach ($dashboardDateModeOptions as $modeValue => $modeLabel): ?>
+                  <option value="<?= e((string) $modeValue); ?>" <?= $dashboardDateMode === $modeValue ? 'selected' : ''; ?>>
+                    <?= e((string) $modeLabel); ?>
+                  </option>
+                <?php endforeach; ?>
+              </select>
+            </div>
+            <div class="col-md-2">
               <label class="form-label">From</label>
               <input type="date" name="from" class="form-control" value="<?= e($dashboardChartDefaultFrom); ?>" required />
             </div>
-            <div class="col-md-3">
+            <div class="col-md-2">
               <label class="form-label">To</label>
               <input type="date" name="to" class="form-control" value="<?= e($dashboardChartDefaultTo); ?>" required />
             </div>
             <div class="col-md-3">
               <label class="form-label">Revenue Trend View</label>
               <select name="trend_mode" class="form-select">
-                <option value="daily" selected>Daily (Last 30 Days)</option>
-                <option value="monthly">Monthly (Last 12 Months)</option>
+                <option value="daily" <?= $dashboardTrendMode === 'daily' ? 'selected' : ''; ?>>Daily (Last 30 Days)</option>
+                <option value="monthly" <?= $dashboardTrendMode === 'monthly' ? 'selected' : ''; ?>>Monthly (Last 12 Months)</option>
               </select>
             </div>
             <div class="col-md-3 d-flex gap-2">
@@ -930,6 +949,10 @@ require_once __DIR__ . '/includes/sidebar.php';
 
     var charts = window.GacCharts.createRegistry('dashboard');
     var latestPayload = null;
+    var fromInput = form.querySelector('input[name="from"]');
+    var toInput = form.querySelector('input[name="to"]');
+    var dateModeSelector = form.querySelector('select[name="date_mode"]');
+    var trendSelector = form.querySelector('select[name="trend_mode"]');
 
     function currencyTick(value) {
       return window.GacCharts.asCurrency(value);
@@ -941,6 +964,19 @@ require_once __DIR__ . '/includes/sidebar.php';
       }
 
       var trendMode = String(payload.trend_mode || 'daily').toLowerCase() === 'monthly' ? 'monthly' : 'daily';
+      if (fromInput && payload.from) {
+        fromInput.value = payload.from;
+      }
+      if (toInput && payload.to) {
+        toInput.value = payload.to;
+      }
+      if (dateModeSelector && payload.date_mode) {
+        dateModeSelector.value = String(payload.date_mode);
+      }
+      if (trendSelector) {
+        trendSelector.value = trendMode;
+      }
+
       var trend = trendMode === 'monthly' ? payload.charts.revenue_monthly : payload.charts.revenue_daily;
       var trendTitle = trendMode === 'monthly' ? 'Monthly Revenue (Last 12 Months)' : 'Daily Revenue (Last 30 Days)';
       var trendColor = trendMode === 'monthly' ? window.GacCharts.palette.indigo : window.GacCharts.palette.blue;
@@ -1087,6 +1123,11 @@ require_once __DIR__ . '/includes/sidebar.php';
     }
 
     function loadCharts() {
+      var staleError = shell.querySelector('[data-dashboard-chart-error="1"]');
+      if (staleError) {
+        staleError.remove();
+      }
+
       var params = new URLSearchParams(new FormData(form));
       params.set('ajax', 'charts');
       shell.classList.add('gac-report-loading');
@@ -1100,7 +1141,7 @@ require_once __DIR__ . '/includes/sidebar.php';
           renderDashboardCharts(payload);
         })
         .catch(function () {
-          shell.insertAdjacentHTML('beforeend', '<div class="alert alert-danger mt-3">Unable to load dashboard charts. Please retry.</div>');
+          shell.insertAdjacentHTML('beforeend', '<div class="alert alert-danger mt-3" data-dashboard-chart-error="1">Unable to load dashboard charts. Please retry.</div>');
         })
         .finally(function () {
           shell.classList.remove('gac-report-loading');
@@ -1112,7 +1153,6 @@ require_once __DIR__ . '/includes/sidebar.php';
       loadCharts();
     });
 
-    var trendSelector = form.querySelector('select[name="trend_mode"]');
     if (trendSelector) {
       trendSelector.addEventListener('change', function () {
         if (latestPayload) {
@@ -1121,6 +1161,18 @@ require_once __DIR__ . '/includes/sidebar.php';
           return;
         }
         loadCharts();
+      });
+    }
+
+    if (dateModeSelector) {
+      dateModeSelector.addEventListener('change', function () {
+        window.setTimeout(function () {
+          if (typeof form.requestSubmit === 'function') {
+            form.requestSubmit();
+            return;
+          }
+          loadCharts();
+        }, 0);
       });
     }
 

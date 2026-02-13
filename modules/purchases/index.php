@@ -1585,8 +1585,47 @@ $statusFilter = strtoupper(trim((string) ($_GET['purchase_status'] ?? '')));
 $assignmentFilter = strtoupper(trim((string) ($_GET['assignment_status'] ?? '')));
 $sourceFilter = strtoupper(trim((string) ($_GET['purchase_source'] ?? '')));
 $invoiceFilter = trim((string) ($_GET['invoice'] ?? ''));
-$fromDate = trim((string) ($_GET['from'] ?? ''));
-$toDate = trim((string) ($_GET['to'] ?? ''));
+$today = date('Y-m-d');
+$purchaseRangeStart = date('Y-m-01', strtotime($today));
+$purchaseRangeEnd = $today;
+if ($purchasesReady) {
+    $boundsStmt = db()->prepare(
+        'SELECT MIN(purchase_date) AS min_date, MAX(purchase_date) AS max_date
+         FROM purchases
+         WHERE company_id = :company_id
+           AND garage_id = :garage_id'
+    );
+    $boundsStmt->execute([
+        'company_id' => $companyId,
+        'garage_id' => $activeGarageId,
+    ]);
+    $dateBounds = $boundsStmt->fetch() ?: [];
+    if (date_filter_is_valid_iso((string) ($dateBounds['min_date'] ?? ''))) {
+        $purchaseRangeStart = (string) $dateBounds['min_date'];
+    }
+    if (date_filter_is_valid_iso((string) ($dateBounds['max_date'] ?? ''))) {
+        $maxDate = (string) $dateBounds['max_date'];
+        $purchaseRangeEnd = $maxDate > $today ? $maxDate : $today;
+    }
+}
+if ($purchaseRangeEnd < $purchaseRangeStart) {
+    $purchaseRangeStart = $purchaseRangeEnd;
+}
+$purchaseDateFilter = date_filter_resolve_request([
+    'company_id' => $companyId,
+    'garage_id' => $activeGarageId,
+    'range_start' => $purchaseRangeStart,
+    'range_end' => $purchaseRangeEnd,
+    'yearly_start' => date('Y-01-01', strtotime($purchaseRangeEnd)),
+    'session_namespace' => 'purchases_index',
+    'request_mode' => $_GET['date_mode'] ?? null,
+    'request_from' => $_GET['from'] ?? null,
+    'request_to' => $_GET['to'] ?? null,
+]);
+$dateMode = (string) ($purchaseDateFilter['mode'] ?? 'monthly');
+$dateModeOptions = date_filter_modes();
+$fromDate = (string) ($purchaseDateFilter['from_date'] ?? $purchaseRangeStart);
+$toDate = (string) ($purchaseDateFilter['to_date'] ?? $purchaseRangeEnd);
 $assignPurchaseId = get_int('assign_purchase_id', 0);
 $payPurchaseId = get_int('pay_purchase_id', 0);
 $editPurchaseId = get_int('edit_purchase_id', 0);
@@ -1607,12 +1646,6 @@ if (!in_array($assignmentFilter, $allowedAssignmentStatuses, true)) {
 }
 if (!in_array($sourceFilter, $allowedSourceStatuses, true)) {
     $sourceFilter = '';
-}
-if (!pur_is_valid_date($fromDate)) {
-    $fromDate = '';
-}
-if (!pur_is_valid_date($toDate)) {
-    $toDate = '';
 }
 
 $purchaseDeletedScopeSql = pur_supports_soft_delete() ? ' AND p.status_code <> "DELETED"' : '';
@@ -1650,14 +1683,10 @@ if ($invoiceFilter !== '') {
     $purchaseWhere[] = 'p.invoice_number LIKE :invoice_like';
     $purchaseParams['invoice_like'] = '%' . $invoiceFilter . '%';
 }
-if ($fromDate !== '') {
-    $purchaseWhere[] = 'p.purchase_date >= :from_date';
-    $purchaseParams['from_date'] = $fromDate;
-}
-if ($toDate !== '') {
-    $purchaseWhere[] = 'p.purchase_date <= :to_date';
-    $purchaseParams['to_date'] = $toDate;
-}
+$purchaseWhere[] = 'p.purchase_date >= :from_date';
+$purchaseParams['from_date'] = $fromDate;
+$purchaseWhere[] = 'p.purchase_date <= :to_date';
+$purchaseParams['to_date'] = $toDate;
 
 $purchases = [];
 $summary = [
@@ -2028,14 +2057,15 @@ if ($purchasesReady) {
 
           pur_csv_download($filename, $headers, $rows, [
             'garage_id' => $activeGarageId,
+            'date_mode' => $dateMode,
             'vendor_id' => $vendorFilter > 0 ? $vendorFilter : null,
             'payment_status' => $paymentFilter !== '' ? $paymentFilter : null,
             'purchase_status' => $statusFilter !== '' ? $statusFilter : null,
             'assignment_status' => $assignmentFilter !== '' ? $assignmentFilter : null,
             'purchase_source' => $sourceFilter !== '' ? $sourceFilter : null,
             'invoice' => $invoiceFilter !== '' ? $invoiceFilter : null,
-            'from' => $fromDate !== '' ? $fromDate : null,
-            'to' => $toDate !== '' ? $toDate : null,
+            'from' => $fromDate,
+            'to' => $toDate,
           ]);
 
         case 'vendor_outstanding':
@@ -2053,8 +2083,9 @@ if ($purchasesReady) {
           ], $vendorOutstandingRows);
           pur_csv_download('purchase_vendor_outstanding_' . date('Ymd_His') . '.csv', ['Vendor', 'Code', 'Purchases', 'Total', 'Paid', 'Outstanding'], $rows, [
             'garage_id' => $activeGarageId,
-            'from' => $fromDate !== '' ? $fromDate : null,
-            'to' => $toDate !== '' ? $toDate : null,
+            'date_mode' => $dateMode,
+            'from' => $fromDate,
+            'to' => $toDate,
           ]);
 
         case 'aging_summary':
@@ -2071,8 +2102,9 @@ if ($purchasesReady) {
           ]];
           pur_csv_download('purchase_aging_summary_' . date('Ymd_His') . '.csv', ['0-30 Days', '31-60 Days', '61-90 Days', '90+ Days', 'Total Outstanding'], $rows, [
             'garage_id' => $activeGarageId,
-            'from' => $fromDate !== '' ? $fromDate : null,
-            'to' => $toDate !== '' ? $toDate : null,
+            'date_mode' => $dateMode,
+            'from' => $fromDate,
+            'to' => $toDate,
           ]);
 
         case 'paid_unpaid':
@@ -2090,8 +2122,9 @@ if ($purchasesReady) {
           ]];
           pur_csv_download('purchase_paid_unpaid_' . date('Ymd_His') . '.csv', ['Paid Count', 'Partial Count', 'Unpaid Count', 'Paid Total', 'Partial Total', 'Unpaid Total'], $rows, [
             'garage_id' => $activeGarageId,
-            'from' => $fromDate !== '' ? $fromDate : null,
-            'to' => $toDate !== '' ? $toDate : null,
+            'date_mode' => $dateMode,
+            'from' => $fromDate,
+            'to' => $toDate,
           ]);
 
         default:
@@ -2703,7 +2736,13 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 
         <div class="card mb-3">
           <div class="card-header"><h3 class="card-title">Purchase Filters & Reports</h3></div>
-          <form method="get">
+          <form
+            method="get"
+            data-date-filter-form="1"
+            data-date-range-start="<?= e($purchaseRangeStart); ?>"
+            data-date-range-end="<?= e($purchaseRangeEnd); ?>"
+            data-date-yearly-start="<?= e(date('Y-01-01', strtotime($purchaseRangeEnd))); ?>"
+          >
             <div class="card-body row g-2">
               <div class="col-md-2">
                 <label class="form-label">Invoice</label>
@@ -2757,12 +2796,22 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                 </select>
               </div>
               <div class="col-md-2">
+                <label class="form-label">Date Mode</label>
+                <select name="date_mode" class="form-select">
+                  <?php foreach ($dateModeOptions as $modeValue => $modeLabel): ?>
+                    <option value="<?= e((string) $modeValue); ?>" <?= $dateMode === $modeValue ? 'selected' : ''; ?>>
+                      <?= e((string) $modeLabel); ?>
+                    </option>
+                  <?php endforeach; ?>
+                </select>
+              </div>
+              <div class="col-md-2">
                 <label class="form-label">From</label>
-                <input type="date" name="from" class="form-control" value="<?= e($fromDate); ?>">
+                <input type="date" name="from" class="form-control" value="<?= e($fromDate); ?>" required>
               </div>
               <div class="col-md-2">
                 <label class="form-label">To</label>
-                <input type="date" name="to" class="form-control" value="<?= e($toDate); ?>">
+                <input type="date" name="to" class="form-control" value="<?= e($toDate); ?>" required>
               </div>
             </div>
             <div class="card-footer d-flex gap-2">

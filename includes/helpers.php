@@ -260,6 +260,373 @@ function status_options(?string $current = null): array
     return $result;
 }
 
+function system_setting_get_value(int $companyId, int $garageId, string $settingKey, ?string $default = null): ?string
+{
+    if ($companyId <= 0) {
+        return $default;
+    }
+
+    $settingKey = trim($settingKey);
+    if ($settingKey === '') {
+        return $default;
+    }
+
+    try {
+        $garageScope = $garageId > 0 ? $garageId : null;
+        $stmt = db()->prepare(
+            'SELECT setting_value
+             FROM system_settings
+             WHERE company_id = :company_id
+               AND setting_key = :setting_key
+               AND status_code = "ACTIVE"
+               AND (garage_id = :garage_id OR garage_id IS NULL)
+             ORDER BY CASE WHEN garage_id = :garage_id THEN 0 ELSE 1 END, id DESC
+             LIMIT 1'
+        );
+        $stmt->execute([
+            'company_id' => $companyId,
+            'setting_key' => $settingKey,
+            'garage_id' => $garageScope,
+        ]);
+        $value = $stmt->fetchColumn();
+    } catch (Throwable $exception) {
+        return $default;
+    }
+
+    if ($value === false || $value === null) {
+        return $default;
+    }
+
+    $normalized = trim((string) $value);
+    return $normalized !== '' ? $normalized : $default;
+}
+
+function system_setting_upsert_value(
+    int $companyId,
+    ?int $garageId,
+    string $settingGroup,
+    string $settingKey,
+    ?string $settingValue,
+    string $valueType = 'STRING',
+    string $statusCode = 'ACTIVE',
+    ?int $actorUserId = null
+): int {
+    if ($companyId <= 0) {
+        return 0;
+    }
+
+    $settingGroup = strtoupper(trim($settingGroup));
+    $settingKey = trim($settingKey);
+    if ($settingGroup === '' || $settingKey === '') {
+        return 0;
+    }
+
+    $valueType = strtoupper(trim($valueType));
+    if (!in_array($valueType, ['STRING', 'NUMBER', 'BOOLEAN', 'JSON'], true)) {
+        $valueType = 'STRING';
+    }
+
+    $statusCode = normalize_status_code($statusCode);
+    $garageScope = ($garageId ?? 0) > 0 ? (int) $garageId : null;
+    $trimmedValue = $settingValue !== null ? trim($settingValue) : null;
+    $storedValue = $trimmedValue !== null && $trimmedValue !== '' ? $trimmedValue : null;
+
+    try {
+        $pdo = db();
+        $findStmt = $pdo->prepare(
+            'SELECT id
+             FROM system_settings
+             WHERE company_id = :company_id
+               AND setting_key = :setting_key
+               AND ((garage_id IS NULL AND :garage_id IS NULL) OR garage_id = :garage_id)
+             ORDER BY id DESC
+             LIMIT 1'
+        );
+        $findStmt->execute([
+            'company_id' => $companyId,
+            'setting_key' => $settingKey,
+            'garage_id' => $garageScope,
+        ]);
+        $existingId = (int) ($findStmt->fetchColumn() ?: 0);
+
+        if ($existingId > 0) {
+            $updateStmt = $pdo->prepare(
+                'UPDATE system_settings
+                 SET setting_group = :setting_group,
+                     setting_value = :setting_value,
+                     value_type = :value_type,
+                     status_code = :status_code,
+                     deleted_at = CASE WHEN :status_code = "DELETED" THEN NOW() ELSE NULL END
+                 WHERE id = :id
+                   AND company_id = :company_id'
+            );
+            $updateStmt->execute([
+                'setting_group' => $settingGroup,
+                'setting_value' => $storedValue,
+                'value_type' => $valueType,
+                'status_code' => $statusCode,
+                'id' => $existingId,
+                'company_id' => $companyId,
+            ]);
+            return $existingId;
+        }
+
+        $insertStmt = $pdo->prepare(
+            'INSERT INTO system_settings
+              (company_id, garage_id, setting_group, setting_key, setting_value, value_type, status_code, deleted_at, created_by)
+             VALUES
+              (:company_id, :garage_id, :setting_group, :setting_key, :setting_value, :value_type, :status_code, :deleted_at, :created_by)'
+        );
+        $insertStmt->execute([
+            'company_id' => $companyId,
+            'garage_id' => $garageScope,
+            'setting_group' => $settingGroup,
+            'setting_key' => $settingKey,
+            'setting_value' => $storedValue,
+            'value_type' => $valueType,
+            'status_code' => $statusCode,
+            'deleted_at' => $statusCode === 'DELETED' ? date('Y-m-d H:i:s') : null,
+            'created_by' => $actorUserId !== null && $actorUserId > 0 ? $actorUserId : null,
+        ]);
+        return (int) $pdo->lastInsertId();
+    } catch (Throwable $exception) {
+        return 0;
+    }
+}
+
+function date_filter_modes(): array
+{
+    return [
+        'daily' => 'Daily',
+        'weekly' => 'Weekly',
+        'monthly' => 'Monthly',
+        'yearly' => 'Yearly',
+        'custom' => 'Custom',
+    ];
+}
+
+function date_filter_is_valid_iso(?string $value): bool
+{
+    $raw = trim((string) $value);
+    if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $raw)) {
+        return false;
+    }
+
+    [$year, $month, $day] = array_map('intval', explode('-', $raw));
+    return checkdate($month, $day, $year);
+}
+
+function date_filter_normalize_mode(?string $value, string $fallback = 'monthly'): string
+{
+    $normalized = strtolower(trim((string) $value));
+    if (array_key_exists($normalized, date_filter_modes())) {
+        return $normalized;
+    }
+
+    $fallbackNormalized = strtolower(trim($fallback));
+    return array_key_exists($fallbackNormalized, date_filter_modes()) ? $fallbackNormalized : 'monthly';
+}
+
+function date_filter_clamp(string $date, string $minDate, string $maxDate): string
+{
+    if ($date < $minDate) {
+        return $minDate;
+    }
+    if ($date > $maxDate) {
+        return $maxDate;
+    }
+    return $date;
+}
+
+function date_filter_default_range_for_mode(
+    string $mode,
+    string $rangeStart,
+    string $rangeEnd,
+    ?string $yearlyStart = null,
+    ?string $customDefaultFrom = null,
+    ?string $customDefaultTo = null
+): array {
+    $start = date_filter_is_valid_iso($rangeStart) ? (string) $rangeStart : date('Y-m-01');
+    $end = date_filter_is_valid_iso($rangeEnd) ? (string) $rangeEnd : date('Y-m-d');
+    if ($end < $start) {
+        $end = $start;
+    }
+
+    $today = date('Y-m-d');
+    $boundedToday = date_filter_clamp($today, $start, $end);
+    $modeKey = date_filter_normalize_mode($mode, 'monthly');
+    $fromDate = $start;
+    $toDate = $boundedToday;
+
+    if ($modeKey === 'daily') {
+        $fromDate = $boundedToday;
+        $toDate = $boundedToday;
+    } elseif ($modeKey === 'weekly') {
+        $weekStart = date('Y-m-d', strtotime($boundedToday . ' -6 days'));
+        $fromDate = date_filter_clamp($weekStart, $start, $end);
+        $toDate = $boundedToday;
+    } elseif ($modeKey === 'monthly') {
+        $monthStart = date('Y-m-01', strtotime($boundedToday));
+        $fromDate = date_filter_clamp($monthStart, $start, $end);
+        $toDate = $boundedToday;
+    } elseif ($modeKey === 'yearly') {
+        $yearStart = $yearlyStart !== null && date_filter_is_valid_iso($yearlyStart)
+            ? (string) $yearlyStart
+            : date('Y-01-01', strtotime($boundedToday));
+        $fromDate = date_filter_clamp($yearStart, $start, $end);
+        $toDate = $boundedToday;
+    } else {
+        $customFrom = $customDefaultFrom !== null && date_filter_is_valid_iso($customDefaultFrom)
+            ? (string) $customDefaultFrom
+            : $start;
+        $customTo = $customDefaultTo !== null && date_filter_is_valid_iso($customDefaultTo)
+            ? (string) $customDefaultTo
+            : $boundedToday;
+        $fromDate = date_filter_clamp($customFrom, $start, $end);
+        $toDate = date_filter_clamp($customTo, $start, $end);
+    }
+
+    if ($toDate < $fromDate) {
+        $toDate = $fromDate;
+    }
+
+    return [
+        'from_date' => $fromDate,
+        'to_date' => $toDate,
+    ];
+}
+
+function date_filter_resolve_request(array $config): array
+{
+    $companyId = (int) ($config['company_id'] ?? 0);
+    $garageId = (int) ($config['garage_id'] ?? 0);
+
+    $rangeStart = (string) ($config['range_start'] ?? date('Y-m-01'));
+    $rangeEnd = (string) ($config['range_end'] ?? date('Y-m-d'));
+    if (!date_filter_is_valid_iso($rangeStart)) {
+        $rangeStart = date('Y-m-01');
+    }
+    if (!date_filter_is_valid_iso($rangeEnd)) {
+        $rangeEnd = date('Y-m-d');
+    }
+    if ($rangeEnd < $rangeStart) {
+        $rangeEnd = $rangeStart;
+    }
+
+    $systemDefaultMode = date_filter_normalize_mode(
+        system_setting_get_value($companyId, $garageId, 'default_date_filter_mode', 'monthly'),
+        'monthly'
+    );
+    $sessionNamespaceRaw = trim((string) ($config['session_namespace'] ?? 'global'));
+    $sessionNamespace = preg_replace('/[^a-z0-9_]+/i', '_', $sessionNamespaceRaw) ?: 'global';
+    $sessionKey = 'gac_date_filter_mode_' . $companyId . '_' . strtolower($sessionNamespace);
+    $sessionFromKey = $sessionKey . '_from';
+    $sessionToKey = $sessionKey . '_to';
+
+    $requestedModeRaw = isset($config['request_mode']) ? trim((string) $config['request_mode']) : '';
+    $hasRequestedMode = $requestedModeRaw !== '';
+    $requestedMode = date_filter_normalize_mode($requestedModeRaw, $systemDefaultMode);
+    $sessionMode = isset($_SESSION[$sessionKey]) ? date_filter_normalize_mode((string) $_SESSION[$sessionKey], $systemDefaultMode) : '';
+    $resolvedMode = $hasRequestedMode
+        ? $requestedMode
+        : ($sessionMode !== '' ? $sessionMode : $systemDefaultMode);
+
+    $defaultRange = date_filter_default_range_for_mode(
+        $resolvedMode,
+        $rangeStart,
+        $rangeEnd,
+        isset($config['yearly_start']) ? (string) $config['yearly_start'] : null,
+        isset($config['custom_default_from']) ? (string) $config['custom_default_from'] : null,
+        isset($config['custom_default_to']) ? (string) $config['custom_default_to'] : null
+    );
+
+    $requestedFromRaw = isset($config['request_from']) ? trim((string) $config['request_from']) : '';
+    $requestedToRaw = isset($config['request_to']) ? trim((string) $config['request_to']) : '';
+    $hasRequestedFrom = date_filter_is_valid_iso($requestedFromRaw);
+    $hasRequestedTo = date_filter_is_valid_iso($requestedToRaw);
+    $sessionFrom = isset($_SESSION[$sessionFromKey]) && date_filter_is_valid_iso((string) $_SESSION[$sessionFromKey])
+        ? (string) $_SESSION[$sessionFromKey]
+        : '';
+    $sessionTo = isset($_SESSION[$sessionToKey]) && date_filter_is_valid_iso((string) $_SESSION[$sessionToKey])
+        ? (string) $_SESSION[$sessionToKey]
+        : '';
+    $useSessionCustomRange = $resolvedMode === 'custom' && !$hasRequestedFrom && !$hasRequestedTo && $sessionFrom !== '' && $sessionTo !== '';
+
+    if ($useSessionCustomRange) {
+        $fromDate = $sessionFrom;
+        $toDate = $sessionTo;
+    } else {
+        $fromDate = $hasRequestedFrom ? $requestedFromRaw : (string) $defaultRange['from_date'];
+        $toDate = $hasRequestedTo ? $requestedToRaw : (string) $defaultRange['to_date'];
+    }
+
+    $fromDate = date_filter_clamp($fromDate, $rangeStart, $rangeEnd);
+    $toDate = date_filter_clamp($toDate, $rangeStart, $rangeEnd);
+    if ($toDate < $fromDate) {
+        $toDate = $fromDate;
+    }
+
+    if (!$hasRequestedMode && ($hasRequestedFrom || $hasRequestedTo)) {
+        $resolvedMode = 'custom';
+    }
+    $_SESSION[$sessionKey] = $resolvedMode;
+    if ($resolvedMode === 'custom') {
+        $_SESSION[$sessionFromKey] = $fromDate;
+        $_SESSION[$sessionToKey] = $toDate;
+    } else {
+        unset($_SESSION[$sessionFromKey], $_SESSION[$sessionToKey]);
+    }
+
+    return [
+        'mode' => $resolvedMode,
+        'default_mode' => $systemDefaultMode,
+        'from_date' => $fromDate,
+        'to_date' => $toDate,
+        'range_start' => $rangeStart,
+        'range_end' => $rangeEnd,
+    ];
+}
+
+function company_logo_relative_path(int $companyId, int $garageId = 0): ?string
+{
+    $rawPath = system_setting_get_value($companyId, $garageId, 'business_logo_path', null);
+    if ($rawPath === null) {
+        return null;
+    }
+
+    $normalized = str_replace('\\', '/', trim($rawPath));
+    $normalized = ltrim($normalized, '/');
+    if ($normalized === '' || str_contains($normalized, '..')) {
+        return null;
+    }
+    if (!str_starts_with($normalized, 'assets/uploads/company_logos/')) {
+        return null;
+    }
+
+    return $normalized;
+}
+
+function company_logo_fs_path(int $companyId, int $garageId = 0): ?string
+{
+    $relative = company_logo_relative_path($companyId, $garageId);
+    if ($relative === null) {
+        return null;
+    }
+
+    $fullPath = APP_ROOT . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $relative);
+    return is_file($fullPath) ? $fullPath : null;
+}
+
+function company_logo_url(int $companyId, int $garageId = 0): ?string
+{
+    $relative = company_logo_relative_path($companyId, $garageId);
+    if ($relative === null) {
+        return null;
+    }
+
+    return company_logo_fs_path($companyId, $garageId) !== null ? url($relative) : null;
+}
+
 function table_columns(string $tableName): array
 {
     static $cache = [];

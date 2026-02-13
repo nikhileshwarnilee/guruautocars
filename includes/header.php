@@ -20,6 +20,12 @@ if ($requestPathForRedirect === '') {
 $flashMessages = flash_pull_all();
 $globalVehicleSearchEnabled = $user !== null && has_permission('vehicle.view');
 $globalVehicleSearchApiUrl = $globalVehicleSearchEnabled ? url('modules/vehicles/search_api.php') : '';
+$headerCompanyId = (int) ($user['company_id'] ?? active_company_id());
+$headerCompanyLogoUrl = $headerCompanyId > 0 ? company_logo_url($headerCompanyId, active_garage_id()) : null;
+$appCssVersion = (string) @filemtime(__DIR__ . '/../assets/css/app.css');
+if ($appCssVersion === '') {
+    $appCssVersion = (string) time();
+}
 ?>
 <!doctype html>
 <html lang="en">
@@ -30,11 +36,12 @@ $globalVehicleSearchApiUrl = $globalVehicleSearchEnabled ? url('modules/vehicles
     <link rel="stylesheet" href="<?= e(url('assets/plugins/bootstrap-icons/bootstrap-icons.min.css')); ?>" />
     <link rel="stylesheet" href="<?= e(url('assets/plugins/overlayscrollbars/overlayscrollbars.min.css')); ?>" />
     <link rel="stylesheet" href="<?= e(url('assets/css/adminlte.min.css')); ?>" />
-    <link rel="stylesheet" href="<?= e(url('assets/css/app.css')); ?>" />
+    <link rel="stylesheet" href="<?= e(url('assets/css/app.css?v=' . $appCssVersion)); ?>" />
   </head>
   <body
     class="layout-fixed sidebar-expand-lg bg-body-tertiary"
     data-inline-customer-form-url="<?= e(url('modules/customers/inline_form.php')); ?>"
+    data-inline-vehicle-form-url="<?= e(url('modules/vehicles/inline_form.php')); ?>"
     data-active-menu="<?= e($activeMenu); ?>"
     data-page-title="<?= e($pageTitle); ?>"
     data-dashboard-url="<?= e(url('dashboard.php')); ?>"
@@ -99,8 +106,18 @@ $globalVehicleSearchApiUrl = $globalVehicleSearchEnabled ? url('modules/vehicles
           <ul class="navbar-nav ms-auto align-items-center">
             <?php if ($user !== null): ?>
               <li class="nav-item me-2 d-none d-md-block">
-                <span class="badge text-bg-light border">
-                  <?= e((string) ($user['company_name'] ?? '')); ?>
+                <span class="d-inline-flex align-items-center gap-2">
+                  <?php if ($headerCompanyLogoUrl !== null): ?>
+                    <img
+                      src="<?= e($headerCompanyLogoUrl); ?>"
+                      alt="Business Logo"
+                      class="rounded border bg-white p-1"
+                      style="height: 26px; width: auto;"
+                    />
+                  <?php endif; ?>
+                  <span class="badge text-bg-light border">
+                    <?= e((string) ($user['company_name'] ?? '')); ?>
+                  </span>
                 </span>
               </li>
               <?php if (count($garages) > 1): ?>

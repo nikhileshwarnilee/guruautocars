@@ -20,6 +20,8 @@ $scopeGarageLabel = (string) $scope['scope_garage_label'];
 $financialYears = $scope['financial_years'];
 $selectedFyId = (int) $scope['selected_fy_id'];
 $fyLabel = (string) $scope['fy_label'];
+$dateMode = (string) $scope['date_mode'];
+$dateModeOptions = $scope['date_mode_options'];
 $fromDate = (string) $scope['from_date'];
 $toDate = (string) $scope['to_date'];
 $canExportData = (bool) $scope['can_export_data'];
@@ -332,7 +334,15 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       <div class="card card-primary mb-3">
         <div class="card-header"><h3 class="card-title">Filters</h3></div>
         <div class="card-body">
-          <form method="get" id="vehicles-report-filter-form" class="row g-2 align-items-end">
+          <form
+            method="get"
+            id="vehicles-report-filter-form"
+            class="row g-2 align-items-end"
+            data-date-filter-form="1"
+            data-date-range-start="<?= e((string) $scope['date_range_start']); ?>"
+            data-date-range-end="<?= e((string) $scope['date_range_end']); ?>"
+            data-date-yearly-start="<?= e((string) $scope['fy_start']); ?>"
+          >
             <?php if ($allowAllGarages || count($garageIds) > 1): ?>
               <div class="col-md-3">
                 <label class="form-label">Garage Scope</label>
@@ -364,6 +374,16 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                     <option value="<?= (int) $fy['id']; ?>" <?= ((int) $fy['id'] === $selectedFyId) ? 'selected' : ''; ?>><?= e((string) $fy['fy_label']); ?></option>
                   <?php endforeach; ?>
                 <?php endif; ?>
+              </select>
+            </div>
+            <div class="col-md-2">
+              <label class="form-label">Date Mode</label>
+              <select name="date_mode" class="form-select">
+                <?php foreach ($dateModeOptions as $modeValue => $modeLabel): ?>
+                  <option value="<?= e((string) $modeValue); ?>" <?= $dateMode === $modeValue ? 'selected' : ''; ?>>
+                    <?= e((string) $modeLabel); ?>
+                  </option>
+                <?php endforeach; ?>
               </select>
             </div>
             <div class="col-md-2"><label class="form-label">From</label><input type="date" name="from" class="form-control" value="<?= e($fromDate); ?>" required /></div>

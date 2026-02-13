@@ -1696,6 +1696,10 @@ $invoiceStmt->execute([
     'garage_id' => $garageId,
 ]);
 $invoice = $invoiceStmt->fetch() ?: null;
+$canPrintJob = has_permission('job.print') || has_permission('job.manage') || has_permission('job.view');
+$jobPrintRestricted = $jobStatus === 'CANCELLED' || normalize_status_code((string) ($job['status_code'] ?? 'ACTIVE')) === 'DELETED';
+$canPrintRestricted = has_permission('job.print.cancelled') || has_permission('job.manage');
+$canRenderPrintButton = $canPrintJob && (!$jobPrintRestricted || $canPrintRestricted);
 
 $nextStatuses = [];
 foreach (job_workflow_statuses(true) as $status) {
@@ -1772,6 +1776,13 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                 <a href="<?= e(url('modules/estimates/view.php?id=' . (int) $job['estimate_id'])); ?>" class="btn btn-info btn-sm">
                   Source Estimate
                 </a>
+              <?php endif; ?>
+              <?php if ($canRenderPrintButton): ?>
+                <a href="<?= e(url('modules/jobs/print_job_card.php?id=' . $jobId)); ?>" class="btn btn-outline-dark btn-sm" target="_blank">
+                  Print Job Card
+                </a>
+              <?php elseif ($jobPrintRestricted): ?>
+                <span class="btn btn-outline-dark btn-sm disabled">Print blocked for <?= e($jobStatus); ?></span>
               <?php endif; ?>
               <?php if ($invoice): ?>
                 <a href="<?= e(url('modules/billing/print_invoice.php?id=' . (int) $invoice['id'])); ?>" class="btn btn-success btn-sm" target="_blank">
@@ -2062,7 +2073,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                   </div>
                   <div class="col-md-3">
                     <label class="form-label">Service Master</label>
-                    <select id="add-labor-service" name="service_id" class="form-select" data-searchable-select="off" <?= $jobLocked ? 'disabled' : ''; ?>>
+                    <select id="add-labor-service" name="service_id" class="form-select" <?= $jobLocked ? 'disabled' : ''; ?>>
                       <option value="0" data-category-key="">Custom Labor Item</option>
                       <?php foreach ($servicesMaster as $service): ?>
                         <?php $serviceCategoryKey = ((int) ($service['category_id'] ?? 0) > 0) ? (string) (int) $service['category_id'] : 'uncategorized'; ?>
@@ -2346,20 +2357,8 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                     <small id="add-part-mode-hint" class="text-muted d-block mt-1">VIS suggestions are optional. Use All Parts anytime for manual override.</small>
                   </div>
                   <div class="col-md-3">
-                    <label class="form-label">Search</label>
-                    <input
-                      type="search"
-                      id="add-part-search"
-                      class="form-control"
-                      placeholder="Part name or SKU"
-                      autocomplete="off"
-                      <?= $jobLocked ? 'disabled' : ''; ?>
-                    >
-                    <small class="text-muted d-block mt-1">Keyboard: <kbd>/</kbd> search, <kbd>Alt+1</kbd>/<kbd>Alt+2</kbd>/<kbd>Alt+3</kbd> mode.</small>
-                  </div>
-                  <div class="col-md-3">
                     <label class="form-label">Part Master</label>
-                    <select id="add-part-select" name="part_id" class="form-select" data-searchable-select="off" required <?= $jobLocked ? 'disabled' : ''; ?>>
+                    <select id="add-part-select" name="part_id" class="form-select" required <?= $jobLocked ? 'disabled' : ''; ?>>
                       <option value="">Select Part</option>
                       <?php foreach ($partsMaster as $part): ?>
                         <?php
@@ -2383,6 +2382,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                         </option>
                       <?php endforeach; ?>
                     </select>
+                    <small class="text-muted d-block mt-1">Keyboard: <kbd>/</kbd> search, <kbd>Alt+1</kbd>/<kbd>Alt+2</kbd>/<kbd>Alt+3</kbd> mode.</small>
                     <small id="add-part-stock-hint" class="text-muted d-block mt-1"></small>
                   </div>
                   <div class="col-md-1">
@@ -2621,6 +2621,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       function syncLaborServiceOptions() {
         var selectedCategoryKey = laborCategorySelect.value || '';
         var hasCategory = selectedCategoryKey !== '';
+        var hasSearchableRefresh = typeof gacRefreshSearchableSelect === 'function';
         for (var i = 0; i < laborServiceSelect.options.length; i++) {
           var option = laborServiceSelect.options[i];
           if (!option) {
@@ -2628,12 +2629,23 @@ require_once __DIR__ . '/../../includes/sidebar.php';
           }
 
           if (option.value === '0') {
-            option.hidden = false;
+            option.setAttribute('data-gac-filter-visible', '1');
+            if (!hasSearchableRefresh) {
+              option.hidden = false;
+            }
             continue;
           }
 
           var optionCategoryKey = option.getAttribute('data-category-key') || '';
-          option.hidden = hasCategory && optionCategoryKey !== selectedCategoryKey;
+          var visibleByCategory = !hasCategory || optionCategoryKey === selectedCategoryKey;
+          option.setAttribute('data-gac-filter-visible', visibleByCategory ? '1' : '0');
+          if (!hasSearchableRefresh) {
+            option.hidden = !visibleByCategory;
+          }
+        }
+
+        if (hasSearchableRefresh) {
+          gacRefreshSearchableSelect(laborServiceSelect);
         }
 
         if (laborInputsLocked) {
@@ -2642,7 +2654,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 
         laborServiceSelect.disabled = false;
         var currentOption = laborServiceSelect.options[laborServiceSelect.selectedIndex];
-        if (currentOption && currentOption.hidden) {
+        if (currentOption && currentOption.value !== '0' && currentOption.getAttribute('data-gac-filter-visible') === '0') {
           laborServiceSelect.value = '0';
         }
       }
@@ -2727,8 +2739,6 @@ require_once __DIR__ . '/../../includes/sidebar.php';
     var partPrice = document.getElementById('add-part-price');
     var partGst = document.getElementById('add-part-gst');
     var partStockHint = document.getElementById('add-part-stock-hint');
-    var partQty = document.getElementById('add-part-qty');
-    var partSearchInput = document.getElementById('add-part-search');
     var partModeInput = document.getElementById('add-part-mode');
     var partModeGroup = document.getElementById('add-part-mode-group');
     var partModeHint = document.getElementById('add-part-mode-hint');
@@ -2775,12 +2785,24 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       return true;
     }
 
-    function optionMatchesPartSearch(option, term) {
-      if (!option || option.value === '' || term === '') {
-        return true;
+    function getPartSearchInput() {
+      if (!partSelect) {
+        return null;
       }
-      var text = normalizePartSearch((option.getAttribute('data-name') || '') + ' ' + (option.getAttribute('data-sku') || ''));
-      return text.indexOf(term) !== -1;
+      if (typeof gacSearchableSelectInput === 'function') {
+        var enhancedInput = gacSearchableSelectInput(partSelect);
+        if (enhancedInput) {
+          return enhancedInput;
+        }
+      }
+      if (!partSelect.closest) {
+        return null;
+      }
+      var wrapper = partSelect.closest('.gac-searchable-select');
+      if (!wrapper) {
+        return null;
+      }
+      return wrapper.querySelector('.gac-search-input');
     }
 
     function updatePartModeButtons(activeMode) {
@@ -2802,9 +2824,9 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       }
 
       var mode = partModeInput ? (partModeInput.value || 'all') : 'all';
-      var searchTerm = normalizePartSearch(partSearchInput ? partSearchInput.value : '');
+      var searchInput = getPartSearchInput();
+      var searchTerm = normalizePartSearch(searchInput ? searchInput.value : '');
       var selectedValue = partSelect.value || '';
-      var visibleCount = 0;
       var selectedForcedVisible = false;
 
       for (var index = 0; index < partSelect.options.length; index++) {
@@ -2813,20 +2835,34 @@ require_once __DIR__ . '/../../includes/sidebar.php';
           continue;
         }
         if (option.value === '') {
+          option.setAttribute('data-gac-filter-visible', '1');
           option.hidden = false;
           continue;
         }
 
-        var visibleByRule = optionMatchesPartMode(option, mode) && optionMatchesPartSearch(option, searchTerm);
+        var visibleByRule = optionMatchesPartMode(option, mode);
         if (!visibleByRule && selectedValue !== '' && option.value === selectedValue) {
           visibleByRule = true;
           selectedForcedVisible = true;
         }
 
-        option.hidden = !visibleByRule;
-        if (visibleByRule) {
-          visibleCount++;
+        option.setAttribute('data-gac-filter-visible', visibleByRule ? '1' : '0');
+        if (typeof gacRefreshSearchableSelect !== 'function') {
+          option.hidden = !visibleByRule;
         }
+      }
+
+      if (typeof gacRefreshSearchableSelect === 'function') {
+        gacRefreshSearchableSelect(partSelect);
+      }
+
+      var visibleCount = 0;
+      for (var countIndex = 0; countIndex < partSelect.options.length; countIndex++) {
+        var visibleOption = partSelect.options[countIndex];
+        if (!visibleOption || visibleOption.value === '' || visibleOption.hidden) {
+          continue;
+        }
+        visibleCount++;
       }
 
       if (selectedValue === '') {
@@ -2862,20 +2898,6 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       partModeHint.textContent = message;
     }
 
-    function firstVisiblePartOption() {
-      if (!partSelect) {
-        return null;
-      }
-      for (var index = 0; index < partSelect.options.length; index++) {
-        var option = partSelect.options[index];
-        if (!option || option.value === '' || option.hidden) {
-          continue;
-        }
-        return option;
-      }
-      return null;
-    }
-
     function applyPartDefaults() {
       if (!partSelect || !partPrice || !partGst || !partStockHint) {
         return;
@@ -2902,9 +2924,16 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       syncPartOptionVisibility();
       applyPartDefaults();
 
-      if (focusSearch && partSearchInput && !partSearchInput.disabled) {
-        partSearchInput.focus();
-        partSearchInput.select();
+      var partSearchInput = getPartSearchInput();
+      if (focusSearch) {
+        if (partSearchInput && !partSearchInput.disabled) {
+          partSearchInput.focus();
+          if (typeof partSearchInput.select === 'function') {
+            partSearchInput.select();
+          }
+        } else if (partSelect && !partSelect.disabled) {
+          partSelect.focus();
+        }
       }
     }
 
@@ -2914,28 +2943,15 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         syncPartOptionVisibility();
       });
 
-      if (partSearchInput) {
-        partSearchInput.addEventListener('input', function () {
+      document.addEventListener('input', function (event) {
+        var partSearchInput = getPartSearchInput();
+        if (!partSearchInput || event.target !== partSearchInput) {
+          return;
+        }
+        window.requestAnimationFrame(function () {
           syncPartOptionVisibility();
         });
-
-        partSearchInput.addEventListener('keydown', function (event) {
-          if (event.key !== 'Enter') {
-            return;
-          }
-          event.preventDefault();
-          var firstVisible = firstVisiblePartOption();
-          if (!firstVisible) {
-            return;
-          }
-          partSelect.value = firstVisible.value;
-          partSelect.dispatchEvent(new Event('change'));
-          if (partQty && !partQty.disabled) {
-            partQty.focus();
-            partQty.select();
-          }
-        });
-      }
+      });
 
       for (var buttonIndex = 0; buttonIndex < partModeButtons.length; buttonIndex++) {
         var modeButton = partModeButtons[buttonIndex];
@@ -2952,10 +2968,16 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         var isTypingContext = targetTag === 'INPUT' || targetTag === 'TEXTAREA' || targetTag === 'SELECT';
 
         if (!isTypingContext && event.key === '/' && !event.altKey && !event.ctrlKey && !event.metaKey) {
+          var partSearchInput = getPartSearchInput();
           if (partSearchInput && !partSearchInput.disabled) {
             event.preventDefault();
             partSearchInput.focus();
-            partSearchInput.select();
+            if (typeof partSearchInput.select === 'function') {
+              partSearchInput.select();
+            }
+          } else if (partSelect && !partSelect.disabled) {
+            event.preventDefault();
+            partSelect.focus();
           }
           return;
         }
@@ -2988,6 +3010,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 
       setPartMode(partModeInput ? partModeInput.value : 'all', false);
       applyPartDefaults();
+      window.setTimeout(syncPartOptionVisibility, 0);
     }
 
     var nextStatusSelect = document.getElementById('next-status-select');

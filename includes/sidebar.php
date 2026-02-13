@@ -20,12 +20,20 @@ $isAdministrationOpen = $isOrganizationSystemOpen
     || is_menu_group_open('people.', $activeMenu)
     || is_menu_group_open('services.', $activeMenu)
     || is_menu_group_open('vis.', $activeMenu);
+$sidebarUser = current_user();
+$sidebarCompanyId = (int) ($sidebarUser['company_id'] ?? active_company_id());
+$sidebarCompanyLogo = $sidebarCompanyId > 0 ? company_logo_url($sidebarCompanyId, active_garage_id()) : null;
+$sidebarBrandLogo = $sidebarCompanyLogo !== null ? $sidebarCompanyLogo : url('assets/images/AdminLTELogo.png');
+$sidebarBrandName = trim((string) ($sidebarUser['company_name'] ?? APP_SHORT_NAME));
+if ($sidebarBrandName === '') {
+    $sidebarBrandName = APP_SHORT_NAME;
+}
 ?>
 <aside class="app-sidebar bg-body-secondary shadow" data-bs-theme="dark">
   <div class="sidebar-brand">
     <a href="<?= e(url('dashboard.php')); ?>" class="brand-link">
-      <img src="<?= e(url('assets/images/AdminLTELogo.png')); ?>" alt="Guru Auto Cars" class="brand-image opacity-75 shadow" />
-      <span class="brand-text fw-light">Guru Auto Cars</span>
+      <img src="<?= e($sidebarBrandLogo); ?>" alt="<?= e($sidebarBrandName); ?>" class="brand-image opacity-75 shadow" />
+      <span class="brand-text fw-light"><?= e($sidebarBrandName); ?></span>
     </a>
   </div>
   <div class="sidebar-wrapper">
