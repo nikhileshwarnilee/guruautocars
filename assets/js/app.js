@@ -1551,7 +1551,8 @@ function initSearchableSelects() {
       highlightedIndex: -1,
       filteredEntries: [],
       closingTimer: null,
-      placeholderText: input.placeholder
+      placeholderText: input.placeholder,
+      clearOnFocus: false
     };
 
     if (isCustomerSelect && !select.disabled) {
@@ -1568,7 +1569,36 @@ function initSearchableSelects() {
     syncInputWithSelection(state);
     renderComboboxMenu(state, '');
 
+    function clearComboboxTypedQuery() {
+      if (input.disabled) {
+        return;
+      }
+      input.value = '';
+    }
+
+    function handlePointerActivation() {
+      if (input.disabled) {
+        return;
+      }
+
+      if (document.activeElement === input) {
+        clearComboboxTypedQuery();
+        renderComboboxMenu(state, '');
+        openComboboxMenu(state);
+        return;
+      }
+
+      state.clearOnFocus = true;
+    }
+
+    input.addEventListener('mousedown', handlePointerActivation);
+    input.addEventListener('touchstart', handlePointerActivation);
+
     input.addEventListener('focus', function () {
+      if (state.clearOnFocus) {
+        clearComboboxTypedQuery();
+        state.clearOnFocus = false;
+      }
       renderComboboxMenu(state, input.value || '');
       openComboboxMenu(state);
     });
@@ -1619,6 +1649,7 @@ function initSearchableSelects() {
     });
 
     input.addEventListener('blur', function () {
+      state.clearOnFocus = false;
       if (state.closingTimer) {
         window.clearTimeout(state.closingTimer);
       }

@@ -138,6 +138,21 @@ function vis_mapping_resolve_status(PDO $pdo, string $entity, int $recordId, str
     return $result;
 }
 
+function vis_mapping_parse_part_ids(mixed $rawPartIds, array $allowedPartLookup): array
+{
+    $inputs = is_array($rawPartIds) ? $rawPartIds : [$rawPartIds];
+    $selectedPartIds = [];
+    foreach ($inputs as $rawPartId) {
+        $partId = (int) $rawPartId;
+        if ($partId <= 0 || !isset($allowedPartLookup[$partId])) {
+            continue;
+        }
+        $selectedPartIds[$partId] = true;
+    }
+
+    return array_keys($selectedPartIds);
+}
+
 $partsStmt = db()->prepare(
     'SELECT id, part_name, part_sku
      FROM parts
@@ -147,6 +162,13 @@ $partsStmt = db()->prepare(
 );
 $partsStmt->execute(['company_id' => $companyId]);
 $parts = $partsStmt->fetchAll();
+$partLookup = [];
+foreach ($parts as $part) {
+    $partId = (int) ($part['id'] ?? 0);
+    if ($partId > 0) {
+        $partLookup[$partId] = true;
+    }
+}
 
 $servicesStmt = db()->prepare(
     'SELECT id, service_name, service_code
@@ -181,35 +203,102 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     if ($action === 'create_compatibility') {
         $variantId = post_int('variant_id');
-        $partId = post_int('part_id');
+        $partIds = vis_mapping_parse_part_ids($_POST['part_ids'] ?? ($_POST['part_id'] ?? []), $partLookup);
         $note = post_string('compatibility_note', 255);
         $statusCode = normalize_status_code((string) ($_POST['status_code'] ?? 'ACTIVE'));
 
-        if ($variantId <= 0 || $partId <= 0) {
-            flash_set('vis_map_error', 'Variant and part are required for compatibility mapping.', 'danger');
+        if ($variantId <= 0 || $partIds === []) {
+            flash_set('vis_map_error', 'Variant and at least one valid part are required for compatibility mapping.', 'danger');
             redirect('modules/vis/compatibility.php');
         }
 
+        $pdo = db();
         try {
-            $stmt = db()->prepare(
+            $params = [
+                'company_id' => $companyId,
+                'variant_id' => $variantId,
+            ];
+            $placeholders = [];
+            foreach ($partIds as $index => $partId) {
+                $paramName = 'part_id_' . $index;
+                $placeholders[] = ':' . $paramName;
+                $params[$paramName] = $partId;
+            }
+
+            $existingStmt = $pdo->prepare(
+                'SELECT part_id
+                 FROM vis_part_compatibility
+                 WHERE company_id = :company_id
+                   AND variant_id = :variant_id
+                   AND part_id IN (' . implode(', ', $placeholders) . ')'
+            );
+            $existingStmt->execute($params);
+            $existingPartLookup = [];
+            foreach ($existingStmt->fetchAll() as $existingRow) {
+                $existingPartId = (int) ($existingRow['part_id'] ?? 0);
+                if ($existingPartId > 0) {
+                    $existingPartLookup[$existingPartId] = true;
+                }
+            }
+
+            $insertStmt = $pdo->prepare(
                 'INSERT INTO vis_part_compatibility
                   (company_id, variant_id, part_id, compatibility_note, status_code, deleted_at)
                  VALUES
                   (:company_id, :variant_id, :part_id, :compatibility_note, :status_code, :deleted_at)'
             );
-            $stmt->execute([
-                'company_id' => $companyId,
-                'variant_id' => $variantId,
-                'part_id' => $partId,
-                'compatibility_note' => $note !== '' ? $note : null,
-                'status_code' => $statusCode,
-                'deleted_at' => $statusCode === 'DELETED' ? date('Y-m-d H:i:s') : null,
-            ]);
+            $createdCount = 0;
+            $skippedCount = 0;
+            $firstInsertId = 0;
+            $pdo->beginTransaction();
+            foreach ($partIds as $partId) {
+                if (isset($existingPartLookup[(int) $partId])) {
+                    $skippedCount++;
+                    continue;
+                }
 
-            log_audit('vis_mapping', 'create_part_compatibility', (int) db()->lastInsertId(), 'Created VIS part compatibility mapping');
-            flash_set('vis_map_success', 'Part compatibility mapping created.', 'success');
+                $insertStmt->execute([
+                    'company_id' => $companyId,
+                    'variant_id' => $variantId,
+                    'part_id' => $partId,
+                    'compatibility_note' => $note !== '' ? $note : null,
+                    'status_code' => $statusCode,
+                    'deleted_at' => $statusCode === 'DELETED' ? date('Y-m-d H:i:s') : null,
+                ]);
+                $createdCount++;
+                if ($firstInsertId === 0) {
+                    $firstInsertId = (int) $pdo->lastInsertId();
+                }
+            }
+            $pdo->commit();
+
+            if ($createdCount > 0) {
+                log_audit('vis_mapping', 'create_part_compatibility', $firstInsertId, 'Created VIS part compatibility mapping', [
+                    'entity' => 'vis_part_compatibility',
+                    'source' => 'UI',
+                    'after' => [
+                        'variant_id' => $variantId,
+                        'created_count' => $createdCount,
+                        'status_code' => $statusCode,
+                    ],
+                    'metadata' => [
+                        'part_ids' => $partIds,
+                        'skipped_duplicates' => $skippedCount,
+                    ],
+                ]);
+                flash_set('vis_map_success', 'Part compatibility mappings created for ' . $createdCount . ' part(s).', 'success');
+            } elseif ($skippedCount > 0) {
+                flash_set('vis_map_warning', 'No new compatibility mappings were created because selected parts are already mapped to this variant.', 'warning');
+            }
+
+            if ($createdCount > 0 && $skippedCount > 0) {
+                flash_set('vis_map_warning', 'Skipped ' . $skippedCount . ' part(s) already mapped to this variant.', 'warning');
+            }
         } catch (Throwable $exception) {
-            flash_set('vis_map_error', 'Unable to create compatibility mapping. Duplicate mapping exists.', 'danger');
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+            flash_set('vis_map_error', 'Unable to create compatibility mappings.', 'danger');
         }
 
         redirect('modules/vis/compatibility.php');
@@ -255,35 +344,103 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     if ($action === 'create_service_part_map') {
         $serviceId = post_int('service_id');
-        $partId = post_int('part_id');
+        $partIds = vis_mapping_parse_part_ids($_POST['part_ids'] ?? ($_POST['part_id'] ?? []), $partLookup);
         $isRequired = post_int('is_required', 1) === 1 ? 1 : 0;
         $statusCode = normalize_status_code((string) ($_POST['status_code'] ?? 'ACTIVE'));
 
-        if ($serviceId <= 0 || $partId <= 0) {
-            flash_set('vis_map_error', 'Service and part are required for service-to-part mapping.', 'danger');
+        if ($serviceId <= 0 || $partIds === []) {
+            flash_set('vis_map_error', 'Service and at least one valid part are required for service-to-part mapping.', 'danger');
             redirect('modules/vis/compatibility.php');
         }
 
+        $pdo = db();
         try {
-            $stmt = db()->prepare(
+            $params = [
+                'company_id' => $companyId,
+                'service_id' => $serviceId,
+            ];
+            $placeholders = [];
+            foreach ($partIds as $index => $partId) {
+                $paramName = 'part_id_' . $index;
+                $placeholders[] = ':' . $paramName;
+                $params[$paramName] = $partId;
+            }
+
+            $existingStmt = $pdo->prepare(
+                'SELECT part_id
+                 FROM vis_service_part_map
+                 WHERE company_id = :company_id
+                   AND service_id = :service_id
+                   AND part_id IN (' . implode(', ', $placeholders) . ')'
+            );
+            $existingStmt->execute($params);
+            $existingPartLookup = [];
+            foreach ($existingStmt->fetchAll() as $existingRow) {
+                $existingPartId = (int) ($existingRow['part_id'] ?? 0);
+                if ($existingPartId > 0) {
+                    $existingPartLookup[$existingPartId] = true;
+                }
+            }
+
+            $insertStmt = $pdo->prepare(
                 'INSERT INTO vis_service_part_map
                   (company_id, service_id, part_id, is_required, status_code, deleted_at)
                  VALUES
                   (:company_id, :service_id, :part_id, :is_required, :status_code, :deleted_at)'
             );
-            $stmt->execute([
-                'company_id' => $companyId,
-                'service_id' => $serviceId,
-                'part_id' => $partId,
-                'is_required' => $isRequired,
-                'status_code' => $statusCode,
-                'deleted_at' => $statusCode === 'DELETED' ? date('Y-m-d H:i:s') : null,
-            ]);
+            $createdCount = 0;
+            $skippedCount = 0;
+            $firstInsertId = 0;
+            $pdo->beginTransaction();
+            foreach ($partIds as $partId) {
+                if (isset($existingPartLookup[(int) $partId])) {
+                    $skippedCount++;
+                    continue;
+                }
 
-            log_audit('vis_mapping', 'create_service_part_map', (int) db()->lastInsertId(), 'Created VIS service-to-part mapping');
-            flash_set('vis_map_success', 'Service-to-part mapping created.', 'success');
+                $insertStmt->execute([
+                    'company_id' => $companyId,
+                    'service_id' => $serviceId,
+                    'part_id' => $partId,
+                    'is_required' => $isRequired,
+                    'status_code' => $statusCode,
+                    'deleted_at' => $statusCode === 'DELETED' ? date('Y-m-d H:i:s') : null,
+                ]);
+                $createdCount++;
+                if ($firstInsertId === 0) {
+                    $firstInsertId = (int) $pdo->lastInsertId();
+                }
+            }
+            $pdo->commit();
+
+            if ($createdCount > 0) {
+                log_audit('vis_mapping', 'create_service_part_map', $firstInsertId, 'Created VIS service-to-part mapping', [
+                    'entity' => 'vis_service_part_map',
+                    'source' => 'UI',
+                    'after' => [
+                        'service_id' => $serviceId,
+                        'created_count' => $createdCount,
+                        'is_required' => $isRequired,
+                        'status_code' => $statusCode,
+                    ],
+                    'metadata' => [
+                        'part_ids' => $partIds,
+                        'skipped_duplicates' => $skippedCount,
+                    ],
+                ]);
+                flash_set('vis_map_success', 'Service-to-part mappings created for ' . $createdCount . ' part(s).', 'success');
+            } elseif ($skippedCount > 0) {
+                flash_set('vis_map_warning', 'No new service-to-part mappings were created because selected parts are already mapped to this service.', 'warning');
+            }
+
+            if ($createdCount > 0 && $skippedCount > 0) {
+                flash_set('vis_map_warning', 'Skipped ' . $skippedCount . ' part(s) already mapped to this service.', 'warning');
+            }
         } catch (Throwable $exception) {
-            flash_set('vis_map_error', 'Unable to create service mapping. Duplicate mapping exists.', 'danger');
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+            flash_set('vis_map_error', 'Unable to create service mappings.', 'danger');
         }
 
         redirect('modules/vis/compatibility.php');
@@ -493,15 +650,26 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 
                   <div class="col-md-6">
                     <label class="form-label">Part</label>
-                    <select name="part_id" class="form-select" required <?= $editCompatibility ? 'disabled' : ''; ?>>
-                      <option value="">Select Part</option>
-                      <?php foreach ($parts as $part): ?>
-                        <option value="<?= (int) $part['id']; ?>" <?= ((int) ($editCompatibility['part_id'] ?? 0) === (int) $part['id']) ? 'selected' : ''; ?>>
-                          <?= e((string) $part['part_name']); ?> (<?= e((string) $part['part_sku']); ?>)
-                        </option>
-                      <?php endforeach; ?>
-                    </select>
-                    <?php if ($editCompatibility): ?><input type="hidden" name="part_id" value="<?= (int) $editCompatibility['part_id']; ?>" /><?php endif; ?>
+                    <?php if ($editCompatibility): ?>
+                      <select name="part_id" class="form-select" required disabled>
+                        <option value="">Select Part</option>
+                        <?php foreach ($parts as $part): ?>
+                          <option value="<?= (int) $part['id']; ?>" <?= ((int) ($editCompatibility['part_id'] ?? 0) === (int) $part['id']) ? 'selected' : ''; ?>>
+                            <?= e((string) $part['part_name']); ?> (<?= e((string) $part['part_sku']); ?>)
+                          </option>
+                        <?php endforeach; ?>
+                      </select>
+                      <input type="hidden" name="part_id" value="<?= (int) $editCompatibility['part_id']; ?>" />
+                    <?php else: ?>
+                      <select name="part_ids[]" class="form-select" required multiple size="8">
+                        <?php foreach ($parts as $part): ?>
+                          <option value="<?= (int) $part['id']; ?>">
+                            <?= e((string) $part['part_name']); ?> (<?= e((string) $part['part_sku']); ?>)
+                          </option>
+                        <?php endforeach; ?>
+                      </select>
+                      <small class="text-muted">Hold Ctrl (Windows) or Cmd (Mac) to select multiple parts.</small>
+                    <?php endif; ?>
                   </div>
 
                   <div class="col-md-8">
@@ -551,15 +719,26 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 
                   <div class="col-md-6">
                     <label class="form-label">Part</label>
-                    <select name="part_id" class="form-select" required <?= $editServiceMap ? 'disabled' : ''; ?>>
-                      <option value="">Select Part</option>
-                      <?php foreach ($parts as $part): ?>
-                        <option value="<?= (int) $part['id']; ?>" <?= ((int) ($editServiceMap['part_id'] ?? 0) === (int) $part['id']) ? 'selected' : ''; ?>>
-                          <?= e((string) $part['part_name']); ?> (<?= e((string) $part['part_sku']); ?>)
-                        </option>
-                      <?php endforeach; ?>
-                    </select>
-                    <?php if ($editServiceMap): ?><input type="hidden" name="part_id" value="<?= (int) $editServiceMap['part_id']; ?>" /><?php endif; ?>
+                    <?php if ($editServiceMap): ?>
+                      <select name="part_id" class="form-select" required disabled>
+                        <option value="">Select Part</option>
+                        <?php foreach ($parts as $part): ?>
+                          <option value="<?= (int) $part['id']; ?>" <?= ((int) ($editServiceMap['part_id'] ?? 0) === (int) $part['id']) ? 'selected' : ''; ?>>
+                            <?= e((string) $part['part_name']); ?> (<?= e((string) $part['part_sku']); ?>)
+                          </option>
+                        <?php endforeach; ?>
+                      </select>
+                      <input type="hidden" name="part_id" value="<?= (int) $editServiceMap['part_id']; ?>" />
+                    <?php else: ?>
+                      <select name="part_ids[]" class="form-select" required multiple size="8">
+                        <?php foreach ($parts as $part): ?>
+                          <option value="<?= (int) $part['id']; ?>">
+                            <?= e((string) $part['part_name']); ?> (<?= e((string) $part['part_sku']); ?>)
+                          </option>
+                        <?php endforeach; ?>
+                      </select>
+                      <small class="text-muted">Hold Ctrl (Windows) or Cmd (Mac) to select multiple parts.</small>
+                    <?php endif; ?>
                   </div>
 
                   <div class="col-md-6">
