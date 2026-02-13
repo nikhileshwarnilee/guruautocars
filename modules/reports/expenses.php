@@ -152,6 +152,7 @@ $expenseTotals = $expenseTotalsStmt->fetch() ?: [
 $revenueTotal = 0.0;
 $finalizedInvoiceCount = 0;
 $invoiceTableAvailable = table_columns('invoices') !== [];
+$monthlyRevenueRows = [];
 if ($invoiceTableAvailable) {
     $revenueParams = [
         'company_id' => $companyId,
@@ -172,6 +173,29 @@ if ($invoiceTableAvailable) {
     $revenueRow = $revenueStmt->fetch() ?: ['finalized_invoice_count' => 0, 'revenue_total' => 0];
     $finalizedInvoiceCount = (int) ($revenueRow['finalized_invoice_count'] ?? 0);
     $revenueTotal = round((float) ($revenueRow['revenue_total'] ?? 0), 2);
+
+    $monthlyRevenueParams = [
+        'company_id' => $companyId,
+        'from_date' => $fromDate,
+        'to_date' => $toDate,
+    ];
+    $monthlyRevenueScopeSql = analytics_garage_scope_sql('i.garage_id', $selectedGarageId, $garageIds, $monthlyRevenueParams, 'exp_rev_month_scope');
+    $monthlyRevenueStmt = db()->prepare(
+        'SELECT DATE_FORMAT(i.invoice_date, "%Y-%m") AS revenue_month,
+                COALESCE(SUM(i.grand_total), 0) AS revenue_total
+         FROM invoices i
+         INNER JOIN job_cards jc ON jc.id = i.job_card_id
+         WHERE i.company_id = :company_id
+           AND i.invoice_status = "FINALIZED"
+           AND jc.status = "CLOSED"
+           AND jc.status_code = "ACTIVE"
+           ' . $monthlyRevenueScopeSql . '
+           AND i.invoice_date BETWEEN :from_date AND :to_date
+         GROUP BY DATE_FORMAT(i.invoice_date, "%Y-%m")
+         ORDER BY revenue_month ASC'
+    );
+    $monthlyRevenueStmt->execute($monthlyRevenueParams);
+    $monthlyRevenueRows = $monthlyRevenueStmt->fetchAll();
 }
 
 $grossExpense = round((float) ($expenseTotals['expense_total'] ?? 0), 2);
@@ -185,6 +209,64 @@ if (!empty($categoryRows)) {
     $topCategoryName = (string) ($categoryRows[0]['category_name'] ?? '');
     $topCategoryNet = round((float) ($categoryRows[0]['net_total'] ?? 0), 2);
 }
+
+$monthLabels = [];
+foreach ($monthlyRows as $row) {
+    $month = (string) ($row['expense_month'] ?? '');
+    if ($month !== '') {
+        $monthLabels[$month] = true;
+    }
+}
+foreach ($monthlyRevenueRows as $row) {
+    $month = (string) ($row['revenue_month'] ?? '');
+    if ($month !== '') {
+        $monthLabels[$month] = true;
+    }
+}
+$monthLabels = array_keys($monthLabels);
+sort($monthLabels);
+
+$expenseMonthMap = [];
+foreach ($monthlyRows as $row) {
+    $month = (string) ($row['expense_month'] ?? '');
+    if ($month === '') {
+        continue;
+    }
+    $expenseMonthMap[$month] = (float) ($row['net_total'] ?? 0);
+}
+
+$revenueMonthMap = [];
+foreach ($monthlyRevenueRows as $row) {
+    $month = (string) ($row['revenue_month'] ?? '');
+    if ($month === '') {
+        continue;
+    }
+    $revenueMonthMap[$month] = (float) ($row['revenue_total'] ?? 0);
+}
+
+$chartPayload = [
+    'category_distribution' => [
+        'labels' => array_map(static fn (array $row): string => (string) ($row['category_name'] ?? ''), $categoryRows),
+        'values' => array_map(static fn (array $row): float => (float) ($row['expense_total'] ?? 0), $categoryRows),
+    ],
+    'monthly_expense_trend' => [
+        'labels' => array_map(static fn (array $row): string => (string) ($row['expense_month'] ?? ''), $monthlyRows),
+        'values' => array_map(static fn (array $row): float => (float) ($row['net_total'] ?? 0), $monthlyRows),
+    ],
+    'expense_vs_revenue' => [
+        'labels' => $monthLabels,
+        'expense_values' => array_map(static fn (string $label): float => (float) ($expenseMonthMap[$label] ?? 0), $monthLabels),
+        'revenue_values' => array_map(static fn (string $label): float => (float) ($revenueMonthMap[$label] ?? 0), $monthLabels),
+    ],
+];
+$chartPayloadJson = json_encode(
+    $chartPayload,
+    JSON_UNESCAPED_UNICODE
+    | JSON_HEX_TAG
+    | JSON_HEX_AMP
+    | JSON_HEX_APOS
+    | JSON_HEX_QUOT
+);
 
 $exportKey = trim((string) ($_GET['export'] ?? ''));
 if ($exportKey !== '') {
@@ -297,9 +379,39 @@ $renderReportBody = static function (
     bool $invoiceTableAvailable,
     array $monthlySummaryCards,
     string $topCategoryName,
-    float $topCategoryNet
+    float $topCategoryNet,
+    string $chartPayloadJson
 ): void {
     ?>
+      <script type="application/json" data-chart-payload><?= $chartPayloadJson ?: '{}'; ?></script>
+
+      <div class="row g-3 mb-3">
+        <div class="col-lg-4">
+          <div class="card h-100">
+            <div class="card-header"><h3 class="card-title mb-0">Category-wise Expense Distribution</h3></div>
+            <div class="card-body">
+              <div class="gac-chart-wrap"><canvas id="expenses-chart-category"></canvas></div>
+            </div>
+          </div>
+        </div>
+        <div class="col-lg-4">
+          <div class="card h-100">
+            <div class="card-header"><h3 class="card-title mb-0">Monthly Expense Trend</h3></div>
+            <div class="card-body">
+              <div class="gac-chart-wrap"><canvas id="expenses-chart-monthly-trend"></canvas></div>
+            </div>
+          </div>
+        </div>
+        <div class="col-lg-4">
+          <div class="card h-100">
+            <div class="card-header"><h3 class="card-title mb-0">Expense vs Revenue Comparison</h3></div>
+            <div class="card-body">
+              <div class="gac-chart-wrap"><canvas id="expenses-chart-revenue-compare"></canvas></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <div class="row g-3 mb-3">
         <div class="col-md-3"><div class="info-box"><span class="info-box-icon text-bg-danger"><i class="bi bi-cash-stack"></i></span><div class="info-box-content"><span class="info-box-text">Gross Expense</span><span class="info-box-number"><?= e(format_currency($grossExpense)); ?></span></div></div></div>
         <div class="col-md-3"><div class="info-box"><span class="info-box-icon text-bg-secondary"><i class="bi bi-arrow-counterclockwise"></i></span><div class="info-box-content"><span class="info-box-text">Reversal Total</span><span class="info-box-number"><?= e(format_currency($reversalTotal)); ?></span></div></div></div>
@@ -486,7 +598,8 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === '1') {
         $invoiceTableAvailable,
         $monthlySummaryCards,
         $topCategoryName,
-        $topCategoryNet
+        $topCategoryNet,
+        $chartPayloadJson
     );
     exit;
 }
@@ -580,41 +693,90 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       </div>
 
       <div id="expense-report-content">
-        <?php $renderReportBody($dailyRows, $monthlyRows, $categoryRows, $garageRows, $pageParams, $canExportData, $grossExpense, $reversalTotal, $netExpense, $revenueTotal, $finalizedInvoiceCount, $netProfit, $invoiceTableAvailable, $monthlySummaryCards, $topCategoryName, $topCategoryNet); ?>
+        <?php $renderReportBody($dailyRows, $monthlyRows, $categoryRows, $garageRows, $pageParams, $canExportData, $grossExpense, $reversalTotal, $netExpense, $revenueTotal, $finalizedInvoiceCount, $netProfit, $invoiceTableAvailable, $monthlySummaryCards, $topCategoryName, $topCategoryNet, $chartPayloadJson); ?>
       </div>
     </div>
   </div>
 </main>
 
 <script>
-  (function () {
+  document.addEventListener('DOMContentLoaded', function () {
+    if (!window.GacCharts) {
+      return;
+    }
+
     var form = document.getElementById('expense-filter-form');
     var target = document.getElementById('expense-report-content');
     if (!form || !target) {
       return;
     }
 
-    form.addEventListener('submit', function (event) {
-      event.preventDefault();
-      var params = new URLSearchParams(new FormData(form));
-      params.set('ajax', '1');
+    var charts = window.GacCharts.createRegistry('expense-report');
 
-      var url = form.getAttribute('action') || window.location.pathname;
-      target.classList.add('opacity-50');
+    function renderCharts() {
+      var payload = window.GacCharts.parsePayload(target);
+      var chartData = payload || {};
 
-      fetch(url + '?' + params.toString(), { headers: { 'X-Requested-With': 'XMLHttpRequest' } })
-        .then(function (response) { return response.text(); })
-        .then(function (html) {
-          target.innerHTML = html;
-        })
-        .catch(function () {
-          target.innerHTML = '<div class="alert alert-danger">Unable to load expense report data. Please retry.</div>';
-        })
-        .finally(function () {
-          target.classList.remove('opacity-50');
-        });
+      charts.render('#expenses-chart-category', {
+        type: 'pie',
+        data: {
+          labels: chartData.category_distribution ? chartData.category_distribution.labels : [],
+          datasets: [{
+            data: chartData.category_distribution ? chartData.category_distribution.values : [],
+            backgroundColor: window.GacCharts.pickColors(12)
+          }]
+        },
+        options: window.GacCharts.commonOptions()
+      }, { emptyMessage: 'No expense category rows in selected range.' });
+
+      charts.render('#expenses-chart-monthly-trend', {
+        type: 'line',
+        data: {
+          labels: chartData.monthly_expense_trend ? chartData.monthly_expense_trend.labels : [],
+          datasets: [{
+            label: 'Net Expense',
+            data: chartData.monthly_expense_trend ? chartData.monthly_expense_trend.values : [],
+            borderColor: window.GacCharts.palette.red,
+            backgroundColor: window.GacCharts.palette.red + '33',
+            fill: true,
+            tension: 0.25
+          }]
+        },
+        options: window.GacCharts.commonOptions()
+      }, { emptyMessage: 'No monthly expense trend rows in selected range.' });
+
+      charts.render('#expenses-chart-revenue-compare', {
+        type: 'bar',
+        data: {
+          labels: chartData.expense_vs_revenue ? chartData.expense_vs_revenue.labels : [],
+          datasets: [{
+            label: 'Expense',
+            data: chartData.expense_vs_revenue ? chartData.expense_vs_revenue.expense_values : [],
+            backgroundColor: window.GacCharts.palette.orange
+          }, {
+            label: 'Revenue',
+            data: chartData.expense_vs_revenue ? chartData.expense_vs_revenue.revenue_values : [],
+            backgroundColor: window.GacCharts.palette.green
+          }]
+        },
+        options: window.GacCharts.commonOptions()
+      }, { emptyMessage: 'No expense-vs-revenue comparison rows in selected range.' });
+    }
+
+    renderCharts();
+
+    window.GacCharts.bindAjaxForm({
+      form: form,
+      target: target,
+      mode: 'partial',
+      extendParams: function (params) {
+        params.set('ajax', '1');
+      },
+      afterUpdate: function () {
+        renderCharts();
+      }
     });
-  })();
+  });
 </script>
 
 <?php require_once __DIR__ . '/../../includes/footer.php'; ?>

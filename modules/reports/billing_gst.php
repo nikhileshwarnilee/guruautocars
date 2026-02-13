@@ -32,6 +32,7 @@ $revenueGarageWise = [];
 $gstSummary = ['invoice_count' => 0, 'taxable_total' => 0, 'cgst_total' => 0, 'sgst_total' => 0, 'igst_total' => 0, 'tax_total' => 0, 'grand_total' => 0];
 $paymentModeSummary = [];
 $outstandingReceivables = [];
+$gstMonthlyBreakdownRows = [];
 
 if ($canViewFinancial) {
     $revenueDailyParams = ['company_id' => $companyId, 'from_date' => $fromDate, 'to_date' => $toDate];
@@ -154,9 +155,69 @@ if ($canViewFinancial) {
     );
     $receivableStmt->execute($receivableParams);
     $outstandingReceivables = $receivableStmt->fetchAll();
+
+    $gstMonthlyParams = ['company_id' => $companyId, 'from_date' => $fromDate, 'to_date' => $toDate];
+    $gstMonthlyScopeSql = analytics_garage_scope_sql('i.garage_id', $selectedGarageId, $garageIds, $gstMonthlyParams, 'gst_month_scope');
+    $gstMonthlyStmt = db()->prepare(
+        'SELECT DATE_FORMAT(i.invoice_date, "%Y-%m") AS tax_month,
+                COALESCE(SUM(i.cgst_amount), 0) AS cgst_total,
+                COALESCE(SUM(i.sgst_amount), 0) AS sgst_total,
+                COALESCE(SUM(i.igst_amount), 0) AS igst_total
+         FROM invoices i
+         INNER JOIN job_cards jc ON jc.id = i.job_card_id
+         WHERE i.company_id = :company_id
+           AND i.invoice_status = "FINALIZED"
+           AND jc.status = "CLOSED"
+           AND jc.status_code = "ACTIVE"
+           ' . $gstMonthlyScopeSql . '
+           AND i.invoice_date BETWEEN :from_date AND :to_date
+         GROUP BY DATE_FORMAT(i.invoice_date, "%Y-%m")
+         ORDER BY tax_month ASC'
+    );
+    $gstMonthlyStmt->execute($gstMonthlyParams);
+    $gstMonthlyBreakdownRows = $gstMonthlyStmt->fetchAll();
 }
 
 $totalOutstanding = array_reduce($outstandingReceivables, static fn (float $sum, array $row): float => $sum + (float) ($row['outstanding_amount'] ?? 0), 0.0);
+
+$gstMonthLabels = array_map(static fn (array $row): string => (string) ($row['tax_month'] ?? ''), $gstMonthlyBreakdownRows);
+$chartPayload = [
+    'gst_breakdown' => [
+        'labels' => $gstMonthLabels,
+        'cgst' => array_map(static fn (array $row): float => (float) ($row['cgst_total'] ?? 0), $gstMonthlyBreakdownRows),
+        'sgst' => array_map(static fn (array $row): float => (float) ($row['sgst_total'] ?? 0), $gstMonthlyBreakdownRows),
+        'igst' => array_map(static fn (array $row): float => (float) ($row['igst_total'] ?? 0), $gstMonthlyBreakdownRows),
+    ],
+    'monthly_sales' => [
+        'labels' => array_map(static fn (array $row): string => (string) ($row['revenue_month'] ?? ''), $revenueMonthly),
+        'values' => array_map(static fn (array $row): float => (float) ($row['revenue_total'] ?? 0), $revenueMonthly),
+    ],
+    'receivable_aging' => [
+        'labels' => ['Current (0-30)', '31-60', '61-90', '90+'],
+        'values' => [0.0, 0.0, 0.0, 0.0],
+    ],
+];
+foreach ($outstandingReceivables as $row) {
+    $overdue = (int) ($row['overdue_days'] ?? 0);
+    $amount = (float) ($row['outstanding_amount'] ?? 0);
+    if ($overdue <= 30) {
+        $chartPayload['receivable_aging']['values'][0] += $amount;
+    } elseif ($overdue <= 60) {
+        $chartPayload['receivable_aging']['values'][1] += $amount;
+    } elseif ($overdue <= 90) {
+        $chartPayload['receivable_aging']['values'][2] += $amount;
+    } else {
+        $chartPayload['receivable_aging']['values'][3] += $amount;
+    }
+}
+$chartPayloadJson = json_encode(
+    $chartPayload,
+    JSON_UNESCAPED_UNICODE
+    | JSON_HEX_TAG
+    | JSON_HEX_AMP
+    | JSON_HEX_APOS
+    | JSON_HEX_QUOT
+);
 
 $exportKey = trim((string) ($_GET['export'] ?? ''));
 if ($exportKey !== '') {
@@ -256,7 +317,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       <div class="card card-primary mb-3">
         <div class="card-header"><h3 class="card-title">Filters</h3></div>
         <div class="card-body">
-          <form method="get" class="row g-2 align-items-end">
+          <form method="get" id="billing-report-filter-form" class="row g-2 align-items-end">
             <?php if ($allowAllGarages || count($garageIds) > 1): ?>
               <div class="col-md-3">
                 <label class="form-label">Garage Scope</label>
@@ -306,6 +367,9 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         </div>
       </div>
 
+      <div id="billing-report-content">
+        <script type="application/json" data-chart-payload><?= $chartPayloadJson ?: '{}'; ?></script>
+
       <?php if (!$canViewFinancial): ?>
         <div class="alert alert-warning">
           Financial reports require `reports.financial` permission.
@@ -345,6 +409,33 @@ require_once __DIR__ . '/../../includes/sidebar.php';
               <div class="info-box-content">
                 <span class="info-box-text">Outstanding</span>
                 <span class="info-box-number"><?= e(format_currency($totalOutstanding)); ?></span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="row g-3 mb-3">
+          <div class="col-lg-6">
+            <div class="card h-100">
+              <div class="card-header"><h3 class="card-title mb-0">GST Tax Breakdown (CGST / SGST / IGST)</h3></div>
+              <div class="card-body">
+                <div class="gac-chart-wrap"><canvas id="billing-chart-gst-breakdown"></canvas></div>
+              </div>
+            </div>
+          </div>
+          <div class="col-lg-6">
+            <div class="card h-100">
+              <div class="card-header"><h3 class="card-title mb-0">Monthly Sales Trend</h3></div>
+              <div class="card-body">
+                <div class="gac-chart-wrap"><canvas id="billing-chart-sales-trend"></canvas></div>
+              </div>
+            </div>
+          </div>
+          <div class="col-lg-12">
+            <div class="card h-100">
+              <div class="card-header"><h3 class="card-title mb-0">Receivable Aging Distribution</h3></div>
+              <div class="card-body">
+                <div class="gac-chart-wrap"><canvas id="billing-chart-receivable-aging"></canvas></div>
               </div>
             </div>
           </div>
@@ -480,9 +571,107 @@ require_once __DIR__ . '/../../includes/sidebar.php';
           </div>
         </div>
       <?php endif; ?>
+      </div>
     </div>
   </div>
 </main>
 
-<?php require_once __DIR__ . '/../../includes/footer.php'; ?>
+<script>
+  document.addEventListener('DOMContentLoaded', function () {
+    if (!window.GacCharts) {
+      return;
+    }
 
+    var form = document.getElementById('billing-report-filter-form');
+    var content = document.getElementById('billing-report-content');
+    if (!form || !content) {
+      return;
+    }
+
+    var charts = window.GacCharts.createRegistry('billing-report');
+
+    function renderCharts() {
+      var payload = window.GacCharts.parsePayload(content);
+      if (!payload || !payload.gst_breakdown) {
+        return;
+      }
+
+      charts.render('#billing-chart-gst-breakdown', {
+        type: 'bar',
+        data: {
+          labels: payload.gst_breakdown.labels || [],
+          datasets: [{
+            label: 'CGST',
+            data: payload.gst_breakdown.cgst || [],
+            backgroundColor: window.GacCharts.palette.blue
+          }, {
+            label: 'SGST',
+            data: payload.gst_breakdown.sgst || [],
+            backgroundColor: window.GacCharts.palette.green
+          }, {
+            label: 'IGST',
+            data: payload.gst_breakdown.igst || [],
+            backgroundColor: window.GacCharts.palette.orange
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          scales: {
+            x: { stacked: true },
+            y: { stacked: true, beginAtZero: true }
+          },
+          plugins: { legend: { position: 'bottom' } }
+        }
+      }, { emptyMessage: 'No GST tax rows for selected range.' });
+
+      charts.render('#billing-chart-sales-trend', {
+        type: 'line',
+        data: {
+          labels: payload.monthly_sales ? payload.monthly_sales.labels : [],
+          datasets: [{
+            label: 'Finalized Sales',
+            data: payload.monthly_sales ? payload.monthly_sales.values : [],
+            borderColor: window.GacCharts.palette.indigo,
+            backgroundColor: window.GacCharts.palette.indigo + '33',
+            fill: true,
+            tension: 0.25
+          }]
+        },
+        options: window.GacCharts.commonOptions()
+      }, { emptyMessage: 'No monthly sales rows in selected range.' });
+
+      charts.render('#billing-chart-receivable-aging', {
+        type: 'bar',
+        data: {
+          labels: payload.receivable_aging ? payload.receivable_aging.labels : [],
+          datasets: [{
+            label: 'Outstanding Amount',
+            data: payload.receivable_aging ? payload.receivable_aging.values : [],
+            backgroundColor: [
+              window.GacCharts.palette.teal,
+              window.GacCharts.palette.yellow,
+              window.GacCharts.palette.orange,
+              window.GacCharts.palette.red
+            ]
+          }]
+        },
+        options: window.GacCharts.commonOptions()
+      }, { emptyMessage: 'No outstanding receivable rows in selected range.' });
+    }
+
+    renderCharts();
+
+    window.GacCharts.bindAjaxForm({
+      form: form,
+      target: content,
+      mode: 'full',
+      sourceSelector: '#billing-report-content',
+      afterUpdate: function () {
+        renderCharts();
+      }
+    });
+  });
+</script>
+
+<?php require_once __DIR__ . '/../../includes/footer.php'; ?>

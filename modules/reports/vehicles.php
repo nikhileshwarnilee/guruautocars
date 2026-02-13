@@ -78,6 +78,50 @@ $modelStmt = db()->prepare(
 $modelStmt->execute($modelParams);
 $servicedModels = $modelStmt->fetchAll();
 
+$serviceTrendParams = ['company_id' => $companyId, 'from_date' => $fromDate, 'to_date' => $toDate];
+$serviceTrendScopeSql = analytics_garage_scope_sql('jc.garage_id', $selectedGarageId, $garageIds, $serviceTrendParams, 'vehicle_trend_scope');
+$serviceTrendVehicleScopeSql = vehicle_master_scope_sql('v', $reportVehicleFilters, $serviceTrendParams, 'report_vehicle_trend_scope');
+$serviceTrendStmt = db()->prepare(
+    'SELECT DATE_FORMAT(jc.closed_at, "%Y-%m") AS service_month,
+            COUNT(*) AS service_count
+     FROM job_cards jc
+     INNER JOIN vehicles v ON v.id = jc.vehicle_id
+     WHERE jc.company_id = :company_id
+       AND jc.status = "CLOSED"
+       AND jc.status_code = "ACTIVE"
+       AND v.company_id = :company_id
+       AND v.status_code = "ACTIVE"
+       ' . $serviceTrendVehicleScopeSql . '
+       ' . $serviceTrendScopeSql . '
+       AND DATE(jc.closed_at) BETWEEN :from_date AND :to_date
+     GROUP BY DATE_FORMAT(jc.closed_at, "%Y-%m")
+     ORDER BY service_month ASC'
+);
+$serviceTrendStmt->execute($serviceTrendParams);
+$serviceTrendRows = $serviceTrendStmt->fetchAll();
+
+$fuelTypeParams = ['company_id' => $companyId, 'from_date' => $fromDate, 'to_date' => $toDate];
+$fuelTypeScopeSql = analytics_garage_scope_sql('jc.garage_id', $selectedGarageId, $garageIds, $fuelTypeParams, 'vehicle_fuel_scope');
+$fuelTypeVehicleScopeSql = vehicle_master_scope_sql('v', $reportVehicleFilters, $fuelTypeParams, 'report_vehicle_fuel_scope');
+$fuelTypeStmt = db()->prepare(
+    'SELECT v.fuel_type,
+            COUNT(*) AS service_count
+     FROM job_cards jc
+     INNER JOIN vehicles v ON v.id = jc.vehicle_id
+     WHERE jc.company_id = :company_id
+       AND jc.status = "CLOSED"
+       AND jc.status_code = "ACTIVE"
+       AND v.company_id = :company_id
+       AND v.status_code = "ACTIVE"
+       ' . $fuelTypeVehicleScopeSql . '
+       ' . $fuelTypeScopeSql . '
+       AND DATE(jc.closed_at) BETWEEN :from_date AND :to_date
+     GROUP BY v.fuel_type
+     ORDER BY service_count DESC'
+);
+$fuelTypeStmt->execute($fuelTypeParams);
+$fuelTypeRows = $fuelTypeStmt->fetchAll();
+
 $frequencyParams = ['company_id' => $companyId, 'from_date' => $fromDate, 'to_date' => $toDate];
 $frequencyScopeSql = analytics_garage_scope_sql('jc.garage_id', $selectedGarageId, $garageIds, $frequencyParams, 'frequency_scope');
 $frequencyVehicleScopeSql = vehicle_master_scope_sql('v', $reportVehicleFilters, $frequencyParams, 'report_frequency_scope');
@@ -171,6 +215,33 @@ $closedJobs = (int) ($vehicleSummary['closed_jobs'] ?? 0);
 $finalizedInvoices = (int) ($revenueSummary['finalized_invoices'] ?? 0);
 $finalizedRevenue = (float) ($revenueSummary['finalized_revenue'] ?? 0);
 
+$modelChartRows = array_slice($servicedModels, 0, 10);
+$chartPayload = [
+    'serviced_models' => [
+        'labels' => array_map(
+            static fn (array $row): string => trim((string) (($row['brand'] ?? '') . ' ' . ($row['model'] ?? ''))),
+            $modelChartRows
+        ),
+        'values' => array_map(static fn (array $row): int => (int) ($row['service_count'] ?? 0), $modelChartRows),
+    ],
+    'service_trend' => [
+        'labels' => array_map(static fn (array $row): string => (string) ($row['service_month'] ?? ''), $serviceTrendRows),
+        'values' => array_map(static fn (array $row): int => (int) ($row['service_count'] ?? 0), $serviceTrendRows),
+    ],
+    'fuel_distribution' => [
+        'labels' => array_map(static fn (array $row): string => (string) ($row['fuel_type'] ?? ''), $fuelTypeRows),
+        'values' => array_map(static fn (array $row): int => (int) ($row['service_count'] ?? 0), $fuelTypeRows),
+    ],
+];
+$chartPayloadJson = json_encode(
+    $chartPayload,
+    JSON_UNESCAPED_UNICODE
+    | JSON_HEX_TAG
+    | JSON_HEX_AMP
+    | JSON_HEX_APOS
+    | JSON_HEX_QUOT
+);
+
 $exportKey = trim((string) ($_GET['export'] ?? ''));
 if ($exportKey !== '') {
     if (!$canExportData) {
@@ -261,7 +332,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       <div class="card card-primary mb-3">
         <div class="card-header"><h3 class="card-title">Filters</h3></div>
         <div class="card-body">
-          <form method="get" class="row g-2 align-items-end">
+          <form method="get" id="vehicles-report-filter-form" class="row g-2 align-items-end">
             <?php if ($allowAllGarages || count($garageIds) > 1): ?>
               <div class="col-md-3">
                 <label class="form-label">Garage Scope</label>
@@ -340,6 +411,9 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         </div>
       </div>
 
+      <div id="vehicles-report-content">
+        <script type="application/json" data-chart-payload><?= $chartPayloadJson ?: '{}'; ?></script>
+
       <div class="row g-3 mb-3">
         <div class="col-md-3">
           <div class="info-box">
@@ -374,6 +448,33 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             <div class="info-box-content">
               <span class="info-box-text">Vehicle Revenue</span>
               <span class="info-box-number"><?= e(format_currency($finalizedRevenue)); ?></span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="row g-3 mb-3">
+        <div class="col-lg-6">
+          <div class="card h-100">
+            <div class="card-header"><h3 class="card-title mb-0">Most Serviced Vehicle Models</h3></div>
+            <div class="card-body">
+              <div class="gac-chart-wrap"><canvas id="vehicles-chart-models"></canvas></div>
+            </div>
+          </div>
+        </div>
+        <div class="col-lg-6">
+          <div class="card h-100">
+            <div class="card-header"><h3 class="card-title mb-0">Service Frequency Trend</h3></div>
+            <div class="card-body">
+              <div class="gac-chart-wrap"><canvas id="vehicles-chart-frequency-trend"></canvas></div>
+            </div>
+          </div>
+        </div>
+        <div class="col-12">
+          <div class="card h-100">
+            <div class="card-header"><h3 class="card-title mb-0">Fuel Type Distribution</h3></div>
+            <div class="card-body">
+              <div class="gac-chart-wrap"><canvas id="vehicles-chart-fuel-type"></canvas></div>
             </div>
           </div>
         </div>
@@ -451,9 +552,88 @@ require_once __DIR__ . '/../../includes/sidebar.php';
           </table>
         </div>
       </div>
+      </div>
     </div>
   </div>
 </main>
 
-<?php require_once __DIR__ . '/../../includes/footer.php'; ?>
+<script>
+  document.addEventListener('DOMContentLoaded', function () {
+    if (!window.GacCharts) {
+      return;
+    }
 
+    var form = document.getElementById('vehicles-report-filter-form');
+    var content = document.getElementById('vehicles-report-content');
+    if (!form || !content) {
+      return;
+    }
+
+    var charts = window.GacCharts.createRegistry('vehicles-report');
+
+    function renderCharts() {
+      var payload = window.GacCharts.parsePayload(content);
+      var chartData = payload || {};
+
+      charts.render('#vehicles-chart-models', {
+        type: 'bar',
+        data: {
+          labels: chartData.serviced_models ? chartData.serviced_models.labels : [],
+          datasets: [{
+            label: 'Closed Services',
+            data: chartData.serviced_models ? chartData.serviced_models.values : [],
+            backgroundColor: window.GacCharts.pickColors(10)
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: { legend: { display: false } },
+          scales: { y: { beginAtZero: true } }
+        }
+      }, { emptyMessage: 'No serviced model data in selected range.' });
+
+      charts.render('#vehicles-chart-frequency-trend', {
+        type: 'line',
+        data: {
+          labels: chartData.service_trend ? chartData.service_trend.labels : [],
+          datasets: [{
+            label: 'Closed Services',
+            data: chartData.service_trend ? chartData.service_trend.values : [],
+            borderColor: window.GacCharts.palette.blue,
+            backgroundColor: window.GacCharts.palette.blue + '33',
+            fill: true,
+            tension: 0.3
+          }]
+        },
+        options: window.GacCharts.commonOptions()
+      }, { emptyMessage: 'No service-frequency trend data in selected range.' });
+
+      charts.render('#vehicles-chart-fuel-type', {
+        type: 'pie',
+        data: {
+          labels: chartData.fuel_distribution ? chartData.fuel_distribution.labels : [],
+          datasets: [{
+            data: chartData.fuel_distribution ? chartData.fuel_distribution.values : [],
+            backgroundColor: window.GacCharts.pickColors(8)
+          }]
+        },
+        options: window.GacCharts.commonOptions()
+      }, { emptyMessage: 'No fuel-type distribution data in selected range.' });
+    }
+
+    renderCharts();
+
+    window.GacCharts.bindAjaxForm({
+      form: form,
+      target: content,
+      mode: 'full',
+      sourceSelector: '#vehicles-report-content',
+      afterUpdate: function () {
+        renderCharts();
+      }
+    });
+  });
+</script>
+
+<?php require_once __DIR__ . '/../../includes/footer.php'; ?>

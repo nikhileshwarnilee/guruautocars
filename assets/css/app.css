@@ -192,6 +192,44 @@
   margin-bottom: 0;
 }
 
+.gac-chart-wrap {
+  position: relative;
+  min-height: 290px;
+}
+
+.gac-chart-wrap canvas {
+  width: 100% !important;
+  height: 290px !important;
+}
+
+.gac-chart-empty {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 0.85rem;
+  color: #6c757d;
+  background: rgba(248, 249, 250, 0.82);
+  border: 1px dashed rgba(108, 117, 125, 0.35);
+  border-radius: 0.35rem;
+  font-size: 0.92rem;
+}
+
+.gac-report-loading {
+  position: relative;
+  pointer-events: none;
+}
+
+.gac-report-loading::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  background: rgba(255, 255, 255, 0.45);
+}
+
 @media (max-width: 991.98px) {
   .app-header .container-fluid {
     flex-wrap: wrap;
@@ -214,5 +252,13 @@
   .gac-table-search {
     min-width: 100%;
     max-width: none;
+  }
+
+  .gac-chart-wrap {
+    min-height: 250px;
+  }
+
+  .gac-chart-wrap canvas {
+    height: 250px !important;
   }
 }

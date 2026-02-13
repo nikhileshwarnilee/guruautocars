@@ -120,6 +120,54 @@ foreach ($purchaseRows as &$row) {
 }
 unset($row);
 
+$salesMonthlyTaxMap = [];
+foreach ($salesRows as $row) {
+    $month = date('Y-m', strtotime((string) ($row['invoice_date'] ?? $fromDate)));
+    if (!isset($salesMonthlyTaxMap[$month])) {
+        $salesMonthlyTaxMap[$month] = 0.0;
+    }
+    $salesMonthlyTaxMap[$month] += (float) ($row['cgst_amount'] ?? 0) + (float) ($row['sgst_amount'] ?? 0) + (float) ($row['igst_amount'] ?? 0);
+}
+
+$purchaseMonthlyTaxMap = [];
+foreach ($purchaseRows as $row) {
+    $month = date('Y-m', strtotime((string) ($row['purchase_date'] ?? $fromDate)));
+    if (!isset($purchaseMonthlyTaxMap[$month])) {
+        $purchaseMonthlyTaxMap[$month] = 0.0;
+    }
+    $purchaseMonthlyTaxMap[$month] += (float) ($row['cgst_amount'] ?? 0) + (float) ($row['sgst_amount'] ?? 0) + (float) ($row['igst_amount'] ?? 0);
+}
+
+$gstMonthLabels = array_keys($salesMonthlyTaxMap + $purchaseMonthlyTaxMap);
+sort($gstMonthLabels);
+
+$chartPayload = [
+    'tax_components' => [
+        'labels' => ['Sales CGST', 'Sales SGST', 'Sales IGST', 'Purchase CGST', 'Purchase SGST', 'Purchase IGST'],
+        'values' => [
+            (float) ($salesSummary['cgst_total'] ?? 0),
+            (float) ($salesSummary['sgst_total'] ?? 0),
+            (float) ($salesSummary['igst_total'] ?? 0),
+            (float) ($purchaseSummary['cgst_total'] ?? 0),
+            (float) ($purchaseSummary['sgst_total'] ?? 0),
+            (float) ($purchaseSummary['igst_total'] ?? 0),
+        ],
+    ],
+    'gst_trend' => [
+        'labels' => $gstMonthLabels,
+        'sales_tax' => array_map(static fn (string $month): float => (float) ($salesMonthlyTaxMap[$month] ?? 0), $gstMonthLabels),
+        'purchase_tax' => array_map(static fn (string $month): float => (float) ($purchaseMonthlyTaxMap[$month] ?? 0), $gstMonthLabels),
+    ],
+];
+$chartPayloadJson = json_encode(
+    $chartPayload,
+    JSON_UNESCAPED_UNICODE
+    | JSON_HEX_TAG
+    | JSON_HEX_AMP
+    | JSON_HEX_APOS
+    | JSON_HEX_QUOT
+);
+
 $exportKey = trim((string) ($_GET['export'] ?? ''));
 if ($exportKey !== '') {
     if (!$canExportData) {
@@ -175,11 +223,33 @@ $renderReportBody = static function (
     array $purchaseRows,
     array $purchaseSummary,
     array $baseParams,
-    bool $canExportData
+    bool $canExportData,
+    string $chartPayloadJson
 ): void {
     $salesExportUrl = reports_export_url('modules/reports/gst_compliance.php', $baseParams, 'sales_gst');
     $purchaseExportUrl = reports_export_url('modules/reports/gst_compliance.php', $baseParams, 'purchase_gst');
     ?>
+    <script type="application/json" data-chart-payload><?= $chartPayloadJson ?: '{}'; ?></script>
+
+    <div class="row g-3 mb-3">
+      <div class="col-lg-6">
+        <div class="card h-100">
+          <div class="card-header"><h3 class="card-title mb-0">GST Tax Components</h3></div>
+          <div class="card-body">
+            <div class="gac-chart-wrap"><canvas id="gst-chart-components"></canvas></div>
+          </div>
+        </div>
+      </div>
+      <div class="col-lg-6">
+        <div class="card h-100">
+          <div class="card-header"><h3 class="card-title mb-0">Sales vs Purchase GST Trend</h3></div>
+          <div class="card-body">
+            <div class="gac-chart-wrap"><canvas id="gst-chart-trend"></canvas></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <div class="row g-3 mb-3">
       <div class="col-md-6">
         <div class="card card-success">
@@ -299,7 +369,7 @@ $renderReportBody = static function (
 
 if (isset($_GET['ajax']) && (string) $_GET['ajax'] === '1') {
     header('Content-Type: text/html; charset=utf-8');
-    $renderReportBody($salesRows, $salesSummary, $purchaseRows, $purchaseSummary, $baseParams, $canExportData);
+    $renderReportBody($salesRows, $salesSummary, $purchaseRows, $purchaseSummary, $baseParams, $canExportData, $chartPayloadJson);
     exit;
 }
 
@@ -392,41 +462,86 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       </div>
 
       <div id="gst-report-content">
-        <?php $renderReportBody($salesRows, $salesSummary, $purchaseRows, $purchaseSummary, $baseParams, $canExportData); ?>
+        <?php $renderReportBody($salesRows, $salesSummary, $purchaseRows, $purchaseSummary, $baseParams, $canExportData, $chartPayloadJson); ?>
       </div>
     </div>
   </div>
 </main>
 
 <script>
-  (function () {
+  document.addEventListener('DOMContentLoaded', function () {
+    if (!window.GacCharts) {
+      return;
+    }
+
     var form = document.getElementById('gst-filter-form');
     var target = document.getElementById('gst-report-content');
     if (!form || !target) {
       return;
     }
 
-    form.addEventListener('submit', function (event) {
-      event.preventDefault();
-      var params = new URLSearchParams(new FormData(form));
-      params.set('ajax', '1');
+    var charts = window.GacCharts.createRegistry('gst-report');
 
-      var url = form.getAttribute('action') || window.location.pathname;
-      target.classList.add('opacity-50');
+    function renderCharts() {
+      var payload = window.GacCharts.parsePayload(target);
+      var chartData = payload || {};
 
-      fetch(url + '?' + params.toString(), { headers: { 'X-Requested-With': 'XMLHttpRequest' } })
-        .then(function (response) { return response.text(); })
-        .then(function (html) {
-          target.innerHTML = html;
-        })
-        .catch(function () {
-          target.innerHTML = '<div class="alert alert-danger">Unable to load GST report data. Please retry.</div>';
-        })
-        .finally(function () {
-          target.classList.remove('opacity-50');
-        });
+      charts.render('#gst-chart-components', {
+        type: 'bar',
+        data: {
+          labels: chartData.tax_components ? chartData.tax_components.labels : [],
+          datasets: [{
+            label: 'GST Amount',
+            data: chartData.tax_components ? chartData.tax_components.values : [],
+            backgroundColor: window.GacCharts.pickColors(6)
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: { legend: { display: false } },
+          scales: { y: { beginAtZero: true } }
+        }
+      }, { emptyMessage: 'No GST component rows in selected range.' });
+
+      charts.render('#gst-chart-trend', {
+        type: 'line',
+        data: {
+          labels: chartData.gst_trend ? chartData.gst_trend.labels : [],
+          datasets: [{
+            label: 'Sales GST',
+            data: chartData.gst_trend ? chartData.gst_trend.sales_tax : [],
+            borderColor: window.GacCharts.palette.green,
+            backgroundColor: window.GacCharts.palette.green + '33',
+            fill: true,
+            tension: 0.25
+          }, {
+            label: 'Purchase GST',
+            data: chartData.gst_trend ? chartData.gst_trend.purchase_tax : [],
+            borderColor: window.GacCharts.palette.blue,
+            backgroundColor: window.GacCharts.palette.blue + '33',
+            fill: true,
+            tension: 0.25
+          }]
+        },
+        options: window.GacCharts.commonOptions()
+      }, { emptyMessage: 'No monthly GST trend rows in selected range.' });
+    }
+
+    renderCharts();
+
+    window.GacCharts.bindAjaxForm({
+      form: form,
+      target: target,
+      mode: 'partial',
+      extendParams: function (params) {
+        params.set('ajax', '1');
+      },
+      afterUpdate: function () {
+        renderCharts();
+      }
     });
-  })();
+  });
 </script>
 
 <?php require_once __DIR__ . '/../../includes/footer.php'; ?>

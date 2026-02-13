@@ -61,6 +61,25 @@ $dailyStmt = db()->prepare(
 $dailyStmt->execute($dailyParams);
 $closedJobsDaily = $dailyStmt->fetchAll();
 
+$completionTrendParams = ['company_id' => $companyId, 'from_date' => $fromDate, 'to_date' => $toDate];
+$completionTrendScopeSql = analytics_garage_scope_sql('jc.garage_id', $selectedGarageId, $garageIds, $completionTrendParams, 'job_completion_scope');
+$completionTrendStmt = db()->prepare(
+    'SELECT DATE(jc.closed_at) AS closed_date,
+            ROUND(COALESCE(AVG(TIMESTAMPDIFF(HOUR, jc.opened_at, jc.closed_at)), 0), 2) AS avg_completion_hours
+     FROM job_cards jc
+     WHERE jc.company_id = :company_id
+       AND jc.status = "CLOSED"
+       AND jc.status_code = "ACTIVE"
+       AND jc.opened_at IS NOT NULL
+       AND jc.closed_at IS NOT NULL
+       ' . $completionTrendScopeSql . '
+       AND DATE(jc.closed_at) BETWEEN :from_date AND :to_date
+     GROUP BY DATE(jc.closed_at)
+     ORDER BY closed_date ASC'
+);
+$completionTrendStmt->execute($completionTrendParams);
+$completionTrendRows = $completionTrendStmt->fetchAll();
+
 $mechanicParams = ['company_id' => $companyId, 'from_date' => $fromDate, 'to_date' => $toDate];
 $mechanicScopeSql = analytics_garage_scope_sql('jc.garage_id', $selectedGarageId, $garageIds, $mechanicParams, 'job_mechanic_scope');
 $mechanicStmt = db()->prepare(
@@ -108,10 +127,65 @@ $serviceMixStmt = db()->prepare(
 $serviceMixStmt->execute($serviceMixParams);
 $serviceMixRows = $serviceMixStmt->fetchAll();
 
+$jobTypeParams = ['company_id' => $companyId, 'from_date' => $fromDate, 'to_date' => $toDate];
+$jobTypeScopeSql = analytics_garage_scope_sql('jc.garage_id', $selectedGarageId, $garageIds, $jobTypeParams, 'job_type_scope');
+$jobTypeStmt = db()->prepare(
+    'SELECT
+        COALESCE(SUM(CASE WHEN outsourced.job_card_id IS NULL THEN 1 ELSE 0 END), 0) AS in_house_jobs,
+        COALESCE(SUM(CASE WHEN outsourced.job_card_id IS NOT NULL THEN 1 ELSE 0 END), 0) AS outsourced_jobs
+     FROM job_cards jc
+     INNER JOIN invoices i ON i.job_card_id = jc.id
+       AND i.company_id = :company_id
+       AND i.invoice_status = "FINALIZED"
+     LEFT JOIN (
+        SELECT DISTINCT jl.job_card_id
+        FROM job_labor jl
+        WHERE jl.execution_type = "OUTSOURCED"
+     ) outsourced ON outsourced.job_card_id = jc.id
+     WHERE jc.company_id = :company_id
+       AND jc.status = "CLOSED"
+       AND jc.status_code = "ACTIVE"
+       ' . $jobTypeScopeSql . '
+       AND DATE(jc.closed_at) BETWEEN :from_date AND :to_date'
+);
+$jobTypeStmt->execute($jobTypeParams);
+$jobTypeMix = $jobTypeStmt->fetch() ?: ['in_house_jobs' => 0, 'outsourced_jobs' => 0];
+
 $closedJobsTotal = (int) ($jobSummary['closed_jobs'] ?? 0);
 $avgCompletionHours = (float) ($jobSummary['avg_completion_hours'] ?? 0);
 $estimatedTotal = (float) ($jobSummary['estimated_total'] ?? 0);
 $mechanicCount = count($mechanicRows);
+
+$mechanicChartRows = array_slice($mechanicRows, 0, 10);
+$chartPayload = [
+    'job_volume' => [
+        'labels' => array_map(static fn (array $row): string => (string) ($row['closed_date'] ?? ''), $closedJobsDaily),
+        'values' => array_map(static fn (array $row): int => (int) ($row['closed_jobs'] ?? 0), $closedJobsDaily),
+    ],
+    'avg_completion' => [
+        'labels' => array_map(static fn (array $row): string => (string) ($row['closed_date'] ?? ''), $completionTrendRows),
+        'values' => array_map(static fn (array $row): float => (float) ($row['avg_completion_hours'] ?? 0), $completionTrendRows),
+    ],
+    'mechanic_productivity' => [
+        'labels' => array_map(static fn (array $row): string => (string) ($row['mechanic_name'] ?? ''), $mechanicChartRows),
+        'values' => array_map(static fn (array $row): int => (int) ($row['closed_jobs'] ?? 0), $mechanicChartRows),
+    ],
+    'execution_mix' => [
+        'labels' => ['In-House', 'Outsourced'],
+        'values' => [
+            (int) ($jobTypeMix['in_house_jobs'] ?? 0),
+            (int) ($jobTypeMix['outsourced_jobs'] ?? 0),
+        ],
+    ],
+];
+$chartPayloadJson = json_encode(
+    $chartPayload,
+    JSON_UNESCAPED_UNICODE
+    | JSON_HEX_TAG
+    | JSON_HEX_AMP
+    | JSON_HEX_APOS
+    | JSON_HEX_QUOT
+);
 
 $exportKey = trim((string) ($_GET['export'] ?? ''));
 if ($exportKey !== '') {
@@ -211,7 +285,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       <div class="card card-primary mb-3">
         <div class="card-header"><h3 class="card-title">Filters</h3></div>
         <div class="card-body">
-          <form method="get" class="row g-2 align-items-end">
+          <form method="get" id="jobs-report-filter-form" class="row g-2 align-items-end">
             <?php if ($allowAllGarages || count($garageIds) > 1): ?>
               <div class="col-md-3">
                 <label class="form-label">Garage Scope</label>
@@ -261,6 +335,9 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         </div>
       </div>
 
+      <div id="jobs-report-content">
+        <script type="application/json" data-chart-payload><?= $chartPayloadJson ?: '{}'; ?></script>
+
       <div class="row g-3 mb-3">
         <div class="col-md-3">
           <div class="info-box">
@@ -295,6 +372,41 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             <div class="info-box-content">
               <span class="info-box-text">Active Mechanics</span>
               <span class="info-box-number"><?= number_format($mechanicCount); ?></span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="row g-3 mb-3">
+        <div class="col-lg-6">
+          <div class="card h-100">
+            <div class="card-header"><h3 class="card-title mb-0">Job Volume Trend</h3></div>
+            <div class="card-body">
+              <div class="gac-chart-wrap"><canvas id="jobs-chart-volume"></canvas></div>
+            </div>
+          </div>
+        </div>
+        <div class="col-lg-6">
+          <div class="card h-100">
+            <div class="card-header"><h3 class="card-title mb-0">Average Job Completion Time (Hours)</h3></div>
+            <div class="card-body">
+              <div class="gac-chart-wrap"><canvas id="jobs-chart-completion"></canvas></div>
+            </div>
+          </div>
+        </div>
+        <div class="col-lg-6">
+          <div class="card h-100">
+            <div class="card-header"><h3 class="card-title mb-0">Mechanic Productivity</h3></div>
+            <div class="card-body">
+              <div class="gac-chart-wrap"><canvas id="jobs-chart-mechanics"></canvas></div>
+            </div>
+          </div>
+        </div>
+        <div class="col-lg-6">
+          <div class="card h-100">
+            <div class="card-header"><h3 class="card-title mb-0">Outsourced vs In-House Jobs</h3></div>
+            <div class="card-body">
+              <div class="gac-chart-wrap"><canvas id="jobs-chart-execution"></canvas></div>
             </div>
           </div>
         </div>
@@ -374,9 +486,101 @@ require_once __DIR__ . '/../../includes/sidebar.php';
           </table>
         </div>
       </div>
+      </div>
     </div>
   </div>
 </main>
 
-<?php require_once __DIR__ . '/../../includes/footer.php'; ?>
+<script>
+  document.addEventListener('DOMContentLoaded', function () {
+    if (!window.GacCharts) {
+      return;
+    }
 
+    var form = document.getElementById('jobs-report-filter-form');
+    var content = document.getElementById('jobs-report-content');
+    if (!form || !content) {
+      return;
+    }
+
+    var charts = window.GacCharts.createRegistry('jobs-report');
+
+    function renderCharts() {
+      var payload = window.GacCharts.parsePayload(content);
+      var chartData = payload || {};
+
+      charts.render('#jobs-chart-volume', {
+        type: 'line',
+        data: {
+          labels: chartData.job_volume ? chartData.job_volume.labels : [],
+          datasets: [{
+            label: 'Closed Jobs',
+            data: chartData.job_volume ? chartData.job_volume.values : [],
+            borderColor: window.GacCharts.palette.blue,
+            backgroundColor: window.GacCharts.palette.blue + '33',
+            fill: true,
+            tension: 0.25
+          }]
+        },
+        options: window.GacCharts.commonOptions()
+      }, { emptyMessage: 'No closed job trend data in selected range.' });
+
+      charts.render('#jobs-chart-completion', {
+        type: 'bar',
+        data: {
+          labels: chartData.avg_completion ? chartData.avg_completion.labels : [],
+          datasets: [{
+            label: 'Avg Completion Hours',
+            data: chartData.avg_completion ? chartData.avg_completion.values : [],
+            backgroundColor: window.GacCharts.palette.orange
+          }]
+        },
+        options: window.GacCharts.commonOptions()
+      }, { emptyMessage: 'No completion-time rows in selected range.' });
+
+      charts.render('#jobs-chart-mechanics', {
+        type: 'bar',
+        data: {
+          labels: chartData.mechanic_productivity ? chartData.mechanic_productivity.labels : [],
+          datasets: [{
+            label: 'Closed Jobs',
+            data: chartData.mechanic_productivity ? chartData.mechanic_productivity.values : [],
+            backgroundColor: window.GacCharts.pickColors(10)
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: { legend: { display: false } },
+          scales: { y: { beginAtZero: true } }
+        }
+      }, { emptyMessage: 'No mechanic productivity rows in selected range.' });
+
+      charts.render('#jobs-chart-execution', {
+        type: 'doughnut',
+        data: {
+          labels: chartData.execution_mix ? chartData.execution_mix.labels : [],
+          datasets: [{
+            data: chartData.execution_mix ? chartData.execution_mix.values : [],
+            backgroundColor: [window.GacCharts.palette.green, window.GacCharts.palette.purple]
+          }]
+        },
+        options: window.GacCharts.commonOptions()
+      }, { emptyMessage: 'No execution-type data in selected range.' });
+    }
+
+    renderCharts();
+
+    window.GacCharts.bindAjaxForm({
+      form: form,
+      target: content,
+      mode: 'full',
+      sourceSelector: '#jobs-report-content',
+      afterUpdate: function () {
+        renderCharts();
+      }
+    });
+  });
+</script>
+
+<?php require_once __DIR__ . '/../../includes/footer.php'; ?>

@@ -185,10 +185,153 @@ $partsUsageStmt = db()->prepare(
 $partsUsageStmt->execute($partsUsageParams);
 $partsUsageRows = $partsUsageStmt->fetchAll();
 
+$buildMonthSeries = static function (string $startDate, string $endDate): array {
+    $labels = [];
+    $cursor = strtotime(date('Y-m-01', strtotime($startDate)));
+    $limit = strtotime(date('Y-m-01', strtotime($endDate)));
+    while ($cursor !== false && $limit !== false && $cursor <= $limit) {
+        $labels[] = date('Y-m', $cursor);
+        $cursor = strtotime('+1 month', $cursor);
+    }
+    return $labels;
+};
+
+$valuationTrendParams = ['company_id' => $companyId, 'from_dt' => $fromDateTime, 'to_dt' => $toDateTime];
+$valuationTrendScopeSql = analytics_garage_scope_sql('im.garage_id', $selectedGarageId, $garageIds, $valuationTrendParams, 'inv_val_scope');
+$valuationTrendStmt = db()->prepare(
+    'SELECT DATE_FORMAT(im.created_at, "%Y-%m") AS movement_month,
+            COALESCE(SUM(CASE
+                WHEN im.movement_type = "IN" THEN ABS(im.quantity) * p.purchase_price
+                WHEN im.movement_type = "OUT" THEN -1 * ABS(im.quantity) * p.purchase_price
+                ELSE im.quantity * p.purchase_price
+            END), 0) AS value_delta
+     FROM inventory_movements im
+     INNER JOIN parts p ON p.id = im.part_id
+     LEFT JOIN job_cards jc_ref ON jc_ref.id = im.reference_id AND im.reference_type = "JOB_CARD"
+     LEFT JOIN inventory_transfers tr ON tr.id = im.reference_id AND im.reference_type = "TRANSFER"
+     WHERE im.company_id = :company_id
+       AND p.company_id = :company_id
+       AND p.status_code = "ACTIVE"
+       ' . $valuationTrendScopeSql . '
+       AND im.created_at BETWEEN :from_dt AND :to_dt
+       AND (
+         im.reference_type <> "JOB_CARD"
+         OR (jc_ref.id IS NOT NULL AND jc_ref.company_id = :company_id AND jc_ref.status = "CLOSED" AND jc_ref.status_code = "ACTIVE")
+       )
+       AND (
+         im.reference_type <> "TRANSFER"
+         OR (tr.id IS NOT NULL AND tr.company_id = :company_id AND tr.status_code = "POSTED")
+       )
+     GROUP BY DATE_FORMAT(im.created_at, "%Y-%m")
+     ORDER BY movement_month ASC'
+);
+$valuationTrendStmt->execute($valuationTrendParams);
+$valuationTrendRows = $valuationTrendStmt->fetchAll();
+
+$categoryStockParams = ['company_id' => $companyId];
+$categoryStockScopeSql = analytics_garage_scope_sql('gi.garage_id', $selectedGarageId, $garageIds, $categoryStockParams, 'inv_cat_scope');
+$categoryStockStmt = db()->prepare(
+    'SELECT COALESCE(pc.category_name, "Uncategorized") AS category_name,
+            COALESCE(SUM(gi.quantity * p.purchase_price), 0) AS stock_value
+     FROM garage_inventory gi
+     INNER JOIN parts p ON p.id = gi.part_id
+     INNER JOIN garages g ON g.id = gi.garage_id
+     LEFT JOIN part_categories pc ON pc.id = p.category_id
+     WHERE p.company_id = :company_id
+       AND p.status_code = "ACTIVE"
+       AND g.company_id = :company_id
+       AND (g.status_code IS NULL OR g.status_code = "ACTIVE")
+       ' . $categoryStockScopeSql . '
+     GROUP BY category_name
+     ORDER BY stock_value DESC'
+);
+$categoryStockStmt->execute($categoryStockParams);
+$categoryStockRows = $categoryStockStmt->fetchAll();
+
+$lowStockGraphParams = ['company_id' => $companyId];
+if ($selectedGarageId > 0) {
+    $lowStockGraphJoinScopeSql = ' AND gi.garage_id = :low_stock_garage ';
+    $lowStockGraphParams['low_stock_garage'] = $selectedGarageId;
+} elseif (empty($garageIds)) {
+    $lowStockGraphJoinScopeSql = ' AND 1 = 0 ';
+} else {
+    $placeholders = [];
+    foreach ($garageIds as $index => $garageId) {
+        $key = 'low_stock_scope_' . $index;
+        $lowStockGraphParams[$key] = $garageId;
+        $placeholders[] = ':' . $key;
+    }
+    $lowStockGraphJoinScopeSql = ' AND gi.garage_id IN (' . implode(', ', $placeholders) . ') ';
+}
+
+$lowStockGraphStmt = db()->prepare(
+    'SELECT p.part_name,
+            p.part_sku,
+            p.min_stock,
+            COALESCE(SUM(gi.quantity), 0) AS current_qty,
+            GREATEST(p.min_stock - COALESCE(SUM(gi.quantity), 0), 0) AS deficit_qty
+     FROM parts p
+     LEFT JOIN garage_inventory gi ON gi.part_id = p.id ' . $lowStockGraphJoinScopeSql . '
+     WHERE p.company_id = :company_id
+       AND p.status_code = "ACTIVE"
+     GROUP BY p.id, p.part_name, p.part_sku, p.min_stock
+     HAVING current_qty <= p.min_stock
+     ORDER BY deficit_qty DESC
+     LIMIT 10'
+);
+$lowStockGraphStmt->execute($lowStockGraphParams);
+$lowStockGraphRows = $lowStockGraphStmt->fetchAll();
+
 $totalStockValue = array_reduce($stockValuationRows, static fn (float $sum, array $row): float => $sum + (float) ($row['stock_value'] ?? 0), 0.0);
 $totalLowStockParts = array_reduce($stockValuationRows, static fn (int $sum, array $row): int => $sum + (int) ($row['low_stock_parts'] ?? 0), 0);
 $movementEntries = array_reduce($movementSummaryRows, static fn (int $sum, array $row): int => $sum + (int) ($row['movement_count'] ?? 0), 0);
 $usageValueTotal = array_reduce($partsUsageRows, static fn (float $sum, array $row): float => $sum + (float) ($row['usage_value'] ?? 0), 0.0);
+
+$fastStockCount = count($fastMovingStockRows);
+$deadStockCount = count($deadStockRows);
+
+$monthLabels = $buildMonthSeries($fromDate, $toDate);
+$valuationDeltaMap = [];
+foreach ($valuationTrendRows as $row) {
+    $label = (string) ($row['movement_month'] ?? '');
+    if ($label === '') {
+        continue;
+    }
+    $valuationDeltaMap[$label] = (float) ($row['value_delta'] ?? 0);
+}
+$valuationTrendValues = [];
+$runningValuation = 0.0;
+foreach ($monthLabels as $label) {
+    $runningValuation += (float) ($valuationDeltaMap[$label] ?? 0);
+    $valuationTrendValues[] = round($runningValuation, 2);
+}
+
+$chartPayload = [
+    'stock_valuation_trend' => [
+        'labels' => $monthLabels,
+        'values' => $valuationTrendValues,
+    ],
+    'fast_vs_dead' => [
+        'labels' => ['Fast Moving', 'Dead Stock'],
+        'values' => [$fastStockCount, $deadStockCount],
+    ],
+    'category_distribution' => [
+        'labels' => array_map(static fn (array $row): string => (string) ($row['category_name'] ?? ''), $categoryStockRows),
+        'values' => array_map(static fn (array $row): float => (float) ($row['stock_value'] ?? 0), $categoryStockRows),
+    ],
+    'low_stock' => [
+        'labels' => array_map(static fn (array $row): string => (string) ($row['part_name'] ?? ''), $lowStockGraphRows),
+        'values' => array_map(static fn (array $row): float => (float) ($row['deficit_qty'] ?? 0), $lowStockGraphRows),
+    ],
+];
+$chartPayloadJson = json_encode(
+    $chartPayload,
+    JSON_UNESCAPED_UNICODE
+    | JSON_HEX_TAG
+    | JSON_HEX_AMP
+    | JSON_HEX_APOS
+    | JSON_HEX_QUOT
+);
 
 $exportKey = trim((string) ($_GET['export'] ?? ''));
 if ($exportKey !== '') {
@@ -304,7 +447,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       <div class="card card-primary mb-3">
         <div class="card-header"><h3 class="card-title">Filters</h3></div>
         <div class="card-body">
-          <form method="get" class="row g-2 align-items-end">
+          <form method="get" id="inventory-report-filter-form" class="row g-2 align-items-end">
             <?php if ($allowAllGarages || count($garageIds) > 1): ?>
               <div class="col-md-3">
                 <label class="form-label">Garage Scope</label>
@@ -354,6 +497,9 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         </div>
       </div>
 
+      <div id="inventory-report-content">
+        <script type="application/json" data-chart-payload><?= $chartPayloadJson ?: '{}'; ?></script>
+
       <div class="row g-3 mb-3">
         <div class="col-md-3">
           <div class="info-box">
@@ -388,6 +534,41 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             <div class="info-box-content">
               <span class="info-box-text">Parts Usage Value</span>
               <span class="info-box-number"><?= e(format_currency($usageValueTotal)); ?></span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="row g-3 mb-3">
+        <div class="col-lg-6">
+          <div class="card h-100">
+            <div class="card-header"><h3 class="card-title mb-0">Stock Valuation Trend</h3></div>
+            <div class="card-body">
+              <div class="gac-chart-wrap"><canvas id="inventory-chart-valuation"></canvas></div>
+            </div>
+          </div>
+        </div>
+        <div class="col-lg-6">
+          <div class="card h-100">
+            <div class="card-header"><h3 class="card-title mb-0">Fast Moving vs Dead Stock</h3></div>
+            <div class="card-body">
+              <div class="gac-chart-wrap"><canvas id="inventory-chart-fast-dead"></canvas></div>
+            </div>
+          </div>
+        </div>
+        <div class="col-lg-6">
+          <div class="card h-100">
+            <div class="card-header"><h3 class="card-title mb-0">Category-wise Stock Distribution</h3></div>
+            <div class="card-body">
+              <div class="gac-chart-wrap"><canvas id="inventory-chart-category"></canvas></div>
+            </div>
+          </div>
+        </div>
+        <div class="col-lg-6">
+          <div class="card h-100">
+            <div class="card-header"><h3 class="card-title mb-0">Low Stock Items Summary</h3></div>
+            <div class="card-body">
+              <div class="gac-chart-wrap"><canvas id="inventory-chart-low-stock"></canvas></div>
             </div>
           </div>
         </div>
@@ -522,9 +703,101 @@ require_once __DIR__ . '/../../includes/sidebar.php';
           </table>
         </div>
       </div>
+      </div>
     </div>
   </div>
 </main>
 
-<?php require_once __DIR__ . '/../../includes/footer.php'; ?>
+<script>
+  document.addEventListener('DOMContentLoaded', function () {
+    if (!window.GacCharts) {
+      return;
+    }
 
+    var form = document.getElementById('inventory-report-filter-form');
+    var content = document.getElementById('inventory-report-content');
+    if (!form || !content) {
+      return;
+    }
+
+    var charts = window.GacCharts.createRegistry('inventory-report');
+
+    function renderCharts() {
+      var payload = window.GacCharts.parsePayload(content);
+      var chartData = payload || {};
+
+      charts.render('#inventory-chart-valuation', {
+        type: 'line',
+        data: {
+          labels: chartData.stock_valuation_trend ? chartData.stock_valuation_trend.labels : [],
+          datasets: [{
+            label: 'Stock Value Trend',
+            data: chartData.stock_valuation_trend ? chartData.stock_valuation_trend.values : [],
+            borderColor: window.GacCharts.palette.blue,
+            backgroundColor: window.GacCharts.palette.blue + '33',
+            fill: true,
+            tension: 0.25
+          }]
+        },
+        options: window.GacCharts.commonOptions()
+      }, { emptyMessage: 'No stock valuation movements in selected range.' });
+
+      charts.render('#inventory-chart-fast-dead', {
+        type: 'bar',
+        data: {
+          labels: chartData.fast_vs_dead ? chartData.fast_vs_dead.labels : [],
+          datasets: [{
+            label: 'Part Count',
+            data: chartData.fast_vs_dead ? chartData.fast_vs_dead.values : [],
+            backgroundColor: [window.GacCharts.palette.green, window.GacCharts.palette.orange]
+          }]
+        },
+        options: window.GacCharts.commonOptions()
+      }, { emptyMessage: 'No stock speed classification data available.' });
+
+      charts.render('#inventory-chart-category', {
+        type: 'pie',
+        data: {
+          labels: chartData.category_distribution ? chartData.category_distribution.labels : [],
+          datasets: [{
+            data: chartData.category_distribution ? chartData.category_distribution.values : [],
+            backgroundColor: window.GacCharts.pickColors(12)
+          }]
+        },
+        options: window.GacCharts.commonOptions()
+      }, { emptyMessage: 'No category-wise stock rows available.' });
+
+      charts.render('#inventory-chart-low-stock', {
+        type: 'bar',
+        data: {
+          labels: chartData.low_stock ? chartData.low_stock.labels : [],
+          datasets: [{
+            label: 'Deficit Quantity',
+            data: chartData.low_stock ? chartData.low_stock.values : [],
+            backgroundColor: window.GacCharts.palette.red
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: { legend: { display: false } },
+          scales: { y: { beginAtZero: true } }
+        }
+      }, { emptyMessage: 'No low-stock items in selected scope.' });
+    }
+
+    renderCharts();
+
+    window.GacCharts.bindAjaxForm({
+      form: form,
+      target: content,
+      mode: 'full',
+      sourceSelector: '#inventory-report-content',
+      afterUpdate: function () {
+        renderCharts();
+      }
+    });
+  });
+</script>
+
+<?php require_once __DIR__ . '/../../includes/footer.php'; ?>

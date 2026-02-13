@@ -81,6 +81,8 @@ $monthlyRowsStmt = db()->prepare(
             psi.base_amount,
             psi.commission_amount,
             psi.overtime_amount,
+            psi.advance_deduction,
+            psi.loan_deduction,
             (psi.advance_deduction + psi.loan_deduction + psi.manual_deduction) AS deduction_total,
             psi.net_payable,
             psi.paid_amount,
@@ -250,6 +252,63 @@ foreach ($monthlySalaryRows as $salaryRow) {
 }
 $unpaidSalaryRowCount = $partialSalaryRowCount + $pendingSalaryRowCount;
 
+$salaryTrendParams = [
+    'company_id' => $companyId,
+    'from_month' => substr($fromDate, 0, 7),
+    'to_month' => substr($toDate, 0, 7),
+];
+$salaryTrendScopeSql = analytics_garage_scope_sql('pss.garage_id', $selectedGarageId, $garageIds, $salaryTrendParams, 'payroll_trend_scope');
+$salaryTrendStmt = db()->prepare(
+    'SELECT pss.salary_month,
+            COALESCE(SUM(pss.total_payable), 0) AS payable_total
+     FROM payroll_salary_sheets pss
+     WHERE pss.company_id = :company_id
+       AND pss.salary_month BETWEEN :from_month AND :to_month
+       ' . $salaryTrendScopeSql . '
+     GROUP BY pss.salary_month
+     ORDER BY pss.salary_month ASC'
+);
+$salaryTrendStmt->execute($salaryTrendParams);
+$salaryTrendRows = $salaryTrendStmt->fetchAll();
+
+$staffEarningsMap = [];
+$advanceDeductionTotal = 0.0;
+$loanDeductionTotal = 0.0;
+foreach ($monthlySalaryRows as $row) {
+    $staffName = (string) ($row['staff_name'] ?? 'Unknown');
+    if (!isset($staffEarningsMap[$staffName])) {
+        $staffEarningsMap[$staffName] = 0.0;
+    }
+    $staffEarningsMap[$staffName] += (float) ($row['net_payable'] ?? 0);
+    $advanceDeductionTotal += (float) ($row['advance_deduction'] ?? 0);
+    $loanDeductionTotal += (float) ($row['loan_deduction'] ?? 0);
+}
+arsort($staffEarningsMap);
+$staffEarningsMap = array_slice($staffEarningsMap, 0, 10, true);
+
+$chartPayload = [
+    'salary_trend' => [
+        'labels' => array_map(static fn (array $row): string => (string) ($row['salary_month'] ?? ''), $salaryTrendRows),
+        'values' => array_map(static fn (array $row): float => (float) ($row['payable_total'] ?? 0), $salaryTrendRows),
+    ],
+    'staff_earnings' => [
+        'labels' => array_keys($staffEarningsMap),
+        'values' => array_values($staffEarningsMap),
+    ],
+    'advance_vs_loan' => [
+        'labels' => ['Advance Deduction', 'Loan Deduction'],
+        'values' => [round($advanceDeductionTotal, 2), round($loanDeductionTotal, 2)],
+    ],
+];
+$chartPayloadJson = json_encode(
+    $chartPayload,
+    JSON_UNESCAPED_UNICODE
+    | JSON_HEX_TAG
+    | JSON_HEX_AMP
+    | JSON_HEX_APOS
+    | JSON_HEX_QUOT
+);
+
 $exportKey = trim((string) ($_GET['export'] ?? ''));
 if ($exportKey !== '') {
     if (!$canExportData) {
@@ -385,9 +444,39 @@ $renderReportBody = static function (
     int $paidSalaryRowCount,
     int $partialSalaryRowCount,
     int $pendingSalaryRowCount,
-    int $unpaidSalaryRowCount
+    int $unpaidSalaryRowCount,
+    string $chartPayloadJson
 ): void {
     ?>
+      <script type="application/json" data-chart-payload><?= $chartPayloadJson ?: '{}'; ?></script>
+
+      <div class="row g-3 mb-3">
+        <div class="col-lg-4">
+          <div class="card h-100">
+            <div class="card-header"><h3 class="card-title mb-0">Monthly Salary Expense Trend</h3></div>
+            <div class="card-body">
+              <div class="gac-chart-wrap"><canvas id="payroll-chart-salary-trend"></canvas></div>
+            </div>
+          </div>
+        </div>
+        <div class="col-lg-4">
+          <div class="card h-100">
+            <div class="card-header"><h3 class="card-title mb-0">Staff Earnings Comparison</h3></div>
+            <div class="card-body">
+              <div class="gac-chart-wrap"><canvas id="payroll-chart-staff-earnings"></canvas></div>
+            </div>
+          </div>
+        </div>
+        <div class="col-lg-4">
+          <div class="card h-100">
+            <div class="card-header"><h3 class="card-title mb-0">Advance vs Loan Deductions</h3></div>
+            <div class="card-body">
+              <div class="gac-chart-wrap"><canvas id="payroll-chart-advance-loan"></canvas></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <div class="row g-3 mb-3">
         <div class="col-md-3"><div class="info-box"><span class="info-box-icon text-bg-primary"><i class="bi bi-wallet2"></i></span><div class="info-box-content"><span class="info-box-text">Monthly Payable</span><span class="info-box-number"><?= e(format_currency($totalPayable)); ?></span></div></div></div>
         <div class="col-md-3"><div class="info-box"><span class="info-box-icon text-bg-success"><i class="bi bi-check2-circle"></i></span><div class="info-box-content"><span class="info-box-text">Monthly Paid</span><span class="info-box-number"><?= e(format_currency($totalPaid)); ?></span></div></div></div>
@@ -589,7 +678,8 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === '1') {
         $paidSalaryRowCount,
         $partialSalaryRowCount,
         $pendingSalaryRowCount,
-        $unpaidSalaryRowCount
+        $unpaidSalaryRowCount,
+        $chartPayloadJson
     );
     exit;
 }
@@ -687,41 +777,92 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       </div>
 
       <div id="payroll-report-content">
-        <?php $renderReportBody($sheetSummary, $monthlySalaryRows, $staffPaymentHistory, $advanceLedgerRows, $loanOutstandingRows, $mechanicEarningsRows, $pageParams, $canExportData, $totalPayable, $totalPaid, $totalOutstanding, $advanceOutstandingTotal, $loanOutstandingTotal, $paidSalaryRowCount, $partialSalaryRowCount, $pendingSalaryRowCount, $unpaidSalaryRowCount); ?>
+        <?php $renderReportBody($sheetSummary, $monthlySalaryRows, $staffPaymentHistory, $advanceLedgerRows, $loanOutstandingRows, $mechanicEarningsRows, $pageParams, $canExportData, $totalPayable, $totalPaid, $totalOutstanding, $advanceOutstandingTotal, $loanOutstandingTotal, $paidSalaryRowCount, $partialSalaryRowCount, $pendingSalaryRowCount, $unpaidSalaryRowCount, $chartPayloadJson); ?>
       </div>
     </div>
   </div>
 </main>
 
 <script>
-  (function () {
+  document.addEventListener('DOMContentLoaded', function () {
+    if (!window.GacCharts) {
+      return;
+    }
+
     var form = document.getElementById('payroll-filter-form');
     var target = document.getElementById('payroll-report-content');
     if (!form || !target) {
       return;
     }
 
-    form.addEventListener('submit', function (event) {
-      event.preventDefault();
-      var params = new URLSearchParams(new FormData(form));
-      params.set('ajax', '1');
+    var charts = window.GacCharts.createRegistry('payroll-report');
 
-      var url = form.getAttribute('action') || window.location.pathname;
-      target.classList.add('opacity-50');
+    function renderCharts() {
+      var payload = window.GacCharts.parsePayload(target);
+      var chartData = payload || {};
 
-      fetch(url + '?' + params.toString(), { headers: { 'X-Requested-With': 'XMLHttpRequest' } })
-        .then(function (response) { return response.text(); })
-        .then(function (html) {
-          target.innerHTML = html;
-        })
-        .catch(function () {
-          target.innerHTML = '<div class="alert alert-danger">Unable to load payroll report data. Please retry.</div>';
-        })
-        .finally(function () {
-          target.classList.remove('opacity-50');
-        });
+      charts.render('#payroll-chart-salary-trend', {
+        type: 'line',
+        data: {
+          labels: chartData.salary_trend ? chartData.salary_trend.labels : [],
+          datasets: [{
+            label: 'Monthly Payable',
+            data: chartData.salary_trend ? chartData.salary_trend.values : [],
+            borderColor: window.GacCharts.palette.blue,
+            backgroundColor: window.GacCharts.palette.blue + '33',
+            fill: true,
+            tension: 0.25
+          }]
+        },
+        options: window.GacCharts.commonOptions()
+      }, { emptyMessage: 'No monthly salary trend rows in selected range.' });
+
+      charts.render('#payroll-chart-staff-earnings', {
+        type: 'bar',
+        data: {
+          labels: chartData.staff_earnings ? chartData.staff_earnings.labels : [],
+          datasets: [{
+            label: 'Net Earnings',
+            data: chartData.staff_earnings ? chartData.staff_earnings.values : [],
+            backgroundColor: window.GacCharts.pickColors(10)
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: { legend: { display: false } },
+          scales: { y: { beginAtZero: true } }
+        }
+      }, { emptyMessage: 'No staff earning rows in selected scope.' });
+
+      charts.render('#payroll-chart-advance-loan', {
+        type: 'bar',
+        data: {
+          labels: chartData.advance_vs_loan ? chartData.advance_vs_loan.labels : [],
+          datasets: [{
+            label: 'Deduction Amount',
+            data: chartData.advance_vs_loan ? chartData.advance_vs_loan.values : [],
+            backgroundColor: [window.GacCharts.palette.orange, window.GacCharts.palette.red]
+          }]
+        },
+        options: window.GacCharts.commonOptions()
+      }, { emptyMessage: 'No deduction rows in selected month.' });
+    }
+
+    renderCharts();
+
+    window.GacCharts.bindAjaxForm({
+      form: form,
+      target: target,
+      mode: 'partial',
+      extendParams: function (params) {
+        params.set('ajax', '1');
+      },
+      afterUpdate: function () {
+        renderCharts();
+      }
     });
-  })();
+  });
 </script>
 
 <?php require_once __DIR__ . '/../../includes/footer.php'; ?>

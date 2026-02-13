@@ -187,8 +187,82 @@ $summary['cost_total'] = round($summary['cost_total'], 2);
 $summary['paid_total'] = round($summary['paid_total'], 2);
 $summary['outstanding_total'] = round($summary['outstanding_total'], 2);
 
-$renderReportBody = static function (array $rows, array $summary): void {
+$costTrendMap = [];
+$vendorCostMap = [];
+foreach ($rows as $row) {
+    $sentDate = (string) ($row['sent_at'] ?? '');
+    $cost = (float) ($row['agreed_cost'] ?? 0);
+    $vendor = (string) ($row['vendor_label'] ?? 'UNASSIGNED');
+    if ($sentDate !== '') {
+        $monthKey = date('Y-m', strtotime($sentDate));
+        if (!isset($costTrendMap[$monthKey])) {
+            $costTrendMap[$monthKey] = 0.0;
+        }
+        $costTrendMap[$monthKey] += $cost;
+    }
+    if (!isset($vendorCostMap[$vendor])) {
+        $vendorCostMap[$vendor] = 0.0;
+    }
+    $vendorCostMap[$vendor] += $cost;
+}
+ksort($costTrendMap);
+arsort($vendorCostMap);
+$vendorCostMap = array_slice($vendorCostMap, 0, 10, true);
+
+$chartPayload = [
+    'cost_trend' => [
+        'labels' => array_keys($costTrendMap),
+        'values' => array_map(static fn (float $value): float => round($value, 2), array_values($costTrendMap)),
+    ],
+    'vendor_cost' => [
+        'labels' => array_keys($vendorCostMap),
+        'values' => array_map(static fn (float $value): float => round($value, 2), array_values($vendorCostMap)),
+    ],
+    'paid_unpaid' => [
+        'labels' => ['Paid', 'Unpaid'],
+        'values' => [(float) ($summary['paid_total'] ?? 0), (float) ($summary['outstanding_total'] ?? 0)],
+    ],
+];
+$chartPayloadJson = json_encode(
+    $chartPayload,
+    JSON_UNESCAPED_UNICODE
+    | JSON_HEX_TAG
+    | JSON_HEX_AMP
+    | JSON_HEX_APOS
+    | JSON_HEX_QUOT
+);
+
+$renderReportBody = static function (array $rows, array $summary, string $chartPayloadJson): void {
     ?>
+      <script type="application/json" data-chart-payload><?= $chartPayloadJson ?: '{}'; ?></script>
+
+      <div class="row g-3 mb-3">
+        <div class="col-lg-4">
+          <div class="card h-100">
+            <div class="card-header"><h3 class="card-title mb-0">Outsource Cost Trend</h3></div>
+            <div class="card-body">
+              <div class="gac-chart-wrap"><canvas id="outsourced-chart-cost-trend"></canvas></div>
+            </div>
+          </div>
+        </div>
+        <div class="col-lg-4">
+          <div class="card h-100">
+            <div class="card-header"><h3 class="card-title mb-0">Vendor-wise Outsource Cost</h3></div>
+            <div class="card-body">
+              <div class="gac-chart-wrap"><canvas id="outsourced-chart-vendor-cost"></canvas></div>
+            </div>
+          </div>
+        </div>
+        <div class="col-lg-4">
+          <div class="card h-100">
+            <div class="card-header"><h3 class="card-title mb-0">Paid vs Unpaid Distribution</h3></div>
+            <div class="card-body">
+              <div class="gac-chart-wrap"><canvas id="outsourced-chart-paid-unpaid"></canvas></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <div class="row g-3 mb-3">
         <div class="col-md-3"><div class="info-box"><span class="info-box-icon text-bg-primary"><i class="bi bi-list-task"></i></span><div class="info-box-content"><span class="info-box-text">Works</span><span class="info-box-number"><?= number_format((int) ($summary['work_count'] ?? 0)); ?></span></div></div></div>
         <div class="col-md-3"><div class="info-box"><span class="info-box-icon text-bg-secondary"><i class="bi bi-currency-rupee"></i></span><div class="info-box-content"><span class="info-box-text">Cost Total</span><span class="info-box-number"><?= e(format_currency((float) ($summary['cost_total'] ?? 0))); ?></span></div></div></div>
@@ -254,7 +328,7 @@ $renderReportBody = static function (array $rows, array $summary): void {
 
 if (isset($_GET['ajax']) && (string) $_GET['ajax'] === '1') {
     header('Content-Type: text/html; charset=utf-8');
-    $renderReportBody($rows, $summary);
+    $renderReportBody($rows, $summary, $chartPayloadJson);
     exit;
 }
 
@@ -384,41 +458,91 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       </div>
 
       <div id="outsourced-report-content">
-        <?php $renderReportBody($rows, $summary); ?>
+        <?php $renderReportBody($rows, $summary, $chartPayloadJson); ?>
       </div>
     </div>
   </div>
 </main>
 
 <script>
-  (function () {
+  document.addEventListener('DOMContentLoaded', function () {
+    if (!window.GacCharts) {
+      return;
+    }
+
     var form = document.getElementById('outsourced-report-filter-form');
     var target = document.getElementById('outsourced-report-content');
     if (!form || !target) {
       return;
     }
 
-    form.addEventListener('submit', function (event) {
-      event.preventDefault();
-      var params = new URLSearchParams(new FormData(form));
-      params.set('ajax', '1');
+    var charts = window.GacCharts.createRegistry('outsourced-report');
 
-      var url = form.getAttribute('action') || window.location.pathname;
-      target.classList.add('opacity-50');
+    function renderCharts() {
+      var payload = window.GacCharts.parsePayload(target);
+      var chartData = payload || {};
 
-      fetch(url + '?' + params.toString(), { headers: { 'X-Requested-With': 'XMLHttpRequest' } })
-        .then(function (response) { return response.text(); })
-        .then(function (html) {
-          target.innerHTML = html;
-        })
-        .catch(function () {
-          target.innerHTML = '<div class="alert alert-danger">Unable to load outsourced labour report data. Please retry.</div>';
-        })
-        .finally(function () {
-          target.classList.remove('opacity-50');
-        });
+      charts.render('#outsourced-chart-cost-trend', {
+        type: 'line',
+        data: {
+          labels: chartData.cost_trend ? chartData.cost_trend.labels : [],
+          datasets: [{
+            label: 'Outsource Cost',
+            data: chartData.cost_trend ? chartData.cost_trend.values : [],
+            borderColor: window.GacCharts.palette.blue,
+            backgroundColor: window.GacCharts.palette.blue + '33',
+            fill: true,
+            tension: 0.25
+          }]
+        },
+        options: window.GacCharts.commonOptions()
+      }, { emptyMessage: 'No outsource cost trend rows in selected range.' });
+
+      charts.render('#outsourced-chart-vendor-cost', {
+        type: 'bar',
+        data: {
+          labels: chartData.vendor_cost ? chartData.vendor_cost.labels : [],
+          datasets: [{
+            label: 'Outsource Cost',
+            data: chartData.vendor_cost ? chartData.vendor_cost.values : [],
+            backgroundColor: window.GacCharts.pickColors(10)
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: { legend: { display: false } },
+          scales: { y: { beginAtZero: true } }
+        }
+      }, { emptyMessage: 'No vendor-wise outsource rows in selected range.' });
+
+      charts.render('#outsourced-chart-paid-unpaid', {
+        type: 'doughnut',
+        data: {
+          labels: chartData.paid_unpaid ? chartData.paid_unpaid.labels : [],
+          datasets: [{
+            data: chartData.paid_unpaid ? chartData.paid_unpaid.values : [],
+            backgroundColor: [window.GacCharts.palette.green, window.GacCharts.palette.orange]
+          }]
+        },
+        options: window.GacCharts.commonOptions()
+      }, { emptyMessage: 'No paid/unpaid distribution in selected range.' });
+    }
+
+    renderCharts();
+
+    window.GacCharts.bindAjaxForm({
+      form: form,
+      target: target,
+      mode: 'partial',
+      extendParams: function (params) {
+        params.set('ajax', '1');
+      },
+      afterUpdate: function () {
+        renderCharts();
+      }
     });
-  })();
+  });
 </script>
 
 <?php require_once __DIR__ . '/../../includes/footer.php'; ?>

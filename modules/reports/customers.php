@@ -103,6 +103,25 @@ $topCustomerStmt = db()->prepare(
 $topCustomerStmt->execute($topCustomerParams);
 $topCustomers = $topCustomerStmt->fetchAll();
 
+$customerRevenueTrendParams = ['company_id' => $companyId, 'from_date' => $fromDate, 'to_date' => $toDate];
+$customerRevenueTrendScopeSql = analytics_garage_scope_sql('i.garage_id', $selectedGarageId, $garageIds, $customerRevenueTrendParams, 'customer_rev_trend_scope');
+$customerRevenueTrendStmt = db()->prepare(
+    'SELECT DATE_FORMAT(i.invoice_date, "%Y-%m") AS revenue_month,
+            COALESCE(SUM(i.grand_total), 0) AS revenue_total
+     FROM invoices i
+     INNER JOIN job_cards jc ON jc.id = i.job_card_id
+     WHERE i.company_id = :company_id
+       AND i.invoice_status = "FINALIZED"
+       AND jc.status = "CLOSED"
+       AND jc.status_code = "ACTIVE"
+       ' . $customerRevenueTrendScopeSql . '
+       AND i.invoice_date BETWEEN :from_date AND :to_date
+     GROUP BY DATE_FORMAT(i.invoice_date, "%Y-%m")
+     ORDER BY revenue_month ASC'
+);
+$customerRevenueTrendStmt->execute($customerRevenueTrendParams);
+$customerRevenueTrendRows = $customerRevenueTrendStmt->fetchAll();
+
 $customerValueParams = ['company_id' => $companyId, 'from_date' => $fromDate, 'to_date' => $toDate];
 $customerValueScopeSql = analytics_garage_scope_sql('jc.garage_id', $selectedGarageId, $garageIds, $customerValueParams, 'cust_value_scope');
 $customerValueStmt = db()->prepare(
@@ -136,6 +155,31 @@ $closedJobs = (int) ($customerSummary['closed_jobs'] ?? 0);
 $avgJobsPerCustomer = $servedCustomers > 0 ? round($closedJobs / $servedCustomers, 2) : 0.0;
 $repeatCustomerCount = count($repeatCustomers);
 $finalizedRevenue = (float) ($revenueSummary['finalized_revenue'] ?? 0);
+$newCustomerCount = max(0, $servedCustomers - $repeatCustomerCount);
+
+$topCustomerChartRows = array_slice($topCustomers, 0, 10);
+$chartPayload = [
+    'repeat_vs_new' => [
+        'labels' => ['Repeat Customers', 'New Customers'],
+        'values' => [$repeatCustomerCount, $newCustomerCount],
+    ],
+    'top_customers' => [
+        'labels' => array_map(static fn (array $row): string => (string) ($row['full_name'] ?? ''), $topCustomerChartRows),
+        'values' => array_map(static fn (array $row): float => (float) ($row['revenue_total'] ?? 0), $topCustomerChartRows),
+    ],
+    'revenue_trend' => [
+        'labels' => array_map(static fn (array $row): string => (string) ($row['revenue_month'] ?? ''), $customerRevenueTrendRows),
+        'values' => array_map(static fn (array $row): float => (float) ($row['revenue_total'] ?? 0), $customerRevenueTrendRows),
+    ],
+];
+$chartPayloadJson = json_encode(
+    $chartPayload,
+    JSON_UNESCAPED_UNICODE
+    | JSON_HEX_TAG
+    | JSON_HEX_AMP
+    | JSON_HEX_APOS
+    | JSON_HEX_QUOT
+);
 
 $exportKey = trim((string) ($_GET['export'] ?? ''));
 if ($exportKey !== '') {
@@ -228,7 +272,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       <div class="card card-primary mb-3">
         <div class="card-header"><h3 class="card-title">Filters</h3></div>
         <div class="card-body">
-          <form method="get" class="row g-2 align-items-end">
+          <form method="get" id="customers-report-filter-form" class="row g-2 align-items-end">
             <?php if ($allowAllGarages || count($garageIds) > 1): ?>
               <div class="col-md-3">
                 <label class="form-label">Garage Scope</label>
@@ -278,6 +322,9 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         </div>
       </div>
 
+      <div id="customers-report-content">
+        <script type="application/json" data-chart-payload><?= $chartPayloadJson ?: '{}'; ?></script>
+
       <div class="row g-3 mb-3">
         <div class="col-md-3">
           <div class="info-box">
@@ -312,6 +359,33 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             <div class="info-box-content">
               <span class="info-box-text">Finalized Revenue</span>
               <span class="info-box-number"><?= e(format_currency($finalizedRevenue)); ?></span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="row g-3 mb-3">
+        <div class="col-lg-4">
+          <div class="card h-100">
+            <div class="card-header"><h3 class="card-title mb-0">Repeat vs New Customers</h3></div>
+            <div class="card-body">
+              <div class="gac-chart-wrap"><canvas id="customers-chart-repeat-new"></canvas></div>
+            </div>
+          </div>
+        </div>
+        <div class="col-lg-8">
+          <div class="card h-100">
+            <div class="card-header"><h3 class="card-title mb-0">Customer Revenue Trend</h3></div>
+            <div class="card-body">
+              <div class="gac-chart-wrap"><canvas id="customers-chart-revenue-trend"></canvas></div>
+            </div>
+          </div>
+        </div>
+        <div class="col-12">
+          <div class="card h-100">
+            <div class="card-header"><h3 class="card-title mb-0">Top Customers by Revenue</h3></div>
+            <div class="card-body">
+              <div class="gac-chart-wrap"><canvas id="customers-chart-top-revenue"></canvas></div>
             </div>
           </div>
         </div>
@@ -394,9 +468,88 @@ require_once __DIR__ . '/../../includes/sidebar.php';
           </table>
         </div>
       </div>
+      </div>
     </div>
   </div>
 </main>
 
-<?php require_once __DIR__ . '/../../includes/footer.php'; ?>
+<script>
+  document.addEventListener('DOMContentLoaded', function () {
+    if (!window.GacCharts) {
+      return;
+    }
 
+    var form = document.getElementById('customers-report-filter-form');
+    var content = document.getElementById('customers-report-content');
+    if (!form || !content) {
+      return;
+    }
+
+    var charts = window.GacCharts.createRegistry('customers-report');
+
+    function renderCharts() {
+      var payload = window.GacCharts.parsePayload(content);
+      var chartData = payload || {};
+
+      charts.render('#customers-chart-repeat-new', {
+        type: 'pie',
+        data: {
+          labels: chartData.repeat_vs_new ? chartData.repeat_vs_new.labels : [],
+          datasets: [{
+            data: chartData.repeat_vs_new ? chartData.repeat_vs_new.values : [],
+            backgroundColor: [window.GacCharts.palette.green, window.GacCharts.palette.blue]
+          }]
+        },
+        options: window.GacCharts.commonOptions()
+      }, { emptyMessage: 'No customer segmentation data for selected range.' });
+
+      charts.render('#customers-chart-revenue-trend', {
+        type: 'line',
+        data: {
+          labels: chartData.revenue_trend ? chartData.revenue_trend.labels : [],
+          datasets: [{
+            label: 'Finalized Revenue',
+            data: chartData.revenue_trend ? chartData.revenue_trend.values : [],
+            borderColor: window.GacCharts.palette.indigo,
+            backgroundColor: window.GacCharts.palette.indigo + '33',
+            fill: true,
+            tension: 0.3
+          }]
+        },
+        options: window.GacCharts.commonOptions()
+      }, { emptyMessage: 'No monthly customer revenue data for selected range.' });
+
+      charts.render('#customers-chart-top-revenue', {
+        type: 'bar',
+        data: {
+          labels: chartData.top_customers ? chartData.top_customers.labels : [],
+          datasets: [{
+            label: 'Revenue',
+            data: chartData.top_customers ? chartData.top_customers.values : [],
+            backgroundColor: window.GacCharts.pickColors(10)
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: { legend: { display: false } },
+          scales: { y: { beginAtZero: true } }
+        }
+      }, { emptyMessage: 'No top-customer revenue rows for selected range.' });
+    }
+
+    renderCharts();
+
+    window.GacCharts.bindAjaxForm({
+      form: form,
+      target: content,
+      mode: 'full',
+      sourceSelector: '#customers-report-content',
+      afterUpdate: function () {
+        renderCharts();
+      }
+    });
+  });
+</script>
+
+<?php require_once __DIR__ . '/../../includes/footer.php'; ?>

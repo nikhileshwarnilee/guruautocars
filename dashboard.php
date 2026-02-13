@@ -65,7 +65,392 @@ if ($mtdStart < $fyStart) {
     $mtdStart = $fyStart;
 }
 
+$dashboardChartDefaultTo = $todayBounded;
+$dashboardChartDefaultFrom = date('Y-m-d', strtotime($dashboardChartDefaultTo . ' -29 days'));
+if ($dashboardChartDefaultFrom < $fyStart) {
+    $dashboardChartDefaultFrom = $fyStart;
+}
+
 $canViewFinancial = has_permission('reports.financial');
+
+if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'charts') {
+    $chartFrom = analytics_parse_iso_date($_GET['from'] ?? null, $dashboardChartDefaultFrom);
+    $chartTo = analytics_parse_iso_date($_GET['to'] ?? null, $dashboardChartDefaultTo);
+    if ($chartFrom < $fyStart) {
+        $chartFrom = $fyStart;
+    }
+    if ($chartTo > $fyEnd) {
+        $chartTo = $fyEnd;
+    }
+    if ($chartTo < $chartFrom) {
+        $chartTo = $chartFrom;
+    }
+
+    $trendMode = strtolower(trim((string) ($_GET['trend_mode'] ?? 'daily')));
+    if (!in_array($trendMode, ['daily', 'monthly'], true)) {
+        $trendMode = 'daily';
+    }
+
+    $dailyTrendStart = date('Y-m-d', strtotime($chartTo . ' -29 days'));
+    if ($dailyTrendStart < $fyStart) {
+        $dailyTrendStart = $fyStart;
+    }
+    $monthlyTrendStart = date('Y-m-01', strtotime(date('Y-m-01', strtotime($chartTo)) . ' -11 months'));
+    if ($monthlyTrendStart < $fyStart) {
+        $monthlyTrendStart = date('Y-m-01', strtotime($fyStart));
+    }
+
+    $buildDateSeries = static function (string $startDate, string $endDate): array {
+        $labels = [];
+        $cursor = strtotime($startDate);
+        $limit = strtotime($endDate);
+        while ($cursor !== false && $limit !== false && $cursor <= $limit) {
+            $labels[] = date('Y-m-d', $cursor);
+            $cursor = strtotime('+1 day', $cursor);
+        }
+        return $labels;
+    };
+
+    $buildMonthSeries = static function (string $startDate, string $endDate): array {
+        $labels = [];
+        $cursor = strtotime(date('Y-m-01', strtotime($startDate)));
+        $limit = strtotime(date('Y-m-01', strtotime($endDate)));
+        while ($cursor !== false && $limit !== false && $cursor <= $limit) {
+            $labels[] = date('Y-m', $cursor);
+            $cursor = strtotime('+1 month', $cursor);
+        }
+        return $labels;
+    };
+
+    $chartPayload = [
+        'revenue_daily' => ['labels' => [], 'values' => [], 'invoice_counts' => []],
+        'revenue_monthly' => ['labels' => [], 'values' => [], 'invoice_counts' => []],
+        'job_status' => ['labels' => ['Open', 'In Progress', 'Waiting Parts', 'Completed', 'Closed'], 'values' => [0, 0, 0, 0, 0]],
+        'revenue_vs_expense' => ['labels' => [], 'revenue' => [], 'expense' => []],
+        'top_services' => ['labels' => [], 'counts' => []],
+        'inventory_movement' => ['labels' => [], 'stock_in' => [], 'stock_out' => [], 'transfers' => []],
+        'payment_modes' => ['labels' => ['Cash', 'UPI', 'Card', 'Mixed'], 'values' => [0, 0, 0, 0]],
+    ];
+
+    if ($canViewFinancial) {
+        $dailyParams = [
+            'company_id' => $companyId,
+            'from_date' => $dailyTrendStart,
+            'to_date' => $chartTo,
+        ];
+        $dailyScopeSql = analytics_garage_scope_sql('i.garage_id', $selectedGarageId, $garageIds, $dailyParams, 'dash_daily_scope');
+        $dailyStmt = db()->prepare(
+            'SELECT i.invoice_date AS bucket_date,
+                    COUNT(*) AS invoice_count,
+                    COALESCE(SUM(i.grand_total), 0) AS revenue_total
+             FROM invoices i
+             INNER JOIN job_cards jc ON jc.id = i.job_card_id
+             WHERE i.company_id = :company_id
+               AND i.invoice_status = "FINALIZED"
+               AND jc.status = "CLOSED"
+               AND jc.status_code = "ACTIVE"
+               ' . $dailyScopeSql . '
+               AND i.invoice_date BETWEEN :from_date AND :to_date
+             GROUP BY i.invoice_date
+             ORDER BY i.invoice_date ASC'
+        );
+        $dailyStmt->execute($dailyParams);
+        $dailyRows = $dailyStmt->fetchAll();
+        $dailyMap = [];
+        foreach ($dailyRows as $row) {
+            $bucket = (string) ($row['bucket_date'] ?? '');
+            if ($bucket === '') {
+                continue;
+            }
+            $dailyMap[$bucket] = [
+                'revenue_total' => (float) ($row['revenue_total'] ?? 0),
+                'invoice_count' => (int) ($row['invoice_count'] ?? 0),
+            ];
+        }
+        $dailyLabels = $buildDateSeries($dailyTrendStart, $chartTo);
+        $dailyValues = [];
+        $dailyInvoices = [];
+        foreach ($dailyLabels as $label) {
+            $dailyValues[] = (float) ($dailyMap[$label]['revenue_total'] ?? 0);
+            $dailyInvoices[] = (int) ($dailyMap[$label]['invoice_count'] ?? 0);
+        }
+        $chartPayload['revenue_daily'] = [
+            'labels' => $dailyLabels,
+            'values' => $dailyValues,
+            'invoice_counts' => $dailyInvoices,
+        ];
+
+        $monthlyParams = [
+            'company_id' => $companyId,
+            'from_date' => $monthlyTrendStart,
+            'to_date' => $chartTo,
+        ];
+        $monthlyScopeSql = analytics_garage_scope_sql('i.garage_id', $selectedGarageId, $garageIds, $monthlyParams, 'dash_month_scope');
+        $monthlyStmt = db()->prepare(
+            'SELECT DATE_FORMAT(i.invoice_date, "%Y-%m") AS revenue_month,
+                    COUNT(*) AS invoice_count,
+                    COALESCE(SUM(i.grand_total), 0) AS revenue_total
+             FROM invoices i
+             INNER JOIN job_cards jc ON jc.id = i.job_card_id
+             WHERE i.company_id = :company_id
+               AND i.invoice_status = "FINALIZED"
+               AND jc.status = "CLOSED"
+               AND jc.status_code = "ACTIVE"
+               ' . $monthlyScopeSql . '
+               AND i.invoice_date BETWEEN :from_date AND :to_date
+             GROUP BY DATE_FORMAT(i.invoice_date, "%Y-%m")
+             ORDER BY revenue_month ASC'
+        );
+        $monthlyStmt->execute($monthlyParams);
+        $monthlyRows = $monthlyStmt->fetchAll();
+        $monthRevenueMap = [];
+        foreach ($monthlyRows as $row) {
+            $bucket = (string) ($row['revenue_month'] ?? '');
+            if ($bucket === '') {
+                continue;
+            }
+            $monthRevenueMap[$bucket] = [
+                'revenue_total' => (float) ($row['revenue_total'] ?? 0),
+                'invoice_count' => (int) ($row['invoice_count'] ?? 0),
+            ];
+        }
+        $monthLabels = $buildMonthSeries($monthlyTrendStart, $chartTo);
+        $monthValues = [];
+        $monthInvoices = [];
+        foreach ($monthLabels as $label) {
+            $monthValues[] = (float) ($monthRevenueMap[$label]['revenue_total'] ?? 0);
+            $monthInvoices[] = (int) ($monthRevenueMap[$label]['invoice_count'] ?? 0);
+        }
+        $chartPayload['revenue_monthly'] = [
+            'labels' => $monthLabels,
+            'values' => $monthValues,
+            'invoice_counts' => $monthInvoices,
+        ];
+
+        $expenseParams = [
+            'company_id' => $companyId,
+            'from_date' => $monthlyTrendStart,
+            'to_date' => $chartTo,
+        ];
+        $expenseScopeSql = analytics_garage_scope_sql('e.garage_id', $selectedGarageId, $garageIds, $expenseParams, 'dash_exp_scope');
+        $expenseStmt = db()->prepare(
+            'SELECT DATE_FORMAT(e.expense_date, "%Y-%m") AS expense_month,
+                    COALESCE(SUM(e.amount), 0) AS expense_total
+             FROM expenses e
+             WHERE e.company_id = :company_id
+               AND e.entry_type <> "DELETED"
+               ' . $expenseScopeSql . '
+               AND e.expense_date BETWEEN :from_date AND :to_date
+             GROUP BY DATE_FORMAT(e.expense_date, "%Y-%m")
+             ORDER BY expense_month ASC'
+        );
+        $expenseStmt->execute($expenseParams);
+        $expenseRows = $expenseStmt->fetchAll();
+        $expenseMap = [];
+        foreach ($expenseRows as $row) {
+            $bucket = (string) ($row['expense_month'] ?? '');
+            if ($bucket === '') {
+                continue;
+            }
+            $expenseMap[$bucket] = (float) ($row['expense_total'] ?? 0);
+        }
+
+        $chartPayload['revenue_vs_expense'] = [
+            'labels' => $monthLabels,
+            'revenue' => array_map(static fn (string $label): float => (float) ($monthRevenueMap[$label]['revenue_total'] ?? 0), $monthLabels),
+            'expense' => array_map(static fn (string $label): float => (float) ($expenseMap[$label] ?? 0), $monthLabels),
+        ];
+
+        $paymentParams = [
+            'company_id' => $companyId,
+            'from_date' => $chartFrom,
+            'to_date' => $chartTo,
+        ];
+        $paymentScopeSql = analytics_garage_scope_sql('i.garage_id', $selectedGarageId, $garageIds, $paymentParams, 'dash_pay_scope');
+        $paymentStmt = db()->prepare(
+            'SELECT CASE
+                        WHEN p.payment_mode = "CASH" THEN "Cash"
+                        WHEN p.payment_mode = "UPI" THEN "UPI"
+                        WHEN p.payment_mode = "CARD" THEN "Card"
+                        ELSE "Mixed"
+                    END AS payment_bucket,
+                    COALESCE(SUM(p.amount), 0) AS mode_total
+             FROM payments p
+             INNER JOIN invoices i ON i.id = p.invoice_id
+             INNER JOIN job_cards jc ON jc.id = i.job_card_id
+             WHERE i.company_id = :company_id
+               AND i.invoice_status = "FINALIZED"
+               AND jc.status = "CLOSED"
+               AND jc.status_code = "ACTIVE"
+               ' . $paymentScopeSql . '
+               AND p.paid_on BETWEEN :from_date AND :to_date
+             GROUP BY payment_bucket'
+        );
+        $paymentStmt->execute($paymentParams);
+        $paymentRows = $paymentStmt->fetchAll();
+        $paymentMap = ['Cash' => 0.0, 'UPI' => 0.0, 'Card' => 0.0, 'Mixed' => 0.0];
+        foreach ($paymentRows as $row) {
+            $bucket = (string) ($row['payment_bucket'] ?? '');
+            if (!array_key_exists($bucket, $paymentMap)) {
+                continue;
+            }
+            $paymentMap[$bucket] = max(0.0, (float) ($row['mode_total'] ?? 0));
+        }
+        $chartPayload['payment_modes'] = [
+            'labels' => ['Cash', 'UPI', 'Card', 'Mixed'],
+            'values' => [
+                $paymentMap['Cash'],
+                $paymentMap['UPI'],
+                $paymentMap['Card'],
+                $paymentMap['Mixed'],
+            ],
+        ];
+    }
+
+    $statusParams = [
+        'company_id' => $companyId,
+        'from_date' => $chartFrom,
+        'to_date' => $chartTo,
+    ];
+    $statusScopeSql = analytics_garage_scope_sql('jc.garage_id', $selectedGarageId, $garageIds, $statusParams, 'dash_status_scope');
+    $statusStmt = db()->prepare(
+        'SELECT CASE
+                    WHEN jc.status = "OPEN" THEN "OPEN"
+                    WHEN jc.status = "IN_PROGRESS" THEN "IN_PROGRESS"
+                    WHEN jc.status = "WAITING_PARTS" THEN "WAITING_PARTS"
+                    WHEN jc.status IN ("COMPLETED", "READY_FOR_DELIVERY") THEN "COMPLETED"
+                    WHEN jc.status = "CLOSED" THEN "CLOSED"
+                    ELSE "OTHER"
+                END AS status_bucket,
+                COUNT(*) AS status_count
+         FROM job_cards jc
+         WHERE jc.company_id = :company_id
+           AND jc.status_code = "ACTIVE"
+           AND jc.status <> "CANCELLED"
+           ' . $statusScopeSql . '
+           AND DATE(COALESCE(jc.closed_at, jc.updated_at, jc.created_at)) BETWEEN :from_date AND :to_date
+         GROUP BY status_bucket'
+    );
+    $statusStmt->execute($statusParams);
+    $statusRows = $statusStmt->fetchAll();
+    $statusMap = [
+        'OPEN' => 0,
+        'IN_PROGRESS' => 0,
+        'WAITING_PARTS' => 0,
+        'COMPLETED' => 0,
+        'CLOSED' => 0,
+    ];
+    foreach ($statusRows as $row) {
+        $bucket = (string) ($row['status_bucket'] ?? '');
+        if (!array_key_exists($bucket, $statusMap)) {
+            continue;
+        }
+        $statusMap[$bucket] = (int) ($row['status_count'] ?? 0);
+    }
+    $chartPayload['job_status'] = [
+        'labels' => ['Open', 'In Progress', 'Waiting Parts', 'Completed', 'Closed'],
+        'values' => [
+            $statusMap['OPEN'],
+            $statusMap['IN_PROGRESS'],
+            $statusMap['WAITING_PARTS'],
+            $statusMap['COMPLETED'],
+            $statusMap['CLOSED'],
+        ],
+    ];
+
+    $servicesParams = [
+        'company_id' => $companyId,
+        'from_date' => $chartFrom,
+        'to_date' => $chartTo,
+    ];
+    $servicesScopeSql = analytics_garage_scope_sql('jc.garage_id', $selectedGarageId, $garageIds, $servicesParams, 'dash_service_scope');
+    $servicesStmt = db()->prepare(
+        'SELECT COALESCE(NULLIF(TRIM(s.service_name), ""), NULLIF(TRIM(jl.description), ""), "Other") AS service_name,
+                COUNT(*) AS service_count
+         FROM job_labor jl
+         INNER JOIN job_cards jc ON jc.id = jl.job_card_id
+         INNER JOIN invoices i ON i.job_card_id = jc.id
+         LEFT JOIN services s ON s.id = jl.service_id
+         WHERE jc.company_id = :company_id
+           AND jc.status = "CLOSED"
+           AND jc.status_code = "ACTIVE"
+           AND i.company_id = :company_id
+           AND i.invoice_status = "FINALIZED"
+           ' . $servicesScopeSql . '
+           AND DATE(jc.closed_at) BETWEEN :from_date AND :to_date
+         GROUP BY service_name
+         ORDER BY service_count DESC
+         LIMIT 8'
+    );
+    $servicesStmt->execute($servicesParams);
+    $servicesRows = $servicesStmt->fetchAll();
+    $chartPayload['top_services'] = [
+        'labels' => array_map(static fn (array $row): string => (string) ($row['service_name'] ?? ''), $servicesRows),
+        'counts' => array_map(static fn (array $row): int => (int) ($row['service_count'] ?? 0), $servicesRows),
+    ];
+
+    $movementParams = [
+        'company_id' => $companyId,
+        'from_dt' => $chartFrom . ' 00:00:00',
+        'to_dt' => $chartTo . ' 23:59:59',
+    ];
+    $movementScopeSql = analytics_garage_scope_sql('im.garage_id', $selectedGarageId, $garageIds, $movementParams, 'dash_mv_scope');
+    $movementStmt = db()->prepare(
+        'SELECT DATE_FORMAT(im.created_at, "%Y-%m") AS movement_month,
+                COALESCE(SUM(CASE WHEN im.movement_type = "IN" AND im.reference_type <> "TRANSFER" THEN ABS(im.quantity) ELSE 0 END), 0) AS stock_in_qty,
+                COALESCE(SUM(CASE WHEN im.movement_type = "OUT" AND im.reference_type <> "TRANSFER" THEN ABS(im.quantity) ELSE 0 END), 0) AS stock_out_qty,
+                COALESCE(SUM(CASE WHEN im.reference_type = "TRANSFER" THEN ABS(im.quantity) ELSE 0 END), 0) AS transfer_qty
+         FROM inventory_movements im
+         INNER JOIN parts p ON p.id = im.part_id
+         LEFT JOIN job_cards jc_ref ON jc_ref.id = im.reference_id AND im.reference_type = "JOB_CARD"
+         LEFT JOIN inventory_transfers tr ON tr.id = im.reference_id AND im.reference_type = "TRANSFER"
+         WHERE im.company_id = :company_id
+           AND p.company_id = :company_id
+           AND p.status_code = "ACTIVE"
+           ' . $movementScopeSql . '
+           AND im.created_at BETWEEN :from_dt AND :to_dt
+           AND (
+             im.reference_type <> "JOB_CARD"
+             OR (jc_ref.id IS NOT NULL AND jc_ref.company_id = :company_id AND jc_ref.status = "CLOSED" AND jc_ref.status_code = "ACTIVE")
+           )
+           AND (
+             im.reference_type <> "TRANSFER"
+             OR (tr.id IS NOT NULL AND tr.company_id = :company_id AND tr.status_code = "POSTED")
+           )
+         GROUP BY DATE_FORMAT(im.created_at, "%Y-%m")
+         ORDER BY movement_month ASC'
+    );
+    $movementStmt->execute($movementParams);
+    $movementRows = $movementStmt->fetchAll();
+    $movementMap = [];
+    foreach ($movementRows as $row) {
+        $bucket = (string) ($row['movement_month'] ?? '');
+        if ($bucket === '') {
+            continue;
+        }
+        $movementMap[$bucket] = [
+            'stock_in_qty' => (float) ($row['stock_in_qty'] ?? 0),
+            'stock_out_qty' => (float) ($row['stock_out_qty'] ?? 0),
+            'transfer_qty' => (float) ($row['transfer_qty'] ?? 0),
+        ];
+    }
+    $movementMonths = $buildMonthSeries($chartFrom, $chartTo);
+    $chartPayload['inventory_movement'] = [
+        'labels' => $movementMonths,
+        'stock_in' => array_map(static fn (string $label): float => (float) ($movementMap[$label]['stock_in_qty'] ?? 0), $movementMonths),
+        'stock_out' => array_map(static fn (string $label): float => (float) ($movementMap[$label]['stock_out_qty'] ?? 0), $movementMonths),
+        'transfers' => array_map(static fn (string $label): float => (float) ($movementMap[$label]['transfer_qty'] ?? 0), $movementMonths),
+    ];
+
+    ajax_json([
+        'ok' => true,
+        'from' => $chartFrom,
+        'to' => $chartTo,
+        'trend_mode' => $trendMode,
+        'can_view_financial' => $canViewFinancial,
+        'charts' => $chartPayload,
+    ]);
+}
 
 $revenueSummary = [
     'revenue_today' => 0,
@@ -369,6 +754,85 @@ require_once __DIR__ . '/includes/sidebar.php';
         </div>
       </div>
 
+      <div id="dashboard-charts-shell" class="card card-outline card-primary mb-3">
+        <div class="card-header">
+          <h3 class="card-title mb-0">Visualization Layer (Trusted Aggregates)</h3>
+        </div>
+        <div class="card-body">
+          <form id="dashboard-chart-filter-form" class="row g-2 align-items-end mb-3">
+            <div class="col-md-3">
+              <label class="form-label">From</label>
+              <input type="date" name="from" class="form-control" value="<?= e($dashboardChartDefaultFrom); ?>" required />
+            </div>
+            <div class="col-md-3">
+              <label class="form-label">To</label>
+              <input type="date" name="to" class="form-control" value="<?= e($dashboardChartDefaultTo); ?>" required />
+            </div>
+            <div class="col-md-3">
+              <label class="form-label">Revenue Trend View</label>
+              <select name="trend_mode" class="form-select">
+                <option value="daily" selected>Daily (Last 30 Days)</option>
+                <option value="monthly">Monthly (Last 12 Months)</option>
+              </select>
+            </div>
+            <div class="col-md-3 d-flex gap-2">
+              <button type="submit" class="btn btn-primary">Refresh Charts</button>
+            </div>
+          </form>
+
+          <div class="row g-3">
+            <div class="col-xl-8">
+              <div class="card h-100">
+                <div class="card-header"><h3 class="card-title mb-0">Revenue Trend (Finalized Invoices)</h3></div>
+                <div class="card-body">
+                  <div class="gac-chart-wrap"><canvas id="dashboard-chart-revenue-trend"></canvas></div>
+                </div>
+              </div>
+            </div>
+            <div class="col-xl-4">
+              <div class="card h-100">
+                <div class="card-header"><h3 class="card-title mb-0">Job Status Distribution</h3></div>
+                <div class="card-body">
+                  <div class="gac-chart-wrap"><canvas id="dashboard-chart-job-status"></canvas></div>
+                </div>
+              </div>
+            </div>
+            <div class="col-lg-6">
+              <div class="card h-100">
+                <div class="card-header"><h3 class="card-title mb-0">Revenue vs Expense (Monthly)</h3></div>
+                <div class="card-body">
+                  <div class="gac-chart-wrap"><canvas id="dashboard-chart-revenue-expense"></canvas></div>
+                </div>
+              </div>
+            </div>
+            <div class="col-lg-6">
+              <div class="card h-100">
+                <div class="card-header"><h3 class="card-title mb-0">Top Services (Count)</h3></div>
+                <div class="card-body">
+                  <div class="gac-chart-wrap"><canvas id="dashboard-chart-top-services"></canvas></div>
+                </div>
+              </div>
+            </div>
+            <div class="col-xl-8">
+              <div class="card h-100">
+                <div class="card-header"><h3 class="card-title mb-0">Inventory Movement Summary</h3></div>
+                <div class="card-body">
+                  <div class="gac-chart-wrap"><canvas id="dashboard-chart-inventory-movement"></canvas></div>
+                </div>
+              </div>
+            </div>
+            <div class="col-xl-4">
+              <div class="card h-100">
+                <div class="card-header"><h3 class="card-title mb-0">Payment Mode Distribution</h3></div>
+                <div class="card-body">
+                  <div class="gac-chart-wrap"><canvas id="dashboard-chart-payment-modes"></canvas></div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <div class="row g-3">
         <div class="col-lg-6">
           <div class="card">
@@ -451,5 +915,217 @@ require_once __DIR__ . '/includes/sidebar.php';
     </div>
   </div>
 </main>
+
+<script>
+  document.addEventListener('DOMContentLoaded', function () {
+    if (!window.GacCharts) {
+      return;
+    }
+
+    var form = document.getElementById('dashboard-chart-filter-form');
+    var shell = document.getElementById('dashboard-charts-shell');
+    if (!form || !shell) {
+      return;
+    }
+
+    var charts = window.GacCharts.createRegistry('dashboard');
+    var latestPayload = null;
+
+    function currencyTick(value) {
+      return window.GacCharts.asCurrency(value);
+    }
+
+    function renderDashboardCharts(payload) {
+      if (!payload || !payload.charts) {
+        return;
+      }
+
+      var trendMode = String(payload.trend_mode || 'daily').toLowerCase() === 'monthly' ? 'monthly' : 'daily';
+      var trend = trendMode === 'monthly' ? payload.charts.revenue_monthly : payload.charts.revenue_daily;
+      var trendTitle = trendMode === 'monthly' ? 'Monthly Revenue (Last 12 Months)' : 'Daily Revenue (Last 30 Days)';
+      var trendColor = trendMode === 'monthly' ? window.GacCharts.palette.indigo : window.GacCharts.palette.blue;
+
+      charts.render('#dashboard-chart-revenue-trend', {
+        type: 'line',
+        data: {
+          labels: trend && trend.labels ? trend.labels : [],
+          datasets: [{
+            label: trendTitle,
+            data: trend && trend.values ? trend.values : [],
+            borderColor: trendColor,
+            backgroundColor: trendColor + '33',
+            fill: true,
+            tension: 0.3
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: { legend: { position: 'bottom' } },
+          scales: {
+            y: {
+              ticks: { callback: currencyTick }
+            }
+          }
+        }
+      }, {
+        emptyMessage: payload.can_view_financial ? 'No finalized revenue rows in selected scope.' : 'Financial charts require reports.financial permission.'
+      });
+
+      charts.render('#dashboard-chart-job-status', {
+        type: 'doughnut',
+        data: {
+          labels: payload.charts.job_status ? payload.charts.job_status.labels : [],
+          datasets: [{
+            data: payload.charts.job_status ? payload.charts.job_status.values : [],
+            backgroundColor: window.GacCharts.pickColors(5)
+          }]
+        },
+        options: window.GacCharts.commonOptions()
+      });
+
+      charts.render('#dashboard-chart-revenue-expense', {
+        type: 'bar',
+        data: {
+          labels: payload.charts.revenue_vs_expense ? payload.charts.revenue_vs_expense.labels : [],
+          datasets: [{
+            label: 'Finalized Revenue',
+            data: payload.charts.revenue_vs_expense ? payload.charts.revenue_vs_expense.revenue : [],
+            backgroundColor: window.GacCharts.palette.green
+          }, {
+            label: 'Recorded Expense',
+            data: payload.charts.revenue_vs_expense ? payload.charts.revenue_vs_expense.expense : [],
+            backgroundColor: window.GacCharts.palette.red
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: { legend: { position: 'bottom' } },
+          scales: {
+            y: {
+              ticks: { callback: currencyTick }
+            }
+          }
+        }
+      }, {
+        emptyMessage: payload.can_view_financial ? 'No revenue/expense rows in selected scope.' : 'Financial charts require reports.financial permission.'
+      });
+
+      charts.render('#dashboard-chart-top-services', {
+        type: 'bar',
+        data: {
+          labels: payload.charts.top_services ? payload.charts.top_services.labels : [],
+          datasets: [{
+            label: 'Service Count',
+            data: payload.charts.top_services ? payload.charts.top_services.counts : [],
+            backgroundColor: window.GacCharts.pickColors(8)
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: { legend: { display: false } },
+          scales: {
+            x: { ticks: { maxRotation: 0, minRotation: 0 } },
+            y: { beginAtZero: true }
+          }
+        }
+      }, {
+        emptyMessage: 'No finalized service rows in selected range.'
+      });
+
+      charts.render('#dashboard-chart-inventory-movement', {
+        type: 'bar',
+        data: {
+          labels: payload.charts.inventory_movement ? payload.charts.inventory_movement.labels : [],
+          datasets: [{
+            label: 'Stock IN',
+            data: payload.charts.inventory_movement ? payload.charts.inventory_movement.stock_in : [],
+            backgroundColor: window.GacCharts.palette.green
+          }, {
+            label: 'Stock OUT',
+            data: payload.charts.inventory_movement ? payload.charts.inventory_movement.stock_out : [],
+            backgroundColor: window.GacCharts.palette.orange
+          }, {
+            label: 'Transfers',
+            data: payload.charts.inventory_movement ? payload.charts.inventory_movement.transfers : [],
+            backgroundColor: window.GacCharts.palette.cyan
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: { legend: { position: 'bottom' } },
+          scales: {
+            x: { stacked: true },
+            y: { stacked: true, beginAtZero: true }
+          }
+        }
+      }, {
+        emptyMessage: 'No valid inventory movements in selected range.'
+      });
+
+      charts.render('#dashboard-chart-payment-modes', {
+        type: 'pie',
+        data: {
+          labels: payload.charts.payment_modes ? payload.charts.payment_modes.labels : [],
+          datasets: [{
+            data: payload.charts.payment_modes ? payload.charts.payment_modes.values : [],
+            backgroundColor: [
+              window.GacCharts.palette.green,
+              window.GacCharts.palette.blue,
+              window.GacCharts.palette.orange,
+              window.GacCharts.palette.slate
+            ]
+          }]
+        },
+        options: window.GacCharts.commonOptions()
+      }, {
+        emptyMessage: payload.can_view_financial ? 'No payment rows in selected range.' : 'Financial charts require reports.financial permission.'
+      });
+    }
+
+    function loadCharts() {
+      var params = new URLSearchParams(new FormData(form));
+      params.set('ajax', 'charts');
+      shell.classList.add('gac-report-loading');
+
+      fetch('dashboard.php?' + params.toString(), { headers: { 'X-Requested-With': 'XMLHttpRequest' } })
+        .then(function (response) {
+          return response.json();
+        })
+        .then(function (payload) {
+          latestPayload = payload;
+          renderDashboardCharts(payload);
+        })
+        .catch(function () {
+          shell.insertAdjacentHTML('beforeend', '<div class="alert alert-danger mt-3">Unable to load dashboard charts. Please retry.</div>');
+        })
+        .finally(function () {
+          shell.classList.remove('gac-report-loading');
+        });
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      loadCharts();
+    });
+
+    var trendSelector = form.querySelector('select[name="trend_mode"]');
+    if (trendSelector) {
+      trendSelector.addEventListener('change', function () {
+        if (latestPayload) {
+          latestPayload.trend_mode = trendSelector.value;
+          renderDashboardCharts(latestPayload);
+          return;
+        }
+        loadCharts();
+      });
+    }
+
+    loadCharts();
+  });
+</script>
 
 <?php require_once __DIR__ . '/includes/footer.php'; ?>
