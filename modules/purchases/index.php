@@ -2275,6 +2275,32 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                       </table>
                     </div>
                     <button type="button" class="btn btn-outline-secondary btn-sm" id="add-item-row">Add Item Row</button>
+                    <div class="row g-2 mt-2" id="purchase-live-summary">
+                      <div class="col-6 col-md-3">
+                        <div class="border rounded p-2 bg-light-subtle">
+                          <div class="text-muted small">Total Qty</div>
+                          <div class="fw-semibold js-live-total-qty">0.00</div>
+                        </div>
+                      </div>
+                      <div class="col-6 col-md-3">
+                        <div class="border rounded p-2 bg-light-subtle">
+                          <div class="text-muted small">Taxable Total</div>
+                          <div class="fw-semibold js-live-total-taxable">0.00</div>
+                        </div>
+                      </div>
+                      <div class="col-6 col-md-3">
+                        <div class="border rounded p-2 bg-light-subtle">
+                          <div class="text-muted small">GST Total</div>
+                          <div class="fw-semibold js-live-total-gst">0.00</div>
+                        </div>
+                      </div>
+                      <div class="col-6 col-md-3">
+                        <div class="border rounded p-2 bg-light-subtle">
+                          <div class="text-muted small">Grand Total</div>
+                          <div class="fw-semibold js-live-total-grand">0.00</div>
+                        </div>
+                      </div>
+                    </div>
 
                     <div class="mt-3">
                       <label class="form-label">Notes</label>
@@ -2485,6 +2511,32 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                   </table>
                 </div>
                 <button type="button" class="btn btn-outline-secondary btn-sm" id="add-edit-item-row">Add Item Row</button>
+                <div class="row g-2 mt-2" id="purchase-edit-live-summary">
+                  <div class="col-6 col-md-3">
+                    <div class="border rounded p-2 bg-light-subtle">
+                      <div class="text-muted small">Total Qty</div>
+                      <div class="fw-semibold js-live-total-qty">0.00</div>
+                    </div>
+                  </div>
+                  <div class="col-6 col-md-3">
+                    <div class="border rounded p-2 bg-light-subtle">
+                      <div class="text-muted small">Taxable Total</div>
+                      <div class="fw-semibold js-live-total-taxable">0.00</div>
+                    </div>
+                  </div>
+                  <div class="col-6 col-md-3">
+                    <div class="border rounded p-2 bg-light-subtle">
+                      <div class="text-muted small">GST Total</div>
+                      <div class="fw-semibold js-live-total-gst">0.00</div>
+                    </div>
+                  </div>
+                  <div class="col-6 col-md-3">
+                    <div class="border rounded p-2 bg-light-subtle">
+                      <div class="text-muted small">Grand Total</div>
+                      <div class="fw-semibold js-live-total-grand">0.00</div>
+                    </div>
+                  </div>
+                </div>
 
                 <div class="row g-2 mt-2">
                   <div class="col-md-6">
@@ -3052,7 +3104,90 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 
 <script>
   (function () {
-    function wirePartSelect(select) {
+    function readNumber(value) {
+      var parsed = parseFloat(value);
+      if (!Number.isFinite(parsed)) {
+        return 0;
+      }
+      return parsed;
+    }
+
+    function roundTwo(value) {
+      return Math.round((value + Number.EPSILON) * 100) / 100;
+    }
+
+    function formatMoney(value) {
+      return value.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    }
+
+    function updateSummary(summaryEl, totals) {
+      if (!summaryEl) {
+        return;
+      }
+
+      var qtyEl = summaryEl.querySelector('.js-live-total-qty');
+      var taxableEl = summaryEl.querySelector('.js-live-total-taxable');
+      var gstEl = summaryEl.querySelector('.js-live-total-gst');
+      var grandEl = summaryEl.querySelector('.js-live-total-grand');
+
+      if (qtyEl) {
+        qtyEl.textContent = formatMoney(totals.qty);
+      }
+      if (taxableEl) {
+        taxableEl.textContent = formatMoney(totals.taxable);
+      }
+      if (gstEl) {
+        gstEl.textContent = formatMoney(totals.gst);
+      }
+      if (grandEl) {
+        grandEl.textContent = formatMoney(totals.grand);
+      }
+    }
+
+    function calculateTableTotals(table) {
+      var totals = {
+        qty: 0,
+        taxable: 0,
+        gst: 0,
+        grand: 0
+      };
+
+      if (!table) {
+        return totals;
+      }
+
+      table.querySelectorAll('tbody tr').forEach(function (row) {
+        var qtyInput = row.querySelector('input[name="item_quantity[]"]');
+        var costInput = row.querySelector('.js-item-cost');
+        var gstInput = row.querySelector('.js-item-gst');
+
+        var qty = Math.max(0, readNumber(qtyInput ? qtyInput.value : 0));
+        var unitCost = Math.max(0, readNumber(costInput ? costInput.value : 0));
+        var gstRate = Math.max(0, readNumber(gstInput ? gstInput.value : 0));
+
+        if (qty <= 0) {
+          return;
+        }
+
+        var taxable = roundTwo(qty * unitCost);
+        var gstAmount = roundTwo((taxable * gstRate) / 100);
+        var lineTotal = roundTwo(taxable + gstAmount);
+
+        totals.qty += qty;
+        totals.taxable += taxable;
+        totals.gst += gstAmount;
+        totals.grand += lineTotal;
+      });
+
+      totals.qty = roundTwo(totals.qty);
+      totals.taxable = roundTwo(totals.taxable);
+      totals.gst = roundTwo(totals.gst);
+      totals.grand = roundTwo(totals.grand);
+
+      return totals;
+    }
+
+    function wirePartSelect(select, onChanged) {
       if (!select) {
         return;
       }
@@ -3086,48 +3221,77 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         if (gstInput && (!gstInput.value || parseFloat(gstInput.value) === 0)) {
           gstInput.value = defaultGst || '';
         }
+
+        if (typeof onChanged === 'function') {
+          onChanged();
+        }
       });
     }
 
-    function initItemTable(tableId, addButtonId) {
-      var table = document.getElementById(tableId);
-      var addRowBtn = document.getElementById(addButtonId);
-      if (!table || !addRowBtn) {
+    function wireRowEvents(row, onChanged) {
+      if (!row) {
         return;
       }
 
-      table.querySelectorAll('.js-item-part').forEach(wirePartSelect);
+      wirePartSelect(row.querySelector('.js-item-part'), onChanged);
 
-      addRowBtn.addEventListener('click', function () {
-        var body = table.querySelector('tbody');
-        if (!body) {
-          return;
-        }
-
-        var templateRow = body.querySelector('tr');
-        if (!templateRow) {
-          return;
-        }
-
-        var clone = templateRow.cloneNode(true);
-        clone.querySelectorAll('input').forEach(function (input) {
-          input.value = '';
-        });
-        clone.querySelectorAll('select').forEach(function (select) {
-          select.selectedIndex = 0;
-        });
-        var stockCell = clone.querySelector('.js-item-stock');
-        if (stockCell) {
-          stockCell.textContent = '-';
-        }
-
-        body.appendChild(clone);
-        wirePartSelect(clone.querySelector('.js-item-part'));
+      row.querySelectorAll('input[name="item_quantity[]"], .js-item-cost, .js-item-gst').forEach(function (input) {
+        input.addEventListener('input', onChanged);
+        input.addEventListener('change', onChanged);
       });
     }
 
-    initItemTable('purchase-item-table', 'add-item-row');
-    initItemTable('purchase-edit-item-table', 'add-edit-item-row');
+    function initItemTable(tableId, addButtonId, summaryId) {
+      var table = document.getElementById(tableId);
+      var addRowBtn = document.getElementById(addButtonId);
+      if (!table) {
+        return;
+      }
+
+      var summaryEl = summaryId ? document.getElementById(summaryId) : null;
+      var recalculateAndRender = function () {
+        updateSummary(summaryEl, calculateTableTotals(table));
+      };
+
+      table.querySelectorAll('tbody tr').forEach(function (row) {
+        wireRowEvents(row, recalculateAndRender);
+      });
+
+      if (addRowBtn) {
+        addRowBtn.addEventListener('click', function () {
+          var body = table.querySelector('tbody');
+          if (!body) {
+            return;
+          }
+
+          var templateRow = body.querySelector('tr');
+          if (!templateRow) {
+            return;
+          }
+
+          var clone = templateRow.cloneNode(true);
+          clone.querySelectorAll('input').forEach(function (input) {
+            input.value = '';
+          });
+          clone.querySelectorAll('select').forEach(function (select) {
+            select.selectedIndex = 0;
+          });
+          var stockCell = clone.querySelector('.js-item-stock');
+          if (stockCell) {
+            stockCell.textContent = '-';
+          }
+
+          body.appendChild(clone);
+          wireRowEvents(clone, recalculateAndRender);
+          recalculateAndRender();
+        });
+      }
+
+      recalculateAndRender();
+    }
+
+    initItemTable('purchase-item-table', 'add-item-row', 'purchase-live-summary');
+    initItemTable('purchase-edit-item-table', 'add-edit-item-row', 'purchase-edit-live-summary');
 
     function setValue(id, value) {
       var field = document.getElementById(id);
