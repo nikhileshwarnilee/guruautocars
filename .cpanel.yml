@@ -1,0 +1,5 @@
+---
+deployment:
+  tasks:
+    - export DEPLOYPATH=/home3/fkwxcbmy/public_html/vishnusudarshana/
+    - /bin/cp -R * $DEPLOYPATH
