@@ -246,6 +246,12 @@ function reports_module_links(): array
             'icon' => 'bi bi-car-front',
             'path' => 'modules/reports/vehicles.php',
         ],
+        [
+            'menu_key' => 'reports.service_reminders',
+            'label' => 'Service Reminders',
+            'icon' => 'bi bi-bell',
+            'path' => 'modules/reports/service_reminders.php',
+        ],
     ];
 
     if (reports_can_view_financial()) {

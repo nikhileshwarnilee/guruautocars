@@ -4,6 +4,7 @@ declare(strict_types=1);
 require_once __DIR__ . '/../../includes/app.php';
 require_login();
 require_once __DIR__ . '/shared.php';
+require_once __DIR__ . '/../jobs/workflow.php';
 
 reports_require_access();
 
@@ -133,6 +134,19 @@ if ((has_permission('expense.view') || has_permission('expense.manage')) && tabl
     $expenseNet = (float) ($expenseStmt->fetchColumn() ?? 0);
 }
 
+$serviceReminderSummary = [
+    'total' => 0,
+    'overdue' => 0,
+    'due_soon' => 0,
+    'upcoming' => 0,
+    'unscheduled' => 0,
+];
+if (service_reminder_feature_ready()) {
+    $serviceReminderSummary = service_reminder_summary_counts(
+        service_reminder_fetch_active_for_scope($companyId, $selectedGarageId, $garageIds, 1000)
+    );
+}
+
 $moduleCards = [
     [
         'title' => 'Job Reports',
@@ -173,6 +187,14 @@ $moduleCards = [
         'icon' => 'bi bi-car-front',
         'badge' => 'Serviced Vehicles',
         'metric' => number_format($servicedVehicles),
+    ],
+    [
+        'title' => 'Service Reminder Reports',
+        'description' => 'Due, overdue, and upcoming service recommendations with vehicle-level next-visit prediction.',
+        'path' => 'modules/reports/service_reminders.php',
+        'icon' => 'bi bi-bell',
+        'badge' => 'Overdue Reminders',
+        'metric' => number_format((int) ($serviceReminderSummary['overdue'] ?? 0)),
     ],
 ];
 

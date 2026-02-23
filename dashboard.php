@@ -4,6 +4,7 @@ declare(strict_types=1);
 require_once __DIR__ . '/includes/app.php';
 require_login();
 require_permission('dashboard.view');
+require_once __DIR__ . '/modules/jobs/workflow.php';
 
 $page_title = 'Dashboard Intelligence';
 $active_menu = 'dashboard';
@@ -605,6 +606,23 @@ $recentJobsStmt = db()->prepare(
 $recentJobsStmt->execute($recentParams);
 $recentJobs = $recentJobsStmt->fetchAll();
 
+$reminderFeatureReady = service_reminder_feature_ready();
+$dashboardReminderRows = $reminderFeatureReady
+    ? service_reminder_fetch_active_for_scope($companyId, $selectedGarageId, $garageIds, 12)
+    : [];
+$dashboardReminderSummary = $reminderFeatureReady
+    ? service_reminder_summary_counts(
+        service_reminder_fetch_active_for_scope($companyId, $selectedGarageId, $garageIds, 500)
+    )
+    : [
+        'total' => 0,
+        'overdue' => 0,
+        'due_soon' => 0,
+        'upcoming' => 0,
+        'unscheduled' => 0,
+    ];
+$reminderReportLink = url('modules/reports/service_reminders.php');
+
 require_once __DIR__ . '/includes/header.php';
 require_once __DIR__ . '/includes/sidebar.php';
 ?>
@@ -753,6 +771,88 @@ require_once __DIR__ . '/includes/sidebar.php';
               <span class="info-box-number erp-stat-number"><?= number_format($lowStockCount); ?></span>
             </div>
           </div>
+        </div>
+      </div>
+
+      <div class="row g-3 mb-3">
+        <div class="col-12 col-sm-6 col-lg-3">
+          <div class="info-box">
+            <span class="info-box-icon text-bg-primary shadow-sm"><i class="bi bi-bell"></i></span>
+            <div class="info-box-content">
+              <span class="info-box-text">Active Reminders</span>
+              <span class="info-box-number erp-stat-number"><?= number_format((int) ($dashboardReminderSummary['total'] ?? 0)); ?></span>
+            </div>
+          </div>
+        </div>
+        <div class="col-12 col-sm-6 col-lg-3">
+          <div class="info-box">
+            <span class="info-box-icon text-bg-danger shadow-sm"><i class="bi bi-exclamation-circle"></i></span>
+            <div class="info-box-content">
+              <span class="info-box-text">Overdue Reminders</span>
+              <span class="info-box-number erp-stat-number"><?= number_format((int) ($dashboardReminderSummary['overdue'] ?? 0)); ?></span>
+            </div>
+          </div>
+        </div>
+        <div class="col-12 col-sm-6 col-lg-3">
+          <div class="info-box">
+            <span class="info-box-icon text-bg-warning shadow-sm"><i class="bi bi-alarm"></i></span>
+            <div class="info-box-content">
+              <span class="info-box-text">Due Soon</span>
+              <span class="info-box-number erp-stat-number"><?= number_format((int) ($dashboardReminderSummary['due_soon'] ?? 0)); ?></span>
+            </div>
+          </div>
+        </div>
+        <div class="col-12 col-sm-6 col-lg-3">
+          <div class="info-box">
+            <span class="info-box-icon text-bg-info shadow-sm"><i class="bi bi-calendar-check"></i></span>
+            <div class="info-box-content">
+              <span class="info-box-text">Upcoming</span>
+              <span class="info-box-number erp-stat-number"><?= number_format((int) ($dashboardReminderSummary['upcoming'] ?? 0)); ?></span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card card-outline card-success mb-3">
+        <div class="card-header d-flex justify-content-between align-items-center">
+          <h3 class="card-title mb-0">Service Reminder Queue</h3>
+          <a href="<?= e($reminderReportLink); ?>" class="btn btn-sm btn-outline-success">Open Reminder Report</a>
+        </div>
+        <div class="card-body table-responsive p-0">
+          <table class="table table-sm table-striped mb-0">
+            <thead>
+              <tr>
+                <th>Vehicle</th>
+                <th>Service</th>
+                <th class="text-end">Due KM</th>
+                <th>Due Date</th>
+                <th>Predicted Next Visit</th>
+                <th>Status</th>
+                <th>Recommendation</th>
+              </tr>
+            </thead>
+            <tbody>
+              <?php if (empty($dashboardReminderRows)): ?>
+                <tr><td colspan="7" class="text-center text-muted py-4">No active reminders found in selected scope.</td></tr>
+              <?php else: ?>
+                <?php foreach ($dashboardReminderRows as $reminder): ?>
+                  <tr>
+                    <td>
+                      <a href="<?= e(url('modules/vehicles/intelligence.php?id=' . (int) ($reminder['vehicle_id'] ?? 0))); ?>">
+                        <?= e((string) ($reminder['registration_no'] ?? '-')); ?>
+                      </a>
+                    </td>
+                    <td><?= e((string) ($reminder['service_label'] ?? service_reminder_type_label((string) ($reminder['service_type'] ?? '')))); ?></td>
+                    <td class="text-end"><?= isset($reminder['next_due_km']) && $reminder['next_due_km'] !== null ? e(number_format((float) $reminder['next_due_km'], 0)) : '-'; ?></td>
+                    <td><?= e((string) (($reminder['next_due_date'] ?? '') !== '' ? $reminder['next_due_date'] : '-')); ?></td>
+                    <td><?= e((string) (($reminder['predicted_next_visit_date'] ?? '') !== '' ? $reminder['predicted_next_visit_date'] : '-')); ?></td>
+                    <td><span class="badge text-bg-<?= e(service_reminder_due_badge_class((string) ($reminder['due_state'] ?? 'UNSCHEDULED'))); ?>"><?= e((string) ($reminder['due_state'] ?? 'UNSCHEDULED')); ?></span></td>
+                    <td class="small"><?= e((string) ($reminder['recommendation_text'] ?? '-')); ?></td>
+                  </tr>
+                <?php endforeach; ?>
+              <?php endif; ?>
+            </tbody>
+          </table>
         </div>
       </div>
 

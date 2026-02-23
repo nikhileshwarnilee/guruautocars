@@ -695,6 +695,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $targetStatus = strtoupper(trim((string) ($_POST['next_status'] ?? '')));
         $statusNote = post_string('status_note', 255);
         $currentStatus = job_normalize_status((string) $jobForWrite['status']);
+        $reminderPreviewRows = [];
+        $reminderOverrides = [];
 
         if (!in_array($targetStatus, job_workflow_statuses(true), true)) {
             flash_set('job_error', 'Invalid target status selected.', 'danger');
@@ -728,6 +730,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         $inventoryWarnings = [];
         if ($targetStatus === 'CLOSED') {
+            $reminderPreviewRows = service_reminder_build_preview_for_job($companyId, $garageId, $jobId);
+            $reminderOverrides = service_reminder_parse_close_override_payload($_POST, $reminderPreviewRows);
             try {
                 $postResult = job_post_inventory_on_close($jobId, $companyId, $garageId, $userId);
                 $inventoryWarnings = $postResult['warnings'] ?? [];
@@ -771,13 +775,33 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'garage_id' => $garageId,
         ]);
 
+        $reminderResult = [
+            'created_count' => 0,
+            'disabled_count' => 0,
+            'created_types' => [],
+            'warnings' => [],
+        ];
+        if ($targetStatus === 'CLOSED') {
+            $reminderResult = service_reminder_apply_on_job_close(
+                $jobId,
+                $companyId,
+                $garageId,
+                $userId,
+                $reminderOverrides
+            );
+        }
+
         job_append_history(
             $jobId,
             'STATUS_CHANGE',
             $currentStatus,
             $targetStatus,
             $statusNote !== '' ? $statusNote : null,
-            ['inventory_warnings' => count($inventoryWarnings)]
+            [
+                'inventory_warnings' => count($inventoryWarnings),
+                'reminders_created' => (int) ($reminderResult['created_count'] ?? 0),
+                'reminders_disabled' => (int) ($reminderResult['disabled_count'] ?? 0),
+            ]
         );
         $jobAfterWrite = fetch_job_row($jobId, $companyId, $garageId);
         $auditAction = 'status_change';
@@ -808,10 +832,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'metadata' => [
                 'workflow_note' => $statusNote !== '' ? $statusNote : null,
                 'inventory_warning_count' => count($inventoryWarnings),
+                'reminders_created' => (int) ($reminderResult['created_count'] ?? 0),
+                'reminders_disabled' => (int) ($reminderResult['disabled_count'] ?? 0),
+                'reminder_types' => (array) ($reminderResult['created_types'] ?? []),
             ],
         ]);
 
         flash_set('job_success', 'Job status updated to ' . $targetStatus . '.', 'success');
+        if ($targetStatus === 'CLOSED' && (int) ($reminderResult['created_count'] ?? 0) > 0) {
+            flash_set('job_success', 'Auto service reminders created: ' . (int) $reminderResult['created_count'] . '.', 'success');
+        }
         if (!empty($inventoryWarnings)) {
             $preview = implode(' | ', array_slice($inventoryWarnings, 0, 3));
             if (count($inventoryWarnings) > 3) {
@@ -819,8 +849,77 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
             flash_set('job_warning', 'Job closed with stock warnings: ' . $preview, 'warning');
         }
+        if (!empty($reminderResult['warnings'])) {
+            $preview = implode(' | ', array_slice((array) $reminderResult['warnings'], 0, 2));
+            if (count((array) $reminderResult['warnings']) > 2) {
+                $preview .= ' | +' . (count((array) $reminderResult['warnings']) - 2) . ' more';
+            }
+            flash_set('job_warning', 'Reminder engine warnings: ' . $preview, 'warning');
+        }
 
         redirect('modules/jobs/view.php?id=' . $jobId);
+    }
+
+    if ($action === 'add_manual_reminder') {
+        if (!$canEdit && !$canClose) {
+            flash_set('job_error', 'You do not have permission to add manual reminders.', 'danger');
+            redirect('modules/jobs/view.php?id=' . $jobId . '#service-reminders');
+        }
+
+        if (!service_reminder_feature_ready()) {
+            flash_set('job_error', 'Service reminder storage is not ready. Contact administrator.', 'danger');
+            redirect('modules/jobs/view.php?id=' . $jobId . '#service-reminders');
+        }
+
+        $serviceType = (string) ($_POST['manual_service_type'] ?? '');
+        $lastServiceKm = service_reminder_parse_positive_int($_POST['manual_last_km'] ?? null);
+        $intervalKm = service_reminder_parse_positive_int($_POST['manual_interval_km'] ?? null);
+        $nextDueKm = service_reminder_parse_positive_int($_POST['manual_next_due_km'] ?? null);
+        $intervalDays = service_reminder_parse_positive_int($_POST['manual_interval_days'] ?? null);
+        $nextDueDate = service_reminder_parse_date((string) ($_POST['manual_next_due_date'] ?? ''));
+        $recommendation = post_string('manual_note', 255);
+
+        $manualResult = service_reminder_create_manual(
+            $companyId,
+            $garageId,
+            (int) ($jobForWrite['vehicle_id'] ?? 0),
+            $jobId,
+            $serviceType,
+            $lastServiceKm,
+            $intervalKm,
+            $nextDueKm,
+            $intervalDays,
+            $nextDueDate,
+            $recommendation,
+            $userId
+        );
+        if (!(bool) ($manualResult['ok'] ?? false)) {
+            flash_set('job_error', (string) ($manualResult['message'] ?? 'Unable to save manual reminder.'), 'danger');
+            redirect('modules/jobs/view.php?id=' . $jobId . '#service-reminders');
+        }
+
+        job_append_history(
+            $jobId,
+            'MANUAL_REMINDER_ADD',
+            null,
+            null,
+            'Manual service reminder added',
+            [
+                'service_type' => service_reminder_normalize_type($serviceType),
+                'reminder_id' => (int) ($manualResult['id'] ?? 0),
+            ]
+        );
+        log_audit('job_cards', 'manual_reminder_add', $jobId, 'Manual service reminder added for vehicle', [
+            'entity' => 'service_reminder',
+            'source' => 'UI',
+            'metadata' => [
+                'reminder_id' => (int) ($manualResult['id'] ?? 0),
+                'service_type' => service_reminder_normalize_type($serviceType),
+            ],
+        ]);
+
+        flash_set('job_success', 'Manual service reminder saved.', 'success');
+        redirect('modules/jobs/view.php?id=' . $jobId . '#service-reminders');
     }
 
     if ($action === 'soft_delete') {
@@ -1841,6 +1940,19 @@ foreach (job_workflow_statuses(true) as $status) {
     $nextStatuses[] = $status;
 }
 
+$serviceReminderFeatureReady = service_reminder_feature_ready();
+$autoReminderPreviewRows = [];
+if ($serviceReminderFeatureReady && !$jobLocked && in_array('CLOSED', $nextStatuses, true)) {
+    $autoReminderPreviewRows = service_reminder_build_preview_for_job($companyId, $garageId, $jobId);
+}
+$activeServiceReminders = $serviceReminderFeatureReady
+    ? service_reminder_fetch_active_by_vehicle($companyId, (int) $job['vehicle_id'], $garageId, 25)
+    : [];
+$serviceReminderSummary = service_reminder_summary_counts($activeServiceReminders);
+$jobCurrentOdometerForReminder = $jobOdometerEnabled
+    ? service_reminder_parse_positive_int($job['odometer_km'] ?? null)
+    : null;
+
 $visData = job_fetch_vis_suggestions($companyId, $garageId, (int) $job['vehicle_id']);
 $visVariant = $visData['vehicle_variant'];
 $visServiceSuggestions = $visData['service_suggestions'] ?? [];
@@ -2112,12 +2224,186 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                       <label class="form-label">Audit Note</label>
                       <textarea id="status-note-input" name="status_note" class="form-control" rows="2" placeholder="Optional note (required for CANCELLED)"></textarea>
                     </div>
+
+                    <div id="close-reminder-preview" class="mt-3 <?= ($serviceReminderFeatureReady && !empty($autoReminderPreviewRows)) ? '' : 'd-none'; ?>">
+                      <div class="border rounded p-2 bg-light">
+                        <div class="fw-semibold mb-2">Auto Service Reminder Preview (Applied On CLOSE)</div>
+                        <?php if (!$serviceReminderFeatureReady): ?>
+                          <div class="text-muted small">Reminder storage is not ready. Run DB upgrade to enable this module.</div>
+                        <?php elseif (empty($autoReminderPreviewRows)): ?>
+                          <div class="text-muted small">No auto reminders detected from current job lines and VIS interval rules.</div>
+                        <?php else: ?>
+                          <div class="table-responsive">
+                            <table class="table table-sm table-bordered mb-2">
+                              <thead>
+                                <tr>
+                                  <th style="width:6%;">On</th>
+                                  <th style="width:15%;">Service</th>
+                                  <th style="width:10%;">Last KM</th>
+                                  <th style="width:10%;">Interval KM</th>
+                                  <th style="width:10%;">Next Due KM</th>
+                                  <th style="width:9%;">Days</th>
+                                  <th style="width:12%;">Next Date</th>
+                                  <th style="width:12%;">Predicted Visit</th>
+                                  <th style="width:16%;">Recommendation</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                <?php foreach ($autoReminderPreviewRows as $previewRow): ?>
+                                  <?php
+                                    $serviceTypeKey = (string) ($previewRow['service_type'] ?? '');
+                                    if ($serviceTypeKey === '') {
+                                        continue;
+                                    }
+                                  ?>
+                                  <tr data-reminder-row="1">
+                                    <td class="text-center">
+                                      <input type="hidden" name="reminder_enabled[<?= e($serviceTypeKey); ?>]" value="0">
+                                      <input class="form-check-input js-reminder-enable" type="checkbox" name="reminder_enabled[<?= e($serviceTypeKey); ?>]" value="1" checked>
+                                    </td>
+                                    <td class="fw-semibold"><?= e((string) ($previewRow['service_label'] ?? $serviceTypeKey)); ?></td>
+                                    <td>
+                                      <input type="number" step="1" min="0" name="reminder_last_km[<?= e($serviceTypeKey); ?>]" value="<?= e((string) ($previewRow['last_service_km'] ?? '')); ?>" class="form-control form-control-sm js-reminder-input">
+                                    </td>
+                                    <td>
+                                      <input type="number" step="1" min="0" name="reminder_interval_km[<?= e($serviceTypeKey); ?>]" value="<?= e((string) ($previewRow['interval_km'] ?? '')); ?>" class="form-control form-control-sm js-reminder-input">
+                                    </td>
+                                    <td>
+                                      <input type="number" step="1" min="0" name="reminder_next_due_km[<?= e($serviceTypeKey); ?>]" value="<?= e((string) ($previewRow['next_due_km'] ?? '')); ?>" class="form-control form-control-sm js-reminder-input">
+                                    </td>
+                                    <td>
+                                      <input type="number" step="1" min="0" name="reminder_interval_days[<?= e($serviceTypeKey); ?>]" value="<?= e((string) ($previewRow['interval_days'] ?? '')); ?>" class="form-control form-control-sm js-reminder-input">
+                                    </td>
+                                    <td>
+                                      <input type="date" name="reminder_next_due_date[<?= e($serviceTypeKey); ?>]" value="<?= e((string) ($previewRow['next_due_date'] ?? '')); ?>" class="form-control form-control-sm js-reminder-input">
+                                    </td>
+                                    <td class="small"><?= e((string) (($previewRow['predicted_next_visit_date'] ?? '') !== '' ? $previewRow['predicted_next_visit_date'] : '-')); ?></td>
+                                    <td>
+                                      <input type="text" maxlength="255" name="reminder_note[<?= e($serviceTypeKey); ?>]" value="<?= e((string) ($previewRow['recommendation_text'] ?? '')); ?>" class="form-control form-control-sm js-reminder-input">
+                                    </td>
+                                  </tr>
+                                <?php endforeach; ?>
+                              </tbody>
+                            </table>
+                          </div>
+                          <div class="small text-muted">Unchecked rows are skipped on close, and any existing active reminder for that service type is marked inactive.</div>
+                        <?php endif; ?>
+                      </div>
+                    </div>
                   <?php endif; ?>
                 </div>
                 <div class="card-footer">
                   <button type="submit" class="btn btn-primary" <?= $jobLocked || empty($nextStatuses) ? 'disabled' : ''; ?>>Apply Transition</button>
                 </div>
               </form>
+            </div>
+
+            <div class="card card-outline card-success" id="service-reminders">
+              <div class="card-header d-flex justify-content-between align-items-center">
+                <h3 class="card-title mb-0">Service Reminders</h3>
+                <span class="badge text-bg-light border"><?= (int) ($serviceReminderSummary['total'] ?? 0); ?> Active</span>
+              </div>
+              <div class="card-body">
+                <?php if (!$serviceReminderFeatureReady): ?>
+                  <div class="alert alert-warning mb-0">Service reminder storage is not ready. Please run DB upgrade.</div>
+                <?php else: ?>
+                  <div class="row g-2 mb-3">
+                    <div class="col-6 col-lg-3">
+                      <div class="small text-muted">Overdue</div>
+                      <div class="fw-semibold text-danger"><?= (int) ($serviceReminderSummary['overdue'] ?? 0); ?></div>
+                    </div>
+                    <div class="col-6 col-lg-3">
+                      <div class="small text-muted">Due Soon</div>
+                      <div class="fw-semibold text-warning"><?= (int) ($serviceReminderSummary['due_soon'] ?? 0); ?></div>
+                    </div>
+                    <div class="col-6 col-lg-3">
+                      <div class="small text-muted">Upcoming</div>
+                      <div class="fw-semibold text-info"><?= (int) ($serviceReminderSummary['upcoming'] ?? 0); ?></div>
+                    </div>
+                    <div class="col-6 col-lg-3">
+                      <div class="small text-muted">Unscheduled</div>
+                      <div class="fw-semibold text-secondary"><?= (int) ($serviceReminderSummary['unscheduled'] ?? 0); ?></div>
+                    </div>
+                  </div>
+
+                  <div class="table-responsive mb-3">
+                    <table class="table table-sm table-bordered align-middle mb-0">
+                      <thead>
+                        <tr>
+                          <th>Service</th>
+                          <th>Due KM</th>
+                          <th>Due Date</th>
+                          <th>Predicted Visit</th>
+                          <th>Status</th>
+                          <th>Source</th>
+                          <th>Recommendation</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        <?php if (empty($activeServiceReminders)): ?>
+                          <tr><td colspan="7" class="text-center text-muted">No active reminders for this vehicle.</td></tr>
+                        <?php else: ?>
+                          <?php foreach ($activeServiceReminders as $reminder): ?>
+                            <tr>
+                              <td><?= e((string) ($reminder['service_label'] ?? service_reminder_type_label((string) ($reminder['service_type'] ?? '')))); ?></td>
+                              <td class="text-end"><?= isset($reminder['next_due_km']) && $reminder['next_due_km'] !== null ? e(number_format((float) $reminder['next_due_km'], 0)) : '-'; ?></td>
+                              <td><?= e((string) (($reminder['next_due_date'] ?? '') !== '' ? $reminder['next_due_date'] : '-')); ?></td>
+                              <td><?= e((string) (($reminder['predicted_next_visit_date'] ?? '') !== '' ? $reminder['predicted_next_visit_date'] : '-')); ?></td>
+                              <td><span class="badge text-bg-<?= e(service_reminder_due_badge_class((string) ($reminder['due_state'] ?? 'UNSCHEDULED'))); ?>"><?= e((string) ($reminder['due_state'] ?? 'UNSCHEDULED')); ?></span></td>
+                              <td><?= e((string) ($reminder['source_type'] ?? 'AUTO')); ?></td>
+                              <td class="small"><?= e((string) ($reminder['recommendation_text'] ?? '-')); ?></td>
+                            </tr>
+                          <?php endforeach; ?>
+                        <?php endif; ?>
+                      </tbody>
+                    </table>
+                  </div>
+
+                  <?php if ($canEdit || $canClose): ?>
+                    <h6 class="mb-2">Add / Override Manual Reminder</h6>
+                    <form method="post" class="row g-2 align-items-end">
+                      <?= csrf_field(); ?>
+                      <input type="hidden" name="_action" value="add_manual_reminder">
+                      <div class="col-md-3">
+                        <label class="form-label">Service Type</label>
+                        <select name="manual_service_type" class="form-select" required>
+                          <option value="">Select</option>
+                          <?php foreach (service_reminder_supported_types() as $serviceType): ?>
+                            <option value="<?= e($serviceType); ?>"><?= e(service_reminder_type_label($serviceType)); ?></option>
+                          <?php endforeach; ?>
+                        </select>
+                      </div>
+                      <div class="col-md-2">
+                        <label class="form-label">Last KM</label>
+                        <input type="number" step="1" min="0" name="manual_last_km" class="form-control" value="<?= e((string) ($jobCurrentOdometerForReminder ?? '')); ?>">
+                      </div>
+                      <div class="col-md-2">
+                        <label class="form-label">Interval KM</label>
+                        <input type="number" step="1" min="0" name="manual_interval_km" class="form-control">
+                      </div>
+                      <div class="col-md-2">
+                        <label class="form-label">Next Due KM</label>
+                        <input type="number" step="1" min="0" name="manual_next_due_km" class="form-control">
+                      </div>
+                      <div class="col-md-1">
+                        <label class="form-label">Days</label>
+                        <input type="number" step="1" min="0" name="manual_interval_days" class="form-control">
+                      </div>
+                      <div class="col-md-2">
+                        <label class="form-label">Next Date</label>
+                        <input type="date" name="manual_next_due_date" class="form-control">
+                      </div>
+                      <div class="col-12">
+                        <label class="form-label">Recommendation</label>
+                        <input type="text" maxlength="255" name="manual_note" class="form-control" placeholder="Custom recommendation text">
+                      </div>
+                      <div class="col-12">
+                        <button type="submit" class="btn btn-outline-success">Save Manual Reminder</button>
+                      </div>
+                    </form>
+                  <?php endif; ?>
+                <?php endif; ?>
+              </div>
             </div>
           <?php endif; ?>
 
@@ -3214,6 +3500,8 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 
     var nextStatusSelect = document.getElementById('next-status-select');
     var statusNoteInput = document.getElementById('status-note-input');
+    var closeReminderPreview = document.getElementById('close-reminder-preview');
+    var reminderRows = document.querySelectorAll('[data-reminder-row]');
 
     function toggleStatusNoteRequirement() {
       if (!nextStatusSelect || !statusNoteInput) {
@@ -3229,9 +3517,54 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       }
     }
 
+    function toggleCloseReminderPreview() {
+      if (!nextStatusSelect || !closeReminderPreview) {
+        return;
+      }
+      if (nextStatusSelect.value === 'CLOSED') {
+        closeReminderPreview.classList.remove('d-none');
+      } else {
+        closeReminderPreview.classList.add('d-none');
+      }
+    }
+
+    function syncReminderRowInputs(row) {
+      if (!row) {
+        return;
+      }
+      var enableCheckbox = row.querySelector('.js-reminder-enable');
+      if (!enableCheckbox) {
+        return;
+      }
+      var rowInputs = row.querySelectorAll('.js-reminder-input');
+      for (var index = 0; index < rowInputs.length; index++) {
+        rowInputs[index].disabled = !enableCheckbox.checked;
+      }
+    }
+
+    if (reminderRows && reminderRows.length > 0) {
+      for (var rowIndex = 0; rowIndex < reminderRows.length; rowIndex++) {
+        var reminderRow = reminderRows[rowIndex];
+        var rowCheckbox = reminderRow ? reminderRow.querySelector('.js-reminder-enable') : null;
+        if (!rowCheckbox) {
+          continue;
+        }
+        rowCheckbox.addEventListener('change', (function (rowRef) {
+          return function () {
+            syncReminderRowInputs(rowRef);
+          };
+        })(reminderRow));
+        syncReminderRowInputs(reminderRow);
+      }
+    }
+
     if (nextStatusSelect && statusNoteInput) {
-      nextStatusSelect.addEventListener('change', toggleStatusNoteRequirement);
+      nextStatusSelect.addEventListener('change', function () {
+        toggleStatusNoteRequirement();
+        toggleCloseReminderPreview();
+      });
       toggleStatusNoteRequirement();
+      toggleCloseReminderPreview();
     }
   })();
 </script>

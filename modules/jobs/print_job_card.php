@@ -100,6 +100,9 @@ foreach ($partLines as $line) {
     $partsTotal += (float) ($line['total_amount'] ?? 0);
 }
 $grandTotal = round($serviceTotal + $partsTotal, 2);
+$nextServiceReminders = service_reminder_feature_ready()
+    ? service_reminder_fetch_active_by_vehicle($companyId, (int) ($job['vehicle_id'] ?? 0), $garageId, 6)
+    : [];
 $companyLogoUrl = company_logo_url((int) ($job['company_id'] ?? $companyId), $garageId);
 ?>
 <!doctype html>
@@ -284,6 +287,38 @@ $companyLogoUrl = company_logo_url((int) ($job['company_id'] ?? $companyId), $ga
                 <?php endif; ?>
               </tbody>
             </table>
+          </div>
+
+          <div class="mb-3">
+            <h6 class="mb-1">Next Recommended Service</h6>
+            <div class="table-responsive">
+              <table class="table table-bordered table-sm mb-0">
+                <thead>
+                  <tr>
+                    <th>Service</th>
+                    <th class="text-end">Due KM</th>
+                    <th>Due Date</th>
+                    <th>Predicted Visit</th>
+                    <th>Status</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <?php if (empty($nextServiceReminders)): ?>
+                    <tr><td colspan="5" class="text-center text-muted">No active service reminders.</td></tr>
+                  <?php else: ?>
+                    <?php foreach ($nextServiceReminders as $reminder): ?>
+                      <tr>
+                        <td><?= e((string) ($reminder['service_label'] ?? service_reminder_type_label((string) ($reminder['service_type'] ?? '')))); ?></td>
+                        <td class="text-end"><?= isset($reminder['next_due_km']) && $reminder['next_due_km'] !== null ? e(number_format((float) $reminder['next_due_km'], 0)) : '-'; ?></td>
+                        <td><?= e((string) (($reminder['next_due_date'] ?? '') !== '' ? $reminder['next_due_date'] : '-')); ?></td>
+                        <td><?= e((string) (($reminder['predicted_next_visit_date'] ?? '') !== '' ? $reminder['predicted_next_visit_date'] : '-')); ?></td>
+                        <td><?= e((string) ($reminder['due_state'] ?? 'UNSCHEDULED')); ?></td>
+                      </tr>
+                    <?php endforeach; ?>
+                  <?php endif; ?>
+                </tbody>
+              </table>
+            </div>
           </div>
 
           <div class="row">

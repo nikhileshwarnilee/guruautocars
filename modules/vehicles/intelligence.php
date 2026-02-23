@@ -468,6 +468,24 @@ foreach ($partsUsage as $row) {
     $partsUsageTotal += (float) ($row['total_amount'] ?? 0);
 }
 
+$activeServiceReminders = service_reminder_feature_ready()
+    ? service_reminder_fetch_active_by_vehicle($companyId, $vehicleId, 0, 25)
+    : [];
+$serviceReminderSummary = service_reminder_summary_counts($activeServiceReminders);
+$predictedNextVisitDate = null;
+foreach ($activeServiceReminders as $reminder) {
+    $candidate = service_reminder_parse_date((string) ($reminder['predicted_next_visit_date'] ?? ''));
+    if ($candidate === null) {
+        $candidate = service_reminder_parse_date((string) ($reminder['next_due_date'] ?? ''));
+    }
+    if ($candidate === null) {
+        continue;
+    }
+    if ($predictedNextVisitDate === null || strcmp($candidate, $predictedNextVisitDate) < 0) {
+        $predictedNextVisitDate = $candidate;
+    }
+}
+
 require_once __DIR__ . '/../../includes/header.php';
 require_once __DIR__ . '/../../includes/sidebar.php';
 ?>
@@ -581,6 +599,15 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                   <?php endif; ?>
                 </div>
                 <div class="col-md-4">
+                  <div class="text-muted small">Predicted Next Visit</div>
+                  <?php if ($predictedNextVisitDate !== null): ?>
+                    <div class="fw-semibold"><?= e($predictedNextVisitDate); ?></div>
+                    <div class="small text-muted">Based on average usage and active service reminders</div>
+                  <?php else: ?>
+                    <div class="text-muted">Insufficient reminder/usage data.</div>
+                  <?php endif; ?>
+                </div>
+                <div class="col-md-4">
                   <div class="text-muted small">Chassis No</div>
                   <div class="fw-semibold"><?= e((string) ($vehicle['chassis_no'] ?? '-')); ?></div>
                 </div>
@@ -676,6 +703,64 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                 </div>
               </div>
             </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card mb-3">
+        <div class="card-header d-flex justify-content-between align-items-center">
+          <h3 class="card-title mb-0">Service Reminders And Next Visit Prediction</h3>
+          <span class="badge text-bg-light border"><?= (int) ($serviceReminderSummary['total'] ?? 0); ?> Active</span>
+        </div>
+        <div class="card-body">
+          <div class="row g-2 mb-3">
+            <div class="col-6 col-md-3">
+              <div class="text-muted small">Overdue</div>
+              <div class="fw-semibold text-danger"><?= (int) ($serviceReminderSummary['overdue'] ?? 0); ?></div>
+            </div>
+            <div class="col-6 col-md-3">
+              <div class="text-muted small">Due Soon</div>
+              <div class="fw-semibold text-warning"><?= (int) ($serviceReminderSummary['due_soon'] ?? 0); ?></div>
+            </div>
+            <div class="col-6 col-md-3">
+              <div class="text-muted small">Upcoming</div>
+              <div class="fw-semibold text-info"><?= (int) ($serviceReminderSummary['upcoming'] ?? 0); ?></div>
+            </div>
+            <div class="col-6 col-md-3">
+              <div class="text-muted small">Predicted Next Visit</div>
+              <div class="fw-semibold"><?= e((string) ($predictedNextVisitDate ?? '-')); ?></div>
+            </div>
+          </div>
+
+          <div class="table-responsive">
+            <table class="table table-sm table-striped mb-0">
+              <thead>
+                <tr>
+                  <th>Service</th>
+                  <th class="text-end">Due KM</th>
+                  <th>Due Date</th>
+                  <th>Predicted Visit</th>
+                  <th>Status</th>
+                  <th>Recommendation</th>
+                </tr>
+              </thead>
+              <tbody>
+                <?php if (empty($activeServiceReminders)): ?>
+                  <tr><td colspan="6" class="text-center text-muted py-3">No active reminders for this vehicle.</td></tr>
+                <?php else: ?>
+                  <?php foreach ($activeServiceReminders as $reminder): ?>
+                    <tr>
+                      <td><?= e((string) ($reminder['service_label'] ?? service_reminder_type_label((string) ($reminder['service_type'] ?? '')))); ?></td>
+                      <td class="text-end"><?= isset($reminder['next_due_km']) && $reminder['next_due_km'] !== null ? e(number_format((float) $reminder['next_due_km'], 0)) : '-'; ?></td>
+                      <td><?= e((string) (($reminder['next_due_date'] ?? '') !== '' ? $reminder['next_due_date'] : '-')); ?></td>
+                      <td><?= e((string) (($reminder['predicted_next_visit_date'] ?? '') !== '' ? $reminder['predicted_next_visit_date'] : '-')); ?></td>
+                      <td><span class="badge text-bg-<?= e(service_reminder_due_badge_class((string) ($reminder['due_state'] ?? 'UNSCHEDULED'))); ?>"><?= e((string) ($reminder['due_state'] ?? 'UNSCHEDULED')); ?></span></td>
+                      <td class="small"><?= e((string) ($reminder['recommendation_text'] ?? '-')); ?></td>
+                    </tr>
+                  <?php endforeach; ?>
+                <?php endif; ?>
+              </tbody>
+            </table>
           </div>
         </div>
       </div>
