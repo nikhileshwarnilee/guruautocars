@@ -17,7 +17,11 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
 
 require_csrf();
 
-if (!has_permission('customer.view') || !has_permission('customer.manage')) {
+$canCustomerManage = has_permission('customer.view') && has_permission('customer.manage');
+$canJobCreate = has_permission('job.create') || has_permission('job.manage');
+$canInlineCreate = $canCustomerManage || $canJobCreate;
+
+if (!$canInlineCreate) {
     http_response_code(403);
     echo json_encode([
         'ok' => false,

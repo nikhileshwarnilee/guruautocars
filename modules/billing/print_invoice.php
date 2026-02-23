@@ -61,6 +61,18 @@ $snapshot = json_decode((string) ($invoice['snapshot_json'] ?? ''), true);
 if (!is_array($snapshot)) {
     $snapshot = [];
 }
+$discountMeta = billing_discount_meta_from_snapshot($snapshot);
+$discountType = (string) ($discountMeta['type'] ?? 'AMOUNT');
+$discountValue = (float) ($discountMeta['value'] ?? 0);
+$discountAmount = (float) ($discountMeta['amount'] ?? 0);
+$discountLabel = '-';
+if ($discountAmount > 0.009 && $discountType === 'PERCENT' && $discountValue > 0.009) {
+    $discountLabel = rtrim(rtrim(number_format($discountValue, 2), '0'), '.') . '%';
+} elseif ($discountAmount > 0.009) {
+    $discountLabel = 'Flat';
+}
+$grossBeforeDiscount = billing_round((float) ($invoice['gross_total'] ?? 0));
+$netBeforeRoundOff = max(0.0, billing_round($grossBeforeDiscount - $discountAmount));
 
 $itemsStmt = db()->prepare(
     'SELECT *
@@ -307,6 +319,12 @@ $companyLogoUrl = company_logo_url((int) ($invoice['company_id'] ?? $companyId),
                 <tr><th>SGST</th><td class="text-end"><?= e(number_format((float) $invoice['sgst_amount'], 2)); ?></td></tr>
                 <tr><th>IGST</th><td class="text-end"><?= e(number_format((float) $invoice['igst_amount'], 2)); ?></td></tr>
                 <tr><th>Total Tax</th><td class="text-end"><?= e(number_format((float) ($invoice['total_tax_amount'] ?? 0), 2)); ?></td></tr>
+                <tr><th>Gross Total (Before Discount)</th><td class="text-end"><?= e(number_format($grossBeforeDiscount, 2)); ?></td></tr>
+                <tr>
+                  <th>Discount<?= $discountLabel !== '-' ? ' (' . e($discountLabel) . ')' : ''; ?></th>
+                  <td class="text-end">-<?= e(number_format($discountAmount, 2)); ?></td>
+                </tr>
+                <tr><th>Net Total (Before Round Off)</th><td class="text-end"><?= e(number_format($netBeforeRoundOff, 2)); ?></td></tr>
                 <tr><th>Round Off</th><td class="text-end"><?= e(number_format((float) $invoice['round_off'], 2)); ?></td></tr>
                 <tr><th>Grand Total</th><td class="text-end"><strong><?= e(number_format((float) $invoice['grand_total'], 2)); ?></strong></td></tr>
                 <tr><th>Paid</th><td class="text-end"><?= e(number_format($paidAmount, 2)); ?></td></tr>

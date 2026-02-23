@@ -16,6 +16,7 @@ $canCreate = has_permission('job.create') || has_permission('job.manage');
 $canEdit = has_permission('job.edit') || has_permission('job.update') || has_permission('job.manage');
 $canAssign = has_permission('job.assign') || has_permission('job.manage');
 $canInlineVehicleCreate = has_permission('vehicle.view') && has_permission('vehicle.manage');
+$canConditionPhotoManage = has_permission('job.manage') || has_permission('settings.manage');
 $jobCardColumns = table_columns('job_cards');
 $jobOdometerEnabled = in_array('odometer_km', $jobCardColumns, true);
 $odometerEditableStatuses = ['OPEN', 'IN_PROGRESS'];
@@ -42,9 +43,111 @@ function job_row(int $id, int $companyId, int $garageId): ?array
     return $row ?: null;
 }
 
+function job_filter_url(string $query, string $status): string
+{
+    $params = [];
+    if ($query !== '') {
+        $params['q'] = $query;
+    }
+    if ($status !== '') {
+        $params['status'] = $status;
+    }
+
+    $path = 'modules/jobs/index.php';
+    if (!empty($params)) {
+        $path .= '?' . http_build_query($params);
+    }
+
+    return url($path) . '#job-list-section';
+}
+
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     require_csrf();
     $action = (string) ($_POST['_action'] ?? '');
+
+    if ($action === 'update_condition_photo_settings') {
+        if (!$canConditionPhotoManage) {
+            flash_set('job_error', 'You do not have permission to manage condition-photo settings.', 'danger');
+            redirect('modules/jobs/index.php');
+        }
+        if (!job_condition_photo_feature_ready()) {
+            flash_set('job_error', 'Condition photo storage is not ready. Please run DB upgrade.', 'danger');
+            redirect('modules/jobs/index.php');
+        }
+
+        $retentionDays = post_int('condition_photo_retention_days');
+        if ($retentionDays < 1) {
+            $retentionDays = 1;
+        }
+        if ($retentionDays > 3650) {
+            $retentionDays = 3650;
+        }
+
+        system_setting_upsert_value(
+            $companyId,
+            $garageId,
+            'JOBS',
+            'job_condition_photo_retention_days',
+            (string) $retentionDays,
+            'NUMBER',
+            'ACTIVE',
+            $userId > 0 ? $userId : null
+        );
+        log_audit('system_settings', 'update', 0, 'Updated job condition photo retention days', [
+            'entity' => 'job_condition_photos',
+            'source' => 'UI',
+            'metadata' => [
+                'garage_id' => $garageId,
+                'retention_days' => $retentionDays,
+            ],
+        ]);
+        flash_set('job_success', 'Condition photo retention updated to ' . $retentionDays . ' day(s).', 'success');
+        redirect('modules/jobs/index.php');
+    }
+
+    if ($action === 'purge_condition_photos') {
+        if (!$canConditionPhotoManage) {
+            flash_set('job_error', 'You do not have permission to purge condition photos.', 'danger');
+            redirect('modules/jobs/index.php');
+        }
+        if (!job_condition_photo_feature_ready()) {
+            flash_set('job_error', 'Condition photo storage is not ready. Please run DB upgrade.', 'danger');
+            redirect('modules/jobs/index.php');
+        }
+
+        $retentionDays = post_int('condition_photo_retention_days');
+        if ($retentionDays <= 0) {
+            $retentionDays = job_condition_photo_retention_days($companyId, $garageId);
+        }
+
+        $purgeResult = job_condition_photo_purge_older_than($companyId, $garageId, $retentionDays);
+        if (!(bool) ($purgeResult['ok'] ?? false)) {
+            flash_set('job_error', (string) ($purgeResult['message'] ?? 'Unable to purge condition photos.'), 'danger');
+            redirect('modules/jobs/index.php');
+        }
+
+        $deletedCount = (int) ($purgeResult['deleted_count'] ?? 0);
+        $failedCount = (int) ($purgeResult['failed_count'] ?? 0);
+        $deletedMb = round(((int) ($purgeResult['deleted_bytes'] ?? 0)) / 1048576, 2);
+
+        flash_set('job_success', 'Purged ' . $deletedCount . ' photo(s) older than ' . $retentionDays . ' day(s). Freed ~' . number_format($deletedMb, 2) . ' MB.', 'success');
+        if ($failedCount > 0) {
+            flash_set('job_warning', $failedCount . ' file(s) could not be removed from filesystem. Metadata was marked deleted.', 'warning');
+        }
+
+        log_audit('job_cards', 'purge_condition_photos', 0, 'Purged old job condition photos', [
+            'entity' => 'job_condition_photos',
+            'source' => 'UI',
+            'metadata' => [
+                'garage_id' => $garageId,
+                'retention_days' => $retentionDays,
+                'deleted_count' => $deletedCount,
+                'failed_count' => $failedCount,
+                'deleted_bytes' => (int) ($purgeResult['deleted_bytes'] ?? 0),
+            ],
+        ]);
+        redirect('modules/jobs/index.php');
+    }
 
     if ($action === 'create' && !$canCreate) {
         flash_set('job_error', 'You do not have permission to create job cards.', 'danger');
@@ -181,8 +284,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 ],
             ]);
             $pdo->commit();
-            flash_set('job_success', 'Job card created successfully.', 'success');
-            redirect('modules/jobs/view.php?id=' . $jobId);
+            flash_set('job_success', 'Job card created successfully. Upload vehicle condition photos now.', 'success');
+            redirect('modules/jobs/view.php?id=' . $jobId . '&prompt_condition_photos=1#condition-photos');
         } catch (Throwable $exception) {
             $pdo->rollBack();
             flash_set('job_error', 'Unable to create job card. Please retry.', 'danger');
@@ -372,20 +475,30 @@ $editJobOdometerEditable = $editJob !== null
 
 $statusFilter = strtoupper(trim((string) ($_GET['status'] ?? '')));
 $query = trim((string) ($_GET['q'] ?? ''));
-$where = ['jc.company_id = :company_id', 'jc.garage_id = :garage_id', 'jc.status_code <> "DELETED"'];
-$params = ['company_id' => $companyId, 'garage_id' => $garageId];
-if (in_array($statusFilter, job_workflow_statuses(true), true)) {
-    $where[] = 'jc.status = :status';
-    $params['status'] = $statusFilter;
+$allowedJobStatuses = job_workflow_statuses(true);
+if (!in_array($statusFilter, $allowedJobStatuses, true)) {
+    $statusFilter = '';
+}
+
+$baseWhere = ['jc.company_id = :company_id', 'jc.garage_id = :garage_id', 'jc.status_code <> "DELETED"'];
+$baseParams = ['company_id' => $companyId, 'garage_id' => $garageId];
+if (in_array($statusFilter, $allowedJobStatuses, true)) {
+    $where = array_merge($baseWhere, ['jc.status = :status']);
+    $params = array_merge($baseParams, ['status' => $statusFilter]);
+} else {
+    $where = $baseWhere;
+    $params = $baseParams;
 }
 if ($query !== '') {
+    $baseWhere[] = '(jc.job_number LIKE :q OR c.full_name LIKE :q OR v.registration_no LIKE :q OR jc.complaint LIKE :q)';
+    $baseParams['q'] = '%' . $query . '%';
     $where[] = '(jc.job_number LIKE :q OR c.full_name LIKE :q OR v.registration_no LIKE :q OR jc.complaint LIKE :q)';
     $params['q'] = '%' . $query . '%';
 }
 
 $sql =
     'SELECT jc.id, jc.job_number, jc.status, jc.status_code, jc.priority, jc.opened_at, jc.estimated_cost,
-            c.full_name AS customer_name, v.registration_no,
+            c.full_name AS customer_name, v.registration_no, v.model AS vehicle_model,
             GROUP_CONCAT(DISTINCT au.name ORDER BY ja.is_primary DESC, au.name SEPARATOR ", ") AS assigned_staff
      FROM job_cards jc
      INNER JOIN customers c ON c.id = jc.customer_id
@@ -398,6 +511,42 @@ $sql =
 $jobs = db()->prepare($sql);
 $jobs->execute($params);
 $jobs = $jobs->fetchAll();
+$conditionPhotoCounts = job_condition_photo_counts_by_job(
+    $companyId,
+    $garageId,
+    array_map(static fn (array $row): int => (int) ($row['id'] ?? 0), $jobs)
+);
+foreach ($jobs as &$job) {
+    $jobId = (int) ($job['id'] ?? 0);
+    $job['condition_photo_count'] = (int) ($conditionPhotoCounts[$jobId] ?? 0);
+}
+unset($job);
+$conditionPhotoFeatureReady = job_condition_photo_feature_ready();
+$conditionPhotoRetentionDays = job_condition_photo_retention_days($companyId, $garageId);
+$conditionPhotoStats = job_condition_photo_scope_stats($companyId, $garageId);
+
+$jobStatusCounts = ['' => 0];
+foreach ($allowedJobStatuses as $status) {
+    $jobStatusCounts[$status] = 0;
+}
+
+$summarySql =
+    'SELECT jc.status, COUNT(*) AS total
+     FROM job_cards jc
+     INNER JOIN customers c ON c.id = jc.customer_id
+     INNER JOIN vehicles v ON v.id = jc.vehicle_id
+     WHERE ' . implode(' AND ', $baseWhere) . '
+     GROUP BY jc.status';
+$summaryStmt = db()->prepare($summarySql);
+$summaryStmt->execute($baseParams);
+foreach ($summaryStmt->fetchAll() as $row) {
+    $statusKey = strtoupper(trim((string) ($row['status'] ?? '')));
+    $total = (int) ($row['total'] ?? 0);
+    $jobStatusCounts[''] += $total;
+    if (isset($jobStatusCounts[$statusKey])) {
+        $jobStatusCounts[$statusKey] = $total;
+    }
+}
 
 require_once __DIR__ . '/../../includes/header.php';
 require_once __DIR__ . '/../../includes/sidebar.php';
@@ -511,16 +660,105 @@ require_once __DIR__ . '/../../includes/sidebar.php';
     <div class="card card-outline card-info mb-3 collapsed-card"><div class="card-header"><h3 class="card-title">VIS Suggestions (Optional)</h3><div class="card-tools"><button type="button" class="btn btn-tool" data-lte-toggle="card-collapse"><i class="bi bi-plus-lg"></i></button></div></div><div class="card-body" id="vis-suggestions-content">Select a vehicle to load optional VIS suggestions. Job creation never depends on VIS.</div></div>
     <?php endif; ?>
 
-    <div class="card">
-      <div class="card-header"><h3 class="card-title">Job List</h3><div class="card-tools"><form method="get" class="d-flex gap-2"><input name="q" value="<?= e($query); ?>" class="form-control form-control-sm" placeholder="Search"><select name="status" class="form-select form-select-sm"><option value="">All</option><?php foreach (job_workflow_statuses(true) as $status): ?><option value="<?= e($status); ?>" <?= $statusFilter === $status ? 'selected' : ''; ?>><?= e($status); ?></option><?php endforeach; ?></select><button class="btn btn-sm btn-outline-primary" type="submit">Filter</button></form></div></div>
-      <div class="card-body table-responsive p-0"><table class="table table-striped mb-0"><thead><tr><th>Job</th><th>Customer</th><th>Vehicle</th><th>Assigned</th><th>Priority</th><th>Status</th><th>Estimate</th><th>Opened</th><th></th></tr></thead><tbody>
-        <?php if (empty($jobs)): ?><tr><td colspan="9" class="text-center text-muted py-4">No job cards found.</td></tr><?php else: foreach ($jobs as $job): ?>
+    <?php if ($canConditionPhotoManage): ?>
+      <div class="card card-outline card-secondary mb-3">
+        <div class="card-header"><h3 class="card-title">Vehicle Condition Photos - Retention</h3></div>
+        <div class="card-body">
+          <?php if (!$conditionPhotoFeatureReady): ?>
+            <div class="alert alert-warning mb-0">
+              Condition photo storage is not ready. Run <code>database/job_condition_photos_upgrade.sql</code> (or ensure DB user has create-table permission).
+            </div>
+          <?php else: ?>
+            <div class="row g-3">
+              <div class="col-md-4">
+                <div class="small-box text-bg-light border mb-0">
+                  <div class="inner">
+                    <h4><?= number_format((int) ($conditionPhotoStats['photo_count'] ?? 0)); ?></h4>
+                    <p>Active Photos (This Garage)</p>
+                  </div>
+                </div>
+              </div>
+              <div class="col-md-4">
+                <div class="small-box text-bg-light border mb-0">
+                  <div class="inner">
+                    <h4><?= number_format(((int) ($conditionPhotoStats['storage_bytes'] ?? 0)) / 1048576, 2); ?> MB</h4>
+                    <p>Storage Used (Approx)</p>
+                  </div>
+                </div>
+              </div>
+              <div class="col-md-4">
+                <div class="small-box text-bg-light border mb-0">
+                  <div class="inner">
+                    <h4><?= (int) $conditionPhotoRetentionDays; ?> days</h4>
+                    <p>Current Retention Policy</p>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="row g-3 mt-1">
+              <div class="col-md-7">
+                <form method="post" class="row g-2 align-items-end">
+                  <?= csrf_field(); ?>
+                  <input type="hidden" name="_action" value="update_condition_photo_settings">
+                  <div class="col-md-6">
+                    <label class="form-label">Retention Days</label>
+                    <input type="number" name="condition_photo_retention_days" class="form-control" min="1" max="3650" value="<?= (int) $conditionPhotoRetentionDays; ?>" required>
+                    <small class="text-muted">Photos older than this can be cleaned in bulk.</small>
+                  </div>
+                  <div class="col-md-6">
+                    <button type="submit" class="btn btn-outline-primary">Save Retention</button>
+                  </div>
+                </form>
+              </div>
+              <div class="col-md-5">
+                <form method="post" data-confirm="Delete all condition photos older than configured retention days? Files will be removed from server.">
+                  <?= csrf_field(); ?>
+                  <input type="hidden" name="_action" value="purge_condition_photos">
+                  <input type="hidden" name="condition_photo_retention_days" value="<?= (int) $conditionPhotoRetentionDays; ?>">
+                  <button type="submit" class="btn btn-outline-danger w-100">Bulk Delete Old Photos Now</button>
+                </form>
+              </div>
+            </div>
+          <?php endif; ?>
+        </div>
+      </div>
+    <?php endif; ?>
+
+    <div class="card" id="job-list-section">
+      <div class="card-header"><h3 class="card-title">Job List</h3><div class="card-tools"><form method="get" action="<?= e(url('modules/jobs/index.php#job-list-section')); ?>" class="d-flex gap-2"><input name="q" value="<?= e($query); ?>" class="form-control form-control-sm" placeholder="Search"><select name="status" class="form-select form-select-sm"><option value="">All</option><?php foreach (job_workflow_statuses(true) as $status): ?><option value="<?= e($status); ?>" <?= $statusFilter === $status ? 'selected' : ''; ?>><?= e($status); ?></option><?php endforeach; ?></select><button class="btn btn-sm btn-outline-primary" type="submit">Filter</button></form></div></div>
+      <div class="card-body border-bottom py-2">
+        <ul class="nav nav-pills gap-2 flex-wrap">
+          <li class="nav-item">
+            <a class="nav-link py-1 px-2 <?= $statusFilter === '' ? 'active' : ''; ?>" href="<?= e(job_filter_url($query, '')); ?>">
+              All
+              <span class="badge <?= $statusFilter === '' ? 'text-bg-light' : 'text-bg-secondary'; ?> ms-1"><?= (int) ($jobStatusCounts[''] ?? 0); ?></span>
+            </a>
+          </li>
+          <?php foreach ($allowedJobStatuses as $status): ?>
+            <li class="nav-item">
+              <a class="nav-link py-1 px-2 <?= $statusFilter === $status ? 'active' : ''; ?>" href="<?= e(job_filter_url($query, $status)); ?>">
+                <?= e(str_replace('_', ' ', $status)); ?>
+                <span class="badge <?= $statusFilter === $status ? 'text-bg-light' : 'text-bg-secondary'; ?> ms-1"><?= (int) ($jobStatusCounts[$status] ?? 0); ?></span>
+              </a>
+            </li>
+          <?php endforeach; ?>
+        </ul>
+      </div>
+      <div class="card-body table-responsive p-0"><table class="table table-striped mb-0"><thead><tr><th>Job</th><th>Customer</th><th>Vehicle</th><th>Model</th><th>Assigned</th><th>Priority</th><th>Status</th><th>Estimate</th><th>Opened</th><th>Photos</th><th></th></tr></thead><tbody>
+        <?php if (empty($jobs)): ?><tr><td colspan="11" class="text-center text-muted py-4">No job cards found.</td></tr><?php else: foreach ($jobs as $job): ?>
         <tr>
           <td><?= e((string) $job['job_number']); ?></td><td><?= e((string) $job['customer_name']); ?></td><td><?= e((string) $job['registration_no']); ?></td>
+          <td><?= e((string) ($job['vehicle_model'] ?? '-')); ?></td>
           <td><?= e((string) (($job['assigned_staff'] ?? '') !== '' ? $job['assigned_staff'] : 'Unassigned')); ?></td>
           <td><span class="badge text-bg-warning"><?= e((string) $job['priority']); ?></span></td>
           <td><span class="badge text-bg-secondary"><?= e((string) $job['status']); ?></span></td>
           <td><?= e(format_currency((float) $job['estimated_cost'])); ?></td><td><?= e((string) $job['opened_at']); ?></td>
+          <td>
+            <a class="btn btn-sm btn-outline-secondary" href="<?= e(url('modules/jobs/view.php?id=' . (int) $job['id'] . '#condition-photos')); ?>">
+              Photos <span class="badge text-bg-light border ms-1"><?= (int) ($job['condition_photo_count'] ?? 0); ?></span>
+            </a>
+          </td>
           <td><a class="btn btn-sm btn-outline-primary" href="<?= e(url('modules/jobs/view.php?id=' . (int) $job['id'])); ?>">Open</a></td>
         </tr>
         <?php endforeach; endif; ?>

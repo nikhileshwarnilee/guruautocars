@@ -19,7 +19,7 @@ function customer_master_badge_class(string $customerType): string
     };
 }
 
-function customer_master_render_rows(array $customers, bool $canManage): string
+function customer_master_render_rows(array $customers, bool $canManage, bool $canVehicleManage): string
 {
     ob_start();
 
@@ -63,6 +63,9 @@ function customer_master_render_rows(array $customers, bool $canManage): string
           <td class="d-flex gap-1">
             <a class="btn btn-sm btn-outline-success" href="<?= e(url('modules/customers/view.php?id=' . (int) ($customer['id'] ?? 0))); ?>">View</a>
             <a class="btn btn-sm btn-outline-info" href="<?= e(url('modules/customers/index.php?history_id=' . (int) ($customer['id'] ?? 0))); ?>">History</a>
+            <?php if ($canVehicleManage && $statusCode !== 'DELETED'): ?>
+              <a class="btn btn-sm btn-outline-dark" href="<?= e(url('modules/vehicles/index.php?prefill_customer_id=' . (int) ($customer['id'] ?? 0))); ?>">Add Vehicle</a>
+            <?php endif; ?>
             <?php if ($canManage): ?>
               <a class="btn btn-sm btn-outline-primary" href="<?= e(url('modules/customers/index.php?edit_id=' . (int) ($customer['id'] ?? 0))); ?>">Edit</a>
               <?php if ($statusCode !== 'DELETED'): ?>
@@ -92,6 +95,7 @@ function customer_master_render_rows(array $customers, bool $canManage): string
 
 $companyId = active_company_id();
 $canManage = has_permission('customer.manage');
+$canVehicleManage = has_permission('vehicle.view') && has_permission('vehicle.manage');
 
 $search = trim((string) ($_GET['q'] ?? ($_GET['table_search'] ?? '')));
 $statusFilter = strtoupper(trim((string) ($_GET['status'] ?? '')));
@@ -232,7 +236,7 @@ try {
         'rows_count' => $totalRows,
         'page_rows_count' => count($rows),
         'pagination' => $paginationMeta,
-        'table_rows_html' => customer_master_render_rows($rows, $canManage),
+        'table_rows_html' => customer_master_render_rows($rows, $canManage, $canVehicleManage),
     ], JSON_UNESCAPED_UNICODE);
 } catch (Throwable $exception) {
     http_response_code(500);

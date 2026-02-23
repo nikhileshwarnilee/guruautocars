@@ -34,9 +34,24 @@ $baseParams = $scope['base_params'];
 $canExportData = has_permission('export.data');
 
 $salesRows = [];
-$salesSummary = ['invoice_count' => 0, 'taxable_total' => 0, 'cgst_total' => 0, 'sgst_total' => 0, 'igst_total' => 0, 'grand_total' => 0];
+$salesSummary = ['invoice_count' => 0, 'taxable_total' => 0, 'cgst_total' => 0, 'sgst_total' => 0, 'igst_total' => 0, 'discount_total' => 0, 'grand_total' => 0];
 $purchaseRows = [];
 $purchaseSummary = ['invoice_count' => 0, 'taxable_total' => 0, 'cgst_total' => 0, 'sgst_total' => 0, 'igst_total' => 0, 'grand_total' => 0];
+
+function gst_compliance_discount_meta_from_snapshot(array $snapshot): array
+{
+    $billing = is_array($snapshot['billing'] ?? null) ? $snapshot['billing'] : [];
+    $type = strtoupper(trim((string) ($billing['discount_type'] ?? 'AMOUNT')));
+    if (!in_array($type, ['AMOUNT', 'PERCENT'], true)) {
+        $type = 'AMOUNT';
+    }
+
+    return [
+        'type' => $type,
+        'value' => round(max(0.0, (float) ($billing['discount_value'] ?? 0)), 2),
+        'amount' => round(max(0.0, (float) ($billing['discount_amount'] ?? 0)), 2),
+    ];
+}
 
 $salesParams = ['company_id' => $companyId, 'from_date' => $fromDate, 'to_date' => $toDate];
 $salesScopeSql = analytics_garage_scope_sql('i.garage_id', $selectedGarageId, $garageIds, $salesParams, 'gst_sales_scope');
@@ -49,6 +64,7 @@ $salesStmt = db()->prepare(
             i.cgst_amount,
             i.sgst_amount,
             i.igst_amount,
+            i.snapshot_json,
             i.grand_total
      FROM invoices i
      INNER JOIN job_cards jc ON jc.id = i.job_card_id
@@ -64,14 +80,32 @@ $salesStmt = db()->prepare(
 $salesStmt->execute($salesParams);
 $salesRows = $salesStmt->fetchAll();
 
-foreach ($salesRows as $row) {
+foreach ($salesRows as &$row) {
+    $snapshot = json_decode((string) ($row['snapshot_json'] ?? ''), true);
+    if (!is_array($snapshot)) {
+        $snapshot = [];
+    }
+    $discountMeta = gst_compliance_discount_meta_from_snapshot($snapshot);
+    $discountAmount = (float) ($discountMeta['amount'] ?? 0);
+    $discountType = (string) ($discountMeta['type'] ?? 'AMOUNT');
+    $discountValue = (float) ($discountMeta['value'] ?? 0);
+    $row['discount_amount'] = $discountAmount;
+    if ($discountAmount > 0.009 && $discountType === 'PERCENT' && $discountValue > 0.009) {
+        $row['discount_label'] = rtrim(rtrim(number_format($discountValue, 2), '0'), '.') . '%';
+    } elseif ($discountAmount > 0.009) {
+        $row['discount_label'] = 'Flat';
+    } else {
+        $row['discount_label'] = '-';
+    }
     $salesSummary['invoice_count'] += 1;
     $salesSummary['taxable_total'] += (float) ($row['taxable_amount'] ?? 0);
     $salesSummary['cgst_total'] += (float) ($row['cgst_amount'] ?? 0);
     $salesSummary['sgst_total'] += (float) ($row['sgst_amount'] ?? 0);
     $salesSummary['igst_total'] += (float) ($row['igst_amount'] ?? 0);
+    $salesSummary['discount_total'] += $discountAmount;
     $salesSummary['grand_total'] += (float) ($row['grand_total'] ?? 0);
 }
+unset($row);
 
 $purchaseParams = ['company_id' => $companyId, 'from_date' => $fromDate, 'to_date' => $toDate];
 $purchaseScopeSql = analytics_garage_scope_sql('p.garage_id', $selectedGarageId, $garageIds, $purchaseParams, 'gst_purchase_scope');
@@ -190,11 +224,12 @@ if ($exportKey !== '') {
                     (float) ($row['cgst_amount'] ?? 0),
                     (float) ($row['sgst_amount'] ?? 0),
                     (float) ($row['igst_amount'] ?? 0),
+                    (float) ($row['discount_amount'] ?? 0),
                     (float) ($row['grand_total'] ?? 0),
                 ],
                 $salesRows
             );
-            reports_csv_download('gst_sales_report_' . $timestamp . '.csv', ['Invoice', 'Date', 'Customer', 'GSTIN', 'Taxable', 'CGST', 'SGST', 'IGST', 'Total'], $rows);
+            reports_csv_download('gst_sales_report_' . $timestamp . '.csv', ['Invoice', 'Date', 'Customer', 'GSTIN', 'Taxable', 'CGST', 'SGST', 'IGST', 'Discount', 'Total'], $rows);
 
         case 'purchase_gst':
             $rows = array_map(
@@ -268,6 +303,7 @@ $renderReportBody = static function (
               <div class="col-6"><strong>CGST:</strong> <?= e(format_currency((float) ($salesSummary['cgst_total'] ?? 0))); ?></div>
               <div class="col-6"><strong>SGST:</strong> <?= e(format_currency((float) ($salesSummary['sgst_total'] ?? 0))); ?></div>
               <div class="col-6"><strong>IGST:</strong> <?= e(format_currency((float) ($salesSummary['igst_total'] ?? 0))); ?></div>
+              <div class="col-6"><strong>Discount:</strong> <?= e(format_currency((float) ($salesSummary['discount_total'] ?? 0))); ?></div>
               <div class="col-6"><strong>Total Value:</strong> <?= e(format_currency((float) ($salesSummary['grand_total'] ?? 0))); ?></div>
             </div>
             <div class="table-responsive">
@@ -282,12 +318,13 @@ $renderReportBody = static function (
                     <th>CGST</th>
                     <th>SGST</th>
                     <th>IGST</th>
+                    <th>Discount</th>
                     <th>Total</th>
                   </tr>
                 </thead>
                 <tbody>
                   <?php if (empty($salesRows)): ?>
-                    <tr><td colspan="9" class="text-center text-muted py-4">No finalized invoices in the selected range.</td></tr>
+                    <tr><td colspan="10" class="text-center text-muted py-4">No finalized invoices in the selected range.</td></tr>
                   <?php else: ?>
                     <?php foreach ($salesRows as $row): ?>
                       <tr>
@@ -299,6 +336,12 @@ $renderReportBody = static function (
                         <td><?= e(format_currency((float) ($row['cgst_amount'] ?? 0))); ?></td>
                         <td><?= e(format_currency((float) ($row['sgst_amount'] ?? 0))); ?></td>
                         <td><?= e(format_currency((float) ($row['igst_amount'] ?? 0))); ?></td>
+                        <td>
+                          <?= e(format_currency((float) ($row['discount_amount'] ?? 0))); ?>
+                          <?php if ((string) ($row['discount_label'] ?? '-') !== '-'): ?>
+                            <div><small class="text-muted"><?= e((string) ($row['discount_label'] ?? '-')); ?></small></div>
+                          <?php endif; ?>
+                        </td>
                         <td><strong><?= e(format_currency((float) ($row['grand_total'] ?? 0))); ?></strong></td>
                       </tr>
                     <?php endforeach; ?>

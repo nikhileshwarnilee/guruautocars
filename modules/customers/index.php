@@ -8,6 +8,7 @@ require_permission('customer.view');
 $page_title = 'Customer Master';
 $active_menu = 'customers';
 $canManage = has_permission('customer.manage');
+$canVehicleManage = has_permission('vehicle.view') && has_permission('vehicle.manage');
 $companyId = active_company_id();
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
@@ -33,6 +34,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $pincode = post_string('pincode', 10);
         $notes = post_string('notes', 2000);
         $statusCode = normalize_status_code((string) ($_POST['status_code'] ?? 'ACTIVE'));
+        $createAndAddVehicle = ((string) ($_POST['create_and_add_vehicle'] ?? '0')) === '1';
 
         if ($fullName === '' || $phone === '') {
             flash_set('customer_error', 'Customer name and phone are required.', 'danger');
@@ -73,6 +75,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'status_code' => $statusCode,
         ]);
         log_audit('customers', 'create', $customerId, 'Created customer ' . $fullName);
+
+        if ($createAndAddVehicle) {
+            if ($canVehicleManage) {
+                flash_set('vehicle_success', 'Customer created. Add vehicle details now.', 'success');
+                redirect('modules/vehicles/index.php?prefill_customer_id=' . $customerId);
+            }
+
+            flash_set('customer_warning', 'Customer created, but you do not have permission to add vehicles.', 'warning');
+            redirect('modules/customers/index.php');
+        }
 
         flash_set('customer_success', 'Customer created successfully.', 'success');
         redirect('modules/customers/index.php');
@@ -362,6 +374,9 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             </div>
             <div class="card-footer d-flex gap-2">
               <button type="submit" class="btn btn-primary"><?= $editCustomer ? 'Update Customer' : 'Create Customer'; ?></button>
+              <?php if (!$editCustomer && $canVehicleManage): ?>
+                <button type="submit" name="create_and_add_vehicle" value="1" class="btn btn-outline-primary">Create Customer + Add Vehicle</button>
+              <?php endif; ?>
               <?php if ($editCustomer): ?>
                 <a href="<?= e(url('modules/customers/index.php')); ?>" class="btn btn-outline-secondary">Cancel Edit</a>
               <?php endif; ?>
@@ -502,6 +517,9 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                     <td class="d-flex gap-1">
                       <a class="btn btn-sm btn-outline-success" href="<?= e(url('modules/customers/view.php?id=' . (int) $customer['id'])); ?>">View</a>
                       <a class="btn btn-sm btn-outline-info" href="<?= e(url('modules/customers/index.php?history_id=' . (int) $customer['id'])); ?>">History</a>
+                      <?php if ($canVehicleManage && (string) $customer['status_code'] !== 'DELETED'): ?>
+                        <a class="btn btn-sm btn-outline-dark" href="<?= e(url('modules/vehicles/index.php?prefill_customer_id=' . (int) $customer['id'])); ?>">Add Vehicle</a>
+                      <?php endif; ?>
                       <?php if ($canManage): ?>
                         <a class="btn btn-sm btn-outline-primary" href="<?= e(url('modules/customers/index.php?edit_id=' . (int) $customer['id'])); ?>">Edit</a>
                         <?php if ((string) $customer['status_code'] !== 'DELETED'): ?>

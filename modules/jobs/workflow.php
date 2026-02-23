@@ -539,3 +539,544 @@ function job_fetch_vis_suggestions(int $companyId, int $garageId, int $vehicleId
         ];
     }
 }
+
+function job_condition_photo_table_exists(bool $refresh = false): bool
+{
+    static $cached = null;
+
+    if (!$refresh && $cached !== null) {
+        return $cached;
+    }
+
+    try {
+        $stmt = db()->query("SHOW TABLES LIKE 'job_condition_photos'");
+        $cached = $stmt !== false && $stmt->fetchColumn() !== false;
+    } catch (Throwable $exception) {
+        $cached = false;
+    }
+
+    return $cached;
+}
+
+function job_condition_photo_feature_ready(): bool
+{
+    if (job_condition_photo_table_exists()) {
+        return true;
+    }
+
+    try {
+        db()->exec(
+            'CREATE TABLE IF NOT EXISTS job_condition_photos (
+                id INT UNSIGNED NOT NULL AUTO_INCREMENT,
+                company_id INT UNSIGNED NOT NULL,
+                garage_id INT UNSIGNED NOT NULL,
+                job_card_id INT UNSIGNED NOT NULL,
+                file_name VARCHAR(255) NOT NULL,
+                file_path VARCHAR(500) NOT NULL,
+                mime_type VARCHAR(100) NOT NULL,
+                file_size_bytes INT UNSIGNED NOT NULL DEFAULT 0,
+                image_width INT UNSIGNED DEFAULT NULL,
+                image_height INT UNSIGNED DEFAULT NULL,
+                note VARCHAR(255) DEFAULT NULL,
+                uploaded_by INT UNSIGNED DEFAULT NULL,
+                status_code VARCHAR(20) NOT NULL DEFAULT "ACTIVE",
+                deleted_at DATETIME DEFAULT NULL,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (id),
+                KEY idx_job_condition_scope_job (company_id, garage_id, job_card_id, status_code),
+                KEY idx_job_condition_created (created_at)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4'
+        );
+    } catch (Throwable $exception) {
+        // Non-fatal: feature will be treated as unavailable.
+    }
+
+    return job_condition_photo_table_exists(true);
+}
+
+function job_condition_photo_base_relative_dir(): string
+{
+    return 'assets/uploads/job_condition_photos';
+}
+
+function job_condition_photo_allowed_mimes(): array
+{
+    return [
+        'image/jpeg' => 'jpg',
+        'image/png' => 'png',
+        'image/webp' => 'webp',
+    ];
+}
+
+function job_condition_photo_max_upload_bytes(int $companyId, int $garageId): int
+{
+    $rawValue = system_setting_get_value($companyId, $garageId, 'job_condition_photo_max_mb', '5');
+    $sizeMb = (int) trim((string) $rawValue);
+    if ($sizeMb < 1) {
+        $sizeMb = 1;
+    }
+    if ($sizeMb > 25) {
+        $sizeMb = 25;
+    }
+
+    return $sizeMb * 1024 * 1024;
+}
+
+function job_condition_photo_retention_days(int $companyId, int $garageId): int
+{
+    $rawValue = system_setting_get_value($companyId, $garageId, 'job_condition_photo_retention_days', '90');
+    $days = (int) trim((string) $rawValue);
+    if ($days < 1) {
+        $days = 1;
+    }
+    if ($days > 3650) {
+        $days = 3650;
+    }
+
+    return $days;
+}
+
+function job_condition_photo_build_relative_dir(int $companyId, int $garageId, int $jobId): string
+{
+    return job_condition_photo_base_relative_dir()
+        . '/' . max(0, $companyId)
+        . '/' . max(0, $garageId)
+        . '/job_' . max(0, $jobId);
+}
+
+function job_condition_photo_full_path(string $relativePath): ?string
+{
+    $normalized = str_replace('\\', '/', trim($relativePath));
+    $normalized = ltrim($normalized, '/');
+    if ($normalized === '' || str_contains($normalized, '..')) {
+        return null;
+    }
+
+    $base = job_condition_photo_base_relative_dir() . '/';
+    if (!str_starts_with($normalized, $base)) {
+        return null;
+    }
+
+    return APP_ROOT . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $normalized);
+}
+
+function job_condition_photo_file_url(?string $relativePath): ?string
+{
+    $path = trim((string) $relativePath);
+    if ($path === '') {
+        return null;
+    }
+
+    $fullPath = job_condition_photo_full_path($path);
+    if ($fullPath === null || !is_file($fullPath)) {
+        return null;
+    }
+
+    return url(str_replace('\\', '/', ltrim($path, '/')));
+}
+
+function job_condition_photo_delete_file(?string $relativePath): bool
+{
+    $path = trim((string) $relativePath);
+    if ($path === '') {
+        return true;
+    }
+
+    $fullPath = job_condition_photo_full_path($path);
+    if ($fullPath === null) {
+        return false;
+    }
+
+    if (!is_file($fullPath)) {
+        return true;
+    }
+
+    return @unlink($fullPath);
+}
+
+function job_condition_photo_normalize_uploads(mixed $files): array
+{
+    if (!is_array($files)) {
+        return [];
+    }
+
+    $names = $files['name'] ?? null;
+    $errors = $files['error'] ?? null;
+    $tmpNames = $files['tmp_name'] ?? null;
+    $sizes = $files['size'] ?? null;
+    $types = $files['type'] ?? null;
+
+    if (!is_array($names) || !is_array($errors) || !is_array($tmpNames) || !is_array($sizes)) {
+        return [];
+    }
+
+    $normalized = [];
+    $count = count($names);
+    for ($index = 0; $index < $count; $index++) {
+        $normalized[] = [
+            'name' => (string) ($names[$index] ?? ''),
+            'type' => is_array($types) ? (string) ($types[$index] ?? '') : '',
+            'tmp_name' => (string) ($tmpNames[$index] ?? ''),
+            'error' => (int) ($errors[$index] ?? UPLOAD_ERR_NO_FILE),
+            'size' => (int) ($sizes[$index] ?? 0),
+        ];
+    }
+
+    return $normalized;
+}
+
+function job_condition_photo_store_upload(
+    array $file,
+    int $companyId,
+    int $garageId,
+    int $jobId,
+    int $actorUserId,
+    ?string $note = null
+): array {
+    if (!job_condition_photo_feature_ready()) {
+        return ['ok' => false, 'message' => 'Condition photo storage is not ready.'];
+    }
+
+    if ($companyId <= 0 || $garageId <= 0 || $jobId <= 0) {
+        return ['ok' => false, 'message' => 'Invalid job reference for image upload.'];
+    }
+
+    $jobStmt = db()->prepare(
+        'SELECT id
+         FROM job_cards
+         WHERE id = :job_id
+           AND company_id = :company_id
+           AND garage_id = :garage_id
+           AND status_code <> "DELETED"
+         LIMIT 1'
+    );
+    $jobStmt->execute([
+        'job_id' => $jobId,
+        'company_id' => $companyId,
+        'garage_id' => $garageId,
+    ]);
+    if (!$jobStmt->fetch()) {
+        return ['ok' => false, 'message' => 'Job card not found for image upload.'];
+    }
+
+    $errorCode = (int) ($file['error'] ?? UPLOAD_ERR_NO_FILE);
+    if ($errorCode !== UPLOAD_ERR_OK) {
+        $message = match ($errorCode) {
+            UPLOAD_ERR_INI_SIZE, UPLOAD_ERR_FORM_SIZE => 'Uploaded image exceeds size limit.',
+            UPLOAD_ERR_NO_FILE => 'No image file selected.',
+            default => 'Unable to process uploaded image.',
+        };
+        return ['ok' => false, 'message' => $message];
+    }
+
+    $tmpPath = (string) ($file['tmp_name'] ?? '');
+    if ($tmpPath === '' || !is_uploaded_file($tmpPath)) {
+        return ['ok' => false, 'message' => 'Uploaded image is not valid.'];
+    }
+
+    $maxBytes = job_condition_photo_max_upload_bytes($companyId, $garageId);
+    $sizeBytes = (int) ($file['size'] ?? 0);
+    if ($sizeBytes <= 0 || $sizeBytes > $maxBytes) {
+        return ['ok' => false, 'message' => 'Image size exceeds configured upload limit.'];
+    }
+
+    $imageInfo = @getimagesize($tmpPath);
+    if (!is_array($imageInfo)) {
+        return ['ok' => false, 'message' => 'Only valid image files can be uploaded.'];
+    }
+
+    $width = (int) ($imageInfo[0] ?? 0);
+    $height = (int) ($imageInfo[1] ?? 0);
+    if ($width <= 0 || $height <= 0 || $width > 12000 || $height > 12000) {
+        return ['ok' => false, 'message' => 'Image dimensions are invalid or too large.'];
+    }
+
+    $allowedMimes = job_condition_photo_allowed_mimes();
+    $finfo = finfo_open(FILEINFO_MIME_TYPE);
+    $mime = $finfo ? (string) finfo_file($finfo, $tmpPath) : '';
+    if ($finfo) {
+        finfo_close($finfo);
+    }
+    if (!isset($allowedMimes[$mime])) {
+        return ['ok' => false, 'message' => 'Only JPG, PNG, and WEBP images are allowed.'];
+    }
+
+    $relativeDir = job_condition_photo_build_relative_dir($companyId, $garageId, $jobId);
+    $fullDir = APP_ROOT . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $relativeDir);
+    if (!is_dir($fullDir) && !mkdir($fullDir, 0755, true) && !is_dir($fullDir)) {
+        return ['ok' => false, 'message' => 'Unable to prepare photo upload directory.'];
+    }
+
+    try {
+        $suffix = bin2hex(random_bytes(5));
+    } catch (Throwable $exception) {
+        $suffix = substr(sha1((string) microtime(true) . (string) mt_rand()), 0, 10);
+    }
+
+    $extension = $allowedMimes[$mime];
+    $fileName = 'job_' . $jobId . '_condition_' . date('YmdHis') . '_' . $suffix . '.' . $extension;
+    $targetPath = $fullDir . DIRECTORY_SEPARATOR . $fileName;
+    if (!move_uploaded_file($tmpPath, $targetPath)) {
+        return ['ok' => false, 'message' => 'Unable to move uploaded image file.'];
+    }
+
+    $relativePath = $relativeDir . '/' . $fileName;
+    $safeNote = trim((string) $note);
+    if ($safeNote !== '') {
+        $safeNote = mb_substr($safeNote, 0, 255);
+    }
+
+    try {
+        $insertStmt = db()->prepare(
+            'INSERT INTO job_condition_photos
+              (company_id, garage_id, job_card_id, file_name, file_path, mime_type, file_size_bytes, image_width, image_height, note, uploaded_by, status_code, deleted_at)
+             VALUES
+              (:company_id, :garage_id, :job_card_id, :file_name, :file_path, :mime_type, :file_size_bytes, :image_width, :image_height, :note, :uploaded_by, "ACTIVE", NULL)'
+        );
+        $insertStmt->execute([
+            'company_id' => $companyId,
+            'garage_id' => $garageId,
+            'job_card_id' => $jobId,
+            'file_name' => $fileName,
+            'file_path' => $relativePath,
+            'mime_type' => $mime,
+            'file_size_bytes' => $sizeBytes,
+            'image_width' => $width,
+            'image_height' => $height,
+            'note' => $safeNote !== '' ? $safeNote : null,
+            'uploaded_by' => $actorUserId > 0 ? $actorUserId : null,
+        ]);
+        $photoId = (int) db()->lastInsertId();
+    } catch (Throwable $exception) {
+        @unlink($targetPath);
+        return ['ok' => false, 'message' => 'Unable to save uploaded image metadata.'];
+    }
+
+    return [
+        'ok' => true,
+        'photo_id' => $photoId,
+        'file_path' => $relativePath,
+        'file_size_bytes' => $sizeBytes,
+        'image_width' => $width,
+        'image_height' => $height,
+    ];
+}
+
+function job_condition_photo_fetch_by_job(int $companyId, int $garageId, int $jobId, int $limit = 200): array
+{
+    if (!job_condition_photo_feature_ready() || $companyId <= 0 || $garageId <= 0 || $jobId <= 0) {
+        return [];
+    }
+
+    $safeLimit = max(1, min(500, $limit));
+    $stmt = db()->prepare(
+        'SELECT jp.*, u.name AS uploaded_by_name
+         FROM job_condition_photos jp
+         LEFT JOIN users u ON u.id = jp.uploaded_by
+         WHERE jp.company_id = :company_id
+           AND jp.garage_id = :garage_id
+           AND jp.job_card_id = :job_card_id
+           AND jp.status_code = "ACTIVE"
+         ORDER BY jp.id DESC
+         LIMIT ' . $safeLimit
+    );
+    $stmt->execute([
+        'company_id' => $companyId,
+        'garage_id' => $garageId,
+        'job_card_id' => $jobId,
+    ]);
+
+    return $stmt->fetchAll();
+}
+
+function job_condition_photo_counts_by_job(int $companyId, int $garageId, array $jobIds): array
+{
+    if (!job_condition_photo_feature_ready() || $companyId <= 0 || $garageId <= 0) {
+        return [];
+    }
+
+    $jobIds = array_values(array_unique(array_filter(array_map('intval', $jobIds), static fn (int $id): bool => $id > 0)));
+    if ($jobIds === []) {
+        return [];
+    }
+
+    $placeholders = implode(',', array_fill(0, count($jobIds), '?'));
+    $sql =
+        'SELECT job_card_id, COUNT(*) AS photo_count
+         FROM job_condition_photos
+         WHERE company_id = ?
+           AND garage_id = ?
+           AND status_code = "ACTIVE"
+           AND job_card_id IN (' . $placeholders . ')
+         GROUP BY job_card_id';
+    $stmt = db()->prepare($sql);
+    $stmt->execute(array_merge([$companyId, $garageId], $jobIds));
+
+    $counts = [];
+    foreach ($stmt->fetchAll() as $row) {
+        $counts[(int) ($row['job_card_id'] ?? 0)] = (int) ($row['photo_count'] ?? 0);
+    }
+
+    return $counts;
+}
+
+function job_condition_photo_scope_stats(int $companyId, int $garageId): array
+{
+    if (!job_condition_photo_feature_ready() || $companyId <= 0 || $garageId <= 0) {
+        return ['photo_count' => 0, 'storage_bytes' => 0];
+    }
+
+    try {
+        $stmt = db()->prepare(
+            'SELECT COUNT(*) AS photo_count,
+                    COALESCE(SUM(file_size_bytes), 0) AS storage_bytes
+             FROM job_condition_photos
+             WHERE company_id = :company_id
+               AND garage_id = :garage_id
+               AND status_code = "ACTIVE"'
+        );
+        $stmt->execute([
+            'company_id' => $companyId,
+            'garage_id' => $garageId,
+        ]);
+        $row = $stmt->fetch() ?: [];
+    } catch (Throwable $exception) {
+        return ['photo_count' => 0, 'storage_bytes' => 0];
+    }
+
+    return [
+        'photo_count' => (int) ($row['photo_count'] ?? 0),
+        'storage_bytes' => (int) ($row['storage_bytes'] ?? 0),
+    ];
+}
+
+function job_condition_photo_delete(int $photoId, int $companyId, int $garageId): array
+{
+    if (!job_condition_photo_feature_ready() || $photoId <= 0 || $companyId <= 0 || $garageId <= 0) {
+        return ['ok' => false, 'message' => 'Invalid image delete request.'];
+    }
+
+    $selectStmt = db()->prepare(
+        'SELECT id, file_path
+         FROM job_condition_photos
+         WHERE id = :id
+           AND company_id = :company_id
+           AND garage_id = :garage_id
+           AND status_code = "ACTIVE"
+         LIMIT 1'
+    );
+    $selectStmt->execute([
+        'id' => $photoId,
+        'company_id' => $companyId,
+        'garage_id' => $garageId,
+    ]);
+    $photo = $selectStmt->fetch();
+    if (!$photo) {
+        return ['ok' => false, 'message' => 'Photo not found or already deleted.'];
+    }
+
+    $deleteStmt = db()->prepare(
+        'UPDATE job_condition_photos
+         SET status_code = "DELETED",
+             deleted_at = NOW()
+         WHERE id = :id
+           AND company_id = :company_id
+           AND garage_id = :garage_id'
+    );
+    $deleteStmt->execute([
+        'id' => $photoId,
+        'company_id' => $companyId,
+        'garage_id' => $garageId,
+    ]);
+
+    $fileDeleted = job_condition_photo_delete_file((string) ($photo['file_path'] ?? ''));
+
+    return [
+        'ok' => true,
+        'file_deleted' => $fileDeleted,
+    ];
+}
+
+function job_condition_photo_purge_older_than(int $companyId, int $garageId, int $retentionDays): array
+{
+    if (!job_condition_photo_feature_ready() || $companyId <= 0 || $garageId <= 0) {
+        return [
+            'ok' => false,
+            'deleted_count' => 0,
+            'failed_count' => 0,
+            'deleted_bytes' => 0,
+            'message' => 'Condition photo storage is not ready.',
+        ];
+    }
+
+    $retentionDays = max(1, min(3650, $retentionDays));
+    $cutoff = date('Y-m-d H:i:s', strtotime('-' . $retentionDays . ' days'));
+
+    $deletedCount = 0;
+    $failedCount = 0;
+    $deletedBytes = 0;
+    $batchSize = 200;
+
+    while (true) {
+        $fetchStmt = db()->prepare(
+            'SELECT id, file_path, file_size_bytes
+             FROM job_condition_photos
+             WHERE company_id = :company_id
+               AND garage_id = :garage_id
+               AND status_code = "ACTIVE"
+               AND created_at < :cutoff
+             ORDER BY id ASC
+             LIMIT ' . $batchSize
+        );
+        $fetchStmt->execute([
+            'company_id' => $companyId,
+            'garage_id' => $garageId,
+            'cutoff' => $cutoff,
+        ]);
+        $rows = $fetchStmt->fetchAll();
+        if ($rows === []) {
+            break;
+        }
+
+        $ids = [];
+        foreach ($rows as $row) {
+            $photoId = (int) ($row['id'] ?? 0);
+            if ($photoId <= 0) {
+                continue;
+            }
+
+            $ids[] = $photoId;
+            if (job_condition_photo_delete_file((string) ($row['file_path'] ?? ''))) {
+                $deletedCount++;
+                $deletedBytes += max(0, (int) ($row['file_size_bytes'] ?? 0));
+            } else {
+                $failedCount++;
+            }
+        }
+
+        if ($ids !== []) {
+            $placeholders = implode(',', array_fill(0, count($ids), '?'));
+            $updateSql =
+                'UPDATE job_condition_photos
+                 SET status_code = "DELETED",
+                     deleted_at = NOW()
+                 WHERE company_id = ?
+                   AND garage_id = ?
+                   AND id IN (' . $placeholders . ')';
+            $updateStmt = db()->prepare($updateSql);
+            $updateStmt->execute(array_merge([$companyId, $garageId], $ids));
+        }
+
+        if (count($rows) < $batchSize) {
+            break;
+        }
+    }
+
+    return [
+        'ok' => true,
+        'deleted_count' => $deletedCount,
+        'failed_count' => $failedCount,
+        'deleted_bytes' => $deletedBytes,
+        'message' => 'Condition photo cleanup completed.',
+    ];
+}

@@ -7,9 +7,11 @@ require_login();
 header('Content-Type: text/html; charset=utf-8');
 
 $canManage = has_permission('customer.view') && has_permission('customer.manage');
+$canJobCreate = has_permission('job.create') || has_permission('job.manage');
+$canInlineCreate = $canManage || $canJobCreate;
 $prefillName = mb_substr(trim((string) ($_GET['q'] ?? '')), 0, 150);
 
-if (!$canManage) {
+if (!$canInlineCreate) {
     http_response_code(403);
     ?>
     <div class="alert alert-danger mb-0">You do not have permission to create customers.</div>

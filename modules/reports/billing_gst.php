@@ -36,6 +36,21 @@ $paymentModeSummary = [];
 $outstandingReceivables = [];
 $gstMonthlyBreakdownRows = [];
 
+function billing_gst_discount_meta_from_snapshot(array $snapshot): array
+{
+    $billing = is_array($snapshot['billing'] ?? null) ? $snapshot['billing'] : [];
+    $type = strtoupper(trim((string) ($billing['discount_type'] ?? 'AMOUNT')));
+    if (!in_array($type, ['AMOUNT', 'PERCENT'], true)) {
+        $type = 'AMOUNT';
+    }
+
+    return [
+        'type' => $type,
+        'value' => round(max(0.0, (float) ($billing['discount_value'] ?? 0)), 2),
+        'amount' => round(max(0.0, (float) ($billing['discount_amount'] ?? 0)), 2),
+    ];
+}
+
 if ($canViewFinancial) {
     $revenueDailyParams = ['company_id' => $companyId, 'from_date' => $fromDate, 'to_date' => $toDate];
     $revenueDailyScopeSql = analytics_garage_scope_sql('i.garage_id', $selectedGarageId, $garageIds, $revenueDailyParams, 'rev_daily_scope');
@@ -138,6 +153,7 @@ if ($canViewFinancial) {
     $receivableStmt = db()->prepare(
         'SELECT i.invoice_number, i.invoice_date, i.due_date, c.full_name AS customer_name,
                 i.grand_total,
+                i.snapshot_json,
                 COALESCE(paid.total_paid, 0) AS paid_amount,
                 (i.grand_total - COALESCE(paid.total_paid, 0)) AS outstanding_amount,
                 CASE WHEN i.due_date IS NOT NULL AND i.due_date < CURDATE() THEN DATEDIFF(CURDATE(), i.due_date) ELSE 0 END AS overdue_days
@@ -157,6 +173,25 @@ if ($canViewFinancial) {
     );
     $receivableStmt->execute($receivableParams);
     $outstandingReceivables = $receivableStmt->fetchAll();
+    foreach ($outstandingReceivables as &$row) {
+        $snapshot = json_decode((string) ($row['snapshot_json'] ?? ''), true);
+        if (!is_array($snapshot)) {
+            $snapshot = [];
+        }
+        $discountMeta = billing_gst_discount_meta_from_snapshot($snapshot);
+        $discountAmount = (float) ($discountMeta['amount'] ?? 0);
+        $discountType = (string) ($discountMeta['type'] ?? 'AMOUNT');
+        $discountValue = (float) ($discountMeta['value'] ?? 0);
+        $row['discount_amount'] = $discountAmount;
+        if ($discountAmount > 0.009 && $discountType === 'PERCENT' && $discountValue > 0.009) {
+            $row['discount_label'] = rtrim(rtrim(number_format($discountValue, 2), '0'), '.') . '%';
+        } elseif ($discountAmount > 0.009) {
+            $row['discount_label'] = 'Flat';
+        } else {
+            $row['discount_label'] = '-';
+        }
+    }
+    unset($row);
 
     $gstMonthlyParams = ['company_id' => $companyId, 'from_date' => $fromDate, 'to_date' => $toDate];
     $gstMonthlyScopeSql = analytics_garage_scope_sql('i.garage_id', $selectedGarageId, $garageIds, $gstMonthlyParams, 'gst_month_scope');
@@ -268,12 +303,13 @@ if ($exportKey !== '') {
                     (string) ($row['invoice_number'] ?? ''),
                     (string) ($row['invoice_date'] ?? ''),
                     (string) ($row['customer_name'] ?? ''),
+                    (float) ($row['discount_amount'] ?? 0),
                     (float) ($row['outstanding_amount'] ?? 0),
                     (int) ($row['overdue_days'] ?? 0),
                 ],
                 $outstandingReceivables
             );
-            reports_csv_download('billing_receivables_' . $timestamp . '.csv', ['Invoice', 'Date', 'Customer', 'Outstanding', 'Overdue Days'], $rows);
+            reports_csv_download('billing_receivables_' . $timestamp . '.csv', ['Invoice', 'Date', 'Customer', 'Discount', 'Outstanding', 'Overdue Days'], $rows);
 
         default:
             flash_set('report_error', 'Unknown export requested.', 'warning');
@@ -573,15 +609,21 @@ require_once __DIR__ . '/../../includes/sidebar.php';
           </div>
           <div class="card-body p-0 table-responsive">
             <table class="table table-sm table-striped mb-0">
-              <thead><tr><th>Invoice</th><th>Date</th><th>Customer</th><th>Outstanding</th><th>Overdue</th></tr></thead>
+              <thead><tr><th>Invoice</th><th>Date</th><th>Customer</th><th>Discount</th><th>Outstanding</th><th>Overdue</th></tr></thead>
               <tbody>
                 <?php if (empty($outstandingReceivables)): ?>
-                  <tr><td colspan="5" class="text-center text-muted py-4">No outstanding receivables.</td></tr>
+                  <tr><td colspan="6" class="text-center text-muted py-4">No outstanding receivables.</td></tr>
                 <?php else: foreach ($outstandingReceivables as $row): ?>
                   <tr>
                     <td><?= e((string) ($row['invoice_number'] ?? '')); ?></td>
                     <td><?= e((string) ($row['invoice_date'] ?? '')); ?></td>
                     <td><?= e((string) ($row['customer_name'] ?? '')); ?></td>
+                    <td>
+                      <?= e(format_currency((float) ($row['discount_amount'] ?? 0))); ?>
+                      <?php if ((string) ($row['discount_label'] ?? '-') !== '-'): ?>
+                        <div><small class="text-muted"><?= e((string) ($row['discount_label'] ?? '-')); ?></small></div>
+                      <?php endif; ?>
+                    </td>
                     <td><?= e(format_currency((float) ($row['outstanding_amount'] ?? 0))); ?></td>
                     <td><?= (int) ($row['overdue_days'] ?? 0); ?> day(s)</td>
                   </tr>

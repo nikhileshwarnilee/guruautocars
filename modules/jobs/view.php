@@ -12,9 +12,11 @@ $companyId = active_company_id();
 $garageId = active_garage_id();
 $userId = (int) ($_SESSION['user_id'] ?? 0);
 
+$canCreate = has_permission('job.create') || has_permission('job.manage');
 $canEdit = has_permission('job.edit') || has_permission('job.update') || has_permission('job.manage');
 $canAssign = has_permission('job.assign') || has_permission('job.manage');
 $canClose = has_permission('job.close') || has_permission('job.manage');
+$canConditionPhotoUpload = $canEdit || $canCreate;
 $jobCardColumns = table_columns('job_cards');
 $jobOdometerEnabled = in_array('odometer_km', $jobCardColumns, true);
 $jobLaborColumns = table_columns('job_labor');
@@ -557,6 +559,116 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if (!$jobForWrite) {
         flash_set('job_error', 'Job card not found for active garage.', 'danger');
         redirect('modules/jobs/index.php');
+    }
+
+    if ($action === 'upload_condition_photos') {
+        if (!$canConditionPhotoUpload) {
+            flash_set('job_error', 'You do not have permission to upload condition photos.', 'danger');
+            redirect('modules/jobs/view.php?id=' . $jobId . '#condition-photos');
+        }
+        if (!job_condition_photo_feature_ready()) {
+            flash_set('job_error', 'Condition photo storage is not ready. Please run DB upgrade.', 'danger');
+            redirect('modules/jobs/view.php?id=' . $jobId . '#condition-photos');
+        }
+
+        $photoNote = post_string('condition_photo_note', 255);
+        $uploadedFiles = job_condition_photo_normalize_uploads($_FILES['condition_images'] ?? null);
+        if ($uploadedFiles === []) {
+            flash_set('job_error', 'Select at least one image file to upload.', 'danger');
+            redirect('modules/jobs/view.php?id=' . $jobId . '#condition-photos');
+        }
+
+        $uploadedCount = 0;
+        $uploadedBytes = 0;
+        $errors = [];
+        $maxFilesPerRequest = 10;
+
+        foreach ($uploadedFiles as $index => $uploadedFile) {
+            if ($index >= $maxFilesPerRequest) {
+                $errors[] = 'Only first ' . $maxFilesPerRequest . ' files were processed in one upload.';
+                break;
+            }
+
+            if ((int) ($uploadedFile['error'] ?? UPLOAD_ERR_NO_FILE) === UPLOAD_ERR_NO_FILE) {
+                continue;
+            }
+
+            $uploadResult = job_condition_photo_store_upload(
+                $uploadedFile,
+                $companyId,
+                $garageId,
+                $jobId,
+                $userId,
+                $photoNote
+            );
+            if ((bool) ($uploadResult['ok'] ?? false)) {
+                $uploadedCount++;
+                $uploadedBytes += (int) ($uploadResult['file_size_bytes'] ?? 0);
+            } else {
+                $errors[] = (string) ($uploadResult['message'] ?? 'Unable to upload one of the images.');
+            }
+        }
+
+        if ($uploadedCount > 0) {
+            $sizeMb = round($uploadedBytes / 1048576, 2);
+            flash_set('job_success', 'Uploaded ' . $uploadedCount . ' condition photo(s). (~' . number_format($sizeMb, 2) . ' MB)', 'success');
+            job_append_history($jobId, 'UPLOAD_CONDITION_PHOTO', null, null, 'Uploaded condition photo(s)', [
+                'count' => $uploadedCount,
+                'bytes' => $uploadedBytes,
+            ]);
+            log_audit('job_cards', 'upload_condition_photos', $jobId, 'Uploaded job condition photos', [
+                'entity' => 'job_condition_photos',
+                'source' => 'UI',
+                'metadata' => [
+                    'count' => $uploadedCount,
+                    'bytes' => $uploadedBytes,
+                ],
+            ]);
+        }
+
+        if ($uploadedCount === 0 && $errors === []) {
+            $errors[] = 'No valid files were uploaded.';
+        }
+
+        if ($errors !== []) {
+            $previewErrors = array_slice(array_values(array_unique(array_filter($errors))), 0, 2);
+            flash_set('job_warning', implode(' | ', $previewErrors), 'warning');
+        }
+
+        redirect('modules/jobs/view.php?id=' . $jobId . '#condition-photos');
+    }
+
+    if ($action === 'delete_condition_photo') {
+        if (!$canConditionPhotoUpload) {
+            flash_set('job_error', 'You do not have permission to delete condition photos.', 'danger');
+            redirect('modules/jobs/view.php?id=' . $jobId . '#condition-photos');
+        }
+        if (!job_condition_photo_feature_ready()) {
+            flash_set('job_error', 'Condition photo storage is not ready. Please run DB upgrade.', 'danger');
+            redirect('modules/jobs/view.php?id=' . $jobId . '#condition-photos');
+        }
+
+        $photoId = post_int('photo_id');
+        $deleteResult = job_condition_photo_delete($photoId, $companyId, $garageId);
+        if (!(bool) ($deleteResult['ok'] ?? false)) {
+            flash_set('job_error', (string) ($deleteResult['message'] ?? 'Unable to delete condition photo.'), 'danger');
+            redirect('modules/jobs/view.php?id=' . $jobId . '#condition-photos');
+        }
+
+        flash_set('job_success', 'Condition photo deleted.', 'success');
+        if (!(bool) ($deleteResult['file_deleted'] ?? false)) {
+            flash_set('job_warning', 'Photo metadata was deleted, but file was not found on server.', 'warning');
+        }
+        job_append_history($jobId, 'DELETE_CONDITION_PHOTO', null, null, 'Deleted condition photo', ['photo_id' => $photoId]);
+        log_audit('job_cards', 'delete_condition_photo', $jobId, 'Deleted job condition photo', [
+            'entity' => 'job_condition_photos',
+            'source' => 'UI',
+            'metadata' => [
+                'photo_id' => $photoId,
+                'file_deleted' => (bool) ($deleteResult['file_deleted'] ?? false),
+            ],
+        ]);
+        redirect('modules/jobs/view.php?id=' . $jobId . '#condition-photos');
     }
 
     if ($action === 'assign_staff') {
@@ -1700,6 +1812,13 @@ $canPrintJob = has_permission('job.print') || has_permission('job.manage') || ha
 $jobPrintRestricted = $jobStatus === 'CANCELLED' || normalize_status_code((string) ($job['status_code'] ?? 'ACTIVE')) === 'DELETED';
 $canPrintRestricted = has_permission('job.print.cancelled') || has_permission('job.manage');
 $canRenderPrintButton = $canPrintJob && (!$jobPrintRestricted || $canPrintRestricted);
+$conditionPhotoFeatureReady = job_condition_photo_feature_ready();
+$conditionPhotos = $conditionPhotoFeatureReady
+    ? job_condition_photo_fetch_by_job($companyId, $garageId, $jobId, 200)
+    : [];
+$conditionPhotoCount = count($conditionPhotos);
+$conditionPhotoMaxMb = round(job_condition_photo_max_upload_bytes($companyId, $garageId) / 1048576, 2);
+$conditionPhotoPrompt = get_int('prompt_condition_photos') === 1 && $conditionPhotoCount === 0;
 
 $nextStatuses = [];
 foreach (job_workflow_statuses(true) as $status) {
@@ -1803,6 +1922,11 @@ require_once __DIR__ . '/../../includes/sidebar.php';
           This job card is locked because it is <?= e((string) $job['status']); ?> or not active. Line items and assignment edits are disabled.
         </div>
       <?php endif; ?>
+      <?php if ($conditionPhotoPrompt): ?>
+        <div class="alert alert-info">
+          Capture and upload vehicle current-condition photos now for dispute-proof records.
+        </div>
+      <?php endif; ?>
 
       <div class="row g-3 mb-3">
         <div class="col-md-3">
@@ -1863,6 +1987,81 @@ require_once __DIR__ . '/../../includes/sidebar.php';
               <p class="mb-0"><strong>Diagnosis:</strong><br><?= nl2br(e((string) ($job['diagnosis'] ?? '-'))); ?></p>
               <?php if (!empty($job['cancel_note'])): ?>
                 <div class="alert alert-light border mt-3 mb-0"><strong>Audit Note:</strong> <?= e((string) $job['cancel_note']); ?></div>
+              <?php endif; ?>
+            </div>
+          </div>
+
+          <div class="card card-outline card-secondary" id="condition-photos">
+            <div class="card-header d-flex justify-content-between align-items-center">
+              <h3 class="card-title mb-0">Vehicle Condition Photos</h3>
+              <span class="badge text-bg-light border"><?= (int) $conditionPhotoCount; ?></span>
+            </div>
+            <div class="card-body">
+              <?php if (!$conditionPhotoFeatureReady): ?>
+                <div class="alert alert-warning mb-0">
+                  Condition photo storage is not ready. Run <code>database/job_condition_photos_upgrade.sql</code> to enable this feature.
+                </div>
+              <?php else: ?>
+                <p class="text-muted small mb-3">
+                  Upload intake-condition photos before/while opening work. Max file size: <?= e(number_format($conditionPhotoMaxMb, 2)); ?> MB per image.
+                </p>
+                <?php if ($canConditionPhotoUpload): ?>
+                  <form method="post" enctype="multipart/form-data" class="row g-2 mb-3">
+                    <?= csrf_field(); ?>
+                    <input type="hidden" name="_action" value="upload_condition_photos">
+                    <div class="col-md-8">
+                      <label class="form-label">Select Images</label>
+                      <input type="file" name="condition_images[]" class="form-control" accept=".jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp" multiple required>
+                    </div>
+                    <div class="col-md-4">
+                      <label class="form-label">Note (Optional)</label>
+                      <input type="text" name="condition_photo_note" class="form-control" maxlength="255" placeholder="Front bumper scratch, etc.">
+                    </div>
+                    <div class="col-12">
+                      <button type="submit" class="btn btn-outline-primary">Upload Condition Photos</button>
+                    </div>
+                  </form>
+                <?php else: ?>
+                  <div class="text-muted small mb-3">Upload/delete is restricted to users with job edit permissions.</div>
+                <?php endif; ?>
+
+                <div class="row g-2">
+                  <?php if (empty($conditionPhotos)): ?>
+                    <div class="col-12">
+                      <div class="text-muted">No condition photos uploaded yet.</div>
+                    </div>
+                  <?php else: ?>
+                    <?php foreach ($conditionPhotos as $photo): ?>
+                      <?php $photoUrl = job_condition_photo_file_url((string) ($photo['file_path'] ?? '')); ?>
+                      <div class="col-md-4 col-sm-6">
+                        <div class="border rounded p-2 h-100 d-flex flex-column">
+                          <?php if ($photoUrl !== null): ?>
+                            <a href="<?= e($photoUrl); ?>" target="_blank" class="d-block mb-2">
+                              <img src="<?= e($photoUrl); ?>" alt="Condition Photo" class="img-fluid rounded" style="width:100%;height:140px;object-fit:cover;">
+                            </a>
+                          <?php else: ?>
+                            <div class="bg-light border rounded d-flex align-items-center justify-content-center mb-2" style="height:140px;">
+                              <span class="text-muted small">File Missing</span>
+                            </div>
+                          <?php endif; ?>
+                          <div class="small text-muted"><?= e((string) ($photo['created_at'] ?? '')); ?></div>
+                          <div class="small"><?= e((string) ($photo['uploaded_by_name'] ?? 'System')); ?></div>
+                          <?php if (!empty($photo['note'])): ?>
+                            <div class="small mt-1"><?= e((string) $photo['note']); ?></div>
+                          <?php endif; ?>
+                          <?php if ($canConditionPhotoUpload): ?>
+                            <form method="post" class="mt-2" data-confirm="Delete this condition photo?">
+                              <?= csrf_field(); ?>
+                              <input type="hidden" name="_action" value="delete_condition_photo">
+                              <input type="hidden" name="photo_id" value="<?= (int) ($photo['id'] ?? 0); ?>">
+                              <button type="submit" class="btn btn-sm btn-outline-danger w-100">Delete</button>
+                            </form>
+                          <?php endif; ?>
+                        </div>
+                      </div>
+                    <?php endforeach; ?>
+                  <?php endif; ?>
+                </div>
               <?php endif; ?>
             </div>
           </div>

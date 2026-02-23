@@ -473,6 +473,19 @@ $customersStmt = db()->prepare(
 );
 $customersStmt->execute(['company_id' => $companyId]);
 $customers = $customersStmt->fetchAll();
+$prefillCustomerId = get_int('prefill_customer_id');
+if ($prefillCustomerId > 0) {
+    $prefillAllowed = false;
+    foreach ($customers as $customerRow) {
+        if ((int) ($customerRow['id'] ?? 0) === $prefillCustomerId) {
+            $prefillAllowed = true;
+            break;
+        }
+    }
+    if (!$prefillAllowed) {
+        $prefillCustomerId = 0;
+    }
+}
 
 $visVariants = [];
 try {
@@ -503,6 +516,7 @@ if ($editId > 0) {
     ]);
     $editVehicle = $editStmt->fetch() ?: null;
 }
+$formCustomerId = $editVehicle ? (int) ($editVehicle['customer_id'] ?? 0) : $prefillCustomerId;
 
 $editAttrIds = [
     'brand_id' => 0,
@@ -740,13 +754,18 @@ require_once __DIR__ . '/../../includes/sidebar.php';
               <?= csrf_field(); ?>
               <input type="hidden" name="_action" value="<?= $editVehicle ? 'update' : 'create'; ?>" />
               <input type="hidden" name="vehicle_id" value="<?= (int) ($editVehicle['id'] ?? 0); ?>" />
+              <?php if (!$editVehicle && $prefillCustomerId > 0): ?>
+                <div class="col-12">
+                  <div class="alert alert-info py-2 mb-0">Customer pre-selected from Customer Master. Fill vehicle details and save.</div>
+                </div>
+              <?php endif; ?>
 
               <div class="col-md-4">
                 <label class="form-label">Customer</label>
                 <select name="customer_id" class="form-select" required>
                   <option value="">Select Customer</option>
                   <?php foreach ($customers as $customer): ?>
-                    <option value="<?= (int) $customer['id']; ?>" <?= ((int) ($editVehicle['customer_id'] ?? 0) === (int) $customer['id']) ? 'selected' : ''; ?>>
+                    <option value="<?= (int) $customer['id']; ?>" <?= ($formCustomerId === (int) $customer['id']) ? 'selected' : ''; ?>>
                       <?= e((string) $customer['full_name']); ?> (<?= e((string) $customer['phone']); ?>)
                     </option>
                   <?php endforeach; ?>

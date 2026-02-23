@@ -211,6 +211,55 @@ function billing_calculate_totals(array $lines): array
     ];
 }
 
+function billing_normalize_discount_type(string $discountType): string
+{
+    $normalized = strtoupper(trim($discountType));
+    return in_array($normalized, ['AMOUNT', 'PERCENT'], true) ? $normalized : 'AMOUNT';
+}
+
+function billing_discount_meta_from_snapshot(array $snapshot): array
+{
+    $billingBlock = is_array($snapshot['billing'] ?? null) ? $snapshot['billing'] : [];
+    $discountType = billing_normalize_discount_type((string) ($billingBlock['discount_type'] ?? 'AMOUNT'));
+    $discountValue = max(0.0, billing_round((float) ($billingBlock['discount_value'] ?? 0)));
+    $discountAmount = max(0.0, billing_round((float) ($billingBlock['discount_amount'] ?? 0)));
+
+    return [
+        'type' => $discountType,
+        'value' => $discountValue,
+        'amount' => $discountAmount,
+    ];
+}
+
+function billing_apply_invoice_discount(array $totals, string $discountType, float $discountValue): array
+{
+    $normalizedType = billing_normalize_discount_type($discountType);
+    $normalizedValue = max(0.0, billing_round($discountValue));
+    $grossTotal = max(0.0, billing_round((float) ($totals['gross_total'] ?? 0)));
+
+    if ($normalizedType === 'PERCENT') {
+        $normalizedValue = min(100.0, $normalizedValue);
+        $discountAmount = billing_round(($grossTotal * $normalizedValue) / 100);
+    } else {
+        $discountAmount = $normalizedValue;
+    }
+    $discountAmount = min($discountAmount, $grossTotal);
+
+    $netBeforeRound = billing_round($grossTotal - $discountAmount);
+    $roundedTotal = round($netBeforeRound, 0);
+    $roundOff = billing_round($roundedTotal - $netBeforeRound);
+    $grandTotal = billing_round($netBeforeRound + $roundOff);
+
+    $totals['discount_type'] = $normalizedType;
+    $totals['discount_value'] = $normalizedValue;
+    $totals['discount_amount'] = $discountAmount;
+    $totals['net_total'] = $netBeforeRound;
+    $totals['round_off'] = $roundOff;
+    $totals['grand_total'] = $grandTotal;
+
+    return $totals;
+}
+
 function billing_get_setting_value(PDO $pdo, int $companyId, int $garageId, string $settingKey, ?string $default = null): ?string
 {
     $stmt = $pdo->prepare(
@@ -546,6 +595,16 @@ function billing_validate_invoice_totals(array $invoiceRow, array $invoiceItems)
     }
 
     $computedTotals = billing_calculate_totals($invoiceItems);
+    $snapshot = json_decode((string) ($invoiceRow['snapshot_json'] ?? ''), true);
+    if (!is_array($snapshot)) {
+        $snapshot = [];
+    }
+    $discountMeta = billing_discount_meta_from_snapshot($snapshot);
+    $computedTotals = billing_apply_invoice_discount(
+        $computedTotals,
+        (string) ($discountMeta['type'] ?? 'AMOUNT'),
+        (float) ($discountMeta['value'] ?? 0)
+    );
     $headerChecks = [
         'subtotal_service',
         'subtotal_parts',

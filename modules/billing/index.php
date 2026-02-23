@@ -64,6 +64,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         $jobCardId = post_int('job_card_id');
         $dueDate = billing_parse_date((string) ($_POST['due_date'] ?? ''));
+        $discountType = billing_normalize_discount_type((string) ($_POST['discount_type'] ?? 'AMOUNT'));
+        $discountValue = max(0.0, billing_round((float) ($_POST['discount_value'] ?? 0)));
         $notes = post_string('notes', 1000);
 
         if ($jobCardId <= 0) {
@@ -182,6 +184,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
 
             $totals = billing_calculate_totals($invoiceLines);
+            $totals = billing_apply_invoice_discount($totals, $discountType, $discountValue);
             if (((float) $totals['grand_total']) <= 0.0) {
                 throw new RuntimeException('Invoice total must be greater than zero.');
             }
@@ -233,6 +236,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'id' => (int) $job['id'],
                     'job_number' => (string) $job['job_number'],
                     'closed_at' => (string) ($job['closed_at'] ?? ''),
+                ],
+                'billing' => [
+                    'discount_type' => (string) ($totals['discount_type'] ?? 'AMOUNT'),
+                    'discount_value' => (float) ($totals['discount_value'] ?? 0),
+                    'discount_amount' => (float) ($totals['discount_amount'] ?? 0),
+                    'gross_before_discount' => (float) ($totals['gross_total'] ?? 0),
+                    'net_after_discount' => (float) ($totals['net_total'] ?? 0),
                 ],
                 'tax_regime' => $taxRegime,
                 'generated_at' => date('c'),
@@ -331,6 +341,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'job_card_id' => (int) $job['id'],
                     'invoice_number' => $invoiceNumber,
                     'tax_regime' => $taxRegime,
+                    'discount_type' => (string) ($totals['discount_type'] ?? 'AMOUNT'),
+                    'discount_value' => (float) ($totals['discount_value'] ?? 0),
+                    'discount_amount' => (float) ($totals['discount_amount'] ?? 0),
                 ]
             );
 
@@ -343,6 +356,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'invoice_status' => 'DRAFT',
                     'payment_status' => 'UNPAID',
                     'grand_total' => (float) ($totals['grand_total'] ?? 0),
+                    'discount_amount' => (float) ($totals['discount_amount'] ?? 0),
                     'taxable_amount' => (float) ($totals['taxable_amount'] ?? 0),
                     'total_tax_amount' => (float) ($totals['total_tax_amount'] ?? 0),
                     'job_card_id' => (int) $job['id'],
@@ -1033,8 +1047,20 @@ foreach ($invoices as &$invoice) {
     $invoice['snapshot'] = $snapshot;
     $snapCustomer = billing_snapshot_value($snapshot, 'customer', 'full_name');
     $snapVehicle = billing_snapshot_value($snapshot, 'vehicle', 'registration_no');
+    $discountMeta = billing_discount_meta_from_snapshot($snapshot);
+    $discountAmount = (float) ($discountMeta['amount'] ?? 0);
+    $discountType = (string) ($discountMeta['type'] ?? 'AMOUNT');
+    $discountValue = (float) ($discountMeta['value'] ?? 0);
     $invoice['display_customer_name'] = $snapCustomer !== '' ? $snapCustomer : (string) ($invoice['live_customer_name'] ?? '-');
     $invoice['display_registration_no'] = $snapVehicle !== '' ? $snapVehicle : (string) ($invoice['live_registration_no'] ?? '-');
+    $invoice['discount_amount'] = $discountAmount;
+    if ($discountAmount > 0.009 && $discountType === 'PERCENT' && $discountValue > 0.009) {
+        $invoice['discount_label'] = rtrim(rtrim(number_format($discountValue, 2), '0'), '.') . '%';
+    } elseif ($discountAmount > 0.009) {
+        $invoice['discount_label'] = 'Flat';
+    } else {
+        $invoice['discount_label'] = '-';
+    }
 }
 unset($invoice);
 
@@ -1125,7 +1151,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             <div class="card-body row g-3">
               <?= csrf_field(); ?>
               <input type="hidden" name="_action" value="create_invoice" />
-              <div class="col-md-8">
+              <div class="col-md-6">
                 <label class="form-label">Eligible Closed Job Card</label>
                 <select name="job_card_id" class="form-select" required>
                   <option value="">Select CLOSED Job Card</option>
@@ -1144,6 +1170,17 @@ require_once __DIR__ . '/../../includes/sidebar.php';
               <div class="col-md-2">
                 <label class="form-label">Invoice Date</label>
                 <input type="text" class="form-control" value="<?= e(date('Y-m-d')); ?>" readonly />
+              </div>
+              <div class="col-md-1">
+                <label class="form-label">Discount Type</label>
+                <select name="discount_type" class="form-select">
+                  <option value="AMOUNT" selected>Flat</option>
+                  <option value="PERCENT">%</option>
+                </select>
+              </div>
+              <div class="col-md-1">
+                <label class="form-label">Discount</label>
+                <input type="number" name="discount_value" class="form-control" min="0" step="0.01" value="0" />
               </div>
               <div class="col-md-12">
                 <label class="form-label">Notes</label>
@@ -1229,6 +1266,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                 <th>Regime</th>
                 <th>Taxable</th>
                 <th>Tax</th>
+                <th>Discount</th>
                 <th>Total</th>
                 <th>Paid</th>
                 <th>Outstanding</th>
@@ -1239,7 +1277,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             </thead>
             <tbody>
               <?php if (empty($invoices)): ?>
-                <tr><td colspan="14" class="text-center text-muted py-4">No invoices generated.</td></tr>
+                <tr><td colspan="15" class="text-center text-muted py-4">No invoices generated.</td></tr>
               <?php else: ?>
                 <?php foreach ($invoices as $invoice): ?>
                   <?php
@@ -1261,6 +1299,12 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                     <td><?= e((string) ($invoice['tax_regime'] ?? '-')); ?></td>
                     <td><?= e(format_currency((float) $invoice['taxable_amount'])); ?></td>
                     <td><?= e(format_currency((float) $invoice['total_tax_amount'])); ?></td>
+                    <td>
+                      <?= e(format_currency((float) ($invoice['discount_amount'] ?? 0))); ?>
+                      <?php if ((string) ($invoice['discount_label'] ?? '-') !== '-'): ?>
+                        <div><small class="text-muted"><?= e((string) $invoice['discount_label']); ?></small></div>
+                      <?php endif; ?>
+                    </td>
                     <td><?= e(format_currency($total)); ?></td>
                     <td><?= e(format_currency($paid)); ?></td>
                     <td><?= e(format_currency($outstanding)); ?></td>
