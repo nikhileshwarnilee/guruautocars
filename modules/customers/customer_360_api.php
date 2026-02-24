@@ -3,6 +3,7 @@ declare(strict_types=1);
 
 require_once __DIR__ . '/../../includes/app.php';
 require_once __DIR__ . '/../billing/workflow.php';
+require_once __DIR__ . '/../jobs/workflow.php';
 require_login();
 require_permission('customer.view');
 
@@ -249,6 +250,53 @@ function customer360_render_payments(array $payments, bool $canViewInvoices): st
     return (string) ob_get_clean();
 }
 
+function customer360_render_maintenance(array $rows, bool $featureReady): string
+{
+    ob_start();
+    if (!$featureReady) {
+        ?>
+        <div class="alert alert-warning mb-0">Maintenance reminder storage is not ready.</div>
+        <?php
+        return (string) ob_get_clean();
+    }
+    ?>
+    <div class="table-responsive">
+      <table class="table table-striped table-sm mb-0">
+        <thead>
+          <tr>
+            <th>Vehicle</th>
+            <th>Service/Part</th>
+            <th class="text-end">Last KM</th>
+            <th class="text-end">Next Due KM</th>
+            <th>Next Due Date</th>
+            <th>Status</th>
+            <th>Source</th>
+          </tr>
+        </thead>
+        <tbody>
+          <?php if ($rows === []): ?>
+            <tr><td colspan="7" class="text-center text-muted py-4">No maintenance reminders found for selected filter.</td></tr>
+          <?php else: ?>
+            <?php foreach ($rows as $row): ?>
+              <tr>
+                <td><?= e((string) ($row['registration_no'] ?? '-')); ?></td>
+                <td><?= e((string) ($row['service_label'] ?? service_reminder_type_label((string) ($row['service_type'] ?? '')))); ?></td>
+                <td class="text-end"><?= isset($row['last_service_km']) && $row['last_service_km'] !== null ? e(number_format((float) $row['last_service_km'], 0)) : '-'; ?></td>
+                <td class="text-end"><?= isset($row['next_due_km']) && $row['next_due_km'] !== null ? e(number_format((float) $row['next_due_km'], 0)) : '-'; ?></td>
+                <td><?= e((string) (($row['next_due_date'] ?? '') !== '' ? $row['next_due_date'] : '-')); ?></td>
+                <td><span class="badge text-bg-<?= e(service_reminder_due_badge_class((string) ($row['due_state'] ?? 'UPCOMING'))); ?>"><?= e((string) ($row['due_state'] ?? 'UPCOMING')); ?></span></td>
+                <td><?= e((string) ($row['source_type'] ?? '-')); ?></td>
+              </tr>
+            <?php endforeach; ?>
+          <?php endif; ?>
+        </tbody>
+      </table>
+    </div>
+    <?php
+
+    return (string) ob_get_clean();
+}
+
 $companyId = active_company_id();
 $customerId = get_int('id');
 $selectedVehicleId = get_int('vehicle_id');
@@ -414,6 +462,41 @@ if ($canViewInvoices) {
     $payments = $paymentsStmt->fetchAll();
 }
 
+$maintenanceFeatureReady = service_reminder_feature_ready();
+$maintenanceRows = [];
+if ($maintenanceFeatureReady) {
+    $maintenanceSql =
+        'SELECT mr.*, v.registration_no, v.brand, v.model, v.variant
+         FROM vehicle_maintenance_reminders mr
+         INNER JOIN vehicles v ON v.id = mr.vehicle_id
+         WHERE mr.company_id = :company_id
+           AND v.customer_id = :customer_id
+           AND mr.status_code <> "DELETED"';
+    $maintenanceParams = [
+        'company_id' => $companyId,
+        'customer_id' => $customerId,
+    ];
+    if ($selectedVehicleId > 0) {
+        $maintenanceSql .= ' AND mr.vehicle_id = :vehicle_id';
+        $maintenanceParams['vehicle_id'] = $selectedVehicleId;
+    }
+    $maintenanceSql .= '
+         ORDER BY mr.is_active DESC, mr.created_at DESC, mr.id DESC
+         LIMIT 300';
+
+    $maintenanceStmt = db()->prepare($maintenanceSql);
+    $maintenanceStmt->execute($maintenanceParams);
+    $rawMaintenanceRows = $maintenanceStmt->fetchAll();
+    foreach ($rawMaintenanceRows as $row) {
+        $row['due_state'] = service_reminder_due_state($row);
+        $row['service_type'] = (string) ($row['item_type'] ?? '');
+        $row['service_label'] = (string) (($row['item_name'] ?? '') !== ''
+            ? $row['item_name']
+            : (service_reminder_type_label((string) ($row['item_type'] ?? '')) . ' #' . (int) ($row['item_id'] ?? 0)));
+        $maintenanceRows[] = $row;
+    }
+}
+
 $totalRevenue = 0.0;
 $outstandingAmount = 0.0;
 foreach ($invoices as $invoice) {
@@ -449,6 +532,7 @@ echo json_encode([
     ],
     'sections' => [
         'vehicles' => customer360_render_vehicles($vehicles, $selectedVehicleId),
+        'maintenance' => customer360_render_maintenance($maintenanceRows, $maintenanceFeatureReady),
         'jobs' => customer360_render_jobs($jobs, $canViewJobs),
         'invoices' => customer360_render_invoices($invoices, $canViewInvoices),
         'payments' => customer360_render_payments($payments, $canViewInvoices),

@@ -18,6 +18,9 @@ $jobCardColumns = table_columns('job_cards');
 $jobOdometerSelect = in_array('odometer_km', $jobCardColumns, true)
     ? 'jc.odometer_km AS live_job_odometer_km'
     : 'NULL AS live_job_odometer_km';
+$jobRecommendationSelect = in_array('recommendation_note', $jobCardColumns, true)
+    ? 'jc.recommendation_note AS live_job_recommendation_note'
+    : 'NULL AS live_job_recommendation_note';
 
 if ($invoiceId <= 0) {
     flash_set('billing_error', 'Invalid invoice id.', 'danger');
@@ -40,7 +43,8 @@ $invoiceStmt = db()->prepare(
             g.name AS live_garage_name,
             cu.full_name AS live_customer_name, cu.phone AS live_customer_phone, cu.gstin AS live_customer_gstin, cu.address_line1 AS live_customer_address,
             v.registration_no AS live_registration_no, v.brand AS live_vehicle_brand, v.model AS live_vehicle_model,
-            ' . $jobOdometerSelect . '
+            ' . $jobOdometerSelect . ',
+            ' . $jobRecommendationSelect . '
      FROM invoices i
      LEFT JOIN companies c ON c.id = i.company_id
      LEFT JOIN garages g ON g.id = i.garage_id
@@ -116,6 +120,12 @@ $customerState = snapshot_get($snapshot, 'customer', 'state', null);
 $vehicleNo = snapshot_get($snapshot, 'vehicle', 'registration_no', (string) ($invoice['live_registration_no'] ?? ''));
 $vehicleBrand = snapshot_get($snapshot, 'vehicle', 'brand', (string) ($invoice['live_vehicle_brand'] ?? ''));
 $vehicleModel = snapshot_get($snapshot, 'vehicle', 'model', (string) ($invoice['live_vehicle_model'] ?? ''));
+$jobRecommendationNote = trim((string) snapshot_get(
+    $snapshot,
+    'job',
+    'recommendation_note',
+    (string) ($invoice['live_job_recommendation_note'] ?? '')
+));
 $invoicedOdometer = null;
 if (isset($snapshot['job']['odometer_km']) && is_numeric($snapshot['job']['odometer_km'])) {
     $invoicedOdometer = (int) round((float) $snapshot['job']['odometer_km']);
@@ -517,6 +527,13 @@ $companyLogoUrl = company_logo_url((int) ($invoice['company_id'] ?? $companyId),
             <div class="panel-line"><strong>Invoiced Odometer:</strong> <?= $invoicedOdometer !== null ? e(number_format((float) $invoicedOdometer, 0)) . ' KM' : '-'; ?></div>
           </div>
         </div>
+
+        <?php if ($jobRecommendationNote !== ''): ?>
+          <div class="panel" style="margin-bottom: 10px;">
+            <div class="panel-heading">Recommendation Note</div>
+            <div class="panel-line"><?= nl2br(e($jobRecommendationNote)); ?></div>
+          </div>
+        <?php endif; ?>
 
         <div class="section-title">Invoice Items</div>
         <table class="line-table">

@@ -189,8 +189,8 @@ $moduleCards = [
         'metric' => number_format($servicedVehicles),
     ],
     [
-        'title' => 'Service Reminder Reports',
-        'description' => 'Due, overdue, and upcoming service recommendations with vehicle-level next-visit prediction.',
+        'title' => 'Maintenance Reminder Reports',
+        'description' => 'Due, overdue, upcoming, and completed maintenance reminders with vehicle-level predictions.',
         'path' => 'modules/reports/service_reminders.php',
         'icon' => 'bi bi-bell',
         'badge' => 'Overdue Reminders',

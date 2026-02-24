@@ -186,8 +186,8 @@ require_once __DIR__ . '/../../includes/sidebar.php';
               <?php endif; ?>
             </div>
             <div class="col-lg-6">
-              <div class="alert alert-info mb-0 py-2">
-                Vehicle filtering updates Jobs, Invoices, Payments and summary cards.
+          <div class="alert alert-info mb-0 py-2">
+                Vehicle filtering updates Maintenance, Jobs, Invoices, Payments and summary cards.
               </div>
             </div>
           </div>
@@ -199,6 +199,9 @@ require_once __DIR__ . '/../../includes/sidebar.php';
           <ul class="nav nav-tabs" id="customer360Tabs" role="tablist">
             <li class="nav-item" role="presentation">
               <button class="nav-link active" id="tab-vehicles" data-bs-toggle="tab" data-bs-target="#pane-vehicles" type="button" role="tab" aria-controls="pane-vehicles" aria-selected="true">Vehicles</button>
+            </li>
+            <li class="nav-item" role="presentation">
+              <button class="nav-link" id="tab-maintenance" data-bs-toggle="tab" data-bs-target="#pane-maintenance" type="button" role="tab" aria-controls="pane-maintenance" aria-selected="false">Maintenance</button>
             </li>
             <li class="nav-item" role="presentation">
               <button class="nav-link" id="tab-jobs" data-bs-toggle="tab" data-bs-target="#pane-jobs" type="button" role="tab" aria-controls="pane-jobs" aria-selected="false">Job Cards</button>
@@ -216,6 +219,9 @@ require_once __DIR__ . '/../../includes/sidebar.php';
           <div class="tab-content">
             <div class="tab-pane fade show active" id="pane-vehicles" role="tabpanel" aria-labelledby="tab-vehicles">
               <div data-customer360-section="vehicles" class="pt-2 text-muted">Loading vehicles...</div>
+            </div>
+            <div class="tab-pane fade" id="pane-maintenance" role="tabpanel" aria-labelledby="tab-maintenance">
+              <div data-customer360-section="maintenance" class="pt-2 text-muted">Loading maintenance reminders...</div>
             </div>
             <div class="tab-pane fade" id="pane-jobs" role="tabpanel" aria-labelledby="tab-jobs">
               <div data-customer360-section="jobs" class="pt-2 text-muted">Loading job cards...</div>
@@ -249,7 +255,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
     var vehicleSelect = root.querySelector('[data-customer360-vehicle-filter="1"]');
     var errorBox = root.querySelector('[data-customer360-error="1"]');
     var statNodes = root.querySelectorAll('[data-customer360-stat]');
-    var sectionNames = ['vehicles', 'jobs', 'invoices', 'payments'];
+    var sectionNames = ['vehicles', 'maintenance', 'jobs', 'invoices', 'payments'];
     var requestSequence = 0;
 
     function setLoadingState() {

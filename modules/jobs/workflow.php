@@ -115,6 +115,28 @@ function job_recalculate_estimate(int $jobId): void
     ]);
 }
 
+function job_recommendation_note_feature_ready(bool $refresh = false): bool
+{
+    static $cached = null;
+
+    if (!$refresh && $cached !== null) {
+        return $cached;
+    }
+
+    try {
+        $columns = table_columns('job_cards');
+        if (!in_array('recommendation_note', $columns, true)) {
+            db()->exec('ALTER TABLE job_cards ADD COLUMN recommendation_note TEXT NULL AFTER diagnosis');
+            $columns = table_columns('job_cards');
+        }
+        $cached = in_array('recommendation_note', $columns, true);
+    } catch (Throwable $exception) {
+        $cached = false;
+    }
+
+    return $cached;
+}
+
 function job_assignment_candidates(int $companyId, int $garageId): array
 {
     $stmt = db()->prepare(
@@ -540,6 +562,119 @@ function job_fetch_vis_suggestions(int $companyId, int $garageId, int $vehicleId
     }
 }
 
+function job_fetch_vis_parts_for_service(int $companyId, int $garageId, int $vehicleId, int $serviceId): array
+{
+    if ($companyId <= 0 || $garageId <= 0 || $vehicleId <= 0 || $serviceId <= 0) {
+        return [];
+    }
+
+    try {
+        $vehicleStmt = db()->prepare(
+            'SELECT vis_variant_id
+             FROM vehicles
+             WHERE id = :id
+               AND company_id = :company_id
+               AND status_code <> "DELETED"
+             LIMIT 1'
+        );
+        $vehicleStmt->execute([
+            'id' => $vehicleId,
+            'company_id' => $companyId,
+        ]);
+        $vehicle = $vehicleStmt->fetch() ?: null;
+        $variantId = (int) ($vehicle['vis_variant_id'] ?? 0);
+        if ($variantId <= 0) {
+            return [];
+        }
+
+        $partsStmt = db()->prepare(
+            'SELECT DISTINCT p.id AS part_id, p.part_name, p.part_sku, p.selling_price, p.gst_rate,
+                    COALESCE(gi.quantity, 0) AS stock_qty,
+                    sm.is_required,
+                    vpc.compatibility_note
+             FROM vis_service_part_map sm
+             INNER JOIN vis_part_compatibility vpc
+               ON vpc.part_id = sm.part_id
+              AND vpc.variant_id = :variant_id
+              AND vpc.company_id = :company_id
+              AND vpc.status_code = "ACTIVE"
+             INNER JOIN parts p
+               ON p.id = sm.part_id
+              AND p.company_id = :company_id
+              AND p.status_code = "ACTIVE"
+             LEFT JOIN garage_inventory gi
+               ON gi.part_id = p.id
+              AND gi.garage_id = :garage_id
+             WHERE sm.company_id = :company_id
+               AND sm.service_id = :service_id
+               AND sm.status_code = "ACTIVE"
+             ORDER BY sm.is_required DESC, p.part_name ASC'
+        );
+        $partsStmt->execute([
+            'variant_id' => $variantId,
+            'company_id' => $companyId,
+            'garage_id' => $garageId,
+            'service_id' => $serviceId,
+        ]);
+
+        return $partsStmt->fetchAll() ?: [];
+    } catch (Throwable $exception) {
+        return [];
+    }
+}
+
+function job_add_vis_parts_to_job(int $jobId, array $parts): array
+{
+    $result = [
+        'added_count' => 0,
+        'part_ids' => [],
+        'warnings' => [],
+    ];
+    if ($jobId <= 0 || $parts === []) {
+        return $result;
+    }
+
+    $insertStmt = db()->prepare(
+        'INSERT INTO job_parts
+          (job_card_id, part_id, quantity, unit_price, gst_rate, total_amount)
+         VALUES
+          (:job_card_id, :part_id, :quantity, :unit_price, :gst_rate, :total_amount)'
+    );
+
+    foreach ($parts as $part) {
+        $partId = (int) ($part['part_id'] ?? 0);
+        if ($partId <= 0) {
+            continue;
+        }
+        $quantity = 1.0;
+        $unitPrice = round((float) ($part['selling_price'] ?? 0), 2);
+        $gstRate = round((float) ($part['gst_rate'] ?? 0), 2);
+        $totalAmount = round($quantity * $unitPrice, 2);
+
+        try {
+            $insertStmt->execute([
+                'job_card_id' => $jobId,
+                'part_id' => $partId,
+                'quantity' => $quantity,
+                'unit_price' => $unitPrice,
+                'gst_rate' => $gstRate,
+                'total_amount' => $totalAmount,
+            ]);
+            $result['added_count']++;
+            $result['part_ids'][] = $partId;
+        } catch (Throwable $exception) {
+            $partName = trim((string) ($part['part_name'] ?? ''));
+            $result['warnings'][] = 'Unable to add mapped part ' . ($partName !== '' ? $partName : ('Part #' . $partId)) . '.';
+        }
+    }
+
+    if ($result['added_count'] > 0) {
+        job_recalculate_estimate($jobId);
+    }
+
+    return $result;
+}
+
 function service_reminder_table_exists(string $tableName, bool $refresh = false): bool
 {
     static $cache = [];
@@ -570,45 +705,33 @@ function service_reminder_feature_ready(bool $refresh = false): bool
     }
 
     try {
-        db()->exec(
-            'CREATE TABLE IF NOT EXISTS vis_service_interval_rules (
-                id INT UNSIGNED NOT NULL AUTO_INCREMENT,
-                company_id INT UNSIGNED NOT NULL,
-                vis_variant_id INT UNSIGNED NOT NULL,
-                engine_oil_interval_km INT UNSIGNED DEFAULT NULL,
-                major_service_interval_km INT UNSIGNED DEFAULT NULL,
-                brake_inspection_interval_km INT UNSIGNED DEFAULT NULL,
-                ac_service_interval_km INT UNSIGNED DEFAULT NULL,
-                interval_days INT UNSIGNED DEFAULT NULL,
-                status_code VARCHAR(20) NOT NULL DEFAULT "ACTIVE",
-                created_by INT UNSIGNED DEFAULT NULL,
-                updated_by INT UNSIGNED DEFAULT NULL,
-                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP NULL DEFAULT NULL ON UPDATE CURRENT_TIMESTAMP,
-                PRIMARY KEY (id),
-                UNIQUE KEY uniq_vis_service_interval_scope_variant (company_id, vis_variant_id),
-                KEY idx_vis_service_interval_status (company_id, status_code),
-                KEY idx_vis_service_interval_variant (vis_variant_id)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci'
-        );
+        $serviceColumns = table_columns('services');
+        if (!in_array('enable_reminder', $serviceColumns, true)) {
+            db()->exec('ALTER TABLE services ADD COLUMN enable_reminder TINYINT(1) NOT NULL DEFAULT 0');
+        }
+    } catch (Throwable $exception) {
+        // Non-fatal at this stage.
+    }
 
+    try {
+        $partColumns = table_columns('parts');
+        if (!in_array('enable_reminder', $partColumns, true)) {
+            db()->exec('ALTER TABLE parts ADD COLUMN enable_reminder TINYINT(1) NOT NULL DEFAULT 0');
+        }
+    } catch (Throwable $exception) {
+        // Non-fatal at this stage.
+    }
+
+    try {
         db()->exec(
-            'CREATE TABLE IF NOT EXISTS service_reminders (
+            'CREATE TABLE IF NOT EXISTS vehicle_maintenance_rules (
                 id INT UNSIGNED NOT NULL AUTO_INCREMENT,
                 company_id INT UNSIGNED NOT NULL,
-                garage_id INT UNSIGNED NOT NULL,
                 vehicle_id INT UNSIGNED NOT NULL,
-                job_card_id INT UNSIGNED DEFAULT NULL,
-                source_type VARCHAR(20) NOT NULL DEFAULT "AUTO",
-                service_type VARCHAR(40) NOT NULL,
-                service_label VARCHAR(120) NOT NULL,
-                recommendation_text VARCHAR(255) DEFAULT NULL,
-                last_service_km INT UNSIGNED DEFAULT NULL,
+                item_type VARCHAR(20) NOT NULL,
+                item_id INT UNSIGNED NOT NULL,
                 interval_km INT UNSIGNED DEFAULT NULL,
-                next_due_km INT UNSIGNED DEFAULT NULL,
                 interval_days INT UNSIGNED DEFAULT NULL,
-                next_due_date DATE DEFAULT NULL,
-                predicted_next_visit_date DATE DEFAULT NULL,
                 is_active TINYINT(1) NOT NULL DEFAULT 1,
                 status_code VARCHAR(20) NOT NULL DEFAULT "ACTIVE",
                 created_by INT UNSIGNED DEFAULT NULL,
@@ -616,37 +739,125 @@ function service_reminder_feature_ready(bool $refresh = false): bool
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP NULL DEFAULT NULL ON UPDATE CURRENT_TIMESTAMP,
                 PRIMARY KEY (id),
-                KEY idx_service_reminder_vehicle_active (company_id, vehicle_id, is_active, status_code),
-                KEY idx_service_reminder_scope (company_id, garage_id, is_active, status_code),
-                KEY idx_service_reminder_due_date (company_id, next_due_date),
-                KEY idx_service_reminder_due_km (company_id, next_due_km),
-                KEY idx_service_reminder_type (company_id, service_type, is_active)
+                UNIQUE KEY uniq_vehicle_item_rule (company_id, vehicle_id, item_type, item_id),
+                KEY idx_maintenance_rule_scope (company_id, vehicle_id, is_active, status_code),
+                KEY idx_maintenance_rule_item (company_id, item_type, item_id, status_code)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci'
+        );
+
+        db()->exec(
+            'CREATE TABLE IF NOT EXISTS vehicle_maintenance_reminders (
+                id INT UNSIGNED NOT NULL AUTO_INCREMENT,
+                company_id INT UNSIGNED NOT NULL,
+                garage_id INT UNSIGNED NOT NULL,
+                vehicle_id INT UNSIGNED NOT NULL,
+                customer_id INT UNSIGNED DEFAULT NULL,
+                job_card_id INT UNSIGNED DEFAULT NULL,
+                rule_id INT UNSIGNED DEFAULT NULL,
+                item_type VARCHAR(20) NOT NULL,
+                item_id INT UNSIGNED NOT NULL,
+                item_name VARCHAR(180) NOT NULL,
+                source_type VARCHAR(30) NOT NULL DEFAULT "AUTO",
+                reminder_status VARCHAR(30) NOT NULL DEFAULT "ACTIVE",
+                recommendation_text VARCHAR(255) DEFAULT NULL,
+                last_service_km INT UNSIGNED DEFAULT NULL,
+                last_service_date DATE DEFAULT NULL,
+                interval_km INT UNSIGNED DEFAULT NULL,
+                next_due_km INT UNSIGNED DEFAULT NULL,
+                interval_days INT UNSIGNED DEFAULT NULL,
+                next_due_date DATE DEFAULT NULL,
+                predicted_next_visit_date DATE DEFAULT NULL,
+                is_active TINYINT(1) NOT NULL DEFAULT 1,
+                status_code VARCHAR(20) NOT NULL DEFAULT "ACTIVE",
+                completed_at DATETIME DEFAULT NULL,
+                created_by INT UNSIGNED DEFAULT NULL,
+                updated_by INT UNSIGNED DEFAULT NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP NULL DEFAULT NULL ON UPDATE CURRENT_TIMESTAMP,
+                PRIMARY KEY (id),
+                KEY idx_maintenance_reminder_vehicle_active (company_id, vehicle_id, item_type, item_id, is_active, status_code),
+                KEY idx_maintenance_reminder_scope (company_id, garage_id, is_active, status_code),
+                KEY idx_maintenance_reminder_due_date (company_id, next_due_date),
+                KEY idx_maintenance_reminder_due_km (company_id, next_due_km),
+                KEY idx_maintenance_reminder_status (company_id, reminder_status, is_active)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci'
+        );
+
+        db()->exec('DROP TABLE IF EXISTS vis_service_interval_rules');
+        db()->exec('DROP TABLE IF EXISTS service_reminders');
+
+        db()->exec(
+            'DELETE r
+             FROM vehicle_maintenance_rules r
+             LEFT JOIN vehicles v ON v.id = r.vehicle_id AND v.company_id = r.company_id
+             WHERE v.id IS NULL OR v.status_code = "DELETED"'
+        );
+        db()->exec(
+            'DELETE r
+             FROM vehicle_maintenance_rules r
+             LEFT JOIN services s ON r.item_type = "SERVICE" AND s.id = r.item_id AND s.company_id = r.company_id
+             LEFT JOIN parts p ON r.item_type = "PART" AND p.id = r.item_id AND p.company_id = r.company_id
+             WHERE (r.item_type = "SERVICE" AND s.id IS NULL)
+                OR (r.item_type = "PART" AND p.id IS NULL)'
+        );
+        db()->exec(
+            'DELETE mr
+             FROM vehicle_maintenance_reminders mr
+             LEFT JOIN vehicles v ON v.id = mr.vehicle_id AND v.company_id = mr.company_id
+             WHERE v.id IS NULL OR v.status_code = "DELETED"'
+        );
+        db()->exec(
+            'DELETE mr
+             FROM vehicle_maintenance_reminders mr
+             LEFT JOIN services s ON mr.item_type = "SERVICE" AND s.id = mr.item_id AND s.company_id = mr.company_id
+             LEFT JOIN parts p ON mr.item_type = "PART" AND p.id = mr.item_id AND p.company_id = mr.company_id
+             WHERE (mr.item_type = "SERVICE" AND s.id IS NULL)
+                OR (mr.item_type = "PART" AND p.id IS NULL)'
+        );
+        db()->exec(
+            'UPDATE vehicle_maintenance_reminders older
+             INNER JOIN vehicle_maintenance_reminders newer
+               ON newer.company_id = older.company_id
+              AND newer.vehicle_id = older.vehicle_id
+              AND newer.item_type = older.item_type
+              AND newer.item_id = older.item_id
+              AND newer.id > older.id
+              AND newer.is_active = 1
+              AND newer.status_code = "ACTIVE"
+             SET older.is_active = 0,
+                 older.status_code = "INACTIVE",
+                 older.reminder_status = CASE
+                   WHEN older.reminder_status IN ("COMPLETED", "POSTPONED", "IGNORED") THEN older.reminder_status
+                   ELSE "INACTIVE"
+                 END,
+                 older.completed_at = COALESCE(older.completed_at, NOW())
+             WHERE older.is_active = 1
+               AND older.status_code = "ACTIVE"'
         );
     } catch (Throwable $exception) {
         $ready = false;
         return false;
     }
 
-    $ready = service_reminder_table_exists('vis_service_interval_rules', true)
-        && service_reminder_table_exists('service_reminders', true);
+    $ready = service_reminder_table_exists('vehicle_maintenance_rules', true)
+        && service_reminder_table_exists('vehicle_maintenance_reminders', true)
+        && in_array('enable_reminder', table_columns('services'), true)
+        && in_array('enable_reminder', table_columns('parts'), true);
 
     return $ready;
 }
 
 function service_reminder_supported_types(): array
 {
-    return ['ENGINE_OIL', 'MAJOR_SERVICE', 'BRAKE_INSPECTION', 'AC_SERVICE'];
+    return ['SERVICE', 'PART'];
 }
 
 function service_reminder_type_label(string $serviceType): string
 {
     return match (service_reminder_normalize_type($serviceType)) {
-        'ENGINE_OIL' => 'Engine Oil',
-        'MAJOR_SERVICE' => 'Major Service',
-        'BRAKE_INSPECTION' => 'Brake Inspection',
-        'AC_SERVICE' => 'AC Service',
-        default => 'Service',
+        'SERVICE' => 'Service',
+        'PART' => 'Part',
+        default => 'Item',
     };
 }
 
@@ -658,12 +869,7 @@ function service_reminder_normalize_type(?string $serviceType): string
 
 function service_reminder_interval_column_map(): array
 {
-    return [
-        'ENGINE_OIL' => 'engine_oil_interval_km',
-        'MAJOR_SERVICE' => 'major_service_interval_km',
-        'BRAKE_INSPECTION' => 'brake_inspection_interval_km',
-        'AC_SERVICE' => 'ac_service_interval_km',
-    ];
+    return [];
 }
 
 function service_reminder_parse_positive_int(mixed $value): ?int
@@ -707,195 +913,245 @@ function service_reminder_parse_date(?string $value): ?string
     return $raw;
 }
 
+function service_reminder_master_items(int $companyId, bool $onlyReminderEnabled = true): array
+{
+    if ($companyId <= 0 || !service_reminder_feature_ready()) {
+        return [];
+    }
+
+    $items = [];
+    $enabledFilter = $onlyReminderEnabled ? ' AND COALESCE(enable_reminder, 0) = 1 ' : '';
+
+    try {
+        $servicesStmt = db()->prepare(
+            'SELECT id, service_name AS item_name, service_code AS item_code, default_rate AS unit_price, gst_rate
+             FROM services
+             WHERE company_id = :company_id
+               AND status_code = "ACTIVE"
+               ' . $enabledFilter . '
+             ORDER BY service_name ASC'
+        );
+        $servicesStmt->execute(['company_id' => $companyId]);
+        foreach ($servicesStmt->fetchAll() as $row) {
+            $items[] = [
+                'item_type' => 'SERVICE',
+                'item_id' => (int) ($row['id'] ?? 0),
+                'item_name' => (string) ($row['item_name'] ?? ''),
+                'item_code' => (string) ($row['item_code'] ?? ''),
+                'unit_price' => (float) ($row['unit_price'] ?? 0),
+                'gst_rate' => (float) ($row['gst_rate'] ?? 0),
+            ];
+        }
+    } catch (Throwable $exception) {
+        // Ignore partial source failure.
+    }
+
+    try {
+        $partsStmt = db()->prepare(
+            'SELECT id, part_name AS item_name, part_sku AS item_code, selling_price AS unit_price, gst_rate
+             FROM parts
+             WHERE company_id = :company_id
+               AND status_code = "ACTIVE"
+               ' . $enabledFilter . '
+             ORDER BY part_name ASC'
+        );
+        $partsStmt->execute(['company_id' => $companyId]);
+        foreach ($partsStmt->fetchAll() as $row) {
+            $items[] = [
+                'item_type' => 'PART',
+                'item_id' => (int) ($row['id'] ?? 0),
+                'item_name' => (string) ($row['item_name'] ?? ''),
+                'item_code' => (string) ($row['item_code'] ?? ''),
+                'unit_price' => (float) ($row['unit_price'] ?? 0),
+                'gst_rate' => (float) ($row['gst_rate'] ?? 0),
+            ];
+        }
+    } catch (Throwable $exception) {
+        // Ignore partial source failure.
+    }
+
+    usort(
+        $items,
+        static function (array $left, array $right): int {
+            $typeCompare = strcmp((string) ($left['item_type'] ?? ''), (string) ($right['item_type'] ?? ''));
+            if ($typeCompare !== 0) {
+                return $typeCompare;
+            }
+            return strcasecmp((string) ($left['item_name'] ?? ''), (string) ($right['item_name'] ?? ''));
+        }
+    );
+
+    return $items;
+}
+
+function service_reminder_item_lookup_map(int $companyId, bool $onlyReminderEnabled = true): array
+{
+    $lookup = [];
+    foreach (service_reminder_master_items($companyId, $onlyReminderEnabled) as $item) {
+        $itemType = service_reminder_normalize_type((string) ($item['item_type'] ?? ''));
+        $itemId = (int) ($item['item_id'] ?? 0);
+        if ($itemType === '' || $itemId <= 0) {
+            continue;
+        }
+        $lookup[$itemType . ':' . $itemId] = $item;
+    }
+
+    return $lookup;
+}
+
+function service_reminder_vehicle_rule_rows(int $companyId, int $vehicleId, bool $includeInactive = false): array
+{
+    if ($companyId <= 0 || $vehicleId <= 0 || !service_reminder_feature_ready()) {
+        return [];
+    }
+
+    $statusFilterSql = $includeInactive
+        ? ' AND r.status_code <> "DELETED" '
+        : ' AND r.is_active = 1 AND r.status_code = "ACTIVE" ';
+
+    $stmt = db()->prepare(
+        'SELECT r.*,
+                CASE
+                  WHEN r.item_type = "SERVICE" THEN s.service_name
+                  WHEN r.item_type = "PART" THEN p.part_name
+                  ELSE NULL
+                END AS item_name,
+                CASE
+                  WHEN r.item_type = "SERVICE" THEN s.service_code
+                  WHEN r.item_type = "PART" THEN p.part_sku
+                  ELSE NULL
+                END AS item_code
+         FROM vehicle_maintenance_rules r
+         LEFT JOIN services s ON r.item_type = "SERVICE" AND s.id = r.item_id AND s.company_id = r.company_id
+         LEFT JOIN parts p ON r.item_type = "PART" AND p.id = r.item_id AND p.company_id = r.company_id
+         WHERE r.company_id = :company_id
+           AND r.vehicle_id = :vehicle_id
+           ' . $statusFilterSql . '
+         ORDER BY r.item_type ASC, r.id ASC'
+    );
+    $stmt->execute([
+        'company_id' => $companyId,
+        'vehicle_id' => $vehicleId,
+    ]);
+
+    return $stmt->fetchAll();
+}
+
+function service_reminder_rule_map_for_vehicle(int $companyId, int $vehicleId, bool $onlyActive = true): array
+{
+    $rows = service_reminder_vehicle_rule_rows($companyId, $vehicleId, !$onlyActive);
+    $map = [];
+    foreach ($rows as $row) {
+        $itemType = service_reminder_normalize_type((string) ($row['item_type'] ?? ''));
+        $itemId = (int) ($row['item_id'] ?? 0);
+        if ($itemType === '' || $itemId <= 0) {
+            continue;
+        }
+        $map[$itemType . ':' . $itemId] = $row;
+    }
+
+    return $map;
+}
+
 function service_reminder_interval_rule_for_vehicle(int $companyId, int $vehicleId): ?array
 {
     if ($companyId <= 0 || $vehicleId <= 0 || !service_reminder_feature_ready()) {
         return null;
     }
 
-    $stmt = db()->prepare(
-        'SELECT v.id AS vehicle_id, v.registration_no, v.brand, v.model, v.variant, v.vis_variant_id,
-                r.engine_oil_interval_km, r.major_service_interval_km, r.brake_inspection_interval_km,
-                r.ac_service_interval_km, r.interval_days
-         FROM vehicles v
-         LEFT JOIN vis_service_interval_rules r
-           ON r.company_id = :company_id
-          AND r.vis_variant_id = v.vis_variant_id
-          AND r.status_code = "ACTIVE"
-         WHERE v.id = :vehicle_id
-           AND v.company_id = :company_id
-           AND v.status_code <> "DELETED"
-         LIMIT 1'
-    );
-    $stmt->execute([
-        'company_id' => $companyId,
-        'vehicle_id' => $vehicleId,
-    ]);
-    $row = $stmt->fetch();
-    if (!$row) {
-        return null;
-    }
-
-    $intervalsKm = [];
-    foreach (service_reminder_interval_column_map() as $serviceType => $columnName) {
-        $intervalsKm[$serviceType] = service_reminder_parse_positive_int($row[$columnName] ?? null);
-    }
-
-    $intervalDays = service_reminder_parse_positive_int($row['interval_days'] ?? null);
-    $hasRule = $intervalDays !== null;
-    foreach ($intervalsKm as $intervalKm) {
-        if ($intervalKm !== null) {
-            $hasRule = true;
-            break;
-        }
-    }
-
+    $activeRules = service_reminder_vehicle_rule_rows($companyId, $vehicleId, false);
     return [
-        'vehicle_id' => (int) ($row['vehicle_id'] ?? 0),
-        'vis_variant_id' => (int) ($row['vis_variant_id'] ?? 0),
-        'registration_no' => (string) ($row['registration_no'] ?? ''),
-        'brand' => (string) ($row['brand'] ?? ''),
-        'model' => (string) ($row['model'] ?? ''),
-        'variant' => (string) ($row['variant'] ?? ''),
-        'intervals_km' => $intervalsKm,
-        'interval_days' => $intervalDays,
-        'has_rule' => $hasRule,
+        'vehicle_id' => $vehicleId,
+        'intervals_km' => [],
+        'interval_days' => null,
+        'has_rule' => !empty($activeRules),
     ];
+}
+
+function service_reminder_detect_performed_items(int $jobId, int $companyId): array
+{
+    if ($jobId <= 0 || $companyId <= 0) {
+        return [];
+    }
+
+    $items = [];
+    try {
+        $serviceStmt = db()->prepare(
+            'SELECT DISTINCT s.id AS item_id, s.service_name AS item_name
+             FROM job_labor jl
+             INNER JOIN job_cards jc ON jc.id = jl.job_card_id
+             INNER JOIN services s ON s.id = jl.service_id
+             WHERE jc.id = :job_id
+               AND jc.company_id = :company_id
+               AND s.company_id = :company_id
+               AND s.status_code = "ACTIVE"
+               AND COALESCE(s.enable_reminder, 0) = 1'
+        );
+        $serviceStmt->execute([
+            'job_id' => $jobId,
+            'company_id' => $companyId,
+        ]);
+        foreach ($serviceStmt->fetchAll() as $row) {
+            $itemId = (int) ($row['item_id'] ?? 0);
+            if ($itemId <= 0) {
+                continue;
+            }
+            $items['SERVICE:' . $itemId] = [
+                'item_type' => 'SERVICE',
+                'item_id' => $itemId,
+                'item_name' => (string) ($row['item_name'] ?? ''),
+            ];
+        }
+    } catch (Throwable $exception) {
+        // Best effort only.
+    }
+
+    try {
+        $partStmt = db()->prepare(
+            'SELECT DISTINCT p.id AS item_id, p.part_name AS item_name
+             FROM job_parts jp
+             INNER JOIN job_cards jc ON jc.id = jp.job_card_id
+             INNER JOIN parts p ON p.id = jp.part_id
+             WHERE jc.id = :job_id
+               AND jc.company_id = :company_id
+               AND p.company_id = :company_id
+               AND p.status_code = "ACTIVE"
+               AND COALESCE(p.enable_reminder, 0) = 1'
+        );
+        $partStmt->execute([
+            'job_id' => $jobId,
+            'company_id' => $companyId,
+        ]);
+        foreach ($partStmt->fetchAll() as $row) {
+            $itemId = (int) ($row['item_id'] ?? 0);
+            if ($itemId <= 0) {
+                continue;
+            }
+            $items['PART:' . $itemId] = [
+                'item_type' => 'PART',
+                'item_id' => $itemId,
+                'item_name' => (string) ($row['item_name'] ?? ''),
+            ];
+        }
+    } catch (Throwable $exception) {
+        // Best effort only.
+    }
+
+    return array_values($items);
 }
 
 function service_reminder_detect_performed_types(int $jobId): array
 {
-    if ($jobId <= 0) {
-        return [];
-    }
-
+    $items = service_reminder_detect_performed_items($jobId, active_company_id());
     $detected = [];
-    $keywordMap = [
-        'ENGINE_OIL' => [
-            'engine oil',
-            'oil service',
-            'oil change',
-            'oil filter',
-            'lubricant',
-        ],
-        'MAJOR_SERVICE' => [
-            'major service',
-            'periodic service',
-            'full service',
-            'scheduled service',
-            'comprehensive service',
-        ],
-        'BRAKE_INSPECTION' => [
-            'brake',
-            'brake pad',
-            'brake shoe',
-            'rotor',
-            'caliper',
-            'brake oil',
-        ],
-        'AC_SERVICE' => [
-            'ac service',
-            'a/c service',
-            'air conditioning',
-            'ac gas',
-            'compressor',
-            'condenser',
-            'evaporator',
-            'cabin filter',
-        ],
-    ];
-
-    try {
-        $laborStmt = db()->prepare(
-            'SELECT jl.description, s.service_name, s.service_code, sc.category_name
-             FROM job_labor jl
-             LEFT JOIN services s ON s.id = jl.service_id
-             LEFT JOIN service_categories sc ON sc.id = s.category_id AND sc.company_id = s.company_id
-             WHERE jl.job_card_id = :job_id'
-        );
-        $laborStmt->execute(['job_id' => $jobId]);
-        $laborRows = $laborStmt->fetchAll();
-    } catch (Throwable $exception) {
-        $laborRows = [];
-    }
-
-    $haystacks = [];
-    foreach ($laborRows as $row) {
-        $chunks = [
-            (string) ($row['description'] ?? ''),
-            (string) ($row['service_name'] ?? ''),
-            (string) ($row['service_code'] ?? ''),
-            (string) ($row['category_name'] ?? ''),
-        ];
-        $combined = strtolower(trim(preg_replace('/\s+/', ' ', implode(' ', $chunks)) ?? ''));
-        if ($combined !== '') {
-            $haystacks[] = ' ' . $combined . ' ';
-        }
-
-        $code = strtoupper(trim((string) ($row['service_code'] ?? '')));
-        if ($code !== '') {
-            if (str_contains($code, 'EO') || str_contains($code, 'OIL')) {
-                $detected['ENGINE_OIL'] = true;
-            }
-            if (str_contains($code, 'MS') || str_contains($code, 'MAJOR')) {
-                $detected['MAJOR_SERVICE'] = true;
-            }
-            if (str_contains($code, 'BRK') || str_contains($code, 'BRAKE')) {
-                $detected['BRAKE_INSPECTION'] = true;
-            }
-            if (str_contains($code, 'AC')) {
-                $detected['AC_SERVICE'] = true;
-            }
+    foreach ($items as $item) {
+        $itemType = service_reminder_normalize_type((string) ($item['item_type'] ?? ''));
+        if ($itemType !== '') {
+            $detected[$itemType] = true;
         }
     }
 
-    try {
-        $partsStmt = db()->prepare(
-            'SELECT p.part_name, p.part_sku
-             FROM job_parts jp
-             INNER JOIN parts p ON p.id = jp.part_id
-             WHERE jp.job_card_id = :job_id'
-        );
-        $partsStmt->execute(['job_id' => $jobId]);
-        $partRows = $partsStmt->fetchAll();
-    } catch (Throwable $exception) {
-        $partRows = [];
-    }
-
-    foreach ($partRows as $row) {
-        $combined = strtolower(
-            trim(
-                preg_replace(
-                    '/\s+/',
-                    ' ',
-                    (string) (($row['part_name'] ?? '') . ' ' . ($row['part_sku'] ?? ''))
-                ) ?? ''
-            )
-        );
-        if ($combined !== '') {
-            $haystacks[] = ' ' . $combined . ' ';
-        }
-    }
-
-    foreach ($haystacks as $haystack) {
-        foreach ($keywordMap as $serviceType => $keywords) {
-            foreach ($keywords as $keyword) {
-                if (strpos($haystack, strtolower($keyword)) !== false) {
-                    $detected[$serviceType] = true;
-                    break;
-                }
-            }
-        }
-    }
-
-    $ordered = [];
-    foreach (service_reminder_supported_types() as $type) {
-        if (!empty($detected[$type])) {
-            $ordered[] = $type;
-        }
-    }
-
-    return $ordered;
+    return array_values(array_keys($detected));
 }
 
 function service_reminder_job_context(int $jobId, int $companyId, int $garageId): ?array
@@ -909,7 +1165,7 @@ function service_reminder_job_context(int $jobId, int $companyId, int $garageId)
     $odometerSelect = $hasOdometer ? 'jc.odometer_km' : 'NULL AS odometer_km';
 
     $stmt = db()->prepare(
-        'SELECT jc.id, jc.vehicle_id, jc.status, jc.opened_at, jc.completed_at, jc.closed_at, ' . $odometerSelect . '
+        'SELECT jc.id, jc.customer_id, jc.vehicle_id, jc.status, jc.opened_at, jc.completed_at, jc.closed_at, ' . $odometerSelect . '
          FROM job_cards jc
          WHERE jc.id = :job_id
            AND jc.company_id = :company_id
@@ -929,6 +1185,7 @@ function service_reminder_job_context(int $jobId, int $companyId, int $garageId)
 
     return [
         'id' => (int) ($row['id'] ?? 0),
+        'customer_id' => (int) ($row['customer_id'] ?? 0),
         'vehicle_id' => (int) ($row['vehicle_id'] ?? 0),
         'status' => (string) ($row['status'] ?? 'OPEN'),
         'opened_at' => (string) ($row['opened_at'] ?? ''),
@@ -1058,7 +1315,10 @@ function service_reminder_predict_next_visit_date(
 
 function service_reminder_default_note(string $serviceType, ?int $nextDueKm, ?string $nextDueDate): string
 {
-    $label = service_reminder_type_label($serviceType);
+    $label = trim($serviceType);
+    if ($label === '') {
+        $label = service_reminder_type_label($serviceType);
+    }
     $parts = [];
     if ($nextDueKm !== null) {
         $parts[] = number_format((float) $nextDueKm, 0) . ' KM';
@@ -1076,168 +1336,99 @@ function service_reminder_default_note(string $serviceType, ?int $nextDueKm, ?st
 
 function service_reminder_build_preview_for_job(int $companyId, int $garageId, int $jobId): array
 {
-    if (!service_reminder_feature_ready()) {
-        return [];
-    }
-
-    $jobContext = service_reminder_job_context($jobId, $companyId, $garageId);
-    if (!$jobContext || (int) ($jobContext['vehicle_id'] ?? 0) <= 0) {
-        return [];
-    }
-
-    $rule = service_reminder_interval_rule_for_vehicle($companyId, (int) $jobContext['vehicle_id']);
-    if (!$rule || empty($rule['has_rule'])) {
-        return [];
-    }
-
-    $performedTypes = service_reminder_detect_performed_types($jobId);
-    if ($performedTypes === []) {
-        return [];
-    }
-
-    $usageProfile = service_reminder_vehicle_usage_profile($companyId, (int) $jobContext['vehicle_id']);
-    $avgKmPerDay = isset($usageProfile['avg_km_per_day']) && is_numeric((string) $usageProfile['avg_km_per_day'])
-        ? (float) $usageProfile['avg_km_per_day']
-        : null;
-
-    $serviceDate = service_reminder_extract_date((string) ($jobContext['closed_at'] ?? ''))
-        ?? service_reminder_extract_date((string) ($jobContext['completed_at'] ?? ''))
-        ?? service_reminder_extract_date((string) ($jobContext['opened_at'] ?? ''))
-        ?? date('Y-m-d');
-
-    $previewRows = [];
-    foreach ($performedTypes as $serviceType) {
-        $intervalKm = service_reminder_parse_positive_int(($rule['intervals_km'][$serviceType] ?? null));
-        $intervalDays = service_reminder_parse_positive_int($rule['interval_days'] ?? null);
-        if ($intervalKm === null && $intervalDays === null) {
-            continue;
-        }
-
-        $lastServiceKm = service_reminder_parse_positive_int($jobContext['odometer_km'] ?? null);
-        $nextDueKm = ($lastServiceKm !== null && $intervalKm !== null) ? ($lastServiceKm + $intervalKm) : null;
-        $nextDueDate = null;
-        if ($intervalDays !== null) {
-            $nextDueTs = strtotime($serviceDate . ' +' . $intervalDays . ' days');
-            if ($nextDueTs !== false) {
-                $nextDueDate = date('Y-m-d', $nextDueTs);
-            }
-        }
-
-        $predictedVisitDate = service_reminder_predict_next_visit_date(
-            $lastServiceKm,
-            $nextDueKm,
-            $serviceDate,
-            $avgKmPerDay,
-            $nextDueDate
-        );
-
-        $previewRows[] = [
-            'service_type' => $serviceType,
-            'service_label' => service_reminder_type_label($serviceType),
-            'enabled' => true,
-            'last_service_km' => $lastServiceKm,
-            'interval_km' => $intervalKm,
-            'next_due_km' => $nextDueKm,
-            'interval_days' => $intervalDays,
-            'next_due_date' => $nextDueDate,
-            'predicted_next_visit_date' => $predictedVisitDate,
-            'service_date' => $serviceDate,
-            'recommendation_text' => service_reminder_default_note($serviceType, $nextDueKm, $nextDueDate),
-        ];
-    }
-
-    return $previewRows;
+    // Legacy close-preview grid was built for fixed reminder types only.
+    // Auto reminder creation still runs on CLOSE from actual job lines.
+    return [];
 }
 
 function service_reminder_parse_close_override_payload(array $postData, array $previewRows): array
 {
-    $enabledInput = is_array($postData['reminder_enabled'] ?? null) ? (array) $postData['reminder_enabled'] : [];
-    $lastKmInput = is_array($postData['reminder_last_km'] ?? null) ? (array) $postData['reminder_last_km'] : [];
-    $intervalKmInput = is_array($postData['reminder_interval_km'] ?? null) ? (array) $postData['reminder_interval_km'] : [];
-    $nextDueKmInput = is_array($postData['reminder_next_due_km'] ?? null) ? (array) $postData['reminder_next_due_km'] : [];
-    $intervalDaysInput = is_array($postData['reminder_interval_days'] ?? null) ? (array) $postData['reminder_interval_days'] : [];
-    $nextDueDateInput = is_array($postData['reminder_next_due_date'] ?? null) ? (array) $postData['reminder_next_due_date'] : [];
-    $notesInput = is_array($postData['reminder_note'] ?? null) ? (array) $postData['reminder_note'] : [];
-
-    $result = [];
-    foreach ($previewRows as $row) {
-        $serviceType = service_reminder_normalize_type((string) ($row['service_type'] ?? ''));
-        if ($serviceType === '') {
-            continue;
-        }
-
-        $enabledRaw = strtolower(trim((string) ($enabledInput[$serviceType] ?? '1')));
-        $enabled = in_array($enabledRaw, ['1', 'yes', 'true', 'on'], true);
-
-        $lastServiceKm = service_reminder_parse_positive_int($lastKmInput[$serviceType] ?? ($row['last_service_km'] ?? null));
-        $intervalKm = service_reminder_parse_positive_int($intervalKmInput[$serviceType] ?? ($row['interval_km'] ?? null));
-        $nextDueKm = service_reminder_parse_positive_int($nextDueKmInput[$serviceType] ?? ($row['next_due_km'] ?? null));
-        $intervalDays = service_reminder_parse_positive_int($intervalDaysInput[$serviceType] ?? ($row['interval_days'] ?? null));
-
-        $serviceDate = service_reminder_extract_date((string) ($row['service_date'] ?? '')) ?? date('Y-m-d');
-        if ($nextDueKm === null && $lastServiceKm !== null && $intervalKm !== null) {
-            $nextDueKm = $lastServiceKm + $intervalKm;
-        }
-
-        $nextDueDate = service_reminder_parse_date((string) ($nextDueDateInput[$serviceType] ?? ($row['next_due_date'] ?? '')));
-        if ($nextDueDate === null && $intervalDays !== null) {
-            $nextDueTs = strtotime($serviceDate . ' +' . $intervalDays . ' days');
-            if ($nextDueTs !== false) {
-                $nextDueDate = date('Y-m-d', $nextDueTs);
-            }
-        }
-
-        $note = trim((string) ($notesInput[$serviceType] ?? ($row['recommendation_text'] ?? '')));
-        if ($note === '') {
-            $note = service_reminder_default_note($serviceType, $nextDueKm, $nextDueDate);
-        }
-
-        $result[$serviceType] = [
-            'enabled' => $enabled,
-            'service_type' => $serviceType,
-            'service_label' => service_reminder_type_label($serviceType),
-            'last_service_km' => $lastServiceKm,
-            'interval_km' => $intervalKm,
-            'next_due_km' => $nextDueKm,
-            'interval_days' => $intervalDays,
-            'next_due_date' => $nextDueDate,
-            'service_date' => $serviceDate,
-            'recommendation_text' => mb_substr($note, 0, 255),
-        ];
-    }
-
-    return $result;
+    return [];
 }
 
 function service_reminder_mark_existing_inactive(
     PDO $pdo,
     int $companyId,
     int $vehicleId,
-    string $serviceType,
-    int $actorUserId
+    string $itemType,
+    int $itemId,
+    int $actorUserId,
+    string $nextReminderStatus = 'COMPLETED'
 ): void {
-    $normalizedType = service_reminder_normalize_type($serviceType);
-    if ($companyId <= 0 || $vehicleId <= 0 || $normalizedType === '') {
+    $normalizedType = service_reminder_normalize_type($itemType);
+    if ($companyId <= 0 || $vehicleId <= 0 || $itemId <= 0 || $normalizedType === '') {
         return;
     }
 
+    $nextStatus = strtoupper(trim($nextReminderStatus));
+    if (!in_array($nextStatus, ['COMPLETED', 'INACTIVE', 'IGNORED', 'POSTPONED'], true)) {
+        $nextStatus = 'COMPLETED';
+    }
+
     $stmt = $pdo->prepare(
-        'UPDATE service_reminders
+        'UPDATE vehicle_maintenance_reminders
          SET is_active = 0,
              status_code = "INACTIVE",
+             reminder_status = :reminder_status,
+             completed_at = CASE WHEN :mark_completed = 1 THEN NOW() ELSE completed_at END,
              updated_by = :updated_by
          WHERE company_id = :company_id
            AND vehicle_id = :vehicle_id
-           AND service_type = :service_type
+           AND item_type = :item_type
+           AND item_id = :item_id
            AND is_active = 1
            AND status_code = "ACTIVE"'
     );
     $stmt->execute([
+        'reminder_status' => $nextStatus,
+        'mark_completed' => $nextStatus === 'COMPLETED' ? 1 : 0,
         'updated_by' => $actorUserId > 0 ? $actorUserId : null,
         'company_id' => $companyId,
         'vehicle_id' => $vehicleId,
-        'service_type' => $normalizedType,
+        'item_type' => $normalizedType,
+        'item_id' => $itemId,
     ]);
+}
+
+function service_reminder_insert_active_reminder(PDO $pdo, array $payload): int
+{
+    $stmt = $pdo->prepare(
+        'INSERT INTO vehicle_maintenance_reminders
+          (company_id, garage_id, vehicle_id, customer_id, job_card_id, rule_id, item_type, item_id, item_name, source_type,
+           reminder_status, recommendation_text, last_service_km, last_service_date, interval_km, interval_days,
+           next_due_km, next_due_date, predicted_next_visit_date, is_active, status_code, created_by, updated_by)
+         VALUES
+          (:company_id, :garage_id, :vehicle_id, :customer_id, :job_card_id, :rule_id, :item_type, :item_id, :item_name, :source_type,
+           :reminder_status, :recommendation_text, :last_service_km, :last_service_date, :interval_km, :interval_days,
+           :next_due_km, :next_due_date, :predicted_next_visit_date, 1, "ACTIVE", :created_by, :updated_by)'
+    );
+    $stmt->execute([
+        'company_id' => (int) ($payload['company_id'] ?? 0),
+        'garage_id' => (int) ($payload['garage_id'] ?? 0),
+        'vehicle_id' => (int) ($payload['vehicle_id'] ?? 0),
+        'customer_id' => (int) ($payload['customer_id'] ?? 0) > 0 ? (int) $payload['customer_id'] : null,
+        'job_card_id' => (int) ($payload['job_card_id'] ?? 0) > 0 ? (int) $payload['job_card_id'] : null,
+        'rule_id' => (int) ($payload['rule_id'] ?? 0) > 0 ? (int) $payload['rule_id'] : null,
+        'item_type' => service_reminder_normalize_type((string) ($payload['item_type'] ?? '')),
+        'item_id' => (int) ($payload['item_id'] ?? 0),
+        'item_name' => mb_substr((string) ($payload['item_name'] ?? ''), 0, 180),
+        'source_type' => mb_substr((string) ($payload['source_type'] ?? 'AUTO'), 0, 30),
+        'reminder_status' => mb_substr((string) ($payload['reminder_status'] ?? 'ACTIVE'), 0, 30),
+        'recommendation_text' => ($payload['recommendation_text'] ?? null) !== null
+            ? mb_substr((string) $payload['recommendation_text'], 0, 255)
+            : null,
+        'last_service_km' => service_reminder_parse_positive_int($payload['last_service_km'] ?? null),
+        'last_service_date' => service_reminder_parse_date((string) ($payload['last_service_date'] ?? '')),
+        'interval_km' => service_reminder_parse_positive_int($payload['interval_km'] ?? null),
+        'interval_days' => service_reminder_parse_positive_int($payload['interval_days'] ?? null),
+        'next_due_km' => service_reminder_parse_positive_int($payload['next_due_km'] ?? null),
+        'next_due_date' => service_reminder_parse_date((string) ($payload['next_due_date'] ?? '')),
+        'predicted_next_visit_date' => service_reminder_parse_date((string) ($payload['predicted_next_visit_date'] ?? '')),
+        'created_by' => (int) ($payload['created_by'] ?? 0) > 0 ? (int) $payload['created_by'] : null,
+        'updated_by' => (int) ($payload['updated_by'] ?? 0) > 0 ? (int) $payload['updated_by'] : null,
+    ]);
+
+    return (int) $pdo->lastInsertId();
 }
 
 function service_reminder_apply_on_job_close(
@@ -1256,7 +1447,7 @@ function service_reminder_apply_on_job_close(
     ];
 
     if (!service_reminder_feature_ready()) {
-        $result['warnings'][] = 'Service reminder storage is not ready.';
+        $result['warnings'][] = 'Maintenance reminder storage is not ready.';
         return $result;
     }
 
@@ -1266,71 +1457,68 @@ function service_reminder_apply_on_job_close(
         return $result;
     }
 
-    $previewRows = service_reminder_build_preview_for_job($companyId, $garageId, $jobId);
-    $result['preview_rows'] = $previewRows;
-    if ($previewRows === []) {
+    $performedItems = service_reminder_detect_performed_items($jobId, $companyId);
+    if ($performedItems === []) {
         return $result;
     }
 
+    $ruleMap = service_reminder_rule_map_for_vehicle($companyId, (int) $jobContext['vehicle_id'], true);
     $usageProfile = service_reminder_vehicle_usage_profile($companyId, (int) $jobContext['vehicle_id']);
     $avgKmPerDay = isset($usageProfile['avg_km_per_day']) && is_numeric((string) $usageProfile['avg_km_per_day'])
         ? (float) $usageProfile['avg_km_per_day']
         : null;
-
-    $fallbackServiceDate = service_reminder_extract_date((string) ($jobContext['closed_at'] ?? ''))
+    $serviceDate = service_reminder_extract_date((string) ($jobContext['closed_at'] ?? ''))
         ?? service_reminder_extract_date((string) ($jobContext['completed_at'] ?? ''))
         ?? service_reminder_extract_date((string) ($jobContext['opened_at'] ?? ''))
         ?? date('Y-m-d');
+    $lastServiceKm = service_reminder_parse_positive_int($jobContext['odometer_km'] ?? null);
 
     $pdo = db();
-    $insertStmt = $pdo->prepare(
-        'INSERT INTO service_reminders
-          (company_id, garage_id, vehicle_id, job_card_id, source_type, service_type, service_label,
-           recommendation_text, last_service_km, interval_km, next_due_km, interval_days, next_due_date,
-           predicted_next_visit_date, is_active, status_code, created_by, updated_by)
-         VALUES
-          (:company_id, :garage_id, :vehicle_id, :job_card_id, "AUTO", :service_type, :service_label,
-           :recommendation_text, :last_service_km, :interval_km, :next_due_km, :interval_days, :next_due_date,
-           :predicted_next_visit_date, 1, "ACTIVE", :created_by, :updated_by)'
-    );
-
     $pdo->beginTransaction();
     try {
-        foreach ($previewRows as $previewRow) {
-            $serviceType = service_reminder_normalize_type((string) ($previewRow['service_type'] ?? ''));
-            if ($serviceType === '') {
+        foreach ($performedItems as $item) {
+            $itemType = service_reminder_normalize_type((string) ($item['item_type'] ?? ''));
+            $itemId = (int) ($item['item_id'] ?? 0);
+            $itemName = trim((string) ($item['item_name'] ?? ''));
+            if ($itemType === '' || $itemId <= 0) {
                 continue;
             }
 
-            $override = is_array($overridesByType[$serviceType] ?? null) ? (array) $overridesByType[$serviceType] : [];
-            $enabled = array_key_exists('enabled', $override) ? (bool) $override['enabled'] : (bool) ($previewRow['enabled'] ?? true);
+            $ruleKey = $itemType . ':' . $itemId;
+            $rule = is_array($ruleMap[$ruleKey] ?? null) ? (array) $ruleMap[$ruleKey] : null;
+            service_reminder_mark_existing_inactive(
+                $pdo,
+                $companyId,
+                (int) $jobContext['vehicle_id'],
+                $itemType,
+                $itemId,
+                $actorUserId,
+                'COMPLETED'
+            );
 
-            $lastServiceKm = service_reminder_parse_positive_int($override['last_service_km'] ?? ($previewRow['last_service_km'] ?? null));
-            $intervalKm = service_reminder_parse_positive_int($override['interval_km'] ?? ($previewRow['interval_km'] ?? null));
-            $nextDueKm = service_reminder_parse_positive_int($override['next_due_km'] ?? ($previewRow['next_due_km'] ?? null));
-            $intervalDays = service_reminder_parse_positive_int($override['interval_days'] ?? ($previewRow['interval_days'] ?? null));
-            $serviceDate = service_reminder_extract_date((string) ($override['service_date'] ?? ($previewRow['service_date'] ?? '')))
-                ?? $fallbackServiceDate;
-            $nextDueDate = service_reminder_parse_date((string) ($override['next_due_date'] ?? ($previewRow['next_due_date'] ?? '')));
-
-            if ($nextDueKm === null && $lastServiceKm !== null && $intervalKm !== null) {
-                $nextDueKm = $lastServiceKm + $intervalKm;
+            if (!$rule) {
+                $result['disabled_count']++;
+                continue;
             }
-            if ($nextDueDate === null && $intervalDays !== null) {
+
+            $intervalKm = service_reminder_parse_positive_int($rule['interval_km'] ?? null);
+            $intervalDays = service_reminder_parse_positive_int($rule['interval_days'] ?? null);
+            if ($intervalKm === null && $intervalDays === null) {
+                $result['disabled_count']++;
+                continue;
+            }
+
+            $nextDueKm = ($lastServiceKm !== null && $intervalKm !== null) ? ($lastServiceKm + $intervalKm) : null;
+            $nextDueDate = null;
+            if ($intervalDays !== null) {
                 $nextDueTs = strtotime($serviceDate . ' +' . $intervalDays . ' days');
                 if ($nextDueTs !== false) {
                     $nextDueDate = date('Y-m-d', $nextDueTs);
                 }
             }
 
-            if (!$enabled) {
-                service_reminder_mark_existing_inactive($pdo, $companyId, (int) $jobContext['vehicle_id'], $serviceType, $actorUserId);
-                $result['disabled_count']++;
-                continue;
-            }
-
             if ($nextDueKm === null && $nextDueDate === null) {
-                $result['warnings'][] = 'Skipped ' . service_reminder_type_label($serviceType) . ' reminder due to empty due KM/date.';
+                $result['warnings'][] = 'Skipped ' . ($itemName !== '' ? $itemName : $ruleKey) . ' due to empty schedule.';
                 continue;
             }
 
@@ -1341,33 +1529,39 @@ function service_reminder_apply_on_job_close(
                 $avgKmPerDay,
                 $nextDueDate
             );
-            $recommendation = trim((string) ($override['recommendation_text'] ?? ($previewRow['recommendation_text'] ?? '')));
-            if ($recommendation === '') {
-                $recommendation = service_reminder_default_note($serviceType, $nextDueKm, $nextDueDate);
-            }
 
-            service_reminder_mark_existing_inactive($pdo, $companyId, (int) $jobContext['vehicle_id'], $serviceType, $actorUserId);
-
-            $insertStmt->execute([
-                'company_id' => $companyId,
-                'garage_id' => $garageId,
-                'vehicle_id' => (int) $jobContext['vehicle_id'],
-                'job_card_id' => $jobId,
-                'service_type' => $serviceType,
-                'service_label' => service_reminder_type_label($serviceType),
-                'recommendation_text' => mb_substr($recommendation, 0, 255),
-                'last_service_km' => $lastServiceKm,
-                'interval_km' => $intervalKm,
-                'next_due_km' => $nextDueKm,
-                'interval_days' => $intervalDays,
-                'next_due_date' => $nextDueDate,
-                'predicted_next_visit_date' => $predictedNextVisitDate,
-                'created_by' => $actorUserId > 0 ? $actorUserId : null,
-                'updated_by' => $actorUserId > 0 ? $actorUserId : null,
-            ]);
-
+            service_reminder_insert_active_reminder(
+                $pdo,
+                [
+                    'company_id' => $companyId,
+                    'garage_id' => $garageId,
+                    'vehicle_id' => (int) $jobContext['vehicle_id'],
+                    'customer_id' => (int) ($jobContext['customer_id'] ?? 0),
+                    'job_card_id' => $jobId,
+                    'rule_id' => (int) ($rule['id'] ?? 0),
+                    'item_type' => $itemType,
+                    'item_id' => $itemId,
+                    'item_name' => $itemName !== '' ? $itemName : ((string) ($rule['item_name'] ?? $ruleKey)),
+                    'source_type' => 'AUTO_CLOSE',
+                    'reminder_status' => 'ACTIVE',
+                    'recommendation_text' => service_reminder_default_note(
+                        $itemName !== '' ? $itemName : ((string) ($rule['item_name'] ?? '')),
+                        $nextDueKm,
+                        $nextDueDate
+                    ),
+                    'last_service_km' => $lastServiceKm,
+                    'last_service_date' => $serviceDate,
+                    'interval_km' => $intervalKm,
+                    'interval_days' => $intervalDays,
+                    'next_due_km' => $nextDueKm,
+                    'next_due_date' => $nextDueDate,
+                    'predicted_next_visit_date' => $predictedNextVisitDate,
+                    'created_by' => $actorUserId,
+                    'updated_by' => $actorUserId,
+                ]
+            );
             $result['created_count']++;
-            $result['created_types'][] = $serviceType;
+            $result['created_types'][] = $ruleKey;
         }
 
         $pdo->commit();
@@ -1375,7 +1569,172 @@ function service_reminder_apply_on_job_close(
         if ($pdo->inTransaction()) {
             $pdo->rollBack();
         }
-        $result['warnings'][] = 'Service reminder auto-generation failed: ' . $exception->getMessage();
+        $result['warnings'][] = 'Maintenance reminder auto-generation failed: ' . $exception->getMessage();
+    }
+
+    return $result;
+}
+
+function service_reminder_create_manual_entry(
+    int $companyId,
+    int $garageId,
+    int $vehicleId,
+    string $itemType,
+    int $itemId,
+    ?int $nextDueKm,
+    ?string $nextDueDate,
+    ?string $predictedNextVisitDate,
+    ?string $recommendationText,
+    int $actorUserId
+): array {
+    $result = [
+        'ok' => false,
+        'message' => '',
+        'reminder_id' => 0,
+    ];
+
+    if ($companyId <= 0 || $vehicleId <= 0 || !service_reminder_feature_ready()) {
+        $result['message'] = 'Reminder storage is not ready.';
+        return $result;
+    }
+
+    $normalizedType = service_reminder_normalize_type($itemType);
+    if ($normalizedType === '' || $itemId <= 0) {
+        $result['message'] = 'Select a valid service or part.';
+        return $result;
+    }
+
+    $lookup = service_reminder_item_lookup_map($companyId, true);
+    $ruleKey = $normalizedType . ':' . $itemId;
+    $itemMeta = is_array($lookup[$ruleKey] ?? null) ? (array) $lookup[$ruleKey] : null;
+    if (!$itemMeta) {
+        $result['message'] = 'Selected item is not reminder-enabled or inactive.';
+        return $result;
+    }
+
+    $vehicleColumns = table_columns('vehicles');
+    $hasVehicleOdometer = in_array('odometer_km', $vehicleColumns, true);
+    $odometerSelect = $hasVehicleOdometer ? 'v.odometer_km' : 'NULL AS odometer_km';
+
+    $vehicleStmt = db()->prepare(
+        'SELECT v.id, v.customer_id, ' . $odometerSelect . '
+         FROM vehicles v
+         WHERE v.company_id = :company_id
+           AND v.id = :vehicle_id
+           AND v.status_code <> "DELETED"
+         LIMIT 1'
+    );
+    $vehicleStmt->execute([
+        'company_id' => $companyId,
+        'vehicle_id' => $vehicleId,
+    ]);
+    $vehicle = $vehicleStmt->fetch() ?: null;
+    if (!$vehicle) {
+        $result['message'] = 'Vehicle not found in active scope.';
+        return $result;
+    }
+
+    $ruleMap = service_reminder_rule_map_for_vehicle($companyId, $vehicleId, true);
+    $rule = is_array($ruleMap[$ruleKey] ?? null) ? (array) $ruleMap[$ruleKey] : null;
+    $intervalKm = service_reminder_parse_positive_int($rule['interval_km'] ?? null);
+    $intervalDays = service_reminder_parse_positive_int($rule['interval_days'] ?? null);
+
+    $nextDueKmValue = service_reminder_parse_positive_int($nextDueKm);
+    $nextDueDateValue = service_reminder_parse_date($nextDueDate);
+    $vehicleOdometer = service_reminder_parse_positive_int($vehicle['odometer_km'] ?? null);
+    $serviceDate = date('Y-m-d');
+
+    if ($nextDueKmValue === null && $intervalKm !== null && $vehicleOdometer !== null) {
+        $nextDueKmValue = $vehicleOdometer + $intervalKm;
+    }
+    if ($nextDueDateValue === null && $intervalDays !== null) {
+        $dueTs = strtotime($serviceDate . ' +' . $intervalDays . ' days');
+        if ($dueTs !== false) {
+            $nextDueDateValue = date('Y-m-d', $dueTs);
+        }
+    }
+    if ($nextDueKmValue === null && $nextDueDateValue === null) {
+        $result['message'] = 'Enter Due KM or Due Date (or configure intervals in Vehicle Maintenance Setup).';
+        return $result;
+    }
+
+    $usageProfile = service_reminder_vehicle_usage_profile($companyId, $vehicleId);
+    $avgKmPerDay = isset($usageProfile['avg_km_per_day']) && is_numeric((string) $usageProfile['avg_km_per_day'])
+        ? (float) $usageProfile['avg_km_per_day']
+        : null;
+    $predictedVisitValue = service_reminder_parse_date($predictedNextVisitDate);
+    if ($predictedVisitValue === null) {
+        $predictedVisitValue = service_reminder_predict_next_visit_date(
+            $vehicleOdometer,
+            $nextDueKmValue,
+            $serviceDate,
+            $avgKmPerDay,
+            $nextDueDateValue
+        );
+    }
+
+    $recommendation = trim((string) $recommendationText);
+    if ($recommendation === '') {
+        $recommendation = service_reminder_default_note(
+            (string) ($itemMeta['item_name'] ?? ''),
+            $nextDueKmValue,
+            $nextDueDateValue
+        );
+    }
+    $itemName = trim((string) ($itemMeta['item_name'] ?? ''));
+    if ($itemName === '') {
+        $itemName = $normalizedType . ' #' . $itemId;
+    }
+
+    $pdo = db();
+    $pdo->beginTransaction();
+    try {
+        service_reminder_mark_existing_inactive(
+            $pdo,
+            $companyId,
+            $vehicleId,
+            $normalizedType,
+            $itemId,
+            $actorUserId,
+            'INACTIVE'
+        );
+
+        $newId = service_reminder_insert_active_reminder(
+            $pdo,
+            [
+                'company_id' => $companyId,
+                'garage_id' => $garageId > 0 ? $garageId : active_garage_id(),
+                'vehicle_id' => $vehicleId,
+                'customer_id' => (int) ($vehicle['customer_id'] ?? 0),
+                'job_card_id' => null,
+                'rule_id' => (int) ($rule['id'] ?? 0),
+                'item_type' => $normalizedType,
+                'item_id' => $itemId,
+                'item_name' => $itemName,
+                'source_type' => 'ADMIN_MANUAL',
+                'reminder_status' => 'ACTIVE',
+                'recommendation_text' => $recommendation,
+                'last_service_km' => $vehicleOdometer,
+                'last_service_date' => $serviceDate,
+                'interval_km' => $intervalKm,
+                'interval_days' => $intervalDays,
+                'next_due_km' => $nextDueKmValue,
+                'next_due_date' => $nextDueDateValue,
+                'predicted_next_visit_date' => $predictedVisitValue,
+                'created_by' => $actorUserId,
+                'updated_by' => $actorUserId,
+            ]
+        );
+
+        $pdo->commit();
+        $result['ok'] = true;
+        $result['reminder_id'] = $newId;
+        $result['message'] = 'Manual reminder added successfully.';
+    } catch (Throwable $exception) {
+        if ($pdo->inTransaction()) {
+            $pdo->rollBack();
+        }
+        $result['message'] = 'Unable to add manual reminder.';
     }
 
     return $result;
@@ -1395,107 +1754,21 @@ function service_reminder_create_manual(
     string $recommendationText,
     int $actorUserId
 ): array {
-    if (!service_reminder_feature_ready()) {
-        return ['ok' => false, 'message' => 'Service reminder storage is not ready.'];
-    }
-
-    $normalizedType = service_reminder_normalize_type($serviceType);
-    if ($companyId <= 0 || $garageId <= 0 || $vehicleId <= 0 || $normalizedType === '') {
-        return ['ok' => false, 'message' => 'Invalid service reminder payload.'];
-    }
-
-    $lastServiceKm = service_reminder_parse_positive_int($lastServiceKm);
-    $intervalKm = service_reminder_parse_positive_int($intervalKm);
-    $nextDueKm = service_reminder_parse_positive_int($nextDueKm);
-    $intervalDays = service_reminder_parse_positive_int($intervalDays);
-    $nextDueDate = service_reminder_parse_date($nextDueDate);
-
-    if ($nextDueKm === null && $lastServiceKm !== null && $intervalKm !== null) {
-        $nextDueKm = $lastServiceKm + $intervalKm;
-    }
-    if ($nextDueDate === null && $intervalDays !== null) {
-        $baseDate = date('Y-m-d');
-        if ($jobId > 0) {
-            $jobContext = service_reminder_job_context($jobId, $companyId, $garageId);
-            $baseDate = service_reminder_extract_date((string) ($jobContext['closed_at'] ?? ''))
-                ?? service_reminder_extract_date((string) ($jobContext['completed_at'] ?? ''))
-                ?? service_reminder_extract_date((string) ($jobContext['opened_at'] ?? ''))
-                ?? $baseDate;
-        }
-        $nextDateTs = strtotime($baseDate . ' +' . $intervalDays . ' days');
-        if ($nextDateTs !== false) {
-            $nextDueDate = date('Y-m-d', $nextDateTs);
-        }
-    }
-
-    if ($nextDueKm === null && $nextDueDate === null) {
-        return ['ok' => false, 'message' => 'Enter next due KM or next due date for reminder.'];
-    }
-
-    $usageProfile = service_reminder_vehicle_usage_profile($companyId, $vehicleId);
-    $avgKmPerDay = isset($usageProfile['avg_km_per_day']) && is_numeric((string) $usageProfile['avg_km_per_day'])
-        ? (float) $usageProfile['avg_km_per_day']
-        : null;
-    $predictedNextVisitDate = service_reminder_predict_next_visit_date(
-        $lastServiceKm,
-        $nextDueKm,
-        date('Y-m-d'),
-        $avgKmPerDay,
-        $nextDueDate
-    );
-
-    $note = trim($recommendationText);
-    if ($note === '') {
-        $note = service_reminder_default_note($normalizedType, $nextDueKm, $nextDueDate);
-    }
-
-    $pdo = db();
-    $pdo->beginTransaction();
-    try {
-        service_reminder_mark_existing_inactive($pdo, $companyId, $vehicleId, $normalizedType, $actorUserId);
-
-        $insertStmt = $pdo->prepare(
-            'INSERT INTO service_reminders
-              (company_id, garage_id, vehicle_id, job_card_id, source_type, service_type, service_label,
-               recommendation_text, last_service_km, interval_km, next_due_km, interval_days, next_due_date,
-               predicted_next_visit_date, is_active, status_code, created_by, updated_by)
-             VALUES
-              (:company_id, :garage_id, :vehicle_id, :job_card_id, "MANUAL", :service_type, :service_label,
-               :recommendation_text, :last_service_km, :interval_km, :next_due_km, :interval_days, :next_due_date,
-               :predicted_next_visit_date, 1, "ACTIVE", :created_by, :updated_by)'
-        );
-        $insertStmt->execute([
-            'company_id' => $companyId,
-            'garage_id' => $garageId,
-            'vehicle_id' => $vehicleId,
-            'job_card_id' => $jobId > 0 ? $jobId : null,
-            'service_type' => $normalizedType,
-            'service_label' => service_reminder_type_label($normalizedType),
-            'recommendation_text' => mb_substr($note, 0, 255),
-            'last_service_km' => $lastServiceKm,
-            'interval_km' => $intervalKm,
-            'next_due_km' => $nextDueKm,
-            'interval_days' => $intervalDays,
-            'next_due_date' => $nextDueDate,
-            'predicted_next_visit_date' => $predictedNextVisitDate,
-            'created_by' => $actorUserId > 0 ? $actorUserId : null,
-            'updated_by' => $actorUserId > 0 ? $actorUserId : null,
-        ]);
-
-        $createdId = (int) $pdo->lastInsertId();
-        $pdo->commit();
-
-        return ['ok' => true, 'id' => $createdId];
-    } catch (Throwable $exception) {
-        if ($pdo->inTransaction()) {
-            $pdo->rollBack();
-        }
-        return ['ok' => false, 'message' => 'Unable to save manual reminder: ' . $exception->getMessage()];
-    }
+    return [
+        'ok' => false,
+        'message' => 'Manual fixed-type reminders are removed. Use Vehicle Maintenance Setup rules.',
+    ];
 }
 
 function service_reminder_due_state(array $reminder): string
 {
+    $isActive = (int) ($reminder['is_active'] ?? 0) === 1
+        && strtoupper(trim((string) ($reminder['status_code'] ?? 'ACTIVE'))) === 'ACTIVE';
+    $reminderStatus = strtoupper(trim((string) ($reminder['reminder_status'] ?? 'ACTIVE')));
+    if (!$isActive || in_array($reminderStatus, ['COMPLETED', 'INACTIVE'], true)) {
+        return 'COMPLETED';
+    }
+
     $today = date('Y-m-d');
     $nextDueDate = service_reminder_parse_date((string) ($reminder['next_due_date'] ?? ''));
     $nextDueKm = service_reminder_parse_positive_int($reminder['next_due_km'] ?? null);
@@ -1509,14 +1782,10 @@ function service_reminder_due_state(array $reminder): string
     $soonDate = date('Y-m-d', strtotime('+7 days'));
     if (($nextDueDate !== null && strcmp($nextDueDate, $soonDate) <= 0)
         || ($nextDueKm !== null && $currentOdometer !== null && ($nextDueKm - $currentOdometer) <= 500)) {
-        return 'DUE_SOON';
+        return 'DUE';
     }
 
-    if ($nextDueDate !== null || $nextDueKm !== null) {
-        return 'UPCOMING';
-    }
-
-    return 'UNSCHEDULED';
+    return 'UPCOMING';
 }
 
 function service_reminder_due_badge_class(string $dueState): string
@@ -1524,8 +1793,9 @@ function service_reminder_due_badge_class(string $dueState): string
     $normalized = strtoupper(trim($dueState));
     return match ($normalized) {
         'OVERDUE' => 'danger',
-        'DUE_SOON' => 'warning',
+        'DUE', 'DUE_SOON' => 'warning',
         'UPCOMING' => 'info',
+        'COMPLETED' => 'success',
         default => 'secondary',
     };
 }
@@ -1547,28 +1817,28 @@ function service_reminder_fetch_active_by_vehicle(int $companyId, int $vehicleId
         'vehicle_id' => $vehicleId,
     ];
     if ($garageId > 0) {
-        $scopeSql = ' AND sr.garage_id = :garage_id ';
+        $scopeSql = ' AND mr.garage_id = :garage_id ';
         $params['garage_id'] = $garageId;
     }
 
     $stmt = db()->prepare(
-        'SELECT sr.*, ' . $odometerSelect . ',
+        'SELECT mr.*, ' . $odometerSelect . ',
                 v.registration_no, v.brand, v.model, v.variant,
                 jc.job_number
-         FROM service_reminders sr
-         INNER JOIN vehicles v ON v.id = sr.vehicle_id
-         LEFT JOIN job_cards jc ON jc.id = sr.job_card_id
-         WHERE sr.company_id = :company_id
-           AND sr.vehicle_id = :vehicle_id
-           AND sr.is_active = 1
-           AND sr.status_code = "ACTIVE"
+         FROM vehicle_maintenance_reminders mr
+         INNER JOIN vehicles v ON v.id = mr.vehicle_id
+         LEFT JOIN job_cards jc ON jc.id = mr.job_card_id
+         WHERE mr.company_id = :company_id
+           AND mr.vehicle_id = :vehicle_id
+           AND mr.is_active = 1
+           AND mr.status_code = "ACTIVE"
            ' . $scopeSql . '
          ORDER BY
-           CASE WHEN sr.next_due_date IS NULL THEN 1 ELSE 0 END ASC,
-           sr.next_due_date ASC,
-           CASE WHEN sr.next_due_km IS NULL THEN 1 ELSE 0 END ASC,
-           sr.next_due_km ASC,
-           sr.id DESC
+           CASE WHEN mr.next_due_date IS NULL THEN 1 ELSE 0 END ASC,
+           mr.next_due_date ASC,
+           CASE WHEN mr.next_due_km IS NULL THEN 1 ELSE 0 END ASC,
+           mr.next_due_km ASC,
+           mr.id DESC
          LIMIT ' . $safeLimit
     );
     $stmt->execute($params);
@@ -1578,6 +1848,8 @@ function service_reminder_fetch_active_by_vehicle(int $companyId, int $vehicleId
         $dueState = service_reminder_due_state($row);
         $rows[$index]['due_state'] = $dueState;
         $rows[$index]['due_badge_class'] = service_reminder_due_badge_class($dueState);
+        $rows[$index]['service_type'] = (string) ($row['item_type'] ?? '');
+        $rows[$index]['service_label'] = (string) (($row['item_name'] ?? '') !== '' ? $row['item_name'] : (service_reminder_type_label((string) ($row['item_type'] ?? '')) . ' #' . (int) ($row['item_id'] ?? 0)));
     }
 
     return $rows;
@@ -1602,7 +1874,7 @@ function service_reminder_fetch_active_for_scope(
     $scopeSql = '';
     $params = ['company_id' => $companyId];
     if ($selectedGarageId > 0) {
-        $scopeSql = ' AND sr.garage_id = :garage_id ';
+        $scopeSql = ' AND mr.garage_id = :garage_id ';
         $params['garage_id'] = $selectedGarageId;
     } else {
         $garageIds = array_values(array_unique(array_filter(array_map('intval', $garageIds), static fn (int $id): bool => $id > 0)));
@@ -1615,37 +1887,37 @@ function service_reminder_fetch_active_for_scope(
             $params[$key] = $garageId;
             $placeholders[] = ':' . $key;
         }
-        $scopeSql = ' AND sr.garage_id IN (' . implode(', ', $placeholders) . ') ';
+        $scopeSql = ' AND mr.garage_id IN (' . implode(', ', $placeholders) . ') ';
     }
 
     $typeSql = '';
     $normalizedType = service_reminder_normalize_type($serviceType);
     if ($normalizedType !== '') {
-        $typeSql = ' AND sr.service_type = :service_type ';
-        $params['service_type'] = $normalizedType;
+        $typeSql = ' AND mr.item_type = :item_type ';
+        $params['item_type'] = $normalizedType;
     }
 
     $safeLimit = max(1, min(1000, $limit));
     $queryLimit = max($safeLimit, min(3000, $safeLimit * 3));
 
     $stmt = db()->prepare(
-        'SELECT sr.*, ' . $odometerSelect . ',
+        'SELECT mr.*, ' . $odometerSelect . ',
                 v.registration_no, v.brand, v.model, v.variant,
                 jc.job_number
-         FROM service_reminders sr
-         INNER JOIN vehicles v ON v.id = sr.vehicle_id
-         LEFT JOIN job_cards jc ON jc.id = sr.job_card_id
-         WHERE sr.company_id = :company_id
-           AND sr.is_active = 1
-           AND sr.status_code = "ACTIVE"
+         FROM vehicle_maintenance_reminders mr
+         INNER JOIN vehicles v ON v.id = mr.vehicle_id
+         LEFT JOIN job_cards jc ON jc.id = mr.job_card_id
+         WHERE mr.company_id = :company_id
+           AND mr.is_active = 1
+           AND mr.status_code = "ACTIVE"
            ' . $scopeSql . '
            ' . $typeSql . '
          ORDER BY
-           CASE WHEN sr.next_due_date IS NULL THEN 1 ELSE 0 END ASC,
-           sr.next_due_date ASC,
-           CASE WHEN sr.next_due_km IS NULL THEN 1 ELSE 0 END ASC,
-           sr.next_due_km ASC,
-           sr.id DESC
+           CASE WHEN mr.next_due_date IS NULL THEN 1 ELSE 0 END ASC,
+           mr.next_due_date ASC,
+           CASE WHEN mr.next_due_km IS NULL THEN 1 ELSE 0 END ASC,
+           mr.next_due_km ASC,
+           mr.id DESC
          LIMIT ' . $queryLimit
     );
     $stmt->execute($params);
@@ -1654,6 +1926,8 @@ function service_reminder_fetch_active_for_scope(
     $dueStateFilter = strtoupper(trim((string) $dueState));
     if ($dueStateFilter === 'ALL') {
         $dueStateFilter = '';
+    } elseif ($dueStateFilter === 'DUE_SOON') {
+        $dueStateFilter = 'DUE';
     }
 
     $result = [];
@@ -1665,6 +1939,8 @@ function service_reminder_fetch_active_for_scope(
 
         $row['due_state'] = $rowDueState;
         $row['due_badge_class'] = service_reminder_due_badge_class($rowDueState);
+        $row['service_type'] = (string) ($row['item_type'] ?? '');
+        $row['service_label'] = (string) (($row['item_name'] ?? '') !== '' ? $row['item_name'] : (service_reminder_type_label((string) ($row['item_type'] ?? '')) . ' #' . (int) ($row['item_id'] ?? 0)));
         $result[] = $row;
 
         if (count($result) >= $safeLimit) {
@@ -1682,6 +1958,7 @@ function service_reminder_summary_counts(array $rows): array
         'overdue' => 0,
         'due_soon' => 0,
         'upcoming' => 0,
+        'completed' => 0,
         'unscheduled' => 0,
     ];
 
@@ -1690,16 +1967,828 @@ function service_reminder_summary_counts(array $rows): array
         $state = strtoupper(trim((string) ($row['due_state'] ?? service_reminder_due_state((array) $row))));
         if ($state === 'OVERDUE') {
             $summary['overdue']++;
-        } elseif ($state === 'DUE_SOON') {
+        } elseif ($state === 'DUE' || $state === 'DUE_SOON') {
             $summary['due_soon']++;
         } elseif ($state === 'UPCOMING') {
             $summary['upcoming']++;
+        } elseif ($state === 'COMPLETED') {
+            $summary['completed']++;
         } else {
             $summary['unscheduled']++;
         }
     }
 
+    $summary['due'] = $summary['due_soon'];
     return $summary;
+}
+
+function service_reminder_fetch_register_for_scope(
+    int $companyId,
+    int $selectedGarageId,
+    array $garageIds,
+    int $limit = 500,
+    ?string $serviceType = null,
+    ?string $status = null,
+    ?string $fromDate = null,
+    ?string $toDate = null
+): array {
+    if ($companyId <= 0 || !service_reminder_feature_ready()) {
+        return [];
+    }
+
+    $vehicleColumns = table_columns('vehicles');
+    $hasVehicleOdometer = in_array('odometer_km', $vehicleColumns, true);
+    $odometerSelect = $hasVehicleOdometer ? 'v.odometer_km AS current_odometer_km' : 'NULL AS current_odometer_km';
+
+    $scopeSql = '';
+    $params = ['company_id' => $companyId];
+    if ($selectedGarageId > 0) {
+        $scopeSql = ' AND mr.garage_id = :garage_id ';
+        $params['garage_id'] = $selectedGarageId;
+    } else {
+        $garageIds = array_values(array_unique(array_filter(array_map('intval', $garageIds), static fn (int $id): bool => $id > 0)));
+        if ($garageIds === []) {
+            return [];
+        }
+        $placeholders = [];
+        foreach ($garageIds as $index => $garageId) {
+            $key = 'garage_' . $index;
+            $params[$key] = $garageId;
+            $placeholders[] = ':' . $key;
+        }
+        $scopeSql = ' AND mr.garage_id IN (' . implode(', ', $placeholders) . ') ';
+    }
+
+    $typeSql = '';
+    $normalizedType = service_reminder_normalize_type($serviceType);
+    if ($normalizedType !== '') {
+        $typeSql = ' AND mr.item_type = :item_type ';
+        $params['item_type'] = $normalizedType;
+    }
+
+    $safeLimit = max(1, min(5000, $limit));
+    $queryLimit = max($safeLimit, min(9000, $safeLimit * 2));
+    $stmt = db()->prepare(
+        'SELECT mr.*, ' . $odometerSelect . ',
+                v.registration_no, v.brand, v.model, v.variant,
+                c.full_name AS customer_name,
+                jc.job_number
+         FROM vehicle_maintenance_reminders mr
+         INNER JOIN vehicles v ON v.id = mr.vehicle_id
+         LEFT JOIN customers c ON c.id = v.customer_id
+         LEFT JOIN job_cards jc ON jc.id = mr.job_card_id
+         WHERE mr.company_id = :company_id
+           AND mr.status_code <> "DELETED"
+           ' . $scopeSql . '
+           ' . $typeSql . '
+         ORDER BY mr.created_at DESC, mr.id DESC
+         LIMIT ' . $queryLimit
+    );
+    $stmt->execute($params);
+    $rows = $stmt->fetchAll();
+
+    $fromDateNorm = service_reminder_parse_date($fromDate);
+    $toDateNorm = service_reminder_parse_date($toDate);
+    $statusFilter = strtoupper(trim((string) $status));
+    if ($statusFilter === '' || $statusFilter === 'ALL') {
+        $statusFilter = '';
+    }
+    if ($statusFilter === 'DUE_SOON') {
+        $statusFilter = 'DUE';
+    }
+
+    $result = [];
+    foreach ($rows as $row) {
+        $dueState = service_reminder_due_state($row);
+        if ($statusFilter !== '' && $statusFilter !== $dueState) {
+            continue;
+        }
+
+        $comparisonDate = service_reminder_parse_date((string) ($row['next_due_date'] ?? ''))
+            ?? service_reminder_parse_date((string) ($row['last_service_date'] ?? ''))
+            ?? service_reminder_extract_date((string) ($row['created_at'] ?? ''));
+        if ($comparisonDate !== null) {
+            if ($fromDateNorm !== null && strcmp($comparisonDate, $fromDateNorm) < 0) {
+                continue;
+            }
+            if ($toDateNorm !== null && strcmp($comparisonDate, $toDateNorm) > 0) {
+                continue;
+            }
+        }
+
+        $row['due_state'] = $dueState;
+        $row['due_badge_class'] = service_reminder_due_badge_class($dueState);
+        $row['service_type'] = (string) ($row['item_type'] ?? '');
+        $row['service_label'] = (string) (($row['item_name'] ?? '') !== '' ? $row['item_name'] : (service_reminder_type_label((string) ($row['item_type'] ?? '')) . ' #' . (int) ($row['item_id'] ?? 0)));
+        $result[] = $row;
+
+        if (count($result) >= $safeLimit) {
+            break;
+        }
+    }
+
+    return $result;
+}
+
+function service_reminder_fetch_rule_grid(int $companyId, int $vehicleId): array
+{
+    if ($companyId <= 0 || $vehicleId <= 0 || !service_reminder_feature_ready()) {
+        return [];
+    }
+
+    $items = service_reminder_master_items($companyId, true);
+    $ruleMap = service_reminder_rule_map_for_vehicle($companyId, $vehicleId, false);
+    $rows = [];
+
+    foreach ($items as $item) {
+        $itemType = service_reminder_normalize_type((string) ($item['item_type'] ?? ''));
+        $itemId = (int) ($item['item_id'] ?? 0);
+        if ($itemType === '' || $itemId <= 0) {
+            continue;
+        }
+
+        $key = $itemType . ':' . $itemId;
+        $rule = is_array($ruleMap[$key] ?? null) ? (array) $ruleMap[$key] : null;
+        $rows[] = [
+            'rule_id' => (int) ($rule['id'] ?? 0),
+            'item_type' => $itemType,
+            'item_id' => $itemId,
+            'item_name' => (string) ($item['item_name'] ?? ''),
+            'item_code' => (string) ($item['item_code'] ?? ''),
+            'interval_km' => service_reminder_parse_positive_int($rule['interval_km'] ?? null),
+            'interval_days' => service_reminder_parse_positive_int($rule['interval_days'] ?? null),
+            'is_active' => $rule !== null ? ((int) ($rule['is_active'] ?? 0) === 1 && (string) ($rule['status_code'] ?? 'ACTIVE') === 'ACTIVE') : false,
+            'status_code' => (string) ($rule['status_code'] ?? 'ACTIVE'),
+        ];
+    }
+
+    return $rows;
+}
+
+function service_reminder_save_rules_for_vehicles(int $companyId, array $vehicleIds, array $ruleRows, int $actorUserId): array
+{
+    $result = [
+        'ok' => false,
+        'vehicle_count' => 0,
+        'rule_count' => 0,
+        'saved_count' => 0,
+        'warnings' => [],
+    ];
+
+    if ($companyId <= 0 || !service_reminder_feature_ready()) {
+        $result['warnings'][] = 'Reminder storage is not ready.';
+        return $result;
+    }
+
+    $vehicleIds = array_values(array_unique(array_filter(array_map('intval', $vehicleIds), static fn (int $id): bool => $id > 0)));
+    if ($vehicleIds === []) {
+        $result['warnings'][] = 'Select at least one vehicle.';
+        return $result;
+    }
+
+    $validVehicleIds = [];
+    try {
+        $placeholders = implode(',', array_fill(0, count($vehicleIds), '?'));
+        $stmt = db()->prepare(
+            'SELECT id
+             FROM vehicles
+             WHERE company_id = ?
+               AND status_code <> "DELETED"
+               AND id IN (' . $placeholders . ')'
+        );
+        $stmt->execute(array_merge([$companyId], $vehicleIds));
+        $validVehicleIds = array_map(static fn (array $row): int => (int) ($row['id'] ?? 0), $stmt->fetchAll());
+    } catch (Throwable $exception) {
+        $result['warnings'][] = 'Unable to validate selected vehicles.';
+        return $result;
+    }
+
+    $validVehicleIds = array_values(array_unique(array_filter($validVehicleIds, static fn (int $id): bool => $id > 0)));
+    if ($validVehicleIds === []) {
+        $result['warnings'][] = 'No valid vehicles found for save.';
+        return $result;
+    }
+
+    $lookup = service_reminder_item_lookup_map($companyId, true);
+    $normalizedRules = [];
+    foreach ($ruleRows as $ruleRow) {
+        if (!is_array($ruleRow)) {
+            continue;
+        }
+
+        $itemType = service_reminder_normalize_type((string) ($ruleRow['item_type'] ?? ''));
+        $itemId = (int) ($ruleRow['item_id'] ?? 0);
+        if ($itemType === '' || $itemId <= 0) {
+            continue;
+        }
+
+        $ruleKey = $itemType . ':' . $itemId;
+        if (!isset($lookup[$ruleKey])) {
+            continue;
+        }
+
+        $intervalKm = service_reminder_parse_positive_int($ruleRow['interval_km'] ?? null);
+        $intervalDays = service_reminder_parse_positive_int($ruleRow['interval_days'] ?? null);
+        $isActive = !empty($ruleRow['is_active']);
+        if ($isActive && $intervalKm === null && $intervalDays === null) {
+            $isActive = false;
+        }
+
+        $normalizedRules[$ruleKey] = [
+            'item_type' => $itemType,
+            'item_id' => $itemId,
+            'interval_km' => $intervalKm,
+            'interval_days' => $intervalDays,
+            'is_active' => $isActive,
+        ];
+    }
+
+    if ($normalizedRules === []) {
+        $result['warnings'][] = 'No valid reminder rows provided.';
+        return $result;
+    }
+
+    $pdo = db();
+    $upsertStmt = $pdo->prepare(
+        'INSERT INTO vehicle_maintenance_rules
+          (company_id, vehicle_id, item_type, item_id, interval_km, interval_days, is_active, status_code, created_by, updated_by)
+         VALUES
+          (:company_id, :vehicle_id, :item_type, :item_id, :interval_km, :interval_days, :is_active, :status_code, :created_by, :updated_by)
+         ON DUPLICATE KEY UPDATE
+          interval_km = VALUES(interval_km),
+          interval_days = VALUES(interval_days),
+          is_active = VALUES(is_active),
+          status_code = VALUES(status_code),
+          updated_by = VALUES(updated_by),
+          updated_at = NOW()'
+    );
+
+    $pdo->beginTransaction();
+    try {
+        foreach ($validVehicleIds as $vehicleId) {
+            foreach ($normalizedRules as $rule) {
+                $upsertStmt->execute([
+                    'company_id' => $companyId,
+                    'vehicle_id' => $vehicleId,
+                    'item_type' => (string) $rule['item_type'],
+                    'item_id' => (int) $rule['item_id'],
+                    'interval_km' => $rule['interval_km'],
+                    'interval_days' => $rule['interval_days'],
+                    'is_active' => !empty($rule['is_active']) ? 1 : 0,
+                    'status_code' => !empty($rule['is_active']) ? 'ACTIVE' : 'INACTIVE',
+                    'created_by' => $actorUserId > 0 ? $actorUserId : null,
+                    'updated_by' => $actorUserId > 0 ? $actorUserId : null,
+                ]);
+                $result['saved_count']++;
+            }
+        }
+        $pdo->commit();
+    } catch (Throwable $exception) {
+        if ($pdo->inTransaction()) {
+            $pdo->rollBack();
+        }
+        $result['warnings'][] = 'Unable to save rules: ' . $exception->getMessage();
+        return $result;
+    }
+
+    $result['ok'] = true;
+    $result['vehicle_count'] = count($validVehicleIds);
+    $result['rule_count'] = count($normalizedRules);
+    return $result;
+}
+
+function service_reminder_delete_rules_for_vehicles(
+    int $companyId,
+    array $vehicleIds,
+    string $itemType,
+    int $itemId,
+    int $actorUserId
+): array {
+    $result = [
+        'ok' => false,
+        'deleted_count' => 0,
+        'warnings' => [],
+    ];
+
+    if ($companyId <= 0 || !service_reminder_feature_ready()) {
+        $result['warnings'][] = 'Reminder storage is not ready.';
+        return $result;
+    }
+
+    $normalizedType = service_reminder_normalize_type($itemType);
+    if ($normalizedType === '' || $itemId <= 0) {
+        $result['warnings'][] = 'Invalid item selected for delete.';
+        return $result;
+    }
+
+    $vehicleIds = array_values(array_unique(array_filter(array_map('intval', $vehicleIds), static fn (int $id): bool => $id > 0)));
+    if ($vehicleIds === []) {
+        $result['warnings'][] = 'No target vehicles selected.';
+        return $result;
+    }
+
+    try {
+        $placeholders = implode(',', array_fill(0, count($vehicleIds), '?'));
+        $sql =
+            'UPDATE vehicle_maintenance_rules
+             SET is_active = 0,
+                 status_code = "DELETED",
+                 updated_by = ?
+             WHERE company_id = ?
+               AND item_type = ?
+               AND item_id = ?
+               AND vehicle_id IN (' . $placeholders . ')';
+        $stmt = db()->prepare($sql);
+        $stmt->execute(
+            array_merge(
+                [$actorUserId > 0 ? $actorUserId : null, $companyId, $normalizedType, $itemId],
+                $vehicleIds
+            )
+        );
+        $result['ok'] = true;
+        $result['deleted_count'] = $stmt->rowCount();
+    } catch (Throwable $exception) {
+        $result['warnings'][] = 'Unable to delete rules: ' . $exception->getMessage();
+    }
+
+    return $result;
+}
+
+function service_reminder_copy_rules_between_vehicles(
+    int $companyId,
+    int $sourceVehicleId,
+    array $targetVehicleIds,
+    int $actorUserId
+): array {
+    $result = [
+        'ok' => false,
+        'copied_count' => 0,
+        'warnings' => [],
+    ];
+
+    if ($companyId <= 0 || $sourceVehicleId <= 0 || !service_reminder_feature_ready()) {
+        $result['warnings'][] = 'Invalid copy request.';
+        return $result;
+    }
+
+    $targetVehicleIds = array_values(array_unique(array_filter(array_map('intval', $targetVehicleIds), static fn (int $id): bool => $id > 0)));
+    $targetVehicleIds = array_values(array_filter($targetVehicleIds, static fn (int $id): bool => $id !== $sourceVehicleId));
+    if ($targetVehicleIds === []) {
+        $result['warnings'][] = 'Select at least one target vehicle.';
+        return $result;
+    }
+
+    $sourceRows = service_reminder_vehicle_rule_rows($companyId, $sourceVehicleId, true);
+    $ruleRows = [];
+    foreach ($sourceRows as $row) {
+        $itemType = service_reminder_normalize_type((string) ($row['item_type'] ?? ''));
+        $itemId = (int) ($row['item_id'] ?? 0);
+        if ($itemType === '' || $itemId <= 0) {
+            continue;
+        }
+        $ruleRows[] = [
+            'item_type' => $itemType,
+            'item_id' => $itemId,
+            'interval_km' => service_reminder_parse_positive_int($row['interval_km'] ?? null),
+            'interval_days' => service_reminder_parse_positive_int($row['interval_days'] ?? null),
+            'is_active' => (int) ($row['is_active'] ?? 0) === 1 && (string) ($row['status_code'] ?? 'ACTIVE') === 'ACTIVE',
+        ];
+    }
+
+    if ($ruleRows === []) {
+        $result['warnings'][] = 'Selected source vehicle has no rules to copy.';
+        return $result;
+    }
+
+    $saveResult = service_reminder_save_rules_for_vehicles($companyId, $targetVehicleIds, $ruleRows, $actorUserId);
+    $result['ok'] = (bool) ($saveResult['ok'] ?? false);
+    $result['copied_count'] = (int) ($saveResult['saved_count'] ?? 0);
+    $result['warnings'] = (array) ($saveResult['warnings'] ?? []);
+    return $result;
+}
+
+function service_reminder_due_recommendations_for_vehicle(int $companyId, int $garageId, int $vehicleId, int $limit = 12): array
+{
+    $rows = service_reminder_fetch_active_by_vehicle($companyId, $vehicleId, $garageId, max(1, min(50, $limit * 3)));
+    if ($rows === []) {
+        return [];
+    }
+
+    $serviceIds = [];
+    $partIds = [];
+    foreach ($rows as $row) {
+        $itemType = service_reminder_normalize_type((string) ($row['item_type'] ?? $row['service_type'] ?? ''));
+        $itemId = (int) ($row['item_id'] ?? 0);
+        if ($itemType === 'SERVICE' && $itemId > 0) {
+            $serviceIds[$itemId] = true;
+        } elseif ($itemType === 'PART' && $itemId > 0) {
+            $partIds[$itemId] = true;
+        }
+    }
+
+    $serviceMeta = [];
+    if ($serviceIds !== []) {
+        try {
+            $serviceIdList = array_keys($serviceIds);
+            $placeholders = implode(',', array_fill(0, count($serviceIdList), '?'));
+            $stmt = db()->prepare(
+                'SELECT id, service_name, default_rate, gst_rate
+                 FROM services
+                 WHERE company_id = ?
+                   AND status_code = "ACTIVE"
+                   AND id IN (' . $placeholders . ')'
+            );
+            $stmt->execute(array_merge([$companyId], $serviceIdList));
+            foreach ($stmt->fetchAll() as $row) {
+                $serviceMeta[(int) ($row['id'] ?? 0)] = $row;
+            }
+        } catch (Throwable $exception) {
+            // Optional metadata only.
+        }
+    }
+
+    $partMeta = [];
+    if ($partIds !== []) {
+        try {
+            $partIdList = array_keys($partIds);
+            $placeholders = implode(',', array_fill(0, count($partIdList), '?'));
+            $stmt = db()->prepare(
+                'SELECT p.id, p.part_name, p.selling_price, p.gst_rate, COALESCE(gi.quantity, 0) AS stock_qty
+                 FROM parts p
+                 LEFT JOIN garage_inventory gi ON gi.part_id = p.id AND gi.garage_id = ?
+                 WHERE p.company_id = ?
+                   AND p.status_code = "ACTIVE"
+                   AND p.id IN (' . $placeholders . ')'
+            );
+            $stmt->execute(array_merge([$garageId, $companyId], $partIdList));
+            foreach ($stmt->fetchAll() as $row) {
+                $partMeta[(int) ($row['id'] ?? 0)] = $row;
+            }
+        } catch (Throwable $exception) {
+            // Optional metadata only.
+        }
+    }
+
+    $recommended = [];
+    foreach ($rows as $row) {
+        $itemType = service_reminder_normalize_type((string) ($row['item_type'] ?? $row['service_type'] ?? ''));
+        $itemId = (int) ($row['item_id'] ?? 0);
+        if ($itemType === '' || $itemId <= 0) {
+            continue;
+        }
+
+        $dueState = strtoupper(trim((string) ($row['due_state'] ?? service_reminder_due_state($row))));
+        if ($dueState === 'COMPLETED') {
+            continue;
+        }
+
+        $unitPrice = 0.0;
+        $gstRate = 0.0;
+        $stockQty = null;
+        if ($itemType === 'SERVICE' && isset($serviceMeta[$itemId])) {
+            $unitPrice = (float) ($serviceMeta[$itemId]['default_rate'] ?? 0);
+            $gstRate = (float) ($serviceMeta[$itemId]['gst_rate'] ?? 0);
+        } elseif ($itemType === 'PART' && isset($partMeta[$itemId])) {
+            $unitPrice = (float) ($partMeta[$itemId]['selling_price'] ?? 0);
+            $gstRate = (float) ($partMeta[$itemId]['gst_rate'] ?? 0);
+            $stockQty = (float) ($partMeta[$itemId]['stock_qty'] ?? 0);
+        }
+
+        $recommended[] = [
+            'reminder_id' => (int) ($row['id'] ?? 0),
+            'item_type' => $itemType,
+            'item_id' => $itemId,
+            'item_name' => (string) (($row['item_name'] ?? '') !== '' ? $row['item_name'] : ($row['service_label'] ?? '-')),
+            'due_state' => $dueState,
+            'next_due_km' => service_reminder_parse_positive_int($row['next_due_km'] ?? null),
+            'next_due_date' => service_reminder_parse_date((string) ($row['next_due_date'] ?? '')),
+            'predicted_next_visit_date' => service_reminder_parse_date((string) ($row['predicted_next_visit_date'] ?? '')),
+            'interval_km' => service_reminder_parse_positive_int($row['interval_km'] ?? null),
+            'interval_days' => service_reminder_parse_positive_int($row['interval_days'] ?? null),
+            'source_type' => (string) (($row['source_type'] ?? '') !== '' ? $row['source_type'] : 'AUTO'),
+            'recommendation_text' => (string) (($row['recommendation_text'] ?? '') !== '' ? $row['recommendation_text'] : service_reminder_default_note((string) (($row['item_name'] ?? '') !== '' ? $row['item_name'] : ($row['service_label'] ?? '')), service_reminder_parse_positive_int($row['next_due_km'] ?? null), service_reminder_parse_date((string) ($row['next_due_date'] ?? '')))),
+            'unit_price' => round($unitPrice, 2),
+            'gst_rate' => round($gstRate, 2),
+            'stock_qty' => $stockQty,
+            'action_default' => in_array($dueState, ['OVERDUE', 'DUE'], true) ? 'add' : 'postpone',
+        ];
+    }
+
+    usort(
+        $recommended,
+        static function (array $left, array $right): int {
+            $weight = [
+                'OVERDUE' => 1,
+                'DUE' => 2,
+                'UPCOMING' => 3,
+            ];
+            $leftWeight = $weight[(string) ($left['due_state'] ?? 'UPCOMING')] ?? 9;
+            $rightWeight = $weight[(string) ($right['due_state'] ?? 'UPCOMING')] ?? 9;
+            if ($leftWeight !== $rightWeight) {
+                return $leftWeight < $rightWeight ? -1 : 1;
+            }
+
+            $leftDate = (string) ($left['next_due_date'] ?? '');
+            $rightDate = (string) ($right['next_due_date'] ?? '');
+            if ($leftDate !== $rightDate) {
+                return strcmp($leftDate, $rightDate);
+            }
+
+            return strcmp((string) ($left['item_name'] ?? ''), (string) ($right['item_name'] ?? ''));
+        }
+    );
+
+    return array_slice($recommended, 0, max(1, min(50, $limit)));
+}
+
+function service_reminder_apply_job_creation_actions(
+    int $companyId,
+    int $garageId,
+    int $jobId,
+    int $vehicleId,
+    int $customerId,
+    ?int $odometerKm,
+    int $actorUserId,
+    array $actionByReminderId
+): array {
+    $result = [
+        'added_count' => 0,
+        'postponed_count' => 0,
+        'ignored_count' => 0,
+        'warnings' => [],
+    ];
+
+    if ($companyId <= 0 || $garageId <= 0 || $jobId <= 0 || $vehicleId <= 0 || !service_reminder_feature_ready()) {
+        return $result;
+    }
+
+    $normalizedActions = [];
+    foreach ($actionByReminderId as $reminderId => $actionRaw) {
+        $id = (int) $reminderId;
+        if ($id <= 0) {
+            continue;
+        }
+        $action = strtolower(trim((string) $actionRaw));
+        if (!in_array($action, ['add', 'ignore', 'postpone'], true)) {
+            $action = 'ignore';
+        }
+        $normalizedActions[$id] = $action;
+    }
+    if ($normalizedActions === []) {
+        return $result;
+    }
+
+    $ids = array_keys($normalizedActions);
+    $placeholders = implode(',', array_fill(0, count($ids), '?'));
+    $params = array_merge([$companyId, $vehicleId], $ids);
+    try {
+        $reminderStmt = db()->prepare(
+            'SELECT *
+             FROM vehicle_maintenance_reminders
+             WHERE company_id = ?
+               AND vehicle_id = ?
+               AND is_active = 1
+               AND status_code = "ACTIVE"
+               AND id IN (' . $placeholders . ')'
+        );
+        $reminderStmt->execute($params);
+        $rows = $reminderStmt->fetchAll();
+    } catch (Throwable $exception) {
+        $result['warnings'][] = 'Unable to read maintenance recommendations.';
+        return $result;
+    }
+
+    if ($rows === []) {
+        return $result;
+    }
+
+    $pdo = db();
+    $serviceFetchStmt = $pdo->prepare(
+        'SELECT id, service_name, default_rate, gst_rate
+         FROM services
+         WHERE id = :id
+           AND company_id = :company_id
+           AND status_code = "ACTIVE"
+         LIMIT 1'
+    );
+    $partFetchStmt = $pdo->prepare(
+        'SELECT p.id, p.part_name, p.selling_price, p.gst_rate, COALESCE(gi.quantity, 0) AS stock_qty
+         FROM parts p
+         LEFT JOIN garage_inventory gi ON gi.part_id = p.id AND gi.garage_id = :garage_id
+         WHERE p.id = :id
+           AND p.company_id = :company_id
+           AND p.status_code = "ACTIVE"
+         LIMIT 1'
+    );
+    $insertLaborStmt = $pdo->prepare(
+        'INSERT INTO job_labor
+          (job_card_id, service_id, execution_type, outsource_vendor_id, outsource_partner_name, outsource_cost,
+           outsource_payable_status, outsource_paid_at, outsource_paid_by, description, quantity, unit_price, gst_rate, total_amount)
+         VALUES
+          (:job_card_id, :service_id, "IN_HOUSE", NULL, NULL, 0, "PAID", NULL, NULL, :description, :quantity, :unit_price, :gst_rate, :total_amount)'
+    );
+    $insertPartStmt = $pdo->prepare(
+        'INSERT INTO job_parts
+          (job_card_id, part_id, quantity, unit_price, gst_rate, total_amount)
+         VALUES
+          (:job_card_id, :part_id, :quantity, :unit_price, :gst_rate, :total_amount)'
+    );
+    $postponeStmt = $pdo->prepare(
+        'UPDATE vehicle_maintenance_reminders
+         SET next_due_km = :next_due_km,
+             next_due_date = :next_due_date,
+             source_type = "POSTPONE",
+             reminder_status = "POSTPONED",
+             updated_by = :updated_by
+         WHERE id = :id
+           AND company_id = :company_id
+           AND vehicle_id = :vehicle_id
+           AND is_active = 1
+           AND status_code = "ACTIVE"'
+    );
+
+    $usageProfile = service_reminder_vehicle_usage_profile($companyId, $vehicleId);
+    $avgKmPerDay = isset($usageProfile['avg_km_per_day']) && is_numeric((string) $usageProfile['avg_km_per_day'])
+        ? (float) $usageProfile['avg_km_per_day']
+        : null;
+    $baseDate = date('Y-m-d');
+
+    foreach ($rows as $row) {
+        $reminderId = (int) ($row['id'] ?? 0);
+        if ($reminderId <= 0) {
+            continue;
+        }
+        $action = $normalizedActions[$reminderId] ?? 'ignore';
+        $itemType = service_reminder_normalize_type((string) ($row['item_type'] ?? ''));
+        $itemId = (int) ($row['item_id'] ?? 0);
+        $itemName = trim((string) ($row['item_name'] ?? ''));
+        $intervalKm = service_reminder_parse_positive_int($row['interval_km'] ?? null);
+        $intervalDays = service_reminder_parse_positive_int($row['interval_days'] ?? null);
+
+        if ($action === 'ignore') {
+            $result['ignored_count']++;
+            continue;
+        }
+
+        if ($action === 'postpone') {
+            $baseKm = $odometerKm ?? service_reminder_parse_positive_int($row['next_due_km'] ?? null) ?? service_reminder_parse_positive_int($row['last_service_km'] ?? null);
+            $nextDueKm = null;
+            if ($baseKm !== null && $intervalKm !== null) {
+                $nextDueKm = $baseKm + $intervalKm;
+            } elseif ($baseKm !== null) {
+                $nextDueKm = $baseKm + 500;
+            }
+
+            $daysShift = $intervalDays ?? 15;
+            $nextDueDate = null;
+            $nextTs = strtotime($baseDate . ' +' . $daysShift . ' days');
+            if ($nextTs !== false) {
+                $nextDueDate = date('Y-m-d', $nextTs);
+            }
+
+            try {
+                $postponeStmt->execute([
+                    'next_due_km' => $nextDueKm,
+                    'next_due_date' => $nextDueDate,
+                    'updated_by' => $actorUserId > 0 ? $actorUserId : null,
+                    'id' => $reminderId,
+                    'company_id' => $companyId,
+                    'vehicle_id' => $vehicleId,
+                ]);
+                $result['postponed_count']++;
+            } catch (Throwable $exception) {
+                $result['warnings'][] = 'Unable to postpone reminder for ' . ($itemName !== '' ? $itemName : ('Item #' . $itemId)) . '.';
+            }
+            continue;
+        }
+
+        if ($action !== 'add' || $itemType === '' || $itemId <= 0) {
+            $result['ignored_count']++;
+            continue;
+        }
+
+        $lineAdded = false;
+        if ($itemType === 'SERVICE') {
+            $serviceFetchStmt->execute([
+                'id' => $itemId,
+                'company_id' => $companyId,
+            ]);
+            $service = $serviceFetchStmt->fetch() ?: null;
+            if (!$service) {
+                $result['warnings'][] = 'Suggested service is no longer active: ' . ($itemName !== '' ? $itemName : ('Service #' . $itemId));
+                continue;
+            }
+
+            $unitPrice = round((float) ($service['default_rate'] ?? 0), 2);
+            $gstRate = round((float) ($service['gst_rate'] ?? 0), 2);
+            $quantity = 1.0;
+            $totalAmount = round($quantity * $unitPrice, 2);
+            try {
+                $insertLaborStmt->execute([
+                    'job_card_id' => $jobId,
+                    'service_id' => $itemId,
+                    'description' => (string) ($service['service_name'] ?? ($itemName !== '' ? $itemName : 'Service')),
+                    'quantity' => $quantity,
+                    'unit_price' => $unitPrice,
+                    'gst_rate' => $gstRate,
+                    'total_amount' => $totalAmount,
+                ]);
+                $lineAdded = true;
+            } catch (Throwable $exception) {
+                $result['warnings'][] = 'Unable to add service line for ' . (string) ($service['service_name'] ?? ('Service #' . $itemId)) . '.';
+            }
+        } elseif ($itemType === 'PART') {
+            $partFetchStmt->execute([
+                'id' => $itemId,
+                'company_id' => $companyId,
+                'garage_id' => $garageId,
+            ]);
+            $part = $partFetchStmt->fetch() ?: null;
+            if (!$part) {
+                $result['warnings'][] = 'Suggested part is no longer active: ' . ($itemName !== '' ? $itemName : ('Part #' . $itemId));
+                continue;
+            }
+
+            $unitPrice = round((float) ($part['selling_price'] ?? 0), 2);
+            $gstRate = round((float) ($part['gst_rate'] ?? 0), 2);
+            $quantity = 1.0;
+            $totalAmount = round($quantity * $unitPrice, 2);
+            try {
+                $insertPartStmt->execute([
+                    'job_card_id' => $jobId,
+                    'part_id' => $itemId,
+                    'quantity' => $quantity,
+                    'unit_price' => $unitPrice,
+                    'gst_rate' => $gstRate,
+                    'total_amount' => $totalAmount,
+                ]);
+                $lineAdded = true;
+            } catch (Throwable $exception) {
+                $result['warnings'][] = 'Unable to add part line for ' . (string) ($part['part_name'] ?? ('Part #' . $itemId)) . '.';
+            }
+        }
+
+        if (!$lineAdded) {
+            continue;
+        }
+
+        $result['added_count']++;
+        service_reminder_mark_existing_inactive($pdo, $companyId, $vehicleId, $itemType, $itemId, $actorUserId, 'COMPLETED');
+
+        $nextDueKm = ($odometerKm !== null && $intervalKm !== null) ? ($odometerKm + $intervalKm) : null;
+        $nextDueDate = null;
+        if ($intervalDays !== null) {
+            $nextTs = strtotime($baseDate . ' +' . $intervalDays . ' days');
+            if ($nextTs !== false) {
+                $nextDueDate = date('Y-m-d', $nextTs);
+            }
+        }
+
+        if ($nextDueKm !== null || $nextDueDate !== null) {
+            try {
+                service_reminder_insert_active_reminder(
+                    $pdo,
+                    [
+                        'company_id' => $companyId,
+                        'garage_id' => $garageId,
+                        'vehicle_id' => $vehicleId,
+                        'customer_id' => $customerId,
+                        'job_card_id' => $jobId,
+                        'rule_id' => (int) ($row['rule_id'] ?? 0),
+                        'item_type' => $itemType,
+                        'item_id' => $itemId,
+                        'item_name' => $itemName !== '' ? $itemName : ($itemType . ' #' . $itemId),
+                        'source_type' => 'JOB_CREATE_ADD',
+                        'reminder_status' => 'ACTIVE',
+                        'recommendation_text' => service_reminder_default_note($itemName, $nextDueKm, $nextDueDate),
+                        'last_service_km' => $odometerKm,
+                        'last_service_date' => $baseDate,
+                        'interval_km' => $intervalKm,
+                        'interval_days' => $intervalDays,
+                        'next_due_km' => $nextDueKm,
+                        'next_due_date' => $nextDueDate,
+                        'predicted_next_visit_date' => service_reminder_predict_next_visit_date(
+                            $odometerKm,
+                            $nextDueKm,
+                            $baseDate,
+                            $avgKmPerDay,
+                            $nextDueDate
+                        ),
+                        'created_by' => $actorUserId,
+                        'updated_by' => $actorUserId,
+                    ]
+                );
+            } catch (Throwable $exception) {
+                $result['warnings'][] = 'Unable to regenerate next due after adding ' . ($itemName !== '' ? $itemName : ('Item #' . $itemId)) . '.';
+            }
+        }
+    }
+
+    if ($result['added_count'] > 0) {
+        job_recalculate_estimate($jobId);
+    }
+
+    return $result;
 }
 
 function job_condition_photo_table_exists(bool $refresh = false): bool

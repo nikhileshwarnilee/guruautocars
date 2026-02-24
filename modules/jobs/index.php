@@ -19,7 +19,10 @@ $canInlineVehicleCreate = has_permission('vehicle.view') && has_permission('vehi
 $canConditionPhotoManage = has_permission('job.manage') || has_permission('settings.manage');
 $jobCardColumns = table_columns('job_cards');
 $jobOdometerEnabled = in_array('odometer_km', $jobCardColumns, true);
+$jobRecommendationNoteEnabled = job_recommendation_note_feature_ready();
 $odometerEditableStatuses = ['OPEN', 'IN_PROGRESS'];
+$maintenanceReminderFeatureReady = service_reminder_feature_ready();
+$maintenanceRecommendationApiUrl = url('modules/jobs/maintenance_recommendations_api.php');
 
 function parse_ids(mixed $value): array
 {
@@ -164,11 +167,29 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $vehicleId = post_int('vehicle_id');
         $complaint = post_string('complaint', 3000);
         $diagnosis = post_string('diagnosis', 3000);
+        $recommendationNote = $jobRecommendationNoteEnabled ? post_string('recommendation_note', 5000) : '';
         $odometerRaw = trim((string) ($_POST['odometer_km'] ?? ''));
         $odometerKm = null;
         $priority = strtoupper(post_string('priority', 10));
         $promisedAt = post_string('promised_at', 25);
         $assignedUserIds = $canAssign ? parse_ids($_POST['assigned_user_ids'] ?? []) : [];
+        $maintenanceActions = [];
+        if ($maintenanceReminderFeatureReady) {
+            $rawMaintenanceActions = $_POST['maintenance_action'] ?? [];
+            if (is_array($rawMaintenanceActions)) {
+                foreach ($rawMaintenanceActions as $reminderId => $actionValue) {
+                    $id = (int) $reminderId;
+                    if ($id <= 0) {
+                        continue;
+                    }
+                    $actionKey = strtolower(trim((string) $actionValue));
+                    if (!in_array($actionKey, ['add', 'ignore', 'postpone'], true)) {
+                        $actionKey = 'ignore';
+                    }
+                    $maintenanceActions[$id] = $actionKey;
+                }
+            }
+        }
         if (!in_array($priority, ['LOW', 'MEDIUM', 'HIGH', 'URGENT'], true)) {
             $priority = 'MEDIUM';
         }
@@ -219,19 +240,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $pdo->beginTransaction();
         try {
             $jobNumber = job_generate_number($pdo, $garageId);
+            $recommendationColumnSql = $jobRecommendationNoteEnabled ? ', recommendation_note' : '';
+            $recommendationValueSql = $jobRecommendationNoteEnabled ? ', :recommendation_note' : '';
             if ($jobOdometerEnabled) {
                 $stmt = $pdo->prepare(
                     'INSERT INTO job_cards
-                      (company_id, garage_id, job_number, customer_id, vehicle_id, odometer_km, assigned_to, service_advisor_id, complaint, diagnosis, status, priority, promised_at, status_code, created_by, updated_by)
+                      (company_id, garage_id, job_number, customer_id, vehicle_id, odometer_km, assigned_to, service_advisor_id, complaint, diagnosis' . $recommendationColumnSql . ', status, priority, promised_at, status_code, created_by, updated_by)
                      VALUES
-                      (:company_id, :garage_id, :job_number, :customer_id, :vehicle_id, :odometer_km, NULL, :service_advisor_id, :complaint, :diagnosis, "OPEN", :priority, :promised_at, "ACTIVE", :created_by, :updated_by)'
+                      (:company_id, :garage_id, :job_number, :customer_id, :vehicle_id, :odometer_km, NULL, :service_advisor_id, :complaint, :diagnosis' . $recommendationValueSql . ', "OPEN", :priority, :promised_at, "ACTIVE", :created_by, :updated_by)'
                 );
             } else {
                 $stmt = $pdo->prepare(
                     'INSERT INTO job_cards
-                      (company_id, garage_id, job_number, customer_id, vehicle_id, assigned_to, service_advisor_id, complaint, diagnosis, status, priority, promised_at, status_code, created_by, updated_by)
+                      (company_id, garage_id, job_number, customer_id, vehicle_id, assigned_to, service_advisor_id, complaint, diagnosis' . $recommendationColumnSql . ', status, priority, promised_at, status_code, created_by, updated_by)
                      VALUES
-                      (:company_id, :garage_id, :job_number, :customer_id, :vehicle_id, NULL, :service_advisor_id, :complaint, :diagnosis, "OPEN", :priority, :promised_at, "ACTIVE", :created_by, :updated_by)'
+                      (:company_id, :garage_id, :job_number, :customer_id, :vehicle_id, NULL, :service_advisor_id, :complaint, :diagnosis' . $recommendationValueSql . ', "OPEN", :priority, :promised_at, "ACTIVE", :created_by, :updated_by)'
                 );
             }
 
@@ -249,6 +272,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'created_by' => $userId,
                 'updated_by' => $userId,
             ];
+            if ($jobRecommendationNoteEnabled) {
+                $insertParams['recommendation_note'] = $recommendationNote !== '' ? $recommendationNote : null;
+            }
             if ($jobOdometerEnabled) {
                 $insertParams['odometer_km'] = $odometerKm !== null ? $odometerKm : 0;
             }
@@ -259,6 +285,29 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if (!empty($assigned)) {
                     job_append_history($jobId, 'ASSIGN_CREATE', null, null, 'Assigned users', ['user_ids' => $assigned]);
                 }
+            }
+            $maintenanceResult = [
+                'added_count' => 0,
+                'postponed_count' => 0,
+                'ignored_count' => 0,
+                'warnings' => [],
+            ];
+            if ($maintenanceReminderFeatureReady && !empty($maintenanceActions)) {
+                $maintenanceResult = service_reminder_apply_job_creation_actions(
+                    $companyId,
+                    $garageId,
+                    $jobId,
+                    $vehicleId,
+                    $customerId,
+                    $jobOdometerEnabled ? $odometerKm : null,
+                    $userId,
+                    $maintenanceActions
+                );
+                job_append_history($jobId, 'MAINTENANCE_ACTIONS', null, null, 'Applied maintenance recommendation actions', [
+                    'added_count' => (int) ($maintenanceResult['added_count'] ?? 0),
+                    'postponed_count' => (int) ($maintenanceResult['postponed_count'] ?? 0),
+                    'ignored_count' => (int) ($maintenanceResult['ignored_count'] ?? 0),
+                ]);
             }
             $createHistoryPayload = ['job_number' => $jobNumber];
             if ($jobOdometerEnabled && $odometerKm !== null) {
@@ -278,13 +327,35 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'customer_id' => $customerId,
                     'vehicle_id' => $vehicleId,
                     'odometer_km' => $jobOdometerEnabled && $odometerKm !== null ? $odometerKm : null,
+                    'recommendation_note' => $jobRecommendationNoteEnabled ? ($recommendationNote !== '' ? $recommendationNote : null) : null,
                 ],
                 'metadata' => [
                     'assigned_count' => isset($assigned) && is_array($assigned) ? count($assigned) : 0,
+                    'maintenance_added' => (int) ($maintenanceResult['added_count'] ?? 0),
+                    'maintenance_postponed' => (int) ($maintenanceResult['postponed_count'] ?? 0),
                 ],
             ]);
             $pdo->commit();
             flash_set('job_success', 'Job card created successfully. Upload vehicle condition photos now.', 'success');
+            if ((int) ($maintenanceResult['added_count'] ?? 0) > 0
+                || (int) ($maintenanceResult['postponed_count'] ?? 0) > 0
+                || (int) ($maintenanceResult['ignored_count'] ?? 0) > 0) {
+                flash_set(
+                    'job_info',
+                    'Maintenance recommendations: Added ' . (int) ($maintenanceResult['added_count'] ?? 0)
+                    . ', Postponed ' . (int) ($maintenanceResult['postponed_count'] ?? 0)
+                    . ', Ignored ' . (int) ($maintenanceResult['ignored_count'] ?? 0) . '.',
+                    'info'
+                );
+            }
+            $maintenanceWarnings = (array) ($maintenanceResult['warnings'] ?? []);
+            foreach ($maintenanceWarnings as $index => $warning) {
+                $warningMessage = trim((string) $warning);
+                if ($warningMessage === '') {
+                    continue;
+                }
+                flash_set('job_warning_maintenance_' . $index, $warningMessage, 'warning');
+            }
             redirect('modules/jobs/view.php?id=' . $jobId . '&prompt_condition_photos=1#condition-photos');
         } catch (Throwable $exception) {
             $pdo->rollBack();
@@ -307,6 +378,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         $complaint = post_string('complaint', 3000);
         $diagnosis = post_string('diagnosis', 3000);
+        $recommendationNote = $jobRecommendationNoteEnabled ? post_string('recommendation_note', 5000) : '';
         $odometerRaw = trim((string) ($_POST['odometer_km'] ?? ''));
         $odometerKm = null;
         $priority = strtoupper(post_string('priority', 10));
@@ -356,6 +428,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'company_id' => $companyId,
             'garage_id' => $garageId,
         ];
+        if ($jobRecommendationNoteEnabled) {
+            $updateSql .= ',
+                 recommendation_note = :recommendation_note';
+            $updateParams['recommendation_note'] = $recommendationNote !== '' ? $recommendationNote : null;
+        }
         if ($jobOdometerEnabled && $odometerEditable && $odometerKm !== null) {
             $updateSql .= ',
                  odometer_km = :odometer_km';
@@ -395,6 +472,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'priority' => (string) ($job['priority'] ?? ''),
                 'promised_at' => (string) ($job['promised_at'] ?? ''),
                 'odometer_km' => $jobOdometerEnabled ? (int) ($job['odometer_km'] ?? 0) : null,
+                'recommendation_note' => $jobRecommendationNoteEnabled ? (string) ($job['recommendation_note'] ?? '') : null,
             ],
             'after' => [
                 'complaint' => $complaint,
@@ -404,6 +482,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'odometer_km' => $jobOdometerEnabled
                     ? ($odometerEditable && $odometerKm !== null ? $odometerKm : (int) ($job['odometer_km'] ?? 0))
                     : null,
+                'recommendation_note' => $jobRecommendationNoteEnabled ? ($recommendationNote !== '' ? $recommendationNote : null) : null,
             ],
             'metadata' => [
                 'assigned_count' => isset($assigned) && is_array($assigned) ? count($assigned) : 0,
@@ -654,7 +733,30 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         <div class="col-md-2"><label class="form-label">Promised</label><input type="datetime-local" name="promised_at" class="form-control" value="<?= e((string) (!empty($editJob['promised_at']) ? str_replace(' ', 'T', substr((string) $editJob['promised_at'], 0, 16)) : '')); ?>"></div>
         <div class="col-md-12"><label class="form-label">Complaint</label><textarea name="complaint" class="form-control" rows="2" required><?= e((string) ($editJob['complaint'] ?? '')); ?></textarea></div>
         <div class="col-md-12"><label class="form-label">Diagnosis</label><textarea name="diagnosis" class="form-control" rows="2"><?= e((string) ($editJob['diagnosis'] ?? '')); ?></textarea></div>
+        <?php if ($jobRecommendationNoteEnabled): ?>
+          <div class="col-md-12">
+            <label class="form-label">Recommendation Note</label>
+            <textarea name="recommendation_note" class="form-control" rows="2" maxlength="5000"><?= e((string) ($editJob['recommendation_note'] ?? '')); ?></textarea>
+            <div class="form-hint">Printed on job card and invoice.</div>
+          </div>
+        <?php endif; ?>
         <?php if ($canAssign): ?><div class="col-md-12"><label class="form-label">Assigned Staff (Multiple)</label><select name="assigned_user_ids[]" class="form-select" multiple size="4"><?php foreach ($staffCandidates as $staff): ?><option value="<?= (int) $staff['id']; ?>" <?= in_array((int) $staff['id'], $editAssignments, true) ? 'selected' : ''; ?>><?= e((string) $staff['name']); ?> - <?= e((string) $staff['role_name']); ?></option><?php endforeach; ?></select></div><?php endif; ?>
+        <?php if (!$editJob): ?>
+          <div class="col-md-12">
+            <div class="card card-outline card-success mb-0">
+              <div class="card-header">
+                <h3 class="card-title mb-0">Recommended Services/Parts Due</h3>
+              </div>
+              <div class="card-body" id="maintenance-recommendations-content">
+                <?php if (!$maintenanceReminderFeatureReady): ?>
+                  <div class="alert alert-warning mb-0">Maintenance reminder storage is not ready. Recommended items are unavailable.</div>
+                <?php else: ?>
+                  <div class="text-muted">Select vehicle to load due recommendations. Choose Add, Ignore, or Postpone for each row.</div>
+                <?php endif; ?>
+              </div>
+            </div>
+          </div>
+        <?php endif; ?>
       </div><div class="card-footer d-flex gap-2"><button class="btn btn-primary" type="submit"><?= $editJob ? 'Update' : 'Create'; ?></button><?php if ($editJob): ?><a class="btn btn-outline-secondary" href="<?= e(url('modules/jobs/index.php')); ?>">Cancel</a><?php endif; ?></div></form>
     </div>
     <div class="card card-outline card-info mb-3 collapsed-card"><div class="card-header"><h3 class="card-title">VIS Suggestions (Optional)</h3><div class="card-tools"><button type="button" class="btn btn-tool" data-lte-toggle="card-collapse"><i class="bi bi-plus-lg"></i></button></div></div><div class="card-body" id="vis-suggestions-content">Select a vehicle to load optional VIS suggestions. Job creation never depends on VIS.</div></div>
@@ -775,6 +877,9 @@ require_once __DIR__ . '/../../includes/sidebar.php';
     var odometerInput = document.getElementById('job-odometer-input');
     var odometerHint = document.getElementById('job-odometer-hint');
     var target = document.getElementById('vis-suggestions-content');
+    var maintenanceTarget = document.getElementById('maintenance-recommendations-content');
+    var maintenanceEnabled = <?= (!$editJob && $maintenanceReminderFeatureReady) ? 'true' : 'false'; ?>;
+    var maintenanceApiUrl = '<?= e($maintenanceRecommendationApiUrl); ?>';
     var isEditMode = <?= $editJob ? 'true' : 'false'; ?>;
     var odometerEnabled = <?= $jobOdometerEnabled ? 'true' : 'false'; ?>;
     if (!vehicleSelect || !target) return;
@@ -814,6 +919,15 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         return value;
       }
       return parsed.toLocaleString();
+    }
+
+    function escapeHtml(value) {
+      return String(value || '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
     }
 
     function renderOwnerHint(message) {
@@ -918,6 +1032,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       }
       syncOdometerFromVehicle(true);
       load('');
+      loadMaintenanceRecommendations('');
     }
 
     function enforceVehicleOwnerMatch() {
@@ -981,6 +1096,87 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       html += '<p class="mb-1"><strong>Suggested Services:</strong> ' + services.length + '</p><p class="mb-0"><strong>Compatible Parts:</strong> ' + parts.length + '</p>';
       target.innerHTML = html;
     }
+
+    function renderMaintenanceRecommendations(payload) {
+      if (!maintenanceEnabled || !maintenanceTarget) {
+        return;
+      }
+
+      var rows = payload && Array.isArray(payload.items) ? payload.items : [];
+      if (!payload || payload.ok === false) {
+        maintenanceTarget.innerHTML = '<div class="text-danger">Unable to load maintenance recommendations.</div>';
+        return;
+      }
+      if (rows.length === 0) {
+        maintenanceTarget.innerHTML = '<div class="text-muted">No active maintenance reminders due for this vehicle.</div>';
+        return;
+      }
+
+      var html = '';
+      html += '<div class="table-responsive">';
+      html += '<table class="table table-sm table-bordered align-middle mb-0">';
+      html += '<thead><tr><th>Service/Part</th><th class="text-end">Due KM</th><th>Due Date</th><th>Predicted Visit</th><th>Status</th><th>Source</th><th>Recommendation</th><th style="width: 170px;">Action</th></tr></thead><tbody>';
+      for (var i = 0; i < rows.length; i++) {
+        var row = rows[i] || {};
+        var reminderId = Number(row.reminder_id || 0);
+        if (reminderId <= 0) {
+          continue;
+        }
+        var itemLabel = String(row.item_name || '');
+        if (itemLabel === '') {
+          itemLabel = String(row.item_type || 'ITEM') + ' #' + String(row.item_id || '');
+        }
+        var nextDueKm = row.next_due_km !== null && typeof row.next_due_km !== 'undefined'
+          ? Number(row.next_due_km).toLocaleString()
+          : '-';
+        var nextDueDate = row.next_due_date ? String(row.next_due_date) : '-';
+        var predictedVisit = row.predicted_next_visit_date ? String(row.predicted_next_visit_date) : '-';
+        var dueState = String(row.due_state || 'UPCOMING');
+        var source = String(row.source_type || 'AUTO');
+        var recommendation = String(row.recommendation_text || '-');
+        var defaultAction = String(row.action_default || 'ignore').toLowerCase();
+        if (['add', 'ignore', 'postpone'].indexOf(defaultAction) === -1) {
+          defaultAction = 'ignore';
+        }
+
+        html += '<tr>';
+        html += '<td>' + escapeHtml(itemLabel) + '</td>';
+        html += '<td class="text-end">' + escapeHtml(nextDueKm) + '</td>';
+        html += '<td>' + escapeHtml(nextDueDate) + '</td>';
+        html += '<td>' + escapeHtml(predictedVisit) + '</td>';
+        html += '<td>' + escapeHtml(dueState) + '</td>';
+        html += '<td>' + escapeHtml(source) + '</td>';
+        html += '<td>' + escapeHtml(recommendation) + '</td>';
+        html += '<td>';
+        html += '<select name="maintenance_action[' + reminderId + ']" class="form-select form-select-sm">';
+        html += '<option value="add"' + (defaultAction === 'add' ? ' selected' : '') + '>Add To Job</option>';
+        html += '<option value="ignore"' + (defaultAction === 'ignore' ? ' selected' : '') + '>Ignore</option>';
+        html += '<option value="postpone"' + (defaultAction === 'postpone' ? ' selected' : '') + '>Postpone</option>';
+        html += '</select>';
+        html += '</td>';
+        html += '</tr>';
+      }
+      html += '</tbody></table></div>';
+      maintenanceTarget.innerHTML = html;
+    }
+
+    function loadMaintenanceRecommendations(id) {
+      if (!maintenanceEnabled || !maintenanceTarget) {
+        return;
+      }
+      if (!id) {
+        maintenanceTarget.innerHTML = '<div class="text-muted">Select vehicle to load due recommendations. Choose Add, Ignore, or Postpone for each row.</div>';
+        return;
+      }
+
+      fetch(maintenanceApiUrl + '?vehicle_id=' + encodeURIComponent(id), { credentials: 'same-origin' })
+        .then(function (r) { return r.json(); })
+        .then(renderMaintenanceRecommendations)
+        .catch(function () {
+          maintenanceTarget.innerHTML = '<div class="text-danger">Unable to load maintenance recommendations.</div>';
+        });
+    }
+
     function load(id) {
       if (!id) { target.innerHTML = 'Select a vehicle to load optional VIS suggestions. Job creation never depends on VIS.'; return; }
       fetch('<?= e(url('modules/jobs/vis_suggestions.php')); ?>?vehicle_id=' + encodeURIComponent(id), {credentials: 'same-origin'})
@@ -992,6 +1188,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       syncOwnerFromVehicle();
       syncOdometerFromVehicle(true);
       load(vehicleSelect.value);
+      loadMaintenanceRecommendations(vehicleSelect.value);
     });
     if (customerSelect) {
       customerSelect.addEventListener('change', enforceVehicleOwnerMatch);
@@ -1000,8 +1197,10 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       syncOwnerFromVehicle();
       syncOdometerFromVehicle(!isEditMode);
       load(vehicleSelect.value);
+      loadMaintenanceRecommendations(vehicleSelect.value);
     } else {
       syncOdometerFromVehicle(false);
+      loadMaintenanceRecommendations('');
     }
     if (customerSelect) {
       enforceVehicleOwnerMatch();

@@ -10,6 +10,16 @@ $active_menu = 'inventory.parts_master';
 $canManage = has_permission('part_master.manage');
 $companyId = active_company_id();
 $garageId = active_garage_id();
+$partColumns = table_columns('parts');
+$hasEnableReminder = in_array('enable_reminder', $partColumns, true);
+if (!$hasEnableReminder) {
+    try {
+        db()->exec('ALTER TABLE parts ADD COLUMN enable_reminder TINYINT(1) NOT NULL DEFAULT 0');
+        $hasEnableReminder = in_array('enable_reminder', table_columns('parts'), true);
+    } catch (Throwable $exception) {
+        $hasEnableReminder = false;
+    }
+}
 
 $visCompatibilityEnabled = table_columns('vis_part_compatibility') !== []
     && table_columns('vis_variants') !== []
@@ -81,6 +91,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $minStock = (float) ($_POST['min_stock'] ?? 0);
         $openingStock = (float) ($_POST['opening_stock'] ?? 0);
         $statusCode = normalize_status_code((string) ($_POST['status_code'] ?? 'ACTIVE'));
+        $enableReminder = (int) ($_POST['enable_reminder'] ?? 0) === 1 ? 1 : 0;
         $compatibilityNote = post_string('compatibility_note', 255);
 
         $selectedVariantIds = [];
@@ -106,13 +117,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $pdo->beginTransaction();
 
         try {
-            $insertStmt = $pdo->prepare(
-                'INSERT INTO parts
-                  (company_id, category_id, vendor_id, part_name, part_sku, hsn_code, unit, purchase_price, selling_price, gst_rate, min_stock, status_code, is_active)
-                 VALUES
-                  (:company_id, :category_id, :vendor_id, :part_name, :part_sku, :hsn_code, :unit, :purchase_price, :selling_price, :gst_rate, :min_stock, :status_code, :is_active)'
-            );
-            $insertStmt->execute([
+            $insertColumns = 'company_id, category_id, vendor_id, part_name, part_sku, hsn_code, unit, purchase_price, selling_price, gst_rate, min_stock, status_code, is_active';
+            $insertValues = ':company_id, :category_id, :vendor_id, :part_name, :part_sku, :hsn_code, :unit, :purchase_price, :selling_price, :gst_rate, :min_stock, :status_code, :is_active';
+            $insertParams = [
                 'company_id' => $companyId,
                 'category_id' => $categoryId > 0 ? $categoryId : null,
                 'vendor_id' => $vendorId > 0 ? $vendorId : null,
@@ -126,7 +133,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'min_stock' => $minStock,
                 'status_code' => $statusCode,
                 'is_active' => $statusCode === 'ACTIVE' ? 1 : 0,
-            ]);
+            ];
+            if ($hasEnableReminder) {
+                $insertColumns .= ', enable_reminder';
+                $insertValues .= ', :enable_reminder';
+                $insertParams['enable_reminder'] = $enableReminder;
+            }
+            $insertStmt = $pdo->prepare(
+                'INSERT INTO parts
+                  (' . $insertColumns . ')
+                 VALUES
+                  (' . $insertValues . ')'
+            );
+            $insertStmt->execute($insertParams);
 
             $partId = (int) $pdo->lastInsertId();
 
@@ -193,6 +212,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'part_name' => $partName,
                     'status_code' => $statusCode,
                     'selling_price' => (float) $sellingPrice,
+                    'enable_reminder' => $hasEnableReminder ? $enableReminder : 0,
                 ],
                 'metadata' => [
                     'opening_stock' => max(0, (float) $openingStock),
@@ -238,8 +258,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $gstRate = (float) ($_POST['gst_rate'] ?? 18);
         $minStock = (float) ($_POST['min_stock'] ?? 0);
         $statusCode = normalize_status_code((string) ($_POST['status_code'] ?? 'ACTIVE'));
+        $enableReminder = (int) ($_POST['enable_reminder'] ?? 0) === 1 ? 1 : 0;
         $beforeStmt = db()->prepare(
-            'SELECT part_name, part_sku, status_code, selling_price, gst_rate, min_stock
+            'SELECT part_name, part_sku, status_code, selling_price, gst_rate, min_stock,
+                    ' . ($hasEnableReminder ? 'enable_reminder' : '0') . ' AS enable_reminder
              FROM parts
              WHERE id = :id
                AND company_id = :company_id
@@ -251,7 +273,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         ]);
         $beforePart = $beforeStmt->fetch() ?: null;
 
-        $stmt = db()->prepare(
+        $updateSql =
             'UPDATE parts
              SET part_name = :part_name,
                  category_id = :category_id,
@@ -263,12 +285,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                  gst_rate = :gst_rate,
                  min_stock = :min_stock,
                  status_code = :status_code,
-                 is_active = :is_active,
+                 is_active = :is_active';
+        if ($hasEnableReminder) {
+            $updateSql .= ',
+                 enable_reminder = :enable_reminder';
+        }
+        $updateSql .= ',
                  deleted_at = CASE WHEN :status_code = "DELETED" THEN NOW() ELSE NULL END
              WHERE id = :id
-               AND company_id = :company_id'
-        );
-        $stmt->execute([
+               AND company_id = :company_id';
+        $updateParams = [
             'part_name' => $partName,
             'category_id' => $categoryId > 0 ? $categoryId : null,
             'vendor_id' => $vendorId > 0 ? $vendorId : null,
@@ -282,7 +308,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'is_active' => $statusCode === 'ACTIVE' ? 1 : 0,
             'id' => $partId,
             'company_id' => $companyId,
-        ]);
+        ];
+        if ($hasEnableReminder) {
+            $updateParams['enable_reminder'] = $enableReminder;
+        }
+        $stmt = db()->prepare($updateSql);
+        $stmt->execute($updateParams);
 
         log_audit('parts_master', 'update', $partId, 'Updated part', [
             'entity' => 'part',
@@ -294,6 +325,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'selling_price' => (float) ($beforePart['selling_price'] ?? 0),
                 'gst_rate' => (float) ($beforePart['gst_rate'] ?? 0),
                 'min_stock' => (float) ($beforePart['min_stock'] ?? 0),
+                'enable_reminder' => (int) ($beforePart['enable_reminder'] ?? 0),
             ] : null,
             'after' => [
                 'part_name' => $partName,
@@ -301,6 +333,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'selling_price' => (float) $sellingPrice,
                 'gst_rate' => (float) $gstRate,
                 'min_stock' => (float) $minStock,
+                'enable_reminder' => $hasEnableReminder ? $enableReminder : 0,
             ],
         ]);
         flash_set('parts_success', 'Part updated successfully.', 'success');
@@ -366,6 +399,12 @@ if ($editId > 0) {
     $editPart = $editStmt->fetch() ?: null;
 }
 
+$reminderFilterRaw = strtolower(trim((string) ($_GET['reminder_filter'] ?? 'all')));
+$filterReminderEnabled = $reminderFilterRaw === 'enabled' && $hasEnableReminder;
+if (!$filterReminderEnabled) {
+    $reminderFilterRaw = 'all';
+}
+
 $partCompatibilityCounts = [];
 if ($visCompatibilityEnabled) {
     $countStmt = db()->prepare(
@@ -384,20 +423,30 @@ if ($visCompatibilityEnabled) {
     }
 }
 
-$partsStmt = db()->prepare(
+$partsSql =
     'SELECT p.*, pc.category_name, v.vendor_name, COALESCE(gi.quantity, 0) AS stock_qty
      FROM parts p
      LEFT JOIN part_categories pc ON pc.id = p.category_id
      LEFT JOIN vendors v ON v.id = p.vendor_id
      LEFT JOIN garage_inventory gi ON gi.part_id = p.id AND gi.garage_id = :garage_id
-     WHERE p.company_id = :company_id
-     ORDER BY p.id DESC'
-);
-$partsStmt->execute([
+     WHERE p.company_id = :company_id';
+$partsParams = [
     'company_id' => $companyId,
     'garage_id' => $garageId,
-]);
+];
+
+if ($filterReminderEnabled) {
+    $partsSql .= ' AND COALESCE(p.enable_reminder, 0) = 1';
+}
+
+$partsSql .= ' ORDER BY p.id DESC';
+
+$partsStmt = db()->prepare($partsSql);
+$partsStmt->execute($partsParams);
 $parts = $partsStmt->fetchAll();
+
+$partsListAllUrl = url('modules/inventory/parts_master.php');
+$partsListReminderUrl = url('modules/inventory/parts_master.php?reminder_filter=enabled');
 
 require_once __DIR__ . '/../../includes/header.php';
 require_once __DIR__ . '/../../includes/sidebar.php';
@@ -484,6 +533,14 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                 <label class="form-label">Min Stock</label>
                 <input type="number" step="0.01" name="min_stock" class="form-control" value="<?= e((string) ($editPart['min_stock'] ?? '0')); ?>" />
               </div>
+              <div class="col-md-2">
+                <label class="form-label">Enable Reminder</label>
+                <select name="enable_reminder" class="form-select">
+                  <?php $enableReminderValue = (int) ($editPart['enable_reminder'] ?? 0); ?>
+                  <option value="0" <?= $enableReminderValue === 0 ? 'selected' : ''; ?>>No</option>
+                  <option value="1" <?= $enableReminderValue === 1 ? 'selected' : ''; ?>>Yes</option>
+                </select>
+              </div>
               <?php if (!$editPart): ?>
                 <div class="col-md-2">
                   <label class="form-label">Opening Stock (Current Garage)</label>
@@ -535,7 +592,13 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       <?php endif; ?>
 
       <div class="card">
-        <div class="card-header"><h3 class="card-title">Parts List</h3></div>
+        <div class="card-header d-flex justify-content-between align-items-center gap-2 flex-wrap">
+          <h3 class="card-title mb-0">Parts List</h3>
+          <div class="btn-group btn-group-sm" role="group" aria-label="Reminder filter">
+            <a href="<?= e($partsListAllUrl); ?>" class="btn <?= $filterReminderEnabled ? 'btn-outline-secondary' : 'btn-secondary'; ?>">All</a>
+            <a href="<?= e($partsListReminderUrl); ?>" class="btn <?= $filterReminderEnabled ? 'btn-success' : 'btn-outline-success'; ?>">Reminder Enabled</a>
+          </div>
+        </div>
         <div class="card-body table-responsive p-0">
           <table class="table table-striped mb-0">
             <thead>
@@ -546,13 +609,14 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                 <th>Vendor</th>
                 <th>Price</th>
                 <th>Stock</th>
+                <th>Reminder</th>
                 <th>Status</th>
                 <th>Actions</th>
               </tr>
             </thead>
             <tbody>
               <?php if (empty($parts)): ?>
-                <tr><td colspan="8" class="text-center text-muted py-4">No parts found.</td></tr>
+                <tr><td colspan="9" class="text-center text-muted py-4">No parts found.</td></tr>
               <?php else: ?>
                 <?php foreach ($parts as $part): ?>
                   <?php $compatibilityCount = (int) ($partCompatibilityCounts[(int) $part['id']] ?? 0); ?>
@@ -569,6 +633,11 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                     <td><?= e((string) ($part['vendor_name'] ?? '-')); ?></td>
                     <td><?= e(format_currency((float) $part['selling_price'])); ?></td>
                     <td><?= e((string) $part['stock_qty']); ?> <?= e((string) $part['unit']); ?></td>
+                    <td>
+                      <span class="badge text-bg-<?= ((int) ($part['enable_reminder'] ?? 0) === 1) ? 'success' : 'secondary'; ?>">
+                        <?= ((int) ($part['enable_reminder'] ?? 0) === 1) ? 'Yes' : 'No'; ?>
+                      </span>
+                    </td>
                     <td><span class="badge text-bg-<?= e(status_badge_class((string) $part['status_code'])); ?>"><?= e((string) $part['status_code']); ?></span></td>
                     <td class="d-flex gap-1">
                       <a class="btn btn-sm btn-outline-primary" href="<?= e(url('modules/inventory/parts_master.php?edit_id=' . (int) $part['id'])); ?>">Edit</a>

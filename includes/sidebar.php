@@ -3,6 +3,8 @@ declare(strict_types=1);
 
 $activeMenu = $active_menu ?? '';
 $isOperationsOpen = $activeMenu === 'jobs'
+    || $activeMenu === 'jobs.maintenance_setup'
+    || $activeMenu === 'jobs.maintenance_reminders'
     || $activeMenu === 'estimates'
     || $activeMenu === 'inventory'
     || is_menu_group_open('outsourced.', $activeMenu);
@@ -61,6 +63,18 @@ if ($sidebarBrandName === '') {
                   <a href="<?= e(url('modules/jobs/index.php')); ?>" class="nav-link <?= e(is_active_menu('jobs', $activeMenu)); ?>">
                     <i class="nav-icon bi bi-card-checklist"></i>
                     <p>Job Cards</p>
+                  </a>
+                </li>
+                <li class="nav-item">
+                  <a href="<?= e(url('modules/jobs/maintenance_setup.php')); ?>" class="nav-link <?= e(is_active_menu('jobs.maintenance_setup', $activeMenu)); ?>">
+                    <i class="nav-icon bi bi-sliders2"></i>
+                    <p>Vehicle Maintenance Setup</p>
+                  </a>
+                </li>
+                <li class="nav-item">
+                  <a href="<?= e(url('modules/jobs/maintenance_reminders.php')); ?>" class="nav-link <?= e(is_active_menu('jobs.maintenance_reminders', $activeMenu)); ?>">
+                    <i class="nav-icon bi bi-bell"></i>
+                    <p>Maintenance Reminders</p>
                   </a>
                 </li>
               <?php endif; ?>

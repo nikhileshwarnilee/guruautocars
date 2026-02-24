@@ -16,9 +16,11 @@ $canCreate = has_permission('job.create') || has_permission('job.manage');
 $canEdit = has_permission('job.edit') || has_permission('job.update') || has_permission('job.manage');
 $canAssign = has_permission('job.assign') || has_permission('job.manage');
 $canClose = has_permission('job.close') || has_permission('job.manage');
+$canManageManualReminders = has_permission('job.manage') || has_permission('settings.manage') || has_permission('job.create');
 $canConditionPhotoUpload = $canEdit || $canCreate;
 $jobCardColumns = table_columns('job_cards');
 $jobOdometerEnabled = in_array('odometer_km', $jobCardColumns, true);
+$jobRecommendationNoteEnabled = job_recommendation_note_feature_ready();
 $jobLaborColumns = table_columns('job_labor');
 $outsourceExpectedReturnSupported = in_array('outsource_expected_return_date', $jobLaborColumns, true);
 $outsourcedModuleReady = table_columns('outsourced_works') !== [] && table_columns('outsourced_work_payments') !== [];
@@ -691,6 +693,286 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         redirect('modules/jobs/view.php?id=' . $jobId);
     }
 
+    if ($action === 'update_recommendation_note') {
+        if (!$jobRecommendationNoteEnabled) {
+            flash_set('job_error', 'Recommendation note storage is not ready.', 'danger');
+            redirect('modules/jobs/view.php?id=' . $jobId);
+        }
+        if (!$canEdit) {
+            flash_set('job_error', 'You do not have permission to update recommendation note.', 'danger');
+            redirect('modules/jobs/view.php?id=' . $jobId);
+        }
+        if (normalize_status_code((string) ($jobForWrite['status_code'] ?? 'ACTIVE')) === 'DELETED') {
+            flash_set('job_error', 'Deleted job cards cannot be modified.', 'danger');
+            redirect('modules/jobs/view.php?id=' . $jobId);
+        }
+
+        $recommendationNote = post_string('recommendation_note', 5000);
+        $previousNote = trim((string) ($jobForWrite['recommendation_note'] ?? ''));
+        $nextNote = trim((string) $recommendationNote);
+
+        $updateStmt = db()->prepare(
+            'UPDATE job_cards
+             SET recommendation_note = :recommendation_note,
+                 updated_by = :updated_by
+             WHERE id = :id
+               AND company_id = :company_id
+               AND garage_id = :garage_id
+               AND status_code <> "DELETED"'
+        );
+        $updateStmt->execute([
+            'recommendation_note' => $nextNote !== '' ? $nextNote : null,
+            'updated_by' => $userId > 0 ? $userId : null,
+            'id' => $jobId,
+            'company_id' => $companyId,
+            'garage_id' => $garageId,
+        ]);
+
+        if ($previousNote !== $nextNote) {
+            job_append_history(
+                $jobId,
+                'UPDATE_RECOMMENDATION_NOTE',
+                null,
+                null,
+                'Recommendation note updated',
+                [
+                    'from_length' => mb_strlen($previousNote),
+                    'to_length' => mb_strlen($nextNote),
+                    'has_note' => $nextNote !== '',
+                ]
+            );
+            log_audit('job_cards', 'update_recommendation_note', $jobId, 'Updated recommendation note', [
+                'entity' => 'job_card',
+                'source' => 'UI',
+                'before' => [
+                    'recommendation_note' => $previousNote !== '' ? $previousNote : null,
+                ],
+                'after' => [
+                    'recommendation_note' => $nextNote !== '' ? $nextNote : null,
+                ],
+            ]);
+        }
+
+        flash_set('job_success', 'Recommendation note saved.', 'success');
+        redirect('modules/jobs/view.php?id=' . $jobId . '#job-information');
+    }
+
+    if ($action === 'add_manual_service_reminder') {
+        if (!$canManageManualReminders) {
+            flash_set('job_error', 'You do not have permission to add manual reminders.', 'danger');
+            redirect('modules/jobs/view.php?id=' . $jobId . '#service-reminders');
+        }
+        if (!service_reminder_feature_ready()) {
+            flash_set('job_error', 'Maintenance reminder storage is not ready.', 'danger');
+            redirect('modules/jobs/view.php?id=' . $jobId . '#service-reminders');
+        }
+        if (normalize_status_code((string) ($jobForWrite['status_code'] ?? 'ACTIVE')) === 'DELETED') {
+            flash_set('job_error', 'Deleted job cards cannot be modified.', 'danger');
+            redirect('modules/jobs/view.php?id=' . $jobId . '#service-reminders');
+        }
+
+        $vehicleId = (int) ($jobForWrite['vehicle_id'] ?? 0);
+        if ($vehicleId <= 0) {
+            flash_set('job_error', 'Invalid vehicle linked to this job.', 'danger');
+            redirect('modules/jobs/view.php?id=' . $jobId . '#service-reminders');
+        }
+
+        $itemType = service_reminder_normalize_type((string) ($_POST['item_type'] ?? ''));
+        $itemId = post_int('item_id');
+        $itemKey = trim((string) ($_POST['item_key'] ?? ''));
+        if (($itemType === '' || $itemId <= 0) && preg_match('/^(SERVICE|PART):(\d+)$/', strtoupper($itemKey), $matches) === 1) {
+            $itemType = service_reminder_normalize_type((string) ($matches[1] ?? ''));
+            $itemId = (int) ($matches[2] ?? 0);
+        }
+
+        $nextDueKm = service_reminder_parse_positive_int($_POST['next_due_km'] ?? null);
+        $nextDueDate = service_reminder_parse_date((string) ($_POST['next_due_date'] ?? ''));
+        $predictedVisitDate = service_reminder_parse_date((string) ($_POST['predicted_next_visit_date'] ?? ''));
+        $recommendationText = post_string('recommendation_text', 255);
+
+        $manualResult = service_reminder_create_manual_entry(
+            $companyId,
+            $garageId,
+            $vehicleId,
+            $itemType,
+            $itemId,
+            $nextDueKm,
+            $nextDueDate,
+            $predictedVisitDate,
+            $recommendationText,
+            $userId
+        );
+
+        if (!(bool) ($manualResult['ok'] ?? false)) {
+            $message = trim((string) ($manualResult['message'] ?? 'Unable to add manual reminder.'));
+            flash_set('job_error', $message !== '' ? $message : 'Unable to add manual reminder.', 'danger');
+            redirect('modules/jobs/view.php?id=' . $jobId . '#service-reminders');
+        }
+
+        $reminderId = (int) ($manualResult['reminder_id'] ?? 0);
+        job_append_history(
+            $jobId,
+            'ADD_MANUAL_REMINDER',
+            null,
+            null,
+            'Admin manual reminder added',
+            [
+                'reminder_id' => $reminderId > 0 ? $reminderId : null,
+                'item_type' => $itemType,
+                'item_id' => $itemId,
+                'source_type' => 'ADMIN_MANUAL',
+            ]
+        );
+        log_audit('job_cards', 'add_manual_reminder', $jobId, 'Added manual maintenance reminder from job view', [
+            'entity' => 'job_card',
+            'source' => 'UI',
+            'metadata' => [
+                'reminder_id' => $reminderId > 0 ? $reminderId : null,
+                'vehicle_id' => $vehicleId,
+                'item_type' => $itemType,
+                'item_id' => $itemId,
+                'source_type' => 'ADMIN_MANUAL',
+            ],
+        ]);
+
+        flash_set('job_success', 'Manual reminder added successfully.', 'success');
+        redirect('modules/jobs/view.php?id=' . $jobId . '#service-reminders');
+    }
+
+    if ($action === 'add_reminder_to_job') {
+        if (!$canEdit) {
+            flash_set('job_error', 'You do not have permission to add reminder items to job lines.', 'danger');
+            redirect('modules/jobs/view.php?id=' . $jobId . '#service-reminders');
+        }
+        if (job_is_locked($jobForWrite)) {
+            flash_set('job_error', 'This job card is locked and cannot be modified.', 'danger');
+            redirect('modules/jobs/view.php?id=' . $jobId . '#service-reminders');
+        }
+        if (!service_reminder_feature_ready()) {
+            flash_set('job_error', 'Maintenance reminder storage is not ready.', 'danger');
+            redirect('modules/jobs/view.php?id=' . $jobId . '#service-reminders');
+        }
+
+        $reminderId = post_int('reminder_id');
+        if ($reminderId <= 0) {
+            flash_set('job_error', 'Invalid reminder selected.', 'danger');
+            redirect('modules/jobs/view.php?id=' . $jobId . '#service-reminders');
+        }
+
+        $vehicleId = (int) ($jobForWrite['vehicle_id'] ?? 0);
+        $customerId = (int) ($jobForWrite['customer_id'] ?? 0);
+        if ($vehicleId <= 0 || $customerId <= 0) {
+            flash_set('job_error', 'Job vehicle/customer details are missing for reminder action.', 'danger');
+            redirect('modules/jobs/view.php?id=' . $jobId . '#service-reminders');
+        }
+
+        $odometerKm = $jobOdometerEnabled
+            ? service_reminder_parse_positive_int($jobForWrite['odometer_km'] ?? null)
+            : null;
+
+        $selectedReminderStmt = db()->prepare(
+            'SELECT id, item_type, item_id, item_name
+             FROM vehicle_maintenance_reminders
+             WHERE id = :id
+               AND company_id = :company_id
+               AND vehicle_id = :vehicle_id
+               AND is_active = 1
+               AND status_code = "ACTIVE"
+             LIMIT 1'
+        );
+        $selectedReminderStmt->execute([
+            'id' => $reminderId,
+            'company_id' => $companyId,
+            'vehicle_id' => $vehicleId,
+        ]);
+        $selectedReminder = $selectedReminderStmt->fetch() ?: null;
+        if (!$selectedReminder) {
+            flash_set('job_warning', 'Selected reminder is no longer active.', 'warning');
+            redirect('modules/jobs/view.php?id=' . $jobId . '#service-reminders');
+        }
+
+        $result = service_reminder_apply_job_creation_actions(
+            $companyId,
+            $garageId,
+            $jobId,
+            $vehicleId,
+            $customerId,
+            $odometerKm,
+            $userId,
+            [$reminderId => 'add']
+        );
+
+        $addedCount = (int) ($result['added_count'] ?? 0);
+        $warnings = array_values(array_filter(array_map('trim', (array) ($result['warnings'] ?? []))));
+        $visPartAddCount = 0;
+        $visPartIds = [];
+
+        $selectedType = service_reminder_normalize_type((string) ($selectedReminder['item_type'] ?? ''));
+        $selectedItemId = (int) ($selectedReminder['item_id'] ?? 0);
+        if ($addedCount > 0 && $selectedType === 'SERVICE' && $selectedItemId > 0) {
+            $mappedParts = job_fetch_vis_parts_for_service($companyId, $garageId, $vehicleId, $selectedItemId);
+            if ($mappedParts !== []) {
+                $visPartResult = job_add_vis_parts_to_job($jobId, $mappedParts);
+                $visPartAddCount = (int) ($visPartResult['added_count'] ?? 0);
+                $visPartIds = array_values(array_unique(array_map('intval', (array) ($visPartResult['part_ids'] ?? []))));
+                $warnings = array_values(array_filter(array_merge(
+                    $warnings,
+                    array_map('trim', (array) ($visPartResult['warnings'] ?? []))
+                )));
+            }
+        }
+
+        if ($addedCount > 0) {
+            job_append_history(
+                $jobId,
+                'ADD_FROM_REMINDER',
+                null,
+                null,
+                'Added reminder item to job lines',
+                [
+                    'reminder_id' => $reminderId,
+                    'added_count' => $addedCount,
+                    'selected_type' => $selectedType,
+                    'selected_item_id' => $selectedItemId,
+                    'vis_parts_added' => $visPartAddCount,
+                    'vis_part_ids' => $visPartIds,
+                ]
+            );
+            log_audit('job_cards', 'add_from_reminder', $jobId, 'Added reminder item to job lines', [
+                'entity' => 'job_card',
+                'source' => 'UI',
+                'metadata' => [
+                    'reminder_id' => $reminderId,
+                    'added_count' => $addedCount,
+                    'selected_type' => $selectedType,
+                    'selected_item_id' => $selectedItemId,
+                    'vis_parts_added' => $visPartAddCount,
+                    'vis_part_ids' => $visPartIds,
+                ],
+            ]);
+            $successMessage = 'Reminder item added to job lines.';
+            if ($selectedType === 'SERVICE') {
+                if ($visPartAddCount > 0) {
+                    $successMessage = 'Service added. VIS compatible parts also added: ' . $visPartAddCount . '.';
+                } else {
+                    $successMessage = 'Service added. No VIS compatible mapped parts found for this vehicle/service.';
+                }
+            }
+            flash_set('job_success', $successMessage, 'success');
+            if (!empty($warnings)) {
+                flash_set('job_warning', implode(' | ', array_slice($warnings, 0, 2)), 'warning');
+            }
+        } else {
+            $message = 'Reminder could not be added. It may already be completed/inactive.';
+            if (!empty($warnings)) {
+                $message = implode(' | ', array_slice($warnings, 0, 2));
+            }
+            flash_set('job_warning', $message, 'warning');
+        }
+
+        redirect('modules/jobs/view.php?id=' . $jobId . '#service-reminders');
+    }
+
     if ($action === 'transition_status') {
         $targetStatus = strtoupper(trim((string) ($_POST['next_status'] ?? '')));
         $statusNote = post_string('status_note', 255);
@@ -730,8 +1012,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         $inventoryWarnings = [];
         if ($targetStatus === 'CLOSED') {
-            $reminderPreviewRows = service_reminder_build_preview_for_job($companyId, $garageId, $jobId);
-            $reminderOverrides = service_reminder_parse_close_override_payload($_POST, $reminderPreviewRows);
             try {
                 $postResult = job_post_inventory_on_close($jobId, $companyId, $garageId, $userId);
                 $inventoryWarnings = $postResult['warnings'] ?? [];
@@ -786,8 +1066,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $jobId,
                 $companyId,
                 $garageId,
-                $userId,
-                $reminderOverrides
+                $userId
             );
         }
 
@@ -840,7 +1119,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         flash_set('job_success', 'Job status updated to ' . $targetStatus . '.', 'success');
         if ($targetStatus === 'CLOSED' && (int) ($reminderResult['created_count'] ?? 0) > 0) {
-            flash_set('job_success', 'Auto service reminders created: ' . (int) $reminderResult['created_count'] . '.', 'success');
+            flash_set('job_success', 'Auto maintenance reminders created: ' . (int) $reminderResult['created_count'] . '.', 'success');
         }
         if (!empty($inventoryWarnings)) {
             $preview = implode(' | ', array_slice($inventoryWarnings, 0, 3));
@@ -854,72 +1133,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             if (count((array) $reminderResult['warnings']) > 2) {
                 $preview .= ' | +' . (count((array) $reminderResult['warnings']) - 2) . ' more';
             }
-            flash_set('job_warning', 'Reminder engine warnings: ' . $preview, 'warning');
+            flash_set('job_warning', 'Maintenance reminder warnings: ' . $preview, 'warning');
         }
 
         redirect('modules/jobs/view.php?id=' . $jobId);
-    }
-
-    if ($action === 'add_manual_reminder') {
-        if (!$canEdit && !$canClose) {
-            flash_set('job_error', 'You do not have permission to add manual reminders.', 'danger');
-            redirect('modules/jobs/view.php?id=' . $jobId . '#service-reminders');
-        }
-
-        if (!service_reminder_feature_ready()) {
-            flash_set('job_error', 'Service reminder storage is not ready. Contact administrator.', 'danger');
-            redirect('modules/jobs/view.php?id=' . $jobId . '#service-reminders');
-        }
-
-        $serviceType = (string) ($_POST['manual_service_type'] ?? '');
-        $lastServiceKm = service_reminder_parse_positive_int($_POST['manual_last_km'] ?? null);
-        $intervalKm = service_reminder_parse_positive_int($_POST['manual_interval_km'] ?? null);
-        $nextDueKm = service_reminder_parse_positive_int($_POST['manual_next_due_km'] ?? null);
-        $intervalDays = service_reminder_parse_positive_int($_POST['manual_interval_days'] ?? null);
-        $nextDueDate = service_reminder_parse_date((string) ($_POST['manual_next_due_date'] ?? ''));
-        $recommendation = post_string('manual_note', 255);
-
-        $manualResult = service_reminder_create_manual(
-            $companyId,
-            $garageId,
-            (int) ($jobForWrite['vehicle_id'] ?? 0),
-            $jobId,
-            $serviceType,
-            $lastServiceKm,
-            $intervalKm,
-            $nextDueKm,
-            $intervalDays,
-            $nextDueDate,
-            $recommendation,
-            $userId
-        );
-        if (!(bool) ($manualResult['ok'] ?? false)) {
-            flash_set('job_error', (string) ($manualResult['message'] ?? 'Unable to save manual reminder.'), 'danger');
-            redirect('modules/jobs/view.php?id=' . $jobId . '#service-reminders');
-        }
-
-        job_append_history(
-            $jobId,
-            'MANUAL_REMINDER_ADD',
-            null,
-            null,
-            'Manual service reminder added',
-            [
-                'service_type' => service_reminder_normalize_type($serviceType),
-                'reminder_id' => (int) ($manualResult['id'] ?? 0),
-            ]
-        );
-        log_audit('job_cards', 'manual_reminder_add', $jobId, 'Manual service reminder added for vehicle', [
-            'entity' => 'service_reminder',
-            'source' => 'UI',
-            'metadata' => [
-                'reminder_id' => (int) ($manualResult['id'] ?? 0),
-                'service_type' => service_reminder_normalize_type($serviceType),
-            ],
-        ]);
-
-        flash_set('job_success', 'Manual service reminder saved.', 'success');
-        redirect('modules/jobs/view.php?id=' . $jobId . '#service-reminders');
     }
 
     if ($action === 'soft_delete') {
@@ -1057,6 +1274,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     if ($action === 'add_labor') {
         $serviceId = post_int('service_id');
+        $visSuggestionSource = trim((string) ($_POST['vis_suggestion_source'] ?? ''));
+        $autoAddVisMappedParts = $visSuggestionSource === 'SERVICE';
         $serviceCategoryKey = trim((string) ($_POST['service_category_key'] ?? ''));
         $description = post_string('description', 255);
         $quantity = post_decimal('quantity', 1.0);
@@ -1226,6 +1445,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
 
         job_recalculate_estimate($jobId);
+        $jobVehicleId = (int) ($jobForWrite['vehicle_id'] ?? 0);
+        $visPartAddCount = 0;
+        $visPartIds = [];
+        $visWarnings = [];
+        if ($autoAddVisMappedParts && $serviceId > 0 && $jobVehicleId > 0) {
+            $mappedParts = job_fetch_vis_parts_for_service($companyId, $garageId, $jobVehicleId, $serviceId);
+            if ($mappedParts !== []) {
+                $visPartResult = job_add_vis_parts_to_job($jobId, $mappedParts);
+                $visPartAddCount = (int) ($visPartResult['added_count'] ?? 0);
+                $visPartIds = array_values(array_unique(array_map('intval', (array) ($visPartResult['part_ids'] ?? []))));
+                $visWarnings = array_values(array_filter(array_map('trim', (array) ($visPartResult['warnings'] ?? []))));
+            }
+        }
+
         job_append_history(
             $jobId,
             'LABOR_ADD',
@@ -1240,6 +1473,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'description' => $description,
                 'quantity' => round($quantity, 2),
                 'unit_price' => round($unitPrice, 2),
+                'vis_suggestion_source' => $autoAddVisMappedParts ? 'SERVICE' : null,
+                'vis_parts_added' => $visPartAddCount,
+                'vis_part_ids' => $visPartIds,
                 'execution_type' => $executionType,
                 'outsource_vendor_id' => ($executionType === 'OUTSOURCED' && $outsourceVendorId > 0) ? $outsourceVendorId : null,
                 'outsource_vendor_name' => $outsourceVendorName,
@@ -1252,7 +1488,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         );
         log_audit('job_cards', 'add_labor', $jobId, 'Added labor line to job card');
 
-        flash_set('job_success', 'Labor line added successfully.', 'success');
+        if ($autoAddVisMappedParts && $serviceId > 0) {
+            if ($visPartAddCount > 0) {
+                flash_set('job_success', 'Suggested service added with VIS compatible parts: ' . $visPartAddCount . '.', 'success');
+            } else {
+                flash_set('job_success', 'Suggested service added. No VIS compatible mapped parts found for this service/vehicle variant.', 'success');
+            }
+            if (!empty($visWarnings)) {
+                flash_set('job_warning', implode(' | ', array_slice($visWarnings, 0, 2)), 'warning');
+            }
+        } else {
+            flash_set('job_success', 'Labor line added successfully.', 'success');
+        }
         redirect('modules/jobs/view.php?id=' . $jobId);
     }
 
@@ -1941,17 +2188,13 @@ foreach (job_workflow_statuses(true) as $status) {
 }
 
 $serviceReminderFeatureReady = service_reminder_feature_ready();
-$autoReminderPreviewRows = [];
-if ($serviceReminderFeatureReady && !$jobLocked && in_array('CLOSED', $nextStatuses, true)) {
-    $autoReminderPreviewRows = service_reminder_build_preview_for_job($companyId, $garageId, $jobId);
-}
 $activeServiceReminders = $serviceReminderFeatureReady
     ? service_reminder_fetch_active_by_vehicle($companyId, (int) $job['vehicle_id'], $garageId, 25)
     : [];
 $serviceReminderSummary = service_reminder_summary_counts($activeServiceReminders);
-$jobCurrentOdometerForReminder = $jobOdometerEnabled
-    ? service_reminder_parse_positive_int($job['odometer_km'] ?? null)
-    : null;
+$manualReminderItems = ($serviceReminderFeatureReady && $canManageManualReminders)
+    ? service_reminder_master_items($companyId, true)
+    : [];
 
 $visData = job_fetch_vis_suggestions($companyId, $garageId, (int) $job['vehicle_id']);
 $visVariant = $visData['vehicle_variant'];
@@ -2081,7 +2324,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 
       <div class="row g-3">
         <div class="col-xl-4">
-          <div class="card">
+          <div class="card" id="job-information">
             <div class="card-header"><h3 class="card-title">Job Information</h3></div>
             <div class="card-body">
               <p class="mb-2"><strong>Status:</strong> <span class="badge text-bg-<?= e(job_status_badge_class((string) $job['status'])); ?>"><?= e((string) $job['status']); ?></span></p>
@@ -2096,7 +2339,21 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                 <p class="mb-2"><strong>Odometer:</strong> <?= e(number_format((float) ($job['odometer_km'] ?? 0), 0)); ?> KM</p>
               <?php endif; ?>
               <p class="mb-2"><strong>Complaint:</strong><br><?= nl2br(e((string) $job['complaint'])); ?></p>
-              <p class="mb-0"><strong>Diagnosis:</strong><br><?= nl2br(e((string) ($job['diagnosis'] ?? '-'))); ?></p>
+              <p class="mb-2"><strong>Diagnosis:</strong><br><?= nl2br(e((string) ($job['diagnosis'] ?? '-'))); ?></p>
+              <?php if ($jobRecommendationNoteEnabled): ?>
+                <p class="mb-2"><strong>Recommendation Note:</strong><br><?= nl2br(e((string) ((($job['recommendation_note'] ?? '') !== '') ? $job['recommendation_note'] : '-'))); ?></p>
+                <?php if ($canEdit && normalize_status_code((string) ($job['status_code'] ?? 'ACTIVE')) !== 'DELETED'): ?>
+                  <form method="post" class="mt-2">
+                    <?= csrf_field(); ?>
+                    <input type="hidden" name="_action" value="update_recommendation_note">
+                    <label class="form-label">Update Recommendation Note</label>
+                    <textarea name="recommendation_note" class="form-control" rows="3" maxlength="5000"><?= e((string) ($job['recommendation_note'] ?? '')); ?></textarea>
+                    <div class="d-flex justify-content-end mt-2">
+                      <button type="submit" class="btn btn-sm btn-outline-primary">Save Recommendation Note</button>
+                    </div>
+                  </form>
+                <?php endif; ?>
+              <?php endif; ?>
               <?php if (!empty($job['cancel_note'])): ?>
                 <div class="alert alert-light border mt-3 mb-0"><strong>Audit Note:</strong> <?= e((string) $job['cancel_note']); ?></div>
               <?php endif; ?>
@@ -2225,71 +2482,11 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                       <textarea id="status-note-input" name="status_note" class="form-control" rows="2" placeholder="Optional note (required for CANCELLED)"></textarea>
                     </div>
 
-                    <div id="close-reminder-preview" class="mt-3 <?= ($serviceReminderFeatureReady && !empty($autoReminderPreviewRows)) ? '' : 'd-none'; ?>">
-                      <div class="border rounded p-2 bg-light">
-                        <div class="fw-semibold mb-2">Auto Service Reminder Preview (Applied On CLOSE)</div>
-                        <?php if (!$serviceReminderFeatureReady): ?>
-                          <div class="text-muted small">Reminder storage is not ready. Run DB upgrade to enable this module.</div>
-                        <?php elseif (empty($autoReminderPreviewRows)): ?>
-                          <div class="text-muted small">No auto reminders detected from current job lines and VIS interval rules.</div>
-                        <?php else: ?>
-                          <div class="table-responsive">
-                            <table class="table table-sm table-bordered mb-2">
-                              <thead>
-                                <tr>
-                                  <th style="width:6%;">On</th>
-                                  <th style="width:15%;">Service</th>
-                                  <th style="width:10%;">Last KM</th>
-                                  <th style="width:10%;">Interval KM</th>
-                                  <th style="width:10%;">Next Due KM</th>
-                                  <th style="width:9%;">Days</th>
-                                  <th style="width:12%;">Next Date</th>
-                                  <th style="width:12%;">Predicted Visit</th>
-                                  <th style="width:16%;">Recommendation</th>
-                                </tr>
-                              </thead>
-                              <tbody>
-                                <?php foreach ($autoReminderPreviewRows as $previewRow): ?>
-                                  <?php
-                                    $serviceTypeKey = (string) ($previewRow['service_type'] ?? '');
-                                    if ($serviceTypeKey === '') {
-                                        continue;
-                                    }
-                                  ?>
-                                  <tr data-reminder-row="1">
-                                    <td class="text-center">
-                                      <input type="hidden" name="reminder_enabled[<?= e($serviceTypeKey); ?>]" value="0">
-                                      <input class="form-check-input js-reminder-enable" type="checkbox" name="reminder_enabled[<?= e($serviceTypeKey); ?>]" value="1" checked>
-                                    </td>
-                                    <td class="fw-semibold"><?= e((string) ($previewRow['service_label'] ?? $serviceTypeKey)); ?></td>
-                                    <td>
-                                      <input type="number" step="1" min="0" name="reminder_last_km[<?= e($serviceTypeKey); ?>]" value="<?= e((string) ($previewRow['last_service_km'] ?? '')); ?>" class="form-control form-control-sm js-reminder-input">
-                                    </td>
-                                    <td>
-                                      <input type="number" step="1" min="0" name="reminder_interval_km[<?= e($serviceTypeKey); ?>]" value="<?= e((string) ($previewRow['interval_km'] ?? '')); ?>" class="form-control form-control-sm js-reminder-input">
-                                    </td>
-                                    <td>
-                                      <input type="number" step="1" min="0" name="reminder_next_due_km[<?= e($serviceTypeKey); ?>]" value="<?= e((string) ($previewRow['next_due_km'] ?? '')); ?>" class="form-control form-control-sm js-reminder-input">
-                                    </td>
-                                    <td>
-                                      <input type="number" step="1" min="0" name="reminder_interval_days[<?= e($serviceTypeKey); ?>]" value="<?= e((string) ($previewRow['interval_days'] ?? '')); ?>" class="form-control form-control-sm js-reminder-input">
-                                    </td>
-                                    <td>
-                                      <input type="date" name="reminder_next_due_date[<?= e($serviceTypeKey); ?>]" value="<?= e((string) ($previewRow['next_due_date'] ?? '')); ?>" class="form-control form-control-sm js-reminder-input">
-                                    </td>
-                                    <td class="small"><?= e((string) (($previewRow['predicted_next_visit_date'] ?? '') !== '' ? $previewRow['predicted_next_visit_date'] : '-')); ?></td>
-                                    <td>
-                                      <input type="text" maxlength="255" name="reminder_note[<?= e($serviceTypeKey); ?>]" value="<?= e((string) ($previewRow['recommendation_text'] ?? '')); ?>" class="form-control form-control-sm js-reminder-input">
-                                    </td>
-                                  </tr>
-                                <?php endforeach; ?>
-                              </tbody>
-                            </table>
-                          </div>
-                          <div class="small text-muted">Unchecked rows are skipped on close, and any existing active reminder for that service type is marked inactive.</div>
-                        <?php endif; ?>
+                    <?php if (in_array('CLOSED', $nextStatuses, true)): ?>
+                      <div class="alert alert-light border mt-3 mb-0">
+                        On <strong>CLOSE</strong>, maintenance reminders are auto-generated from completed services/parts using vehicle-specific maintenance rules.
                       </div>
-                    </div>
+                    <?php endif; ?>
                   <?php endif; ?>
                 </div>
                 <div class="card-footer">
@@ -2298,113 +2495,6 @@ require_once __DIR__ . '/../../includes/sidebar.php';
               </form>
             </div>
 
-            <div class="card card-outline card-success" id="service-reminders">
-              <div class="card-header d-flex justify-content-between align-items-center">
-                <h3 class="card-title mb-0">Service Reminders</h3>
-                <span class="badge text-bg-light border"><?= (int) ($serviceReminderSummary['total'] ?? 0); ?> Active</span>
-              </div>
-              <div class="card-body">
-                <?php if (!$serviceReminderFeatureReady): ?>
-                  <div class="alert alert-warning mb-0">Service reminder storage is not ready. Please run DB upgrade.</div>
-                <?php else: ?>
-                  <div class="row g-2 mb-3">
-                    <div class="col-6 col-lg-3">
-                      <div class="small text-muted">Overdue</div>
-                      <div class="fw-semibold text-danger"><?= (int) ($serviceReminderSummary['overdue'] ?? 0); ?></div>
-                    </div>
-                    <div class="col-6 col-lg-3">
-                      <div class="small text-muted">Due Soon</div>
-                      <div class="fw-semibold text-warning"><?= (int) ($serviceReminderSummary['due_soon'] ?? 0); ?></div>
-                    </div>
-                    <div class="col-6 col-lg-3">
-                      <div class="small text-muted">Upcoming</div>
-                      <div class="fw-semibold text-info"><?= (int) ($serviceReminderSummary['upcoming'] ?? 0); ?></div>
-                    </div>
-                    <div class="col-6 col-lg-3">
-                      <div class="small text-muted">Unscheduled</div>
-                      <div class="fw-semibold text-secondary"><?= (int) ($serviceReminderSummary['unscheduled'] ?? 0); ?></div>
-                    </div>
-                  </div>
-
-                  <div class="table-responsive mb-3">
-                    <table class="table table-sm table-bordered align-middle mb-0">
-                      <thead>
-                        <tr>
-                          <th>Service</th>
-                          <th>Due KM</th>
-                          <th>Due Date</th>
-                          <th>Predicted Visit</th>
-                          <th>Status</th>
-                          <th>Source</th>
-                          <th>Recommendation</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        <?php if (empty($activeServiceReminders)): ?>
-                          <tr><td colspan="7" class="text-center text-muted">No active reminders for this vehicle.</td></tr>
-                        <?php else: ?>
-                          <?php foreach ($activeServiceReminders as $reminder): ?>
-                            <tr>
-                              <td><?= e((string) ($reminder['service_label'] ?? service_reminder_type_label((string) ($reminder['service_type'] ?? '')))); ?></td>
-                              <td class="text-end"><?= isset($reminder['next_due_km']) && $reminder['next_due_km'] !== null ? e(number_format((float) $reminder['next_due_km'], 0)) : '-'; ?></td>
-                              <td><?= e((string) (($reminder['next_due_date'] ?? '') !== '' ? $reminder['next_due_date'] : '-')); ?></td>
-                              <td><?= e((string) (($reminder['predicted_next_visit_date'] ?? '') !== '' ? $reminder['predicted_next_visit_date'] : '-')); ?></td>
-                              <td><span class="badge text-bg-<?= e(service_reminder_due_badge_class((string) ($reminder['due_state'] ?? 'UNSCHEDULED'))); ?>"><?= e((string) ($reminder['due_state'] ?? 'UNSCHEDULED')); ?></span></td>
-                              <td><?= e((string) ($reminder['source_type'] ?? 'AUTO')); ?></td>
-                              <td class="small"><?= e((string) ($reminder['recommendation_text'] ?? '-')); ?></td>
-                            </tr>
-                          <?php endforeach; ?>
-                        <?php endif; ?>
-                      </tbody>
-                    </table>
-                  </div>
-
-                  <?php if ($canEdit || $canClose): ?>
-                    <h6 class="mb-2">Add / Override Manual Reminder</h6>
-                    <form method="post" class="row g-2 align-items-end">
-                      <?= csrf_field(); ?>
-                      <input type="hidden" name="_action" value="add_manual_reminder">
-                      <div class="col-md-3">
-                        <label class="form-label">Service Type</label>
-                        <select name="manual_service_type" class="form-select" required>
-                          <option value="">Select</option>
-                          <?php foreach (service_reminder_supported_types() as $serviceType): ?>
-                            <option value="<?= e($serviceType); ?>"><?= e(service_reminder_type_label($serviceType)); ?></option>
-                          <?php endforeach; ?>
-                        </select>
-                      </div>
-                      <div class="col-md-2">
-                        <label class="form-label">Last KM</label>
-                        <input type="number" step="1" min="0" name="manual_last_km" class="form-control" value="<?= e((string) ($jobCurrentOdometerForReminder ?? '')); ?>">
-                      </div>
-                      <div class="col-md-2">
-                        <label class="form-label">Interval KM</label>
-                        <input type="number" step="1" min="0" name="manual_interval_km" class="form-control">
-                      </div>
-                      <div class="col-md-2">
-                        <label class="form-label">Next Due KM</label>
-                        <input type="number" step="1" min="0" name="manual_next_due_km" class="form-control">
-                      </div>
-                      <div class="col-md-1">
-                        <label class="form-label">Days</label>
-                        <input type="number" step="1" min="0" name="manual_interval_days" class="form-control">
-                      </div>
-                      <div class="col-md-2">
-                        <label class="form-label">Next Date</label>
-                        <input type="date" name="manual_next_due_date" class="form-control">
-                      </div>
-                      <div class="col-12">
-                        <label class="form-label">Recommendation</label>
-                        <input type="text" maxlength="255" name="manual_note" class="form-control" placeholder="Custom recommendation text">
-                      </div>
-                      <div class="col-12">
-                        <button type="submit" class="btn btn-outline-success">Save Manual Reminder</button>
-                      </div>
-                    </form>
-                  <?php endif; ?>
-                <?php endif; ?>
-              </div>
-            </div>
           <?php endif; ?>
 
           <?php if (($canEdit || $canClose) && normalize_status_code((string) ($job['status_code'] ?? 'ACTIVE')) !== 'DELETED'): ?>
@@ -2468,6 +2558,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                           <form method="post" class="d-inline">
                             <?= csrf_field(); ?>
                             <input type="hidden" name="_action" value="add_labor">
+                            <input type="hidden" name="vis_suggestion_source" value="SERVICE">
                             <input type="hidden" name="service_id" value="<?= (int) $suggestion['service_id']; ?>">
                             <input type="hidden" name="service_category_key" value="<?= e($suggestionCategoryKey); ?>">
                             <input type="hidden" name="description" value="<?= e((string) $suggestion['service_name']); ?>">
@@ -2970,6 +3061,143 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                   <?php endif; ?>
                 </tbody>
               </table>
+            </div>
+          </div>
+
+          <div class="card card-outline card-success" id="service-reminders">
+            <div class="card-header d-flex justify-content-between align-items-center">
+              <h3 class="card-title mb-0">Maintenance Reminders</h3>
+              <span class="badge text-bg-light border"><?= (int) ($serviceReminderSummary['total'] ?? 0); ?> Active</span>
+            </div>
+            <div class="card-body">
+              <?php if (!$serviceReminderFeatureReady): ?>
+                <div class="alert alert-warning mb-0">Maintenance reminder storage is not ready. Please run DB upgrade.</div>
+              <?php else: ?>
+                <?php if ($canManageManualReminders): ?>
+                  <div class="card card-outline card-success mb-3">
+                    <div class="card-header py-2"><h3 class="card-title mb-0">Add Manual Service Reminder (Admin)</h3></div>
+                    <div class="card-body">
+                      <?php if (empty($manualReminderItems)): ?>
+                        <div class="text-muted small">No reminder-enabled services/parts found in masters.</div>
+                      <?php else: ?>
+                        <form method="post" class="row g-2 align-items-end">
+                          <?= csrf_field(); ?>
+                          <input type="hidden" name="_action" value="add_manual_service_reminder">
+                          <div class="col-lg-5">
+                            <label class="form-label">Service / Part</label>
+                            <select name="item_key" class="form-select" required>
+                              <option value="">Select Reminder-Enabled Item</option>
+                              <?php foreach ($manualReminderItems as $manualItem): ?>
+                                <?php
+                                  $manualType = service_reminder_normalize_type((string) ($manualItem['item_type'] ?? ''));
+                                  $manualId = (int) ($manualItem['item_id'] ?? 0);
+                                  if ($manualType === '' || $manualId <= 0) {
+                                      continue;
+                                  }
+                                  $manualName = trim((string) ($manualItem['item_name'] ?? ''));
+                                  $manualCode = trim((string) ($manualItem['item_code'] ?? ''));
+                                ?>
+                                <option value="<?= e($manualType . ':' . $manualId); ?>">
+                                  [<?= e($manualType); ?>] <?= e($manualName !== '' ? $manualName : ($manualType . ' #' . $manualId)); ?><?= $manualCode !== '' ? ' (' . e($manualCode) . ')' : ''; ?>
+                                </option>
+                              <?php endforeach; ?>
+                            </select>
+                          </div>
+                          <div class="col-lg-2">
+                            <label class="form-label">Due KM</label>
+                            <input type="number" name="next_due_km" class="form-control" min="0" placeholder="Optional">
+                          </div>
+                          <div class="col-lg-2">
+                            <label class="form-label">Due Date</label>
+                            <input type="date" name="next_due_date" class="form-control">
+                          </div>
+                          <div class="col-lg-3">
+                            <label class="form-label">Predicted Visit</label>
+                            <input type="date" name="predicted_next_visit_date" class="form-control">
+                          </div>
+                          <div class="col-lg-9">
+                            <label class="form-label">Recommendation</label>
+                            <input type="text" name="recommendation_text" class="form-control" maxlength="255" placeholder="Optional recommendation text">
+                          </div>
+                          <div class="col-lg-3 d-grid">
+                            <button type="submit" class="btn btn-success">Add Manual Reminder</button>
+                          </div>
+                        </form>
+                        <div class="form-text mt-2">Reminder source will be saved as <strong>ADMIN_MANUAL</strong>.</div>
+                      <?php endif; ?>
+                    </div>
+                  </div>
+                <?php endif; ?>
+
+                <div class="row g-2 mb-3">
+                  <div class="col-6 col-lg-3">
+                    <div class="small text-muted">Overdue</div>
+                    <div class="fw-semibold text-danger"><?= (int) ($serviceReminderSummary['overdue'] ?? 0); ?></div>
+                  </div>
+                  <div class="col-6 col-lg-3">
+                    <div class="small text-muted">Due</div>
+                    <div class="fw-semibold text-warning"><?= (int) (($serviceReminderSummary['due'] ?? 0) + ($serviceReminderSummary['due_soon'] ?? 0)); ?></div>
+                  </div>
+                  <div class="col-6 col-lg-3">
+                    <div class="small text-muted">Upcoming</div>
+                    <div class="fw-semibold text-info"><?= (int) ($serviceReminderSummary['upcoming'] ?? 0); ?></div>
+                  </div>
+                  <div class="col-6 col-lg-3">
+                    <div class="small text-muted">Completed</div>
+                    <div class="fw-semibold text-secondary"><?= (int) ($serviceReminderSummary['completed'] ?? 0); ?></div>
+                  </div>
+                </div>
+
+                <div class="small text-muted mb-2">
+                  Quick Add: selecting <strong>Add</strong> on a service reminder adds the service line and all VIS-mapped compatible parts for this vehicle variant.
+                </div>
+
+                <div class="table-responsive mb-3">
+                  <table class="table table-sm table-bordered align-middle mb-0">
+                    <thead>
+                      <tr>
+                        <th>Service/Part</th>
+                        <th>Due KM</th>
+                        <th>Due Date</th>
+                        <th>Predicted Visit</th>
+                        <th>Status</th>
+                        <th>Source</th>
+                        <th>Recommendation</th>
+                        <th>Action</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <?php if (empty($activeServiceReminders)): ?>
+                        <tr><td colspan="8" class="text-center text-muted">No active reminders for this vehicle.</td></tr>
+                      <?php else: ?>
+                        <?php foreach ($activeServiceReminders as $reminder): ?>
+                          <tr>
+                            <td><?= e((string) ($reminder['service_label'] ?? service_reminder_type_label((string) ($reminder['service_type'] ?? '')))); ?></td>
+                            <td class="text-end"><?= isset($reminder['next_due_km']) && $reminder['next_due_km'] !== null ? e(number_format((float) $reminder['next_due_km'], 0)) : '-'; ?></td>
+                            <td><?= e((string) (($reminder['next_due_date'] ?? '') !== '' ? $reminder['next_due_date'] : '-')); ?></td>
+                            <td><?= e((string) (($reminder['predicted_next_visit_date'] ?? '') !== '' ? $reminder['predicted_next_visit_date'] : '-')); ?></td>
+                            <td><span class="badge text-bg-<?= e(service_reminder_due_badge_class((string) ($reminder['due_state'] ?? 'UNSCHEDULED'))); ?>"><?= e((string) ($reminder['due_state'] ?? 'UNSCHEDULED')); ?></span></td>
+                            <td><?= e((string) ($reminder['source_type'] ?? 'AUTO')); ?></td>
+                            <td class="small"><?= e((string) ($reminder['recommendation_text'] ?? '-')); ?></td>
+                            <td>
+                              <?php if ($canEdit && !$jobLocked): ?>
+                                <form method="post" class="d-inline">
+                                  <?= csrf_field(); ?>
+                                  <input type="hidden" name="_action" value="add_reminder_to_job">
+                                  <input type="hidden" name="reminder_id" value="<?= (int) ($reminder['id'] ?? 0); ?>">
+                                  <button type="submit" class="btn btn-sm btn-outline-primary">Add</button>
+                                </form>
+                              <?php else: ?>
+                                <span class="text-muted small">Locked</span>
+                              <?php endif; ?>
+                            </td>
+                          </tr>
+                        <?php endforeach; ?>
+                      <?php endif; ?>
+                    </tbody>
+                  </table>
+                </div>
+              <?php endif; ?>
             </div>
           </div>
 
@@ -3500,8 +3728,6 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 
     var nextStatusSelect = document.getElementById('next-status-select');
     var statusNoteInput = document.getElementById('status-note-input');
-    var closeReminderPreview = document.getElementById('close-reminder-preview');
-    var reminderRows = document.querySelectorAll('[data-reminder-row]');
 
     function toggleStatusNoteRequirement() {
       if (!nextStatusSelect || !statusNoteInput) {
@@ -3517,54 +3743,11 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       }
     }
 
-    function toggleCloseReminderPreview() {
-      if (!nextStatusSelect || !closeReminderPreview) {
-        return;
-      }
-      if (nextStatusSelect.value === 'CLOSED') {
-        closeReminderPreview.classList.remove('d-none');
-      } else {
-        closeReminderPreview.classList.add('d-none');
-      }
-    }
-
-    function syncReminderRowInputs(row) {
-      if (!row) {
-        return;
-      }
-      var enableCheckbox = row.querySelector('.js-reminder-enable');
-      if (!enableCheckbox) {
-        return;
-      }
-      var rowInputs = row.querySelectorAll('.js-reminder-input');
-      for (var index = 0; index < rowInputs.length; index++) {
-        rowInputs[index].disabled = !enableCheckbox.checked;
-      }
-    }
-
-    if (reminderRows && reminderRows.length > 0) {
-      for (var rowIndex = 0; rowIndex < reminderRows.length; rowIndex++) {
-        var reminderRow = reminderRows[rowIndex];
-        var rowCheckbox = reminderRow ? reminderRow.querySelector('.js-reminder-enable') : null;
-        if (!rowCheckbox) {
-          continue;
-        }
-        rowCheckbox.addEventListener('change', (function (rowRef) {
-          return function () {
-            syncReminderRowInputs(rowRef);
-          };
-        })(reminderRow));
-        syncReminderRowInputs(reminderRow);
-      }
-    }
-
     if (nextStatusSelect && statusNoteInput) {
       nextStatusSelect.addEventListener('change', function () {
         toggleStatusNoteRequirement();
-        toggleCloseReminderPreview();
       });
       toggleStatusNoteRequirement();
-      toggleCloseReminderPreview();
     }
   })();
 </script>

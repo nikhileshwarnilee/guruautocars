@@ -248,7 +248,7 @@ function reports_module_links(): array
         ],
         [
             'menu_key' => 'reports.service_reminders',
-            'label' => 'Service Reminders',
+            'label' => 'Maintenance Reminders',
             'icon' => 'bi bi-bell',
             'path' => 'modules/reports/service_reminders.php',
         ],

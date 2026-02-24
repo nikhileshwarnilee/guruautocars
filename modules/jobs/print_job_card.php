@@ -225,6 +225,13 @@ $companyLogoUrl = company_logo_url((int) ($job['company_id'] ?? $companyId), $ga
             <div class="border rounded p-2"><?= nl2br(e((string) (($job['diagnosis'] ?? '') !== '' ? $job['diagnosis'] : '-'))); ?></div>
           </div>
 
+          <?php if (trim((string) ($job['recommendation_note'] ?? '')) !== ''): ?>
+            <div class="mb-3">
+              <h6 class="mb-1">Recommendation Note</h6>
+              <div class="border rounded p-2"><?= nl2br(e((string) $job['recommendation_note'])); ?></div>
+            </div>
+          <?php endif; ?>
+
           <div class="table-responsive mb-3">
             <table class="table table-bordered table-sm">
               <thead>

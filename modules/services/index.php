@@ -10,6 +10,16 @@ $active_menu = 'services.master';
 $canManage = has_permission('service.manage');
 $companyId = active_company_id();
 $userId = (int) ($_SESSION['user_id'] ?? 0);
+$serviceColumns = table_columns('services');
+$hasEnableReminder = in_array('enable_reminder', $serviceColumns, true);
+if (!$hasEnableReminder) {
+    try {
+        db()->exec('ALTER TABLE services ADD COLUMN enable_reminder TINYINT(1) NOT NULL DEFAULT 0');
+        $hasEnableReminder = in_array('enable_reminder', table_columns('services'), true);
+    } catch (Throwable $exception) {
+        $hasEnableReminder = false;
+    }
+}
 
 function fetch_service_categories_master(int $companyId): array
 {
@@ -82,6 +92,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $defaultRate = (float) ($_POST['default_rate'] ?? 0);
         $gstRate = (float) ($_POST['gst_rate'] ?? 18);
         $statusCode = normalize_status_code((string) ($_POST['status_code'] ?? 'ACTIVE'));
+        $enableReminder = (int) ($_POST['enable_reminder'] ?? 0) === 1 ? 1 : 0;
 
         $category = find_service_category($companyId, $categoryId);
         if ($serviceCode === '' || $serviceName === '' || !$category) {
@@ -90,13 +101,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
 
         try {
-            $stmt = db()->prepare(
-                'INSERT INTO services
-                  (company_id, category_id, service_code, service_name, description, default_hours, default_rate, gst_rate, status_code, deleted_at, created_by)
-                 VALUES
-                  (:company_id, :category_id, :service_code, :service_name, :description, :default_hours, :default_rate, :gst_rate, :status_code, :deleted_at, :created_by)'
-            );
-            $stmt->execute([
+            $insertColumns = 'company_id, category_id, service_code, service_name, description, default_hours, default_rate, gst_rate, status_code, deleted_at, created_by';
+            $insertValues = ':company_id, :category_id, :service_code, :service_name, :description, :default_hours, :default_rate, :gst_rate, :status_code, :deleted_at, :created_by';
+            $insertParams = [
                 'company_id' => $companyId,
                 'category_id' => $categoryId,
                 'service_code' => $serviceCode,
@@ -108,7 +115,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'status_code' => $statusCode,
                 'deleted_at' => $statusCode === 'DELETED' ? date('Y-m-d H:i:s') : null,
                 'created_by' => $userId > 0 ? $userId : null,
-            ]);
+            ];
+            if ($hasEnableReminder) {
+                $insertColumns .= ', enable_reminder';
+                $insertValues .= ', :enable_reminder';
+                $insertParams['enable_reminder'] = $enableReminder;
+            }
+
+            $stmt = db()->prepare(
+                'INSERT INTO services
+                  (' . $insertColumns . ')
+                 VALUES
+                  (' . $insertValues . ')'
+            );
+            $stmt->execute($insertParams);
 
             $serviceId = (int) db()->lastInsertId();
             log_audit('services', 'create', $serviceId, 'Created service ' . $serviceCode, [
@@ -124,6 +144,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'status_code' => $statusCode,
                     'default_rate' => (float) $defaultRate,
                     'gst_rate' => (float) $gstRate,
+                    'enable_reminder' => $hasEnableReminder ? $enableReminder : 0,
                 ],
             ]);
             flash_set('service_success', 'Service created successfully.', 'success');
@@ -143,6 +164,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $defaultRate = (float) ($_POST['default_rate'] ?? 0);
         $gstRate = (float) ($_POST['gst_rate'] ?? 18);
         $statusCode = normalize_status_code((string) ($_POST['status_code'] ?? 'ACTIVE'));
+        $enableReminder = (int) ($_POST['enable_reminder'] ?? 0) === 1 ? 1 : 0;
 
         $category = find_service_category($companyId, $categoryId);
         if ($serviceId <= 0 || $serviceName === '' || !$category) {
@@ -151,7 +173,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
 
         $beforeStmt = db()->prepare(
-            'SELECT service_name, status_code, default_rate, gst_rate, category_id
+            'SELECT service_name, status_code, default_rate, gst_rate, category_id,
+                    ' . ($hasEnableReminder ? 'enable_reminder' : '0') . ' AS enable_reminder
              FROM services
              WHERE id = :id
                AND company_id = :company_id
@@ -163,7 +186,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         ]);
         $beforeService = $beforeStmt->fetch() ?: null;
 
-        $stmt = db()->prepare(
+        $updateSql =
             'UPDATE services
              SET category_id = :category_id,
                  service_name = :service_name,
@@ -171,12 +194,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                  default_hours = :default_hours,
                  default_rate = :default_rate,
                  gst_rate = :gst_rate,
-                 status_code = :status_code,
+                 status_code = :status_code';
+        if ($hasEnableReminder) {
+            $updateSql .= ',
+                 enable_reminder = :enable_reminder';
+        }
+        $updateSql .= ',
                  deleted_at = CASE WHEN :status_code = "DELETED" THEN NOW() ELSE NULL END
              WHERE id = :id
-               AND company_id = :company_id'
-        );
-        $stmt->execute([
+               AND company_id = :company_id';
+        $updateParams = [
             'category_id' => $categoryId,
             'service_name' => $serviceName,
             'description' => $description !== '' ? $description : null,
@@ -186,7 +213,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'status_code' => $statusCode,
             'id' => $serviceId,
             'company_id' => $companyId,
-        ]);
+        ];
+        if ($hasEnableReminder) {
+            $updateParams['enable_reminder'] = $enableReminder;
+        }
+        $stmt = db()->prepare($updateSql);
+        $stmt->execute($updateParams);
 
         log_audit('services', 'update', $serviceId, 'Updated service', [
             'entity' => 'service',
@@ -197,6 +229,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'status_code' => (string) ($beforeService['status_code'] ?? ''),
                 'default_rate' => (float) ($beforeService['default_rate'] ?? 0),
                 'gst_rate' => (float) ($beforeService['gst_rate'] ?? 0),
+                'enable_reminder' => (int) ($beforeService['enable_reminder'] ?? 0),
             ] : null,
             'after' => [
                 'category_id' => $categoryId,
@@ -205,6 +238,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'status_code' => $statusCode,
                 'default_rate' => (float) $defaultRate,
                 'gst_rate' => (float) $gstRate,
+                'enable_reminder' => $hasEnableReminder ? $enableReminder : 0,
             ],
         ]);
         flash_set('service_success', 'Service updated successfully.', 'success');
@@ -275,8 +309,10 @@ if ($editId > 0) {
 
 $serviceCategories = fetch_service_categories_master($companyId);
 $categoryFilterRaw = trim((string) ($_GET['category_filter'] ?? 'all'));
+$reminderFilterRaw = strtolower(trim((string) ($_GET['reminder_filter'] ?? 'all')));
 $categoryFilterId = null;
 $filterUncategorized = false;
+$filterReminderEnabled = false;
 
 if ($categoryFilterRaw === 'uncategorized') {
     $filterUncategorized = true;
@@ -284,6 +320,12 @@ if ($categoryFilterRaw === 'uncategorized') {
     $categoryFilterId = (int) $categoryFilterRaw;
 } else {
     $categoryFilterRaw = 'all';
+}
+
+if ($reminderFilterRaw === 'enabled' && $hasEnableReminder) {
+    $filterReminderEnabled = true;
+} else {
+    $reminderFilterRaw = 'all';
 }
 
 $uncategorizedCountStmt = db()->prepare(
@@ -313,6 +355,10 @@ if ($filterUncategorized) {
     $sql .= ' AND s.category_id IS NULL';
 }
 
+if ($filterReminderEnabled) {
+    $sql .= ' AND COALESCE(s.enable_reminder, 0) = 1';
+}
+
 $sql .= ' ORDER BY
             CASE WHEN s.category_id IS NULL THEN 1 ELSE 0 END,
             COALESCE(sc.category_name, "Uncategorized"),
@@ -335,6 +381,15 @@ foreach ($services as $service) {
 
     $serviceGroups[$groupKey]['rows'][] = $service;
 }
+
+$listFilterParams = [];
+if ($categoryFilterRaw !== 'all') {
+    $listFilterParams['category_filter'] = $categoryFilterRaw;
+}
+$serviceListAllUrl = url('modules/services/index.php' . ($listFilterParams !== [] ? ('?' . http_build_query($listFilterParams)) : ''));
+$reminderFilterParams = $listFilterParams;
+$reminderFilterParams['reminder_filter'] = 'enabled';
+$serviceListReminderUrl = url('modules/services/index.php?' . http_build_query($reminderFilterParams));
 
 require_once __DIR__ . '/../../includes/header.php';
 require_once __DIR__ . '/../../includes/sidebar.php';
@@ -375,6 +430,9 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                 <?php endif; ?>
               </select>
             </div>
+            <?php if ($filterReminderEnabled): ?>
+              <input type="hidden" name="reminder_filter" value="enabled">
+            <?php endif; ?>
             <div class="col-auto d-flex gap-2">
               <button type="submit" class="btn btn-outline-primary">Apply</button>
               <a href="<?= e(url('modules/services/index.php')); ?>" class="btn btn-outline-secondary">Reset</a>
@@ -435,6 +493,14 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                 <label class="form-label">GST%</label>
                 <input type="number" name="gst_rate" step="0.01" class="form-control" value="<?= e((string) ($editService['gst_rate'] ?? '18')); ?>" />
               </div>
+              <div class="col-md-2">
+                <label class="form-label">Enable Reminder</label>
+                <select name="enable_reminder" class="form-select">
+                  <?php $enableReminderValue = (int) ($editService['enable_reminder'] ?? 0); ?>
+                  <option value="0" <?= $enableReminderValue === 0 ? 'selected' : ''; ?>>No</option>
+                  <option value="1" <?= $enableReminderValue === 1 ? 'selected' : ''; ?>>Yes</option>
+                </select>
+              </div>
               <div class="col-md-1">
                 <label class="form-label">Status</label>
                 <select name="status_code" class="form-select" required>
@@ -460,7 +526,13 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       <?php endif; ?>
 
       <div class="card">
-        <div class="card-header"><h3 class="card-title">Service List</h3></div>
+        <div class="card-header d-flex justify-content-between align-items-center gap-2 flex-wrap">
+          <h3 class="card-title mb-0">Service List</h3>
+          <div class="btn-group btn-group-sm" role="group" aria-label="Reminder filter">
+            <a href="<?= e($serviceListAllUrl); ?>" class="btn <?= $filterReminderEnabled ? 'btn-outline-secondary' : 'btn-secondary'; ?>">All</a>
+            <a href="<?= e($serviceListReminderUrl); ?>" class="btn <?= $filterReminderEnabled ? 'btn-success' : 'btn-outline-success'; ?>">Reminder Enabled</a>
+          </div>
+        </div>
         <div class="card-body table-responsive p-0">
           <table class="table table-striped mb-0">
             <thead>
@@ -471,6 +543,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                 <th>Hours</th>
                 <th>Rate</th>
                 <th>GST%</th>
+                <th>Reminder</th>
                 <th>VIS Parts Mapped</th>
                 <th>Status</th>
                 <th>Actions</th>
@@ -478,11 +551,11 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             </thead>
             <tbody>
               <?php if (empty($serviceGroups)): ?>
-                <tr><td colspan="9" class="text-center text-muted py-4">No services found.</td></tr>
+                <tr><td colspan="10" class="text-center text-muted py-4">No services found.</td></tr>
               <?php else: ?>
                 <?php foreach ($serviceGroups as $group): ?>
                   <tr class="table-secondary">
-                    <th colspan="9">Category: <?= e((string) $group['label']); ?> (<?= count($group['rows']); ?>)</th>
+                    <th colspan="10">Category: <?= e((string) $group['label']); ?> (<?= count($group['rows']); ?>)</th>
                   </tr>
                   <?php foreach ($group['rows'] as $service): ?>
                     <tr>
@@ -492,6 +565,11 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                       <td><?= e((string) $service['default_hours']); ?></td>
                       <td><?= e(format_currency((float) $service['default_rate'])); ?></td>
                       <td><?= e((string) $service['gst_rate']); ?></td>
+                      <td>
+                        <span class="badge text-bg-<?= ((int) ($service['enable_reminder'] ?? 0) === 1) ? 'success' : 'secondary'; ?>">
+                          <?= ((int) ($service['enable_reminder'] ?? 0) === 1) ? 'Yes' : 'No'; ?>
+                        </span>
+                      </td>
                       <td><?= (int) $service['mapped_parts']; ?></td>
                       <td><span class="badge text-bg-<?= e(status_badge_class((string) $service['status_code'])); ?>"><?= e((string) $service['status_code']); ?></span></td>
                       <td class="d-flex gap-1">

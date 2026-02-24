@@ -602,7 +602,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                   <div class="text-muted small">Predicted Next Visit</div>
                   <?php if ($predictedNextVisitDate !== null): ?>
                     <div class="fw-semibold"><?= e($predictedNextVisitDate); ?></div>
-                    <div class="small text-muted">Based on average usage and active service reminders</div>
+                    <div class="small text-muted">Based on average usage and active maintenance reminders</div>
                   <?php else: ?>
                     <div class="text-muted">Insufficient reminder/usage data.</div>
                   <?php endif; ?>
@@ -709,7 +709,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 
       <div class="card mb-3">
         <div class="card-header d-flex justify-content-between align-items-center">
-          <h3 class="card-title mb-0">Service Reminders And Next Visit Prediction</h3>
+          <h3 class="card-title mb-0">Maintenance Reminders And Next Visit Prediction</h3>
           <span class="badge text-bg-light border"><?= (int) ($serviceReminderSummary['total'] ?? 0); ?> Active</span>
         </div>
         <div class="card-body">
@@ -719,8 +719,8 @@ require_once __DIR__ . '/../../includes/sidebar.php';
               <div class="fw-semibold text-danger"><?= (int) ($serviceReminderSummary['overdue'] ?? 0); ?></div>
             </div>
             <div class="col-6 col-md-3">
-              <div class="text-muted small">Due Soon</div>
-              <div class="fw-semibold text-warning"><?= (int) ($serviceReminderSummary['due_soon'] ?? 0); ?></div>
+              <div class="text-muted small">Due</div>
+              <div class="fw-semibold text-warning"><?= (int) (($serviceReminderSummary['due'] ?? 0) + ($serviceReminderSummary['due_soon'] ?? 0)); ?></div>
             </div>
             <div class="col-6 col-md-3">
               <div class="text-muted small">Upcoming</div>
@@ -736,7 +736,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             <table class="table table-sm table-striped mb-0">
               <thead>
                 <tr>
-                  <th>Service</th>
+                  <th>Service/Part</th>
                   <th class="text-end">Due KM</th>
                   <th>Due Date</th>
                   <th>Predicted Visit</th>

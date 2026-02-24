@@ -8,7 +8,7 @@ require_once __DIR__ . '/../jobs/workflow.php';
 
 reports_require_access();
 
-$page_title = 'Service Reminder Reports';
+$page_title = 'Maintenance Reminder Reports';
 $active_menu = 'reports.service_reminders';
 
 $scope = reports_build_scope_context();
@@ -30,7 +30,7 @@ $baseParams = $scope['base_params'];
 
 $serviceTypeFilter = service_reminder_normalize_type((string) ($_GET['service_type'] ?? ''));
 $dueStateFilter = strtoupper(trim((string) ($_GET['due_state'] ?? 'ALL')));
-$allowedDueStates = ['ALL', 'OVERDUE', 'DUE_SOON', 'UPCOMING', 'UNSCHEDULED'];
+$allowedDueStates = ['ALL', 'OVERDUE', 'DUE', 'UPCOMING', 'COMPLETED'];
 if (!in_array($dueStateFilter, $allowedDueStates, true)) {
     $dueStateFilter = 'ALL';
 }
@@ -39,25 +39,18 @@ $baseParams['service_type'] = $serviceTypeFilter !== '' ? $serviceTypeFilter : n
 $baseParams['due_state'] = $dueStateFilter !== 'ALL' ? $dueStateFilter : null;
 
 $featureReady = service_reminder_feature_ready();
-$scopeRows = $featureReady
-    ? service_reminder_fetch_active_for_scope(
+$reminderRows = $featureReady
+    ? service_reminder_fetch_register_for_scope(
         $companyId,
         $selectedGarageId,
         $garageIds,
         1200,
         $serviceTypeFilter !== '' ? $serviceTypeFilter : null,
-        $dueStateFilter
+        $dueStateFilter,
+        $fromDate,
+        $toDate
     )
     : [];
-
-$reminderRows = [];
-foreach ($scopeRows as $row) {
-    $dueDate = service_reminder_parse_date((string) ($row['next_due_date'] ?? ''));
-    if ($dueDate !== null && ($dueDate < $fromDate || $dueDate > $toDate)) {
-        continue;
-    }
-    $reminderRows[] = $row;
-}
 
 $summary = service_reminder_summary_counts($reminderRows);
 
@@ -77,8 +70,10 @@ if ($exportKey !== '') {
                     (string) ($row['brand'] ?? ''),
                     (string) ($row['model'] ?? ''),
                     (string) ($row['variant'] ?? ''),
+                    (string) ($row['customer_name'] ?? ''),
                     (string) ($row['job_number'] ?? ''),
                     (string) ($row['service_label'] ?? service_reminder_type_label((string) ($row['service_type'] ?? ''))),
+                    $row['last_service_km'],
                     $row['next_due_km'],
                     (string) ($row['next_due_date'] ?? ''),
                     (string) ($row['predicted_next_visit_date'] ?? ''),
@@ -91,14 +86,16 @@ if ($exportKey !== '') {
             $reminderRows
         );
         reports_csv_download(
-            'service_reminders_' . $timestamp . '.csv',
+            'maintenance_reminders_' . $timestamp . '.csv',
             [
                 'Registration',
                 'Brand',
                 'Model',
                 'Variant',
+                'Customer',
                 'Job Number',
-                'Service',
+                'Service/Part',
+                'Last Service KM',
                 'Next Due KM',
                 'Next Due Date',
                 'Predicted Next Visit',
@@ -123,12 +120,12 @@ require_once __DIR__ . '/../../includes/sidebar.php';
   <div class="app-content-header">
     <div class="container-fluid">
       <div class="row">
-        <div class="col-sm-6"><h3 class="mb-0">Service Reminder Reports</h3></div>
+        <div class="col-sm-6"><h3 class="mb-0">Maintenance Reminder Reports</h3></div>
         <div class="col-sm-6">
           <ol class="breadcrumb float-sm-end">
             <li class="breadcrumb-item"><a href="<?= e(url('dashboard.php')); ?>">Home</a></li>
             <li class="breadcrumb-item"><a href="<?= e(url('modules/reports/index.php')); ?>">Reports</a></li>
-            <li class="breadcrumb-item active">Service Reminders</li>
+            <li class="breadcrumb-item active">Maintenance Reminders</li>
           </ol>
         </div>
       </div>
@@ -243,13 +240,13 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       </div>
 
       <?php if (!$featureReady): ?>
-        <div class="alert alert-warning">Service reminder storage is not ready. Run DB upgrade to enable reminder reports.</div>
+        <div class="alert alert-warning">Maintenance reminder storage is not ready. Run DB upgrade to enable reminder reports.</div>
       <?php endif; ?>
 
       <div class="row g-3 mb-3">
         <div class="col-md-3"><div class="info-box"><span class="info-box-icon text-bg-primary"><i class="bi bi-bell"></i></span><div class="info-box-content"><span class="info-box-text">Active</span><span class="info-box-number"><?= number_format((int) ($summary['total'] ?? 0)); ?></span></div></div></div>
         <div class="col-md-3"><div class="info-box"><span class="info-box-icon text-bg-danger"><i class="bi bi-exclamation-circle"></i></span><div class="info-box-content"><span class="info-box-text">Overdue</span><span class="info-box-number"><?= number_format((int) ($summary['overdue'] ?? 0)); ?></span></div></div></div>
-        <div class="col-md-3"><div class="info-box"><span class="info-box-icon text-bg-warning"><i class="bi bi-alarm"></i></span><div class="info-box-content"><span class="info-box-text">Due Soon</span><span class="info-box-number"><?= number_format((int) ($summary['due_soon'] ?? 0)); ?></span></div></div></div>
+        <div class="col-md-3"><div class="info-box"><span class="info-box-icon text-bg-warning"><i class="bi bi-alarm"></i></span><div class="info-box-content"><span class="info-box-text">Due</span><span class="info-box-number"><?= number_format((int) (($summary['due'] ?? 0) + ($summary['due_soon'] ?? 0))); ?></span></div></div></div>
         <div class="col-md-3"><div class="info-box"><span class="info-box-icon text-bg-info"><i class="bi bi-calendar-check"></i></span><div class="info-box-content"><span class="info-box-text">Upcoming</span><span class="info-box-number"><?= number_format((int) ($summary['upcoming'] ?? 0)); ?></span></div></div></div>
       </div>
 
@@ -263,8 +260,10 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             <thead>
               <tr>
                 <th>Vehicle</th>
+                <th>Customer</th>
                 <th>Job</th>
-                <th>Service</th>
+                <th>Service/Part</th>
+                <th class="text-end">Last KM</th>
                 <th class="text-end">Due KM</th>
                 <th>Due Date</th>
                 <th>Predicted Visit</th>
@@ -276,7 +275,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             </thead>
             <tbody>
               <?php if (empty($reminderRows)): ?>
-                <tr><td colspan="10" class="text-center text-muted py-4">No reminders found for selected filters.</td></tr>
+                <tr><td colspan="12" class="text-center text-muted py-4">No reminders found for selected filters.</td></tr>
               <?php else: ?>
                 <?php foreach ($reminderRows as $row): ?>
                   <tr>
@@ -286,8 +285,10 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                       </a>
                       <div class="small text-muted"><?= e((string) ($row['brand'] ?? '')); ?> <?= e((string) ($row['model'] ?? '')); ?> <?= e((string) ($row['variant'] ?? '')); ?></div>
                     </td>
+                    <td><?= e((string) ($row['customer_name'] ?? '-')); ?></td>
                     <td><?= e((string) (($row['job_number'] ?? '') !== '' ? $row['job_number'] : '-')); ?></td>
                     <td><?= e((string) ($row['service_label'] ?? service_reminder_type_label((string) ($row['service_type'] ?? '')))); ?></td>
+                    <td class="text-end"><?= isset($row['last_service_km']) && $row['last_service_km'] !== null ? e(number_format((float) $row['last_service_km'], 0)) : '-'; ?></td>
                     <td class="text-end"><?= isset($row['next_due_km']) && $row['next_due_km'] !== null ? e(number_format((float) $row['next_due_km'], 0)) : '-'; ?></td>
                     <td><?= e((string) (($row['next_due_date'] ?? '') !== '' ? $row['next_due_date'] : '-')); ?></td>
                     <td><?= e((string) (($row['predicted_next_visit_date'] ?? '') !== '' ? $row['predicted_next_visit_date'] : '-')); ?></td>

@@ -518,135 +518,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 
     if ($action === 'save_interval_rule') {
-        if (!service_reminder_feature_ready()) {
-            flash_set('vis_error', 'Service reminder storage is not ready. Please run DB upgrade.', 'danger');
-            redirect('modules/vis/catalog.php');
-        }
-
-        $ruleId = post_int('rule_id');
-        $variantId = post_int('variant_id');
-        $engineOilIntervalKm = service_reminder_parse_positive_int($_POST['engine_oil_interval_km'] ?? null);
-        $majorServiceIntervalKm = service_reminder_parse_positive_int($_POST['major_service_interval_km'] ?? null);
-        $brakeInspectionIntervalKm = service_reminder_parse_positive_int($_POST['brake_inspection_interval_km'] ?? null);
-        $acServiceIntervalKm = service_reminder_parse_positive_int($_POST['ac_service_interval_km'] ?? null);
-        $intervalDays = service_reminder_parse_positive_int($_POST['interval_days'] ?? null);
-        $statusCode = normalize_status_code((string) ($_POST['status_code'] ?? 'ACTIVE'));
-        $actorUserId = isset($_SESSION['user_id']) ? (int) $_SESSION['user_id'] : null;
-
-        if ($variantId <= 0) {
-            flash_set('vis_error', 'Variant is required for interval rules.', 'danger');
-            redirect('modules/vis/catalog.php');
-        }
-
-        try {
-            if ($ruleId > 0) {
-                $updateStmt = db()->prepare(
-                    'UPDATE vis_service_interval_rules
-                     SET vis_variant_id = :vis_variant_id,
-                         engine_oil_interval_km = :engine_oil_interval_km,
-                         major_service_interval_km = :major_service_interval_km,
-                         brake_inspection_interval_km = :brake_inspection_interval_km,
-                         ac_service_interval_km = :ac_service_interval_km,
-                         interval_days = :interval_days,
-                         status_code = :status_code,
-                         updated_by = :updated_by
-                     WHERE id = :id
-                       AND company_id = :company_id'
-                );
-                $updateStmt->execute([
-                    'vis_variant_id' => $variantId,
-                    'engine_oil_interval_km' => $engineOilIntervalKm,
-                    'major_service_interval_km' => $majorServiceIntervalKm,
-                    'brake_inspection_interval_km' => $brakeInspectionIntervalKm,
-                    'ac_service_interval_km' => $acServiceIntervalKm,
-                    'interval_days' => $intervalDays,
-                    'status_code' => $statusCode,
-                    'updated_by' => $actorUserId,
-                    'id' => $ruleId,
-                    'company_id' => $companyId,
-                ]);
-                log_audit('vis_catalog', 'update_interval_rule', $ruleId, 'Updated VIS service interval rule', [
-                    'entity' => 'vis_service_interval_rule',
-                    'source' => 'UI',
-                    'metadata' => [
-                        'variant_id' => $variantId,
-                        'engine_oil_interval_km' => $engineOilIntervalKm,
-                        'major_service_interval_km' => $majorServiceIntervalKm,
-                        'brake_inspection_interval_km' => $brakeInspectionIntervalKm,
-                        'ac_service_interval_km' => $acServiceIntervalKm,
-                        'interval_days' => $intervalDays,
-                        'status_code' => $statusCode,
-                    ],
-                ]);
-                flash_set('vis_success', 'Service interval rule updated.', 'success');
-            } else {
-                $insertStmt = db()->prepare(
-                    'INSERT INTO vis_service_interval_rules
-                      (company_id, vis_variant_id, engine_oil_interval_km, major_service_interval_km,
-                       brake_inspection_interval_km, ac_service_interval_km, interval_days,
-                       status_code, created_by, updated_by)
-                     VALUES
-                      (:company_id, :vis_variant_id, :engine_oil_interval_km, :major_service_interval_km,
-                       :brake_inspection_interval_km, :ac_service_interval_km, :interval_days,
-                       :status_code, :created_by, :updated_by)
-                     ON DUPLICATE KEY UPDATE
-                       engine_oil_interval_km = VALUES(engine_oil_interval_km),
-                       major_service_interval_km = VALUES(major_service_interval_km),
-                       brake_inspection_interval_km = VALUES(brake_inspection_interval_km),
-                       ac_service_interval_km = VALUES(ac_service_interval_km),
-                       interval_days = VALUES(interval_days),
-                       status_code = VALUES(status_code),
-                       updated_by = VALUES(updated_by),
-                       updated_at = NOW()'
-                );
-                $insertStmt->execute([
-                    'company_id' => $companyId,
-                    'vis_variant_id' => $variantId,
-                    'engine_oil_interval_km' => $engineOilIntervalKm,
-                    'major_service_interval_km' => $majorServiceIntervalKm,
-                    'brake_inspection_interval_km' => $brakeInspectionIntervalKm,
-                    'ac_service_interval_km' => $acServiceIntervalKm,
-                    'interval_days' => $intervalDays,
-                    'status_code' => $statusCode,
-                    'created_by' => $actorUserId,
-                    'updated_by' => $actorUserId,
-                ]);
-
-                $createdId = (int) db()->lastInsertId();
-                if ($createdId <= 0) {
-                    $idLookupStmt = db()->prepare(
-                        'SELECT id
-                         FROM vis_service_interval_rules
-                         WHERE company_id = :company_id
-                           AND vis_variant_id = :vis_variant_id
-                         LIMIT 1'
-                    );
-                    $idLookupStmt->execute([
-                        'company_id' => $companyId,
-                        'vis_variant_id' => $variantId,
-                    ]);
-                    $createdId = (int) ($idLookupStmt->fetchColumn() ?: 0);
-                }
-
-                log_audit('vis_catalog', 'save_interval_rule', $createdId > 0 ? $createdId : null, 'Saved VIS service interval rule', [
-                    'entity' => 'vis_service_interval_rule',
-                    'source' => 'UI',
-                    'metadata' => [
-                        'variant_id' => $variantId,
-                        'engine_oil_interval_km' => $engineOilIntervalKm,
-                        'major_service_interval_km' => $majorServiceIntervalKm,
-                        'brake_inspection_interval_km' => $brakeInspectionIntervalKm,
-                        'ac_service_interval_km' => $acServiceIntervalKm,
-                        'interval_days' => $intervalDays,
-                        'status_code' => $statusCode,
-                    ],
-                ]);
-                flash_set('vis_success', 'Service interval rule saved.', 'success');
-            }
-        } catch (Throwable $exception) {
-            flash_set('vis_error', 'Unable to save service interval rule. Variant rule must be unique.', 'danger');
-        }
-
+        flash_set('vis_warning', 'VIS interval rules are retired. Use Vehicle Maintenance Setup for vehicle-specific reminders.', 'warning');
         redirect('modules/vis/catalog.php');
     }
 
@@ -694,13 +566,11 @@ $editBrandId = get_int('edit_brand_id');
 $editModelId = get_int('edit_model_id');
 $editVariantId = get_int('edit_variant_id');
 $editSpecId = get_int('edit_spec_id');
-$editRuleId = get_int('edit_rule_id');
 
 $editBrand = null;
 $editModel = null;
 $editVariant = null;
 $editSpec = null;
-$editIntervalRule = null;
 
 if ($editBrandId > 0) {
     $stmt = db()->prepare('SELECT * FROM vis_brands WHERE id = :id LIMIT 1');
@@ -721,20 +591,6 @@ if ($editSpecId > 0) {
     $stmt = db()->prepare('SELECT * FROM vis_variant_specs WHERE id = :id LIMIT 1');
     $stmt->execute(['id' => $editSpecId]);
     $editSpec = $stmt->fetch() ?: null;
-}
-if ($editRuleId > 0 && service_reminder_feature_ready()) {
-    $stmt = db()->prepare(
-        'SELECT *
-         FROM vis_service_interval_rules
-         WHERE id = :id
-           AND company_id = :company_id
-         LIMIT 1'
-    );
-    $stmt->execute([
-        'id' => $editRuleId,
-        'company_id' => $companyId,
-    ]);
-    $editIntervalRule = $stmt->fetch() ?: null;
 }
 
 $brands = db()->query('SELECT * FROM vis_brands ORDER BY brand_name ASC')->fetchAll();
@@ -760,20 +616,6 @@ $specs = db()->query(
      ORDER BY s.id DESC
      LIMIT 120'
 )->fetchAll();
-$intervalRules = [];
-if (service_reminder_feature_ready()) {
-    $intervalStmt = db()->prepare(
-        'SELECT r.*, v.variant_name, m.model_name, b.brand_name
-         FROM vis_service_interval_rules r
-         INNER JOIN vis_variants v ON v.id = r.vis_variant_id
-         INNER JOIN vis_models m ON m.id = v.model_id
-         INNER JOIN vis_brands b ON b.id = m.brand_id
-         WHERE r.company_id = :company_id
-         ORDER BY b.brand_name ASC, m.model_name ASC, v.variant_name ASC'
-    );
-    $intervalStmt->execute(['company_id' => $companyId]);
-    $intervalRules = $intervalStmt->fetchAll();
-}
 
 require_once __DIR__ . '/../../includes/header.php';
 require_once __DIR__ . '/../../includes/sidebar.php';
@@ -854,63 +696,10 @@ require_once __DIR__ . '/../../includes/sidebar.php';
           </div><div class="card-footer"><button class="btn btn-warning" type="submit"><?= $editSpec ? 'Update' : 'Add'; ?></button></div></form>
         </div>
 
-        <div class="card card-outline card-success mt-3">
-          <div class="card-header"><h3 class="card-title"><?= $editIntervalRule ? 'Edit Service Interval Rules' : 'Add Service Interval Rules'; ?></h3></div>
-          <?php if (!service_reminder_feature_ready()): ?>
-            <div class="card-body">
-              <div class="alert alert-warning mb-0">Service reminder storage is not ready. Please run DB upgrade to enable interval rules.</div>
-            </div>
-          <?php else: ?>
-            <form method="post"><div class="card-body row g-2">
-              <?= csrf_field(); ?>
-              <input type="hidden" name="_action" value="save_interval_rule">
-              <input type="hidden" name="rule_id" value="<?= (int) ($editIntervalRule['id'] ?? 0); ?>">
-              <div class="col-md-4">
-                <label class="form-label">Vehicle Variant</label>
-                <select name="variant_id" class="form-select" required>
-                  <option value="">Select variant</option>
-                  <?php foreach ($variants as $variant): ?>
-                    <option value="<?= (int) $variant['id']; ?>" <?= ((int) ($editIntervalRule['vis_variant_id'] ?? 0) === (int) $variant['id']) ? 'selected' : ''; ?>>
-                      <?= e((string) $variant['brand_name']); ?> / <?= e((string) $variant['model_name']); ?> / <?= e((string) $variant['variant_name']); ?>
-                    </option>
-                  <?php endforeach; ?>
-                </select>
-              </div>
-              <div class="col-md-2">
-                <label class="form-label">Engine Oil KM</label>
-                <input type="number" step="1" min="0" name="engine_oil_interval_km" class="form-control" value="<?= e((string) ($editIntervalRule['engine_oil_interval_km'] ?? '')); ?>">
-              </div>
-              <div class="col-md-2">
-                <label class="form-label">Major Service KM</label>
-                <input type="number" step="1" min="0" name="major_service_interval_km" class="form-control" value="<?= e((string) ($editIntervalRule['major_service_interval_km'] ?? '')); ?>">
-              </div>
-              <div class="col-md-2">
-                <label class="form-label">Brake Insp. KM</label>
-                <input type="number" step="1" min="0" name="brake_inspection_interval_km" class="form-control" value="<?= e((string) ($editIntervalRule['brake_inspection_interval_km'] ?? '')); ?>">
-              </div>
-              <div class="col-md-2">
-                <label class="form-label">AC Service KM</label>
-                <input type="number" step="1" min="0" name="ac_service_interval_km" class="form-control" value="<?= e((string) ($editIntervalRule['ac_service_interval_km'] ?? '')); ?>">
-              </div>
-              <div class="col-md-2">
-                <label class="form-label">Interval Days</label>
-                <input type="number" step="1" min="0" name="interval_days" class="form-control" value="<?= e((string) ($editIntervalRule['interval_days'] ?? '')); ?>">
-              </div>
-              <div class="col-md-2">
-                <label class="form-label">Status</label>
-                <select name="status_code" class="form-select">
-                  <?php foreach (status_options((string) ($editIntervalRule['status_code'] ?? 'ACTIVE')) as $option): ?>
-                    <option value="<?= e($option['value']); ?>" <?= $option['selected'] ? 'selected' : ''; ?>><?= e($option['value']); ?></option>
-                  <?php endforeach; ?>
-                </select>
-              </div>
-            </div><div class="card-footer d-flex gap-2">
-              <button class="btn btn-success" type="submit"><?= $editIntervalRule ? 'Update Rules' : 'Save Rules'; ?></button>
-              <?php if ($editIntervalRule): ?>
-                <a href="<?= e(url('modules/vis/catalog.php')); ?>" class="btn btn-outline-secondary">Cancel Edit</a>
-              <?php endif; ?>
-            </div></form>
-          <?php endif; ?>
+        <div class="alert alert-light border mt-3 mb-0">
+          VIS fixed interval rules are retired.
+          Use <a href="<?= e(url('modules/jobs/maintenance_setup.php')); ?>" class="alert-link">Vehicle Maintenance Setup</a>
+          for vehicle-specific service/part reminder rules.
         </div>
       <?php endif; ?>
 
@@ -1060,47 +849,6 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         </div>
       </div>
 
-      <div class="card mt-3">
-        <div class="card-header"><h3 class="card-title">Service Interval Rules</h3></div>
-        <div class="card-body table-responsive p-0">
-          <table class="table table-sm table-striped mb-0">
-            <thead>
-              <tr>
-                <th>Variant</th>
-                <th class="text-end">Engine Oil KM</th>
-                <th class="text-end">Major Service KM</th>
-                <th class="text-end">Brake Insp. KM</th>
-                <th class="text-end">AC Service KM</th>
-                <th class="text-end">Days</th>
-                <th>Status</th>
-                <th></th>
-              </tr>
-            </thead>
-            <tbody>
-              <?php if (empty($intervalRules)): ?>
-                <tr><td colspan="8" class="text-center text-muted py-4">No service interval rules configured yet.</td></tr>
-              <?php else: ?>
-                <?php foreach ($intervalRules as $rule): ?>
-                  <tr>
-                    <td><?= e((string) $rule['brand_name']); ?> / <?= e((string) $rule['model_name']); ?> / <?= e((string) $rule['variant_name']); ?></td>
-                    <td class="text-end"><?= isset($rule['engine_oil_interval_km']) && $rule['engine_oil_interval_km'] !== null ? e(number_format((float) $rule['engine_oil_interval_km'], 0)) : '-'; ?></td>
-                    <td class="text-end"><?= isset($rule['major_service_interval_km']) && $rule['major_service_interval_km'] !== null ? e(number_format((float) $rule['major_service_interval_km'], 0)) : '-'; ?></td>
-                    <td class="text-end"><?= isset($rule['brake_inspection_interval_km']) && $rule['brake_inspection_interval_km'] !== null ? e(number_format((float) $rule['brake_inspection_interval_km'], 0)) : '-'; ?></td>
-                    <td class="text-end"><?= isset($rule['ac_service_interval_km']) && $rule['ac_service_interval_km'] !== null ? e(number_format((float) $rule['ac_service_interval_km'], 0)) : '-'; ?></td>
-                    <td class="text-end"><?= isset($rule['interval_days']) && $rule['interval_days'] !== null ? e(number_format((float) $rule['interval_days'], 0)) : '-'; ?></td>
-                    <td><span class="badge text-bg-<?= e(status_badge_class((string) ($rule['status_code'] ?? 'ACTIVE'))); ?>"><?= e((string) ($rule['status_code'] ?? 'ACTIVE')); ?></span></td>
-                    <td>
-                      <?php if ($canManage): ?>
-                        <a class="btn btn-sm btn-outline-primary" href="<?= e(url('modules/vis/catalog.php?edit_rule_id=' . (int) $rule['id'])); ?>">Edit</a>
-                      <?php endif; ?>
-                    </td>
-                  </tr>
-                <?php endforeach; ?>
-              <?php endif; ?>
-            </tbody>
-          </table>
-        </div>
-      </div>
     </div>
   </div>
 </main>

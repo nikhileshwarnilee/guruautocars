@@ -236,6 +236,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'id' => (int) $job['id'],
                     'job_number' => (string) $job['job_number'],
                     'closed_at' => (string) ($job['closed_at'] ?? ''),
+                    'recommendation_note' => (string) ($job['recommendation_note'] ?? ''),
                 ],
                 'billing' => [
                     'discount_type' => (string) ($totals['discount_type'] ?? 'AMOUNT'),

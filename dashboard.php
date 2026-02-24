@@ -621,7 +621,7 @@ $dashboardReminderSummary = $reminderFeatureReady
         'upcoming' => 0,
         'unscheduled' => 0,
     ];
-$reminderReportLink = url('modules/reports/service_reminders.php');
+$reminderReportLink = url('modules/jobs/maintenance_reminders.php');
 
 require_once __DIR__ . '/includes/header.php';
 require_once __DIR__ . '/includes/sidebar.php';
@@ -795,10 +795,10 @@ require_once __DIR__ . '/includes/sidebar.php';
         </div>
         <div class="col-12 col-sm-6 col-lg-3">
           <div class="info-box">
-            <span class="info-box-icon text-bg-warning shadow-sm"><i class="bi bi-alarm"></i></span>
+              <span class="info-box-icon text-bg-warning shadow-sm"><i class="bi bi-alarm"></i></span>
             <div class="info-box-content">
-              <span class="info-box-text">Due Soon</span>
-              <span class="info-box-number erp-stat-number"><?= number_format((int) ($dashboardReminderSummary['due_soon'] ?? 0)); ?></span>
+              <span class="info-box-text">Due</span>
+              <span class="info-box-number erp-stat-number"><?= number_format((int) (($dashboardReminderSummary['due'] ?? 0) + ($dashboardReminderSummary['due_soon'] ?? 0))); ?></span>
             </div>
           </div>
         </div>
@@ -815,15 +815,15 @@ require_once __DIR__ . '/includes/sidebar.php';
 
       <div class="card card-outline card-success mb-3">
         <div class="card-header d-flex justify-content-between align-items-center">
-          <h3 class="card-title mb-0">Service Reminder Queue</h3>
-          <a href="<?= e($reminderReportLink); ?>" class="btn btn-sm btn-outline-success">Open Reminder Report</a>
+          <h3 class="card-title mb-0">Maintenance Reminder Queue</h3>
+          <a href="<?= e($reminderReportLink); ?>" class="btn btn-sm btn-outline-success">Open Reminder Module</a>
         </div>
         <div class="card-body table-responsive p-0">
           <table class="table table-sm table-striped mb-0">
             <thead>
               <tr>
                 <th>Vehicle</th>
-                <th>Service</th>
+                <th>Service/Part</th>
                 <th class="text-end">Due KM</th>
                 <th>Due Date</th>
                 <th>Predicted Next Visit</th>
