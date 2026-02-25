@@ -3,6 +3,7 @@ document.addEventListener('DOMContentLoaded', function () {
 });
 
 function gacBoot() {
+  runInitTask(initPageScrollPersistence, 'initPageScrollPersistence');
   runInitTask(initSidebarStatePersistence, 'initSidebarStatePersistence');
   runInitTask(initSidebarWidthResizer, 'initSidebarWidthResizer');
   runInitTask(initSidebarUiEnhancements, 'initSidebarUiEnhancements');
@@ -31,6 +32,136 @@ function runInitTask(task, label) {
       window.console.error('GAC init failed: ' + String(label || 'unknown'), error);
     }
   }
+}
+
+function initPageScrollPersistence() {
+  if (!document.body || document.body.getAttribute('data-gac-scroll-init') === '1') {
+    return;
+  }
+  document.body.setAttribute('data-gac-scroll-init', '1');
+
+  restoreReloadScrollPosition();
+
+  var saveScheduled = false;
+  function scheduleSave() {
+    if (saveScheduled) {
+      return;
+    }
+    saveScheduled = true;
+
+    var runner = function () {
+      saveScheduled = false;
+      rememberScrollMarker();
+    };
+
+    if (typeof window.requestAnimationFrame === 'function') {
+      window.requestAnimationFrame(runner);
+      return;
+    }
+
+    window.setTimeout(runner, 16);
+  }
+
+  window.addEventListener('scroll', scheduleSave, { passive: true });
+  window.addEventListener('beforeunload', rememberScrollMarker);
+  document.addEventListener('visibilitychange', function () {
+    if (document.visibilityState === 'hidden') {
+      rememberScrollMarker();
+    }
+  });
+
+  rememberScrollMarker();
+}
+
+function rememberScrollMarker() {
+  try {
+    if (!window.sessionStorage || !window.location) {
+      return;
+    }
+
+    var marker = {
+      path: String(window.location.pathname || ''),
+      search: String(window.location.search || ''),
+      y: resolvePageScrollTop(),
+      ts: Date.now()
+    };
+    window.sessionStorage.setItem('gac.scroll.marker', JSON.stringify(marker));
+  } catch (error) {
+    // Ignore storage permission errors.
+  }
+}
+
+function restoreReloadScrollPosition() {
+  try {
+    if (!window.sessionStorage || !window.location) {
+      return;
+    }
+
+    if (String(window.location.hash || '') !== '') {
+      return;
+    }
+
+    var marker = safeParseJson(window.sessionStorage.getItem('gac.scroll.marker') || '');
+    if (!marker || typeof marker !== 'object') {
+      return;
+    }
+
+    var currentPath = String(window.location.pathname || '');
+    if (String(marker.path || '') !== currentPath) {
+      return;
+    }
+
+    var markerTimestamp = parseInt(String(marker.ts || ''), 10);
+    if (isNaN(markerTimestamp) || (Date.now() - markerTimestamp) > 120000) {
+      window.sessionStorage.removeItem('gac.scroll.marker');
+      return;
+    }
+
+    var markerY = parseInt(String(marker.y || ''), 10);
+    if (isNaN(markerY) || markerY <= 0) {
+      window.sessionStorage.removeItem('gac.scroll.marker');
+      return;
+    }
+
+    window.sessionStorage.removeItem('gac.scroll.marker');
+    applyScrollRestore(markerY);
+  } catch (error) {
+    // Ignore storage permission errors.
+  }
+}
+
+function applyScrollRestore(scrollTop) {
+  var targetTop = Math.max(0, Number(scrollTop) || 0);
+  if (targetTop <= 0) {
+    return;
+  }
+
+  var attempts = 0;
+  function restoreAttempt() {
+    attempts += 1;
+    window.scrollTo(0, targetTop);
+    if (attempts < 4) {
+      window.setTimeout(restoreAttempt, attempts === 1 ? 80 : 180);
+    }
+  }
+
+  window.setTimeout(restoreAttempt, 0);
+}
+
+function resolvePageScrollTop() {
+  if (typeof window.pageYOffset === 'number') {
+    return Math.max(0, Math.round(window.pageYOffset));
+  }
+
+  if (document.documentElement && typeof document.documentElement.scrollTop === 'number') {
+    return Math.max(0, Math.round(document.documentElement.scrollTop));
+  }
+
+  if (document.body && typeof document.body.scrollTop === 'number') {
+    return Math.max(0, Math.round(document.body.scrollTop));
+  }
+
+  return 0;
 }
 
 function initSidebarStatePersistence() {
@@ -588,6 +719,7 @@ function buildBreadcrumbMap(dashboardUrl) {
 
   return {
     'dashboard': [home, { label: 'Dashboard' }],
+    'profile': [home, { label: 'My Profile' }],
     'jobs': [home, { label: 'Operations' }, { label: 'Job Card' }],
     'jobs.maintenance_reminders': [home, { label: 'Operations' }, { label: 'Service Reminders' }],
     'jobs.maintenance_setup': [home, { label: 'Vehicle Intelligence' }, { label: 'Vehicle Maintenance Setup' }],
@@ -1162,8 +1294,11 @@ function resolveFlashContainer() {
 
 function navigateWithinApp(url, flashMessages) {
   var destination;
+  var currentLocation = null;
+  var previousScrollTop = resolvePageScrollTop();
   try {
     destination = new URL(String(url || ''), window.location.href);
+    currentLocation = new URL(window.location.href);
   } catch (error) {
     return Promise.reject(error);
   }
@@ -1191,6 +1326,13 @@ function navigateWithinApp(url, flashMessages) {
       var finalUrl = result.response && result.response.url
         ? String(result.response.url)
         : destination.toString();
+      var finalLocation = null;
+      try {
+        finalLocation = new URL(finalUrl, window.location.href);
+      } catch (error) {
+        finalLocation = null;
+      }
+      var preserveScroll = shouldPreserveNavigationScroll(currentLocation, finalLocation);
 
       if (window.history && typeof window.history.replaceState === 'function') {
         window.history.replaceState({}, '', finalUrl);
@@ -1201,9 +1343,42 @@ function navigateWithinApp(url, flashMessages) {
       }
 
       gacBoot();
-      window.scrollTo(0, 0);
+      applyPostNavigationScroll(finalLocation, preserveScroll, previousScrollTop);
       return true;
     });
+}
+
+function shouldPreserveNavigationScroll(previousLocation, nextLocation) {
+  if (!previousLocation || !nextLocation) {
+    return false;
+  }
+
+  if (previousLocation.origin !== nextLocation.origin) {
+    return false;
+  }
+
+  return previousLocation.pathname === nextLocation.pathname;
+}
+
+function applyPostNavigationScroll(nextLocation, preserveScroll, previousScrollTop) {
+  if (preserveScroll) {
+    window.scrollTo(0, Math.max(0, Number(previousScrollTop) || 0));
+    rememberScrollMarker();
+    return;
+  }
+
+  if (nextLocation && typeof nextLocation.hash === 'string' && nextLocation.hash.length > 1) {
+    var anchorId = nextLocation.hash.substring(1);
+    var anchorNode = document.getElementById(anchorId);
+    if (anchorNode && typeof anchorNode.scrollIntoView === 'function') {
+      anchorNode.scrollIntoView({ block: 'start' });
+      rememberScrollMarker();
+      return;
+    }
+  }
+
+  window.scrollTo(0, 0);
+  rememberScrollMarker();
 }
 
 function replaceAppWrapperFromHtml(html) {

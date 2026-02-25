@@ -199,6 +199,10 @@ if ($appCssVersion === '') {
                   <span class="dropdown-item-text fw-semibold"><?= e((string) ($user['name'] ?? 'User')); ?></span>
                   <span class="dropdown-item-text text-muted small"><?= e((string) ($user['role_name'] ?? '')); ?></span>
                   <div class="dropdown-divider"></div>
+                  <a href="<?= e(url('modules/system/profile.php')); ?>" class="dropdown-item">
+                    <i class="bi bi-person-vcard me-1"></i> My Profile
+                  </a>
+                  <div class="dropdown-divider"></div>
                   <a href="<?= e(url('logout.php')); ?>" class="dropdown-item">
                     <i class="bi bi-box-arrow-right me-1"></i> Logout
                   </a>
