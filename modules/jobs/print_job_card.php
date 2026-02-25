@@ -232,6 +232,20 @@ $companyLogoUrl = company_logo_url((int) ($job['company_id'] ?? $companyId), $ga
             </div>
           <?php endif; ?>
 
+          <?php if (trim((string) ($job['insurance_company_name'] ?? '')) !== '' || trim((string) ($job['insurance_claim_number'] ?? '')) !== ''): ?>
+            <div class="mb-3">
+              <h6 class="mb-1">Insurance Claim</h6>
+              <div class="border rounded p-2">
+                <div><strong>Company:</strong> <?= e((string) (($job['insurance_company_name'] ?? '') !== '' ? $job['insurance_company_name'] : '-')); ?></div>
+                <div><strong>Claim Number:</strong> <?= e((string) (($job['insurance_claim_number'] ?? '') !== '' ? $job['insurance_claim_number'] : '-')); ?></div>
+                <div><strong>Surveyor:</strong> <?= e((string) (($job['insurance_surveyor_name'] ?? '') !== '' ? $job['insurance_surveyor_name'] : '-')); ?></div>
+                <div><strong>Status:</strong> <?= e((string) (($job['insurance_claim_status'] ?? '') !== '' ? $job['insurance_claim_status'] : 'PENDING')); ?></div>
+                <div><strong>Approved Claim:</strong> <?= e(number_format((float) ($job['insurance_claim_amount_approved'] ?? 0), 2)); ?></div>
+                <div><strong>Customer Payable:</strong> <?= e(number_format((float) ($job['insurance_customer_payable_amount'] ?? 0), 2)); ?></div>
+              </div>
+            </div>
+          <?php endif; ?>
+
           <div class="table-responsive mb-3">
             <table class="table table-bordered table-sm">
               <thead>

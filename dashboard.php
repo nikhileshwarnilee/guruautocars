@@ -5,6 +5,7 @@ require_once __DIR__ . '/includes/app.php';
 require_login();
 require_permission('dashboard.view');
 require_once __DIR__ . '/modules/jobs/workflow.php';
+require_once __DIR__ . '/modules/jobs/insurance.php';
 
 $page_title = 'Dashboard Intelligence';
 $active_menu = 'dashboard';
@@ -622,6 +623,8 @@ $dashboardReminderSummary = $reminderFeatureReady
         'unscheduled' => 0,
     ];
 $reminderReportLink = url('modules/jobs/maintenance_reminders.php');
+$insuranceDashboardSummary = job_insurance_dashboard_summary($companyId, $selectedGarageId, $garageIds);
+$insuranceClaimsReportLink = url('modules/reports/insurance_claims.php');
 
 require_once __DIR__ . '/includes/header.php';
 require_once __DIR__ . '/includes/sidebar.php';
@@ -810,6 +813,28 @@ require_once __DIR__ . '/includes/sidebar.php';
               <span class="info-box-number erp-stat-number"><?= number_format((int) ($dashboardReminderSummary['upcoming'] ?? 0)); ?></span>
             </div>
           </div>
+        </div>
+        <div class="col-12 col-sm-6 col-lg-3">
+          <a href="<?= e($insuranceClaimsReportLink); ?>" class="text-decoration-none">
+            <div class="info-box">
+              <span class="info-box-icon text-bg-warning shadow-sm"><i class="bi bi-shield-exclamation"></i></span>
+              <div class="info-box-content">
+                <span class="info-box-text text-body">Pending Insurance Claims</span>
+                <span class="info-box-number erp-stat-number text-body"><?= number_format((int) ($insuranceDashboardSummary['pending_count'] ?? 0)); ?></span>
+              </div>
+            </div>
+          </a>
+        </div>
+        <div class="col-12 col-sm-6 col-lg-3">
+          <a href="<?= e($insuranceClaimsReportLink); ?>" class="text-decoration-none">
+            <div class="info-box">
+              <span class="info-box-icon text-bg-secondary shadow-sm"><i class="bi bi-file-earmark-lock2"></i></span>
+              <div class="info-box-content">
+                <span class="info-box-text text-body">Pending Claim Amount</span>
+                <span class="info-box-number erp-stat-number text-body"><?= e(format_currency((float) ($insuranceDashboardSummary['pending_amount'] ?? 0))); ?></span>
+              </div>
+            </div>
+          </a>
         </div>
       </div>
 

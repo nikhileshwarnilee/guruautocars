@@ -5,6 +5,7 @@ require_once __DIR__ . '/../../includes/app.php';
 require_login();
 require_once __DIR__ . '/shared.php';
 require_once __DIR__ . '/../jobs/workflow.php';
+require_once __DIR__ . '/../jobs/insurance.php';
 
 reports_require_access();
 
@@ -77,6 +78,48 @@ $movementStmt = db()->prepare(
 $movementStmt->execute($movementParams);
 $movementEntries = (int) (($movementStmt->fetch() ?: ['movement_entries' => 0])['movement_entries'] ?? 0);
 
+$returnsCount = 0;
+if (table_columns('returns_rma') !== []) {
+    $returnsParams = ['company_id' => $companyId, 'from_date' => $fromDate, 'to_date' => $toDate];
+    $returnsScopeSql = analytics_garage_scope_sql('r.garage_id', $selectedGarageId, $garageIds, $returnsParams, 'ov_returns_scope');
+    $returnsStmt = db()->prepare(
+        'SELECT COUNT(*) AS return_count
+         FROM returns_rma r
+         WHERE r.company_id = :company_id
+           AND r.status_code = "ACTIVE"
+           ' . $returnsScopeSql . '
+           AND r.return_date BETWEEN :from_date AND :to_date'
+    );
+    $returnsStmt->execute($returnsParams);
+    $returnsCount = (int) ($returnsStmt->fetchColumn() ?? 0);
+}
+
+$inStockSkuCount = 0;
+if (table_columns('inventory_movements') !== [] && table_columns('parts') !== []) {
+    $stockSkuParams = ['company_id' => $companyId];
+    $stockSkuScopeSql = analytics_garage_scope_sql('im.garage_id', $selectedGarageId, $garageIds, $stockSkuParams, 'ov_stocksku_scope');
+    $stockSkuStmt = db()->prepare(
+        'SELECT COUNT(*) AS sku_count
+         FROM (
+            SELECT im.part_id
+            FROM inventory_movements im
+            INNER JOIN parts p ON p.id = im.part_id
+            WHERE im.company_id = :company_id
+              AND p.company_id = :company_id
+              AND p.status_code = "ACTIVE"
+              ' . $stockSkuScopeSql . '
+            GROUP BY im.part_id
+            HAVING COALESCE(SUM(CASE
+              WHEN im.movement_type = "IN" THEN ABS(im.quantity)
+              WHEN im.movement_type = "OUT" THEN -1 * ABS(im.quantity)
+              ELSE im.quantity
+            END), 0) > 0
+         ) stock_parts'
+    );
+    $stockSkuStmt->execute($stockSkuParams);
+    $inStockSkuCount = (int) ($stockSkuStmt->fetchColumn() ?? 0);
+}
+
 $finalizedInvoices = 0;
 $finalizedRevenue = 0.0;
 if ($canViewFinancial) {
@@ -134,6 +177,50 @@ if ((has_permission('expense.view') || has_permission('expense.manage')) && tabl
     $expenseNet = (float) ($expenseStmt->fetchColumn() ?? 0);
 }
 
+$paymentEntriesCount = 0;
+if ($canViewFinancial && table_columns('payments') !== [] && table_columns('invoices') !== []) {
+    $paymentsParams = ['company_id' => $companyId, 'from_date' => $fromDate, 'to_date' => $toDate];
+    $paymentsScopeSql = analytics_garage_scope_sql('i.garage_id', $selectedGarageId, $garageIds, $paymentsParams, 'ov_payments_scope');
+    $paymentsStmt = db()->prepare(
+        'SELECT COUNT(*) AS payment_count
+         FROM payments p
+         INNER JOIN invoices i ON i.id = p.invoice_id
+         WHERE i.company_id = :company_id
+           AND p.paid_on BETWEEN :from_date AND :to_date
+           ' . $paymentsScopeSql
+    );
+    $paymentsStmt->execute($paymentsParams);
+    $paymentEntriesCount = (int) ($paymentsStmt->fetchColumn() ?? 0);
+}
+
+$advanceReceiptCount = 0;
+$advanceCollectedAmount = 0.0;
+if ($canViewFinancial && table_columns('job_advances') !== []) {
+    $advanceParams = ['company_id' => $companyId, 'from_date' => $fromDate, 'to_date' => $toDate];
+    $advanceScopeSql = analytics_garage_scope_sql('ja.garage_id', $selectedGarageId, $garageIds, $advanceParams, 'ov_advance_scope');
+    $advanceStmt = db()->prepare(
+        'SELECT COUNT(*) AS receipt_count,
+                COALESCE(SUM(ja.advance_amount), 0) AS advance_total
+         FROM job_advances ja
+         WHERE ja.company_id = :company_id
+           AND ja.status_code = "ACTIVE"
+           AND ja.received_on BETWEEN :from_date AND :to_date
+           ' . $advanceScopeSql
+    );
+    $advanceStmt->execute($advanceParams);
+    $advanceSummary = $advanceStmt->fetch() ?: ['receipt_count' => 0, 'advance_total' => 0];
+    $advanceReceiptCount = (int) ($advanceSummary['receipt_count'] ?? 0);
+    $advanceCollectedAmount = (float) ($advanceSummary['advance_total'] ?? 0);
+}
+
+$insurancePendingCount = 0;
+if (job_insurance_feature_ready() && (has_permission('job.view') || has_permission('job.manage') || has_permission('reports.financial'))) {
+    $insuranceSummary = job_insurance_dashboard_summary($companyId, $selectedGarageId, $garageIds);
+    $insurancePendingCount = (int) ($insuranceSummary['pending_count'] ?? 0);
+}
+
+$profitPreview = $finalizedRevenue - $payrollPayable - $expenseNet;
+
 $serviceReminderSummary = [
     'total' => 0,
     'overdue' => 0,
@@ -163,6 +250,14 @@ $moduleCards = [
         'icon' => 'bi bi-box-seam',
         'badge' => 'Valid Movements',
         'metric' => number_format($movementEntries),
+    ],
+    [
+        'title' => 'Inventory Valuation',
+        'description' => 'FIFO and weighted-average stock valuation with purchase history summary.',
+        'path' => 'modules/reports/inventory_valuation.php',
+        'icon' => 'bi bi-calculator',
+        'badge' => 'In-stock SKU',
+        'metric' => number_format($inStockSkuCount),
     ],
     [
         'title' => 'Billing & GST Reports',
@@ -197,6 +292,46 @@ $moduleCards = [
         'metric' => number_format((int) ($serviceReminderSummary['overdue'] ?? 0)),
     ],
 ];
+
+if ($canViewFinancial) {
+    $moduleCards[] = [
+        'title' => 'Payments Report',
+        'description' => 'Unified sales and purchase payment ledger with mode-wise and daily cash summaries.',
+        'path' => 'modules/reports/payments.php',
+        'icon' => 'bi bi-wallet2',
+        'badge' => 'Payment Entries',
+        'metric' => number_format($paymentEntriesCount),
+    ];
+
+    $moduleCards[] = [
+        'title' => 'Advance Collections',
+        'description' => 'Job-card advance ledger with customer/job filters and adjustment tracking.',
+        'path' => 'modules/reports/advance_collections.php',
+        'icon' => 'bi bi-cash-stack',
+        'badge' => 'Receipts',
+        'metric' => number_format($advanceReceiptCount),
+    ];
+
+    $moduleCards[] = [
+        'title' => 'Profit & Loss',
+        'description' => 'Income, direct costs, and expenses from finalized financial records.',
+        'path' => 'modules/reports/profit_loss.php',
+        'icon' => 'bi bi-graph-up-arrow',
+        'badge' => 'Profit Preview',
+        'metric' => format_currency($profitPreview),
+    ];
+}
+
+if (has_permission('inventory.view') || has_permission('billing.view') || has_permission('purchase.view') || has_permission('report.view')) {
+    $moduleCards[] = [
+        'title' => 'Returns Report',
+        'description' => 'Customer/vendor return ledger with approval workflow and reversal references.',
+        'path' => 'modules/reports/returns.php',
+        'icon' => 'bi bi-arrow-counterclockwise',
+        'badge' => 'Return Entries',
+        'metric' => number_format($returnsCount),
+    ];
+}
 
 if (has_permission('outsourced.view') && table_columns('outsourced_works') !== []) {
     $outsourcedSummaryParams = ['company_id' => $companyId, 'from_date' => $fromDate, 'to_date' => $toDate];
@@ -253,6 +388,17 @@ if (has_permission('purchase.view') || has_permission('purchase.manage')) {
         'icon' => 'bi bi-bag-check',
         'badge' => 'Purchase Analytics',
         'metric' => 'Open',
+    ];
+}
+
+if (has_permission('job.view') || has_permission('job.manage') || has_permission('reports.financial')) {
+    $moduleCards[] = [
+        'title' => 'Insurance Claims',
+        'description' => 'Insurance-wise claims, pending settlements, and claim ledger exports.',
+        'path' => 'modules/reports/insurance_claims.php',
+        'icon' => 'bi bi-shield-check',
+        'badge' => 'Pending Claims',
+        'metric' => number_format($insurancePendingCount),
     ];
 }
 

@@ -131,6 +131,14 @@ $paymentsStmt = db()->prepare(
 );
 $paymentsStmt->execute(['invoice_id' => $invoiceId]);
 $payments = $paymentsStmt->fetchAll();
+$advanceAdjustmentHistory = billing_financial_extensions_ready()
+    ? billing_invoice_advance_adjustment_history(db(), $invoiceId)
+    : [];
+$advanceAdjustedTotal = 0.0;
+foreach ($advanceAdjustmentHistory as $advanceAdjustmentRow) {
+    $advanceAdjustedTotal += (float) ($advanceAdjustmentRow['adjusted_amount'] ?? 0);
+}
+$advanceAdjustedTotal = billing_round($advanceAdjustedTotal);
 
 $companyName = snapshot_get($snapshot, 'company', 'name', (string) ($invoice['live_company_name'] ?? ''));
 $companyGstin = snapshot_get($snapshot, 'company', 'gstin', (string) ($invoice['live_company_gstin'] ?? ''));
@@ -200,7 +208,7 @@ $taxableAmount = (float) ($invoice['taxable_amount'] ?? ($serviceSubtotal + $par
 $totalTaxAmount = (float) ($invoice['total_tax_amount'] ?? ($serviceTaxAmount + $partsTaxAmount));
 $serviceTotalWithTax = billing_round($serviceSubtotal + $serviceTaxAmount);
 $partsTotalWithTax = billing_round($partsSubtotal + $partsTaxAmount);
-$outstanding = max(0.0, (float) $invoice['grand_total'] - $paidAmount);
+$outstanding = max(0.0, (float) $invoice['grand_total'] - $paidAmount - $advanceAdjustedTotal);
 $invoiceStatus = (string) ($invoice['invoice_status'] ?? 'FINALIZED');
 $nextServiceReminders = $showNextServiceReminders && service_reminder_feature_ready()
     ? service_reminder_fetch_active_by_vehicle($companyId, (int) ($invoice['vehicle_id'] ?? 0), $garageId, 6)
@@ -735,6 +743,12 @@ if ($companyLogoUrl === null) {
                     <th>Paid</th>
                     <td class="text-end"><?= e(number_format($paidAmount, 2)); ?></td>
                   </tr>
+                  <?php if ($advanceAdjustedTotal > 0.009): ?>
+                    <tr>
+                      <th>Advance Adjusted</th>
+                      <td class="text-end"><?= e(number_format($advanceAdjustedTotal, 2)); ?></td>
+                    </tr>
+                  <?php endif; ?>
                   <tr>
                     <th>Outstanding</th>
                     <td class="text-end"><?= e(number_format($outstanding, 2)); ?></td>
@@ -744,6 +758,32 @@ if ($companyLogoUrl === null) {
             </table>
           </div>
         </div>
+
+        <?php if (!empty($advanceAdjustmentHistory)): ?>
+          <div class="section-title">Advance Adjustment History</div>
+          <table class="line-table">
+            <thead>
+              <tr>
+                <th style="width:26%;">Advance Receipt</th>
+                <th style="width:16%;">Advance Date</th>
+                <th style="width:16%;" class="text-end">Adjusted</th>
+                <th style="width:16%;">Mode</th>
+                <th style="width:26%;">Remark</th>
+              </tr>
+            </thead>
+            <tbody>
+              <?php foreach ($advanceAdjustmentHistory as $row): ?>
+                <tr>
+                  <td><?= e((string) ($row['receipt_number'] ?? '-')); ?></td>
+                  <td><?= e((string) ($row['received_on'] ?? '-')); ?></td>
+                  <td class="text-end"><?= e(number_format((float) ($row['adjusted_amount'] ?? 0), 2)); ?></td>
+                  <td><?= e((string) ($row['payment_mode'] ?? '-')); ?></td>
+                  <td><?= e((string) (($row['notes'] ?? '') !== '' ? $row['notes'] : '-')); ?></td>
+                </tr>
+              <?php endforeach; ?>
+            </tbody>
+          </table>
+        <?php endif; ?>
 
         <?php if ($showNextServiceReminders): ?>
           <div class="section-title">Next Recommended Service</div>

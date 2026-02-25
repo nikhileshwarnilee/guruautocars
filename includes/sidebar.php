@@ -3,13 +3,16 @@ declare(strict_types=1);
 
 $activeMenu = $active_menu ?? '';
 $isOperationsOpen = $activeMenu === 'jobs'
+    || $activeMenu === 'jobs.queue'
     || $activeMenu === 'jobs.maintenance_reminders'
     || $activeMenu === 'estimates'
     || is_menu_group_open('outsourced.', $activeMenu);
 $isPurchaseOpen = is_menu_group_open('purchases.', $activeMenu)
     || is_menu_group_open('vendors.', $activeMenu);
-$isInventoryOpen = $activeMenu === 'inventory';
+$isInventoryOpen = $activeMenu === 'inventory'
+    || $activeMenu === 'inventory.returns';
 $isSalesOpen = $activeMenu === 'billing'
+    || $activeMenu === 'billing.credit_notes'
     || $activeMenu === 'customers'
     || $activeMenu === 'vehicles';
 $isFinanceOpen = is_menu_group_open('finance.', $activeMenu);
@@ -27,6 +30,7 @@ $isAdministrationOpen = is_menu_group_open('organization.', $activeMenu)
 $servicesMenuActive = ($activeMenu === 'services.master' || $activeMenu === 'services.categories') ? 'active' : '';
 $partsMenuActive = ($activeMenu === 'inventory.parts_master' || $activeMenu === 'inventory.categories' || $activeMenu === 'inventory.units') ? 'active' : '';
 $canViewReports = has_permission('reports.view') || has_permission('report.view');
+$canViewFinancialReports = has_permission('reports.financial') || has_permission('financial.reports') || has_permission('gst.reports');
 $canViewUsersPermissions = has_permission('staff.view')
     || has_permission('staff.manage')
     || has_permission('role.view')
@@ -107,6 +111,12 @@ if ($sidebarBrandName === '') {
                     <p>Service Reminders</p>
                   </a>
                 </li>
+                <li class="nav-item">
+                  <a href="<?= e(url('modules/jobs/queue_board.php')); ?>" class="nav-link <?= e(is_active_menu('jobs.queue', $activeMenu)); ?>">
+                    <i class="nav-icon bi bi-kanban"></i>
+                    <p>Vehicle Queue Board</p>
+                  </a>
+                </li>
               <?php endif; ?>
             </ul>
           </li>
@@ -142,7 +152,7 @@ if ($sidebarBrandName === '') {
           </li>
         <?php endif; ?>
 
-        <?php if (has_permission('inventory.view')): ?>
+        <?php if (has_permission('inventory.view') || has_permission('billing.view') || has_permission('purchase.view') || has_permission('report.view')): ?>
           <li class="nav-item <?= $isInventoryOpen ? 'menu-open' : ''; ?>">
             <a href="#" class="nav-link <?= $isInventoryOpen ? 'active' : ''; ?>">
               <i class="nav-icon bi bi-box-seam"></i>
@@ -152,12 +162,22 @@ if ($sidebarBrandName === '') {
               </p>
             </a>
             <ul class="nav nav-treeview">
-              <li class="nav-item">
-                <a href="<?= e(url('modules/inventory/index.php')); ?>" class="nav-link <?= e(is_active_menu('inventory', $activeMenu)); ?>">
-                  <i class="nav-icon bi bi-arrow-left-right"></i>
-                  <p>Stock Movements</p>
-                </a>
-              </li>
+              <?php if (has_permission('inventory.view')): ?>
+                <li class="nav-item">
+                  <a href="<?= e(url('modules/inventory/index.php')); ?>" class="nav-link <?= e(is_active_menu('inventory', $activeMenu)); ?>">
+                    <i class="nav-icon bi bi-arrow-left-right"></i>
+                    <p>Stock Movements</p>
+                  </a>
+                </li>
+              <?php endif; ?>
+              <?php if (has_permission('inventory.view') || has_permission('billing.view') || has_permission('purchase.view') || has_permission('report.view')): ?>
+                <li class="nav-item">
+                  <a href="<?= e(url('modules/returns/index.php')); ?>" class="nav-link <?= e(is_active_menu('inventory.returns', $activeMenu)); ?>">
+                    <i class="nav-icon bi bi-arrow-counterclockwise"></i>
+                    <p>Returns &amp; RMA</p>
+                  </a>
+                </li>
+              <?php endif; ?>
             </ul>
           </li>
         <?php endif; ?>
@@ -177,6 +197,12 @@ if ($sidebarBrandName === '') {
                   <a href="<?= e(url('modules/billing/index.php')); ?>" class="nav-link <?= e(is_active_menu('billing', $activeMenu)); ?>">
                     <i class="nav-icon bi bi-receipt-cutoff"></i>
                     <p>Billing</p>
+                  </a>
+                </li>
+                <li class="nav-item">
+                  <a href="<?= e(url('modules/billing/credit_notes.php')); ?>" class="nav-link <?= e(is_active_menu('billing.credit_notes', $activeMenu)); ?>">
+                    <i class="nav-icon bi bi-receipt"></i>
+                    <p>Credit Notes</p>
                   </a>
                 </li>
               <?php endif; ?>
@@ -311,7 +337,19 @@ if ($sidebarBrandName === '') {
                   <p>Inventory Reports</p>
                 </a>
               </li>
-              <?php if (has_permission('reports.financial') || has_permission('financial.reports') || has_permission('gst.reports')): ?>
+              <li class="nav-item">
+                <a href="<?= e(url('modules/reports/inventory_valuation.php')); ?>" class="nav-link <?= e(is_active_menu('reports.inventory_valuation', $activeMenu)); ?>">
+                  <i class="nav-icon bi bi-calculator"></i>
+                  <p>Inventory Valuation</p>
+                </a>
+              </li>
+              <li class="nav-item">
+                <a href="<?= e(url('modules/reports/returns.php')); ?>" class="nav-link <?= e(is_active_menu('reports.returns', $activeMenu)); ?>">
+                  <i class="nav-icon bi bi-arrow-counterclockwise"></i>
+                  <p>Returns Report</p>
+                </a>
+              </li>
+              <?php if ($canViewFinancialReports): ?>
                 <li class="nav-item">
                   <a href="<?= e(url('modules/reports/billing_gst.php')); ?>" class="nav-link <?= e(is_active_menu('reports.billing', $activeMenu)); ?>">
                     <i class="nav-icon bi bi-receipt-cutoff"></i>
@@ -319,9 +357,35 @@ if ($sidebarBrandName === '') {
                   </a>
                 </li>
                 <li class="nav-item">
+                  <a href="<?= e(url('modules/reports/payments.php')); ?>" class="nav-link <?= e(is_active_menu('reports.payments', $activeMenu)); ?>">
+                    <i class="nav-icon bi bi-wallet2"></i>
+                    <p>Payments Report</p>
+                  </a>
+                </li>
+                <li class="nav-item">
+                  <a href="<?= e(url('modules/reports/advance_collections.php')); ?>" class="nav-link <?= e(is_active_menu('reports.advance_collections', $activeMenu)); ?>">
+                    <i class="nav-icon bi bi-cash-stack"></i>
+                    <p>Advance Collections</p>
+                  </a>
+                </li>
+                <li class="nav-item">
+                  <a href="<?= e(url('modules/reports/profit_loss.php')); ?>" class="nav-link <?= e(is_active_menu('reports.profit_loss', $activeMenu)); ?>">
+                    <i class="nav-icon bi bi-graph-up-arrow"></i>
+                    <p>Profit &amp; Loss</p>
+                  </a>
+                </li>
+                <li class="nav-item">
                   <a href="<?= e(url('modules/reports/gst_compliance.php')); ?>" class="nav-link <?= e(is_active_menu('reports.gst_compliance', $activeMenu)); ?>">
                     <i class="nav-icon bi bi-journal-text"></i>
                     <p>GST Compliance</p>
+                  </a>
+                </li>
+              <?php endif; ?>
+              <?php if (has_permission('job.view') || has_permission('job.manage') || has_permission('reports.financial')): ?>
+                <li class="nav-item">
+                  <a href="<?= e(url('modules/reports/insurance_claims.php')); ?>" class="nav-link <?= e(is_active_menu('reports.insurance_claims', $activeMenu)); ?>">
+                    <i class="nav-icon bi bi-shield-check"></i>
+                    <p>Insurance Claims</p>
                   </a>
                 </li>
               <?php endif; ?>

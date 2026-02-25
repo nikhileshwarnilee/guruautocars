@@ -35,6 +35,8 @@ $gstSummary = ['invoice_count' => 0, 'taxable_total' => 0, 'cgst_total' => 0, 's
 $paymentModeSummary = [];
 $outstandingReceivables = [];
 $gstMonthlyBreakdownRows = [];
+$creditNoteRows = [];
+$creditNoteSummary = ['note_count' => 0, 'taxable_total' => 0, 'cgst_total' => 0, 'sgst_total' => 0, 'igst_total' => 0, 'tax_total' => 0, 'grand_total' => 0];
 
 function billing_gst_discount_meta_from_snapshot(array $snapshot): array
 {
@@ -213,9 +215,48 @@ if ($canViewFinancial) {
     );
     $gstMonthlyStmt->execute($gstMonthlyParams);
     $gstMonthlyBreakdownRows = $gstMonthlyStmt->fetchAll();
+
+    if (table_columns('credit_notes') !== []) {
+        $creditParams = ['company_id' => $companyId, 'from_date' => $fromDate, 'to_date' => $toDate];
+        $creditScopeSql = analytics_garage_scope_sql('cn.garage_id', $selectedGarageId, $garageIds, $creditParams, 'bill_credit_scope');
+        $creditStmt = db()->prepare(
+            'SELECT cn.credit_note_number,
+                    cn.credit_note_date,
+                    cu.full_name AS customer_name,
+                    cu.gstin AS customer_gstin,
+                    cn.taxable_amount,
+                    cn.cgst_amount,
+                    cn.sgst_amount,
+                    cn.igst_amount,
+                    cn.total_tax_amount,
+                    cn.total_amount
+             FROM credit_notes cn
+             LEFT JOIN customers cu ON cu.id = cn.customer_id
+             WHERE cn.company_id = :company_id
+               AND cn.status_code = "ACTIVE"
+               ' . $creditScopeSql . '
+               AND cn.credit_note_date BETWEEN :from_date AND :to_date
+             ORDER BY cn.credit_note_date DESC, cn.id DESC
+             LIMIT 200'
+        );
+        $creditStmt->execute($creditParams);
+        $creditNoteRows = $creditStmt->fetchAll();
+
+        foreach ($creditNoteRows as $row) {
+            $creditNoteSummary['note_count'] += 1;
+            $creditNoteSummary['taxable_total'] += (float) ($row['taxable_amount'] ?? 0);
+            $creditNoteSummary['cgst_total'] += (float) ($row['cgst_amount'] ?? 0);
+            $creditNoteSummary['sgst_total'] += (float) ($row['sgst_amount'] ?? 0);
+            $creditNoteSummary['igst_total'] += (float) ($row['igst_amount'] ?? 0);
+            $creditNoteSummary['tax_total'] += (float) ($row['total_tax_amount'] ?? 0);
+            $creditNoteSummary['grand_total'] += (float) ($row['total_amount'] ?? 0);
+        }
+    }
 }
 
 $totalOutstanding = array_reduce($outstandingReceivables, static fn (float $sum, array $row): float => $sum + (float) ($row['outstanding_amount'] ?? 0), 0.0);
+$netRevenueAfterCredit = (float) ($gstSummary['grand_total'] ?? 0) - (float) ($creditNoteSummary['grand_total'] ?? 0);
+$netTaxAfterCredit = (float) ($gstSummary['tax_total'] ?? 0) - (float) ($creditNoteSummary['tax_total'] ?? 0);
 
 $gstMonthLabels = array_map(static fn (array $row): string => (string) ($row['tax_month'] ?? ''), $gstMonthlyBreakdownRows);
 $chartPayload = [
@@ -232,6 +273,11 @@ $chartPayload = [
     'receivable_aging' => [
         'labels' => ['Current (0-30)', '31-60', '61-90', '90+'],
         'values' => [0.0, 0.0, 0.0, 0.0],
+    ],
+    'credit_note_totals' => [
+        'count' => (int) ($creditNoteSummary['note_count'] ?? 0),
+        'tax_total' => (float) ($creditNoteSummary['tax_total'] ?? 0),
+        'grand_total' => (float) ($creditNoteSummary['grand_total'] ?? 0),
     ],
 ];
 foreach ($outstandingReceivables as $row) {
@@ -292,6 +338,24 @@ if ($exportKey !== '') {
                 (float) ($gstSummary['grand_total'] ?? 0),
             ]];
             reports_csv_download('billing_gst_summary_' . $timestamp . '.csv', ['Invoices', 'Taxable', 'CGST', 'SGST', 'IGST', 'Total GST', 'Grand Total'], $rows);
+
+        case 'credit_notes':
+            $rows = array_map(
+                static fn (array $row): array => [
+                    (string) ($row['credit_note_number'] ?? ''),
+                    (string) ($row['credit_note_date'] ?? ''),
+                    (string) ($row['customer_name'] ?? ''),
+                    (string) ($row['customer_gstin'] ?? ''),
+                    (float) ($row['taxable_amount'] ?? 0),
+                    (float) ($row['cgst_amount'] ?? 0),
+                    (float) ($row['sgst_amount'] ?? 0),
+                    (float) ($row['igst_amount'] ?? 0),
+                    (float) ($row['total_tax_amount'] ?? 0),
+                    (float) ($row['total_amount'] ?? 0),
+                ],
+                $creditNoteRows
+            );
+            reports_csv_download('billing_credit_notes_' . $timestamp . '.csv', ['Credit Note', 'Date', 'Customer', 'GSTIN', 'Taxable', 'CGST', 'SGST', 'IGST', 'Total GST', 'Total'], $rows);
 
         case 'payment_modes':
             $rows = array_map(static fn (array $row): array => [(string) ($row['payment_mode'] ?? ''), (int) ($row['payment_count'] ?? 0), (float) ($row['collected_amount'] ?? 0)], $paymentModeSummary);
@@ -471,6 +535,36 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         </div>
 
         <div class="row g-3 mb-3">
+          <div class="col-md-4">
+            <div class="info-box">
+              <span class="info-box-icon text-bg-warning"><i class="bi bi-arrow-counterclockwise"></i></span>
+              <div class="info-box-content">
+                <span class="info-box-text">Credit Note Reversal</span>
+                <span class="info-box-number"><?= e(format_currency((float) ($creditNoteSummary['grand_total'] ?? 0))); ?></span>
+              </div>
+            </div>
+          </div>
+          <div class="col-md-4">
+            <div class="info-box">
+              <span class="info-box-icon text-bg-success"><i class="bi bi-graph-up-arrow"></i></span>
+              <div class="info-box-content">
+                <span class="info-box-text">Net Revenue (After CN)</span>
+                <span class="info-box-number"><?= e(format_currency($netRevenueAfterCredit)); ?></span>
+              </div>
+            </div>
+          </div>
+          <div class="col-md-4">
+            <div class="info-box">
+              <span class="info-box-icon text-bg-primary"><i class="bi bi-journal-check"></i></span>
+              <div class="info-box-content">
+                <span class="info-box-text">Net GST (After CN)</span>
+                <span class="info-box-number"><?= e(format_currency($netTaxAfterCredit)); ?></span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="row g-3 mb-3">
           <div class="col-lg-6">
             <div class="card h-100">
               <div class="card-header"><h3 class="card-title mb-0">GST Tax Breakdown (CGST / SGST / IGST)</h3></div>
@@ -576,6 +670,8 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                 <div><strong>SGST:</strong> <?= e(format_currency((float) ($gstSummary['sgst_total'] ?? 0))); ?></div>
                 <div><strong>IGST:</strong> <?= e(format_currency((float) ($gstSummary['igst_total'] ?? 0))); ?></div>
                 <div><strong>Total GST:</strong> <?= e(format_currency((float) ($gstSummary['tax_total'] ?? 0))); ?></div>
+                <div><strong>Credit Note GST:</strong> <?= e(format_currency((float) ($creditNoteSummary['tax_total'] ?? 0))); ?></div>
+                <div><strong>Net GST:</strong> <?= e(format_currency($netTaxAfterCredit)); ?></div>
               </div>
             </div>
           </div>
@@ -599,6 +695,36 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                 </table>
               </div>
             </div>
+          </div>
+        </div>
+
+        <div class="card mb-3">
+          <div class="card-header d-flex justify-content-between align-items-center">
+            <h3 class="card-title mb-0">Credit Note GST Register</h3>
+            <a href="<?= e(reports_export_url('modules/reports/billing_gst.php', $baseParams, 'credit_notes')); ?>" class="btn btn-sm btn-outline-warning">CSV</a>
+          </div>
+          <div class="card-body p-0 table-responsive">
+            <table class="table table-sm table-striped mb-0">
+              <thead><tr><th>Credit Note</th><th>Date</th><th>Customer</th><th>GSTIN</th><th>Taxable</th><th>CGST</th><th>SGST</th><th>IGST</th><th>Total GST</th><th>Total</th></tr></thead>
+              <tbody>
+                <?php if (empty($creditNoteRows)): ?>
+                  <tr><td colspan="10" class="text-center text-muted py-4">No credit notes in selected range.</td></tr>
+                <?php else: foreach ($creditNoteRows as $row): ?>
+                  <tr>
+                    <td><?= e((string) ($row['credit_note_number'] ?? '')); ?></td>
+                    <td><?= e((string) ($row['credit_note_date'] ?? '')); ?></td>
+                    <td><?= e((string) ($row['customer_name'] ?? '')); ?></td>
+                    <td><?= e((string) ($row['customer_gstin'] ?? '-')); ?></td>
+                    <td><?= e(format_currency((float) ($row['taxable_amount'] ?? 0))); ?></td>
+                    <td><?= e(format_currency((float) ($row['cgst_amount'] ?? 0))); ?></td>
+                    <td><?= e(format_currency((float) ($row['sgst_amount'] ?? 0))); ?></td>
+                    <td><?= e(format_currency((float) ($row['igst_amount'] ?? 0))); ?></td>
+                    <td><?= e(format_currency((float) ($row['total_tax_amount'] ?? 0))); ?></td>
+                    <td><?= e(format_currency((float) ($row['total_amount'] ?? 0))); ?></td>
+                  </tr>
+                <?php endforeach; endif; ?>
+              </tbody>
+            </table>
           </div>
         </div>
 

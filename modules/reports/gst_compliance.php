@@ -37,6 +37,8 @@ $salesRows = [];
 $salesSummary = ['invoice_count' => 0, 'taxable_total' => 0, 'cgst_total' => 0, 'sgst_total' => 0, 'igst_total' => 0, 'discount_total' => 0, 'grand_total' => 0];
 $purchaseRows = [];
 $purchaseSummary = ['invoice_count' => 0, 'taxable_total' => 0, 'cgst_total' => 0, 'sgst_total' => 0, 'igst_total' => 0, 'grand_total' => 0];
+$creditNoteRows = [];
+$creditNoteSummary = ['note_count' => 0, 'taxable_total' => 0, 'cgst_total' => 0, 'sgst_total' => 0, 'igst_total' => 0, 'tax_total' => 0, 'grand_total' => 0];
 
 function gst_compliance_discount_meta_from_snapshot(array $snapshot): array
 {
@@ -156,6 +158,42 @@ foreach ($purchaseRows as &$row) {
 }
 unset($row);
 
+if (table_columns('credit_notes') !== []) {
+    $creditParams = ['company_id' => $companyId, 'from_date' => $fromDate, 'to_date' => $toDate];
+    $creditScopeSql = analytics_garage_scope_sql('cn.garage_id', $selectedGarageId, $garageIds, $creditParams, 'gst_credit_scope');
+    $creditStmt = db()->prepare(
+        'SELECT cn.credit_note_number,
+                cn.credit_note_date,
+                cu.full_name AS customer_name,
+                cu.gstin AS customer_gstin,
+                cn.taxable_amount,
+                cn.cgst_amount,
+                cn.sgst_amount,
+                cn.igst_amount,
+                cn.total_tax_amount,
+                cn.total_amount
+         FROM credit_notes cn
+         LEFT JOIN customers cu ON cu.id = cn.customer_id
+         WHERE cn.company_id = :company_id
+           AND cn.status_code = "ACTIVE"
+           ' . $creditScopeSql . '
+           AND cn.credit_note_date BETWEEN :from_date AND :to_date
+         ORDER BY cn.credit_note_date ASC, cn.credit_note_number ASC'
+    );
+    $creditStmt->execute($creditParams);
+    $creditNoteRows = $creditStmt->fetchAll();
+
+    foreach ($creditNoteRows as $row) {
+        $creditNoteSummary['note_count'] += 1;
+        $creditNoteSummary['taxable_total'] += (float) ($row['taxable_amount'] ?? 0);
+        $creditNoteSummary['cgst_total'] += (float) ($row['cgst_amount'] ?? 0);
+        $creditNoteSummary['sgst_total'] += (float) ($row['sgst_amount'] ?? 0);
+        $creditNoteSummary['igst_total'] += (float) ($row['igst_amount'] ?? 0);
+        $creditNoteSummary['tax_total'] += (float) ($row['total_tax_amount'] ?? 0);
+        $creditNoteSummary['grand_total'] += (float) ($row['total_amount'] ?? 0);
+    }
+}
+
 $salesMonthlyTaxMap = [];
 foreach ($salesRows as $row) {
     $month = date('Y-m', strtotime((string) ($row['invoice_date'] ?? $fromDate)));
@@ -174,7 +212,16 @@ foreach ($purchaseRows as $row) {
     $purchaseMonthlyTaxMap[$month] += (float) ($row['cgst_amount'] ?? 0) + (float) ($row['sgst_amount'] ?? 0) + (float) ($row['igst_amount'] ?? 0);
 }
 
-$gstMonthLabels = array_keys($salesMonthlyTaxMap + $purchaseMonthlyTaxMap);
+$creditMonthlyTaxMap = [];
+foreach ($creditNoteRows as $row) {
+    $month = date('Y-m', strtotime((string) ($row['credit_note_date'] ?? $fromDate)));
+    if (!isset($creditMonthlyTaxMap[$month])) {
+        $creditMonthlyTaxMap[$month] = 0.0;
+    }
+    $creditMonthlyTaxMap[$month] += (float) ($row['cgst_amount'] ?? 0) + (float) ($row['sgst_amount'] ?? 0) + (float) ($row['igst_amount'] ?? 0);
+}
+
+$gstMonthLabels = array_keys($salesMonthlyTaxMap + $purchaseMonthlyTaxMap + $creditMonthlyTaxMap);
 sort($gstMonthLabels);
 
 $chartPayload = [
@@ -193,6 +240,8 @@ $chartPayload = [
         'labels' => $gstMonthLabels,
         'sales_tax' => array_map(static fn (string $month): float => (float) ($salesMonthlyTaxMap[$month] ?? 0), $gstMonthLabels),
         'purchase_tax' => array_map(static fn (string $month): float => (float) ($purchaseMonthlyTaxMap[$month] ?? 0), $gstMonthLabels),
+        'credit_note_tax' => array_map(static fn (string $month): float => (float) ($creditMonthlyTaxMap[$month] ?? 0), $gstMonthLabels),
+        'net_sales_tax' => array_map(static fn (string $month): float => (float) ($salesMonthlyTaxMap[$month] ?? 0) - (float) ($creditMonthlyTaxMap[$month] ?? 0), $gstMonthLabels),
     ],
 ];
 $chartPayloadJson = json_encode(
@@ -248,6 +297,24 @@ if ($exportKey !== '') {
             );
             reports_csv_download('gst_purchase_report_' . $timestamp . '.csv', ['Vendor', 'Invoice', 'Date', 'GSTIN', 'Taxable', 'CGST', 'SGST', 'IGST', 'Total'], $rows);
 
+        case 'credit_notes':
+            $rows = array_map(
+                static fn (array $row): array => [
+                    (string) ($row['credit_note_number'] ?? ''),
+                    (string) ($row['credit_note_date'] ?? ''),
+                    (string) ($row['customer_name'] ?? ''),
+                    (string) ($row['customer_gstin'] ?? ''),
+                    (float) ($row['taxable_amount'] ?? 0),
+                    (float) ($row['cgst_amount'] ?? 0),
+                    (float) ($row['sgst_amount'] ?? 0),
+                    (float) ($row['igst_amount'] ?? 0),
+                    (float) ($row['total_tax_amount'] ?? 0),
+                    (float) ($row['total_amount'] ?? 0),
+                ],
+                $creditNoteRows
+            );
+            reports_csv_download('gst_credit_notes_' . $timestamp . '.csv', ['Credit Note', 'Date', 'Customer', 'GSTIN', 'Taxable', 'CGST', 'SGST', 'IGST', 'Total GST', 'Total'], $rows);
+
         default:
             flash_set('report_error', 'Unknown export requested.', 'warning');
             redirect('modules/reports/gst_compliance.php?' . http_build_query(reports_compact_query_params($baseParams)));
@@ -259,12 +326,15 @@ $renderReportBody = static function (
     array $salesSummary,
     array $purchaseRows,
     array $purchaseSummary,
+    array $creditNoteRows,
+    array $creditNoteSummary,
     array $baseParams,
     bool $canExportData,
     string $chartPayloadJson
 ): void {
     $salesExportUrl = reports_export_url('modules/reports/gst_compliance.php', $baseParams, 'sales_gst');
     $purchaseExportUrl = reports_export_url('modules/reports/gst_compliance.php', $baseParams, 'purchase_gst');
+    $creditExportUrl = reports_export_url('modules/reports/gst_compliance.php', $baseParams, 'credit_notes');
     ?>
     <script type="application/json" data-chart-payload><?= $chartPayloadJson ?: '{}'; ?></script>
 
@@ -279,7 +349,7 @@ $renderReportBody = static function (
       </div>
       <div class="col-lg-6">
         <div class="card h-100">
-          <div class="card-header"><h3 class="card-title mb-0">Sales vs Purchase GST Trend</h3></div>
+          <div class="card-header"><h3 class="card-title mb-0">Sales, Credit Note &amp; Purchase GST Trend</h3></div>
           <div class="card-body">
             <div class="gac-chart-wrap"><canvas id="gst-chart-trend"></canvas></div>
           </div>
@@ -409,12 +479,69 @@ $renderReportBody = static function (
         </div>
       </div>
     </div>
+
+    <div class="card card-warning mb-3">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <h3 class="card-title mb-0">Credit Note GST Register (Sales Reversal)</h3>
+        <?php if ($canExportData): ?>
+          <a href="<?= e($creditExportUrl); ?>" class="btn btn-sm btn-outline-dark">Export CSV</a>
+        <?php endif; ?>
+      </div>
+      <div class="card-body">
+        <div class="row g-2 mb-3">
+          <div class="col-md-3"><strong>Credit Notes:</strong> <?= (int) ($creditNoteSummary['note_count'] ?? 0); ?></div>
+          <div class="col-md-3"><strong>Taxable Reversal:</strong> <?= e(format_currency((float) ($creditNoteSummary['taxable_total'] ?? 0))); ?></div>
+          <div class="col-md-3"><strong>GST Reversal:</strong> <?= e(format_currency((float) ($creditNoteSummary['tax_total'] ?? 0))); ?></div>
+          <div class="col-md-3"><strong>Total Reversal:</strong> <?= e(format_currency((float) ($creditNoteSummary['grand_total'] ?? 0))); ?></div>
+          <div class="col-md-6"><strong>Net Sales Tax (Sales GST - Credit Note GST):</strong> <?= e(format_currency(((float) ($salesSummary['cgst_total'] ?? 0) + (float) ($salesSummary['sgst_total'] ?? 0) + (float) ($salesSummary['igst_total'] ?? 0)) - (float) ($creditNoteSummary['tax_total'] ?? 0))); ?></div>
+          <div class="col-md-6"><strong>Net Sales Value (Sales Total - Credit Note Total):</strong> <?= e(format_currency((float) ($salesSummary['grand_total'] ?? 0) - (float) ($creditNoteSummary['grand_total'] ?? 0))); ?></div>
+        </div>
+        <div class="table-responsive">
+          <table class="table table-sm table-striped mb-0">
+            <thead>
+              <tr>
+                <th>Credit Note</th>
+                <th>Date</th>
+                <th>Customer</th>
+                <th>GSTIN</th>
+                <th>Taxable</th>
+                <th>CGST</th>
+                <th>SGST</th>
+                <th>IGST</th>
+                <th>Total GST</th>
+                <th>Total</th>
+              </tr>
+            </thead>
+            <tbody>
+              <?php if (empty($creditNoteRows)): ?>
+                <tr><td colspan="10" class="text-center text-muted py-4">No credit notes in the selected range.</td></tr>
+              <?php else: ?>
+                <?php foreach ($creditNoteRows as $row): ?>
+                  <tr>
+                    <td><?= e((string) ($row['credit_note_number'] ?? '')); ?></td>
+                    <td><?= e((string) ($row['credit_note_date'] ?? '')); ?></td>
+                    <td><?= e((string) ($row['customer_name'] ?? '-')); ?></td>
+                    <td><?= e((string) ($row['customer_gstin'] ?? '-')); ?></td>
+                    <td><?= e(format_currency((float) ($row['taxable_amount'] ?? 0))); ?></td>
+                    <td><?= e(format_currency((float) ($row['cgst_amount'] ?? 0))); ?></td>
+                    <td><?= e(format_currency((float) ($row['sgst_amount'] ?? 0))); ?></td>
+                    <td><?= e(format_currency((float) ($row['igst_amount'] ?? 0))); ?></td>
+                    <td><?= e(format_currency((float) ($row['total_tax_amount'] ?? 0))); ?></td>
+                    <td><strong><?= e(format_currency((float) ($row['total_amount'] ?? 0))); ?></strong></td>
+                  </tr>
+                <?php endforeach; ?>
+              <?php endif; ?>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
     <?php
 };
 
 if (isset($_GET['ajax']) && (string) $_GET['ajax'] === '1') {
     header('Content-Type: text/html; charset=utf-8');
-    $renderReportBody($salesRows, $salesSummary, $purchaseRows, $purchaseSummary, $baseParams, $canExportData, $chartPayloadJson);
+    $renderReportBody($salesRows, $salesSummary, $purchaseRows, $purchaseSummary, $creditNoteRows, $creditNoteSummary, $baseParams, $canExportData, $chartPayloadJson);
     exit;
 }
 
@@ -525,7 +652,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       </div>
 
       <div id="gst-report-content">
-        <?php $renderReportBody($salesRows, $salesSummary, $purchaseRows, $purchaseSummary, $baseParams, $canExportData, $chartPayloadJson); ?>
+        <?php $renderReportBody($salesRows, $salesSummary, $purchaseRows, $purchaseSummary, $creditNoteRows, $creditNoteSummary, $baseParams, $canExportData, $chartPayloadJson); ?>
       </div>
     </div>
   </div>
@@ -579,11 +706,25 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             fill: true,
             tension: 0.25
           }, {
+            label: 'Credit Note GST',
+            data: chartData.gst_trend ? chartData.gst_trend.credit_note_tax : [],
+            borderColor: window.GacCharts.palette.red,
+            backgroundColor: window.GacCharts.palette.red + '22',
+            fill: true,
+            tension: 0.25
+          }, {
             label: 'Purchase GST',
             data: chartData.gst_trend ? chartData.gst_trend.purchase_tax : [],
             borderColor: window.GacCharts.palette.blue,
             backgroundColor: window.GacCharts.palette.blue + '33',
             fill: true,
+            tension: 0.25
+          }, {
+            label: 'Net Sales GST',
+            data: chartData.gst_trend ? chartData.gst_trend.net_sales_tax : [],
+            borderColor: window.GacCharts.palette.indigo,
+            backgroundColor: window.GacCharts.palette.indigo + '1a',
+            fill: false,
             tension: 0.25
           }]
         },

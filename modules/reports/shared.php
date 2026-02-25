@@ -235,6 +235,18 @@ function reports_module_links(): array
             'path' => 'modules/reports/inventory.php',
         ],
         [
+            'menu_key' => 'reports.inventory_valuation',
+            'label' => 'Inventory Valuation',
+            'icon' => 'bi bi-calculator',
+            'path' => 'modules/reports/inventory_valuation.php',
+        ],
+        [
+            'menu_key' => 'reports.returns',
+            'label' => 'Returns Report',
+            'icon' => 'bi bi-arrow-counterclockwise',
+            'path' => 'modules/reports/returns.php',
+        ],
+        [
             'menu_key' => 'reports.customers',
             'label' => 'Customer Reports',
             'icon' => 'bi bi-people',
@@ -260,7 +272,31 @@ function reports_module_links(): array
             'label' => 'Billing & GST',
             'icon' => 'bi bi-receipt',
             'path' => 'modules/reports/billing_gst.php',
+        ], [
+            'menu_key' => 'reports.payments',
+            'label' => 'Payments Report',
+            'icon' => 'bi bi-wallet2',
+            'path' => 'modules/reports/payments.php',
+        ], [
+            'menu_key' => 'reports.advance_collections',
+            'label' => 'Advance Collections',
+            'icon' => 'bi bi-cash-stack',
+            'path' => 'modules/reports/advance_collections.php',
+        ], [
+            'menu_key' => 'reports.profit_loss',
+            'label' => 'Profit & Loss',
+            'icon' => 'bi bi-graph-up-arrow',
+            'path' => 'modules/reports/profit_loss.php',
         ]]);
+    }
+
+    if (has_permission('job.view') || has_permission('job.manage') || has_permission('reports.financial')) {
+        $links[] = [
+            'menu_key' => 'reports.insurance_claims',
+            'label' => 'Insurance Claims',
+            'icon' => 'bi bi-shield-check',
+            'path' => 'modules/reports/insurance_claims.php',
+        ];
     }
 
     if (has_permission('purchase.view') || has_permission('purchase.manage')) {

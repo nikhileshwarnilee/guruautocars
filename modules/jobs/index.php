@@ -5,6 +5,7 @@ require_once __DIR__ . '/../../includes/app.php';
 require_login();
 require_permission('job.view');
 require_once __DIR__ . '/workflow.php';
+require_once __DIR__ . '/insurance.php';
 
 $page_title = 'Job Cards / Work Orders';
 $active_menu = 'jobs';
@@ -20,6 +21,7 @@ $canConditionPhotoManage = has_permission('job.manage') || has_permission('setti
 $jobCardColumns = table_columns('job_cards');
 $jobOdometerEnabled = in_array('odometer_km', $jobCardColumns, true);
 $jobRecommendationNoteEnabled = job_recommendation_note_feature_ready();
+$jobInsuranceEnabled = job_insurance_feature_ready();
 $odometerEditableStatuses = ['OPEN', 'IN_PROGRESS'];
 $maintenanceReminderFeatureReady = service_reminder_feature_ready();
 $maintenanceRecommendationApiUrl = url('modules/jobs/maintenance_recommendations_api.php');
@@ -168,6 +170,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $complaint = post_string('complaint', 3000);
         $diagnosis = post_string('diagnosis', 3000);
         $recommendationNote = $jobRecommendationNoteEnabled ? post_string('recommendation_note', 5000) : '';
+        $insuranceCompanyName = $jobInsuranceEnabled ? post_string('insurance_company_name', 150) : '';
+        $insuranceClaimNumber = $jobInsuranceEnabled ? post_string('insurance_claim_number', 80) : '';
+        $insuranceSurveyorName = $jobInsuranceEnabled ? post_string('insurance_surveyor_name', 120) : '';
+        $insuranceClaimAmountApproved = $jobInsuranceEnabled ? job_insurance_parse_amount($_POST['insurance_claim_amount_approved'] ?? null) : null;
+        $insuranceCustomerPayableAmount = $jobInsuranceEnabled ? job_insurance_parse_amount($_POST['insurance_customer_payable_amount'] ?? null) : null;
+        $insuranceClaimStatus = $jobInsuranceEnabled
+            ? job_insurance_normalize_status((string) ($_POST['insurance_claim_status'] ?? 'PENDING'))
+            : 'PENDING';
         $odometerRaw = trim((string) ($_POST['odometer_km'] ?? ''));
         $odometerKm = null;
         $priority = strtoupper(post_string('priority', 10));
@@ -242,19 +252,25 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $jobNumber = job_generate_number($pdo, $garageId);
             $recommendationColumnSql = $jobRecommendationNoteEnabled ? ', recommendation_note' : '';
             $recommendationValueSql = $jobRecommendationNoteEnabled ? ', :recommendation_note' : '';
+            $insuranceColumnSql = $jobInsuranceEnabled
+                ? ', insurance_company_name, insurance_claim_number, insurance_surveyor_name, insurance_claim_amount_approved, insurance_customer_payable_amount, insurance_claim_status'
+                : '';
+            $insuranceValueSql = $jobInsuranceEnabled
+                ? ', :insurance_company_name, :insurance_claim_number, :insurance_surveyor_name, :insurance_claim_amount_approved, :insurance_customer_payable_amount, :insurance_claim_status'
+                : '';
             if ($jobOdometerEnabled) {
                 $stmt = $pdo->prepare(
                     'INSERT INTO job_cards
-                      (company_id, garage_id, job_number, customer_id, vehicle_id, odometer_km, assigned_to, service_advisor_id, complaint, diagnosis' . $recommendationColumnSql . ', status, priority, promised_at, status_code, created_by, updated_by)
+                      (company_id, garage_id, job_number, customer_id, vehicle_id, odometer_km, assigned_to, service_advisor_id, complaint, diagnosis' . $recommendationColumnSql . $insuranceColumnSql . ', status, priority, promised_at, status_code, created_by, updated_by)
                      VALUES
-                      (:company_id, :garage_id, :job_number, :customer_id, :vehicle_id, :odometer_km, NULL, :service_advisor_id, :complaint, :diagnosis' . $recommendationValueSql . ', "OPEN", :priority, :promised_at, "ACTIVE", :created_by, :updated_by)'
+                      (:company_id, :garage_id, :job_number, :customer_id, :vehicle_id, :odometer_km, NULL, :service_advisor_id, :complaint, :diagnosis' . $recommendationValueSql . $insuranceValueSql . ', "OPEN", :priority, :promised_at, "ACTIVE", :created_by, :updated_by)'
                 );
             } else {
                 $stmt = $pdo->prepare(
                     'INSERT INTO job_cards
-                      (company_id, garage_id, job_number, customer_id, vehicle_id, assigned_to, service_advisor_id, complaint, diagnosis' . $recommendationColumnSql . ', status, priority, promised_at, status_code, created_by, updated_by)
+                      (company_id, garage_id, job_number, customer_id, vehicle_id, assigned_to, service_advisor_id, complaint, diagnosis' . $recommendationColumnSql . $insuranceColumnSql . ', status, priority, promised_at, status_code, created_by, updated_by)
                      VALUES
-                      (:company_id, :garage_id, :job_number, :customer_id, :vehicle_id, NULL, :service_advisor_id, :complaint, :diagnosis' . $recommendationValueSql . ', "OPEN", :priority, :promised_at, "ACTIVE", :created_by, :updated_by)'
+                      (:company_id, :garage_id, :job_number, :customer_id, :vehicle_id, NULL, :service_advisor_id, :complaint, :diagnosis' . $recommendationValueSql . $insuranceValueSql . ', "OPEN", :priority, :promised_at, "ACTIVE", :created_by, :updated_by)'
                 );
             }
 
@@ -274,6 +290,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             ];
             if ($jobRecommendationNoteEnabled) {
                 $insertParams['recommendation_note'] = $recommendationNote !== '' ? $recommendationNote : null;
+            }
+            if ($jobInsuranceEnabled) {
+                $insertParams['insurance_company_name'] = $insuranceCompanyName !== '' ? $insuranceCompanyName : null;
+                $insertParams['insurance_claim_number'] = $insuranceClaimNumber !== '' ? $insuranceClaimNumber : null;
+                $insertParams['insurance_surveyor_name'] = $insuranceSurveyorName !== '' ? $insuranceSurveyorName : null;
+                $insertParams['insurance_claim_amount_approved'] = $insuranceClaimAmountApproved;
+                $insertParams['insurance_customer_payable_amount'] = $insuranceCustomerPayableAmount;
+                $insertParams['insurance_claim_status'] = $insuranceClaimStatus;
             }
             if ($jobOdometerEnabled) {
                 $insertParams['odometer_km'] = $odometerKm !== null ? $odometerKm : 0;
@@ -328,6 +352,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'vehicle_id' => $vehicleId,
                     'odometer_km' => $jobOdometerEnabled && $odometerKm !== null ? $odometerKm : null,
                     'recommendation_note' => $jobRecommendationNoteEnabled ? ($recommendationNote !== '' ? $recommendationNote : null) : null,
+                    'insurance_company_name' => $jobInsuranceEnabled ? ($insuranceCompanyName !== '' ? $insuranceCompanyName : null) : null,
+                    'insurance_claim_number' => $jobInsuranceEnabled ? ($insuranceClaimNumber !== '' ? $insuranceClaimNumber : null) : null,
+                    'insurance_surveyor_name' => $jobInsuranceEnabled ? ($insuranceSurveyorName !== '' ? $insuranceSurveyorName : null) : null,
+                    'insurance_claim_amount_approved' => $jobInsuranceEnabled ? $insuranceClaimAmountApproved : null,
+                    'insurance_customer_payable_amount' => $jobInsuranceEnabled ? $insuranceCustomerPayableAmount : null,
+                    'insurance_claim_status' => $jobInsuranceEnabled ? $insuranceClaimStatus : null,
                 ],
                 'metadata' => [
                     'assigned_count' => isset($assigned) && is_array($assigned) ? count($assigned) : 0,
@@ -379,6 +409,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $complaint = post_string('complaint', 3000);
         $diagnosis = post_string('diagnosis', 3000);
         $recommendationNote = $jobRecommendationNoteEnabled ? post_string('recommendation_note', 5000) : '';
+        $insuranceCompanyName = $jobInsuranceEnabled ? post_string('insurance_company_name', 150) : '';
+        $insuranceClaimNumber = $jobInsuranceEnabled ? post_string('insurance_claim_number', 80) : '';
+        $insuranceSurveyorName = $jobInsuranceEnabled ? post_string('insurance_surveyor_name', 120) : '';
+        $insuranceClaimAmountApproved = $jobInsuranceEnabled ? job_insurance_parse_amount($_POST['insurance_claim_amount_approved'] ?? null) : null;
+        $insuranceCustomerPayableAmount = $jobInsuranceEnabled ? job_insurance_parse_amount($_POST['insurance_customer_payable_amount'] ?? null) : null;
+        $insuranceClaimStatus = $jobInsuranceEnabled
+            ? job_insurance_normalize_status((string) ($_POST['insurance_claim_status'] ?? 'PENDING'))
+            : 'PENDING';
         $odometerRaw = trim((string) ($_POST['odometer_km'] ?? ''));
         $odometerKm = null;
         $priority = strtoupper(post_string('priority', 10));
@@ -433,6 +471,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                  recommendation_note = :recommendation_note';
             $updateParams['recommendation_note'] = $recommendationNote !== '' ? $recommendationNote : null;
         }
+        if ($jobInsuranceEnabled) {
+            $updateSql .= ',
+                 insurance_company_name = :insurance_company_name,
+                 insurance_claim_number = :insurance_claim_number,
+                 insurance_surveyor_name = :insurance_surveyor_name,
+                 insurance_claim_amount_approved = :insurance_claim_amount_approved,
+                 insurance_customer_payable_amount = :insurance_customer_payable_amount,
+                 insurance_claim_status = :insurance_claim_status';
+            $updateParams['insurance_company_name'] = $insuranceCompanyName !== '' ? $insuranceCompanyName : null;
+            $updateParams['insurance_claim_number'] = $insuranceClaimNumber !== '' ? $insuranceClaimNumber : null;
+            $updateParams['insurance_surveyor_name'] = $insuranceSurveyorName !== '' ? $insuranceSurveyorName : null;
+            $updateParams['insurance_claim_amount_approved'] = $insuranceClaimAmountApproved;
+            $updateParams['insurance_customer_payable_amount'] = $insuranceCustomerPayableAmount;
+            $updateParams['insurance_claim_status'] = $insuranceClaimStatus;
+        }
         if ($jobOdometerEnabled && $odometerEditable && $odometerKm !== null) {
             $updateSql .= ',
                  odometer_km = :odometer_km';
@@ -473,6 +526,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'promised_at' => (string) ($job['promised_at'] ?? ''),
                 'odometer_km' => $jobOdometerEnabled ? (int) ($job['odometer_km'] ?? 0) : null,
                 'recommendation_note' => $jobRecommendationNoteEnabled ? (string) ($job['recommendation_note'] ?? '') : null,
+                'insurance_company_name' => $jobInsuranceEnabled ? (string) ($job['insurance_company_name'] ?? '') : null,
+                'insurance_claim_number' => $jobInsuranceEnabled ? (string) ($job['insurance_claim_number'] ?? '') : null,
+                'insurance_surveyor_name' => $jobInsuranceEnabled ? (string) ($job['insurance_surveyor_name'] ?? '') : null,
+                'insurance_claim_amount_approved' => $jobInsuranceEnabled
+                    ? ($job['insurance_claim_amount_approved'] !== null ? (float) $job['insurance_claim_amount_approved'] : null)
+                    : null,
+                'insurance_customer_payable_amount' => $jobInsuranceEnabled
+                    ? ($job['insurance_customer_payable_amount'] !== null ? (float) $job['insurance_customer_payable_amount'] : null)
+                    : null,
+                'insurance_claim_status' => $jobInsuranceEnabled ? (string) ($job['insurance_claim_status'] ?? '') : null,
             ],
             'after' => [
                 'complaint' => $complaint,
@@ -483,6 +546,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     ? ($odometerEditable && $odometerKm !== null ? $odometerKm : (int) ($job['odometer_km'] ?? 0))
                     : null,
                 'recommendation_note' => $jobRecommendationNoteEnabled ? ($recommendationNote !== '' ? $recommendationNote : null) : null,
+                'insurance_company_name' => $jobInsuranceEnabled ? ($insuranceCompanyName !== '' ? $insuranceCompanyName : null) : null,
+                'insurance_claim_number' => $jobInsuranceEnabled ? ($insuranceClaimNumber !== '' ? $insuranceClaimNumber : null) : null,
+                'insurance_surveyor_name' => $jobInsuranceEnabled ? ($insuranceSurveyorName !== '' ? $insuranceSurveyorName : null) : null,
+                'insurance_claim_amount_approved' => $jobInsuranceEnabled ? $insuranceClaimAmountApproved : null,
+                'insurance_customer_payable_amount' => $jobInsuranceEnabled ? $insuranceCustomerPayableAmount : null,
+                'insurance_claim_status' => $jobInsuranceEnabled ? $insuranceClaimStatus : null,
             ],
             'metadata' => [
                 'assigned_count' => isset($assigned) && is_array($assigned) ? count($assigned) : 0,
@@ -738,6 +807,43 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             <label class="form-label">Recommendation Note</label>
             <textarea name="recommendation_note" class="form-control" rows="2" maxlength="5000"><?= e((string) ($editJob['recommendation_note'] ?? '')); ?></textarea>
             <div class="form-hint">Printed on job card and invoice.</div>
+          </div>
+        <?php endif; ?>
+        <?php if ($jobInsuranceEnabled): ?>
+          <div class="col-12"><hr class="my-1"></div>
+          <div class="col-12">
+            <h6 class="mb-0 text-muted">Insurance Claim Details</h6>
+          </div>
+          <div class="col-md-4">
+            <label class="form-label">Insurance Company</label>
+            <input type="text" name="insurance_company_name" class="form-control" maxlength="150" value="<?= e((string) ($editJob['insurance_company_name'] ?? '')); ?>" placeholder="Insurer name">
+          </div>
+          <div class="col-md-3">
+            <label class="form-label">Claim Number</label>
+            <input type="text" name="insurance_claim_number" class="form-control" maxlength="80" value="<?= e((string) ($editJob['insurance_claim_number'] ?? '')); ?>" placeholder="Claim no">
+          </div>
+          <div class="col-md-3">
+            <label class="form-label">Surveyor Name</label>
+            <input type="text" name="insurance_surveyor_name" class="form-control" maxlength="120" value="<?= e((string) ($editJob['insurance_surveyor_name'] ?? '')); ?>" placeholder="Surveyor">
+          </div>
+          <div class="col-md-2">
+            <label class="form-label">Claim Status</label>
+            <select name="insurance_claim_status" class="form-select">
+              <?php $insuranceStatus = job_insurance_normalize_status((string) ($editJob['insurance_claim_status'] ?? 'PENDING')); ?>
+              <?php foreach (job_insurance_allowed_statuses() as $statusOption): ?>
+                <option value="<?= e($statusOption); ?>" <?= $insuranceStatus === $statusOption ? 'selected' : ''; ?>><?= e($statusOption); ?></option>
+              <?php endforeach; ?>
+            </select>
+          </div>
+          <div class="col-md-3">
+            <label class="form-label">Claim Amount Approved</label>
+            <input type="number" name="insurance_claim_amount_approved" class="form-control" step="0.01" min="0"
+                   value="<?= e(($editJob['insurance_claim_amount_approved'] ?? null) !== null ? number_format((float) $editJob['insurance_claim_amount_approved'], 2, '.', '') : ''); ?>">
+          </div>
+          <div class="col-md-3">
+            <label class="form-label">Customer Payable Difference</label>
+            <input type="number" name="insurance_customer_payable_amount" class="form-control" step="0.01" min="0"
+                   value="<?= e(($editJob['insurance_customer_payable_amount'] ?? null) !== null ? number_format((float) $editJob['insurance_customer_payable_amount'], 2, '.', '') : ''); ?>">
           </div>
         <?php endif; ?>
         <?php if ($canAssign): ?><div class="col-md-12"><label class="form-label">Assigned Staff (Multiple)</label><select name="assigned_user_ids[]" class="form-select" multiple size="4"><?php foreach ($staffCandidates as $staff): ?><option value="<?= (int) $staff['id']; ?>" <?= in_array((int) $staff['id'], $editAssignments, true) ? 'selected' : ''; ?>><?= e((string) $staff['name']); ?> - <?= e((string) $staff['role_name']); ?></option><?php endforeach; ?></select></div><?php endif; ?>

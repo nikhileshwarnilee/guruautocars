@@ -1,6 +1,8 @@
 <?php
 declare(strict_types=1);
 
+require_once __DIR__ . '/financial_extensions.php';
+
 function billing_has_permission(array $permissionKeys): bool
 {
     foreach ($permissionKeys as $permissionKey) {

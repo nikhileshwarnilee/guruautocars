@@ -21,6 +21,7 @@ $canCancel = billing_can_cancel();
 $canPay = billing_can_pay();
 $canManageInvoiceSettings = billing_has_permission(['invoice.manage', 'settings.manage']);
 $canViewJobs = has_permission('job.view');
+$financialExtensionsReady = billing_financial_extensions_ready();
 $paymentColumns = table_columns('payments');
 $paymentHasEntryType = in_array('entry_type', $paymentColumns, true);
 $paymentHasReversedPaymentId = in_array('reversed_payment_id', $paymentColumns, true);
@@ -28,6 +29,11 @@ $paymentHasIsReversed = in_array('is_reversed', $paymentColumns, true);
 $paymentHasReversedAt = in_array('reversed_at', $paymentColumns, true);
 $paymentHasReversedBy = in_array('reversed_by', $paymentColumns, true);
 $paymentHasReverseReason = in_array('reverse_reason', $paymentColumns, true);
+$paymentHasReceiptNumber = in_array('receipt_number', $paymentColumns, true);
+$paymentHasReceiptSequence = in_array('receipt_sequence_number', $paymentColumns, true);
+$paymentHasReceiptFinancialYear = in_array('receipt_financial_year_label', $paymentColumns, true);
+$paymentHasOutstandingBefore = in_array('outstanding_before', $paymentColumns, true);
+$paymentHasOutstandingAfter = in_array('outstanding_after', $paymentColumns, true);
 
 function billing_parse_date(?string $date): ?string
 {
@@ -57,6 +63,67 @@ function billing_snapshot_value(array $snapshot, string $section, string $key): 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     require_csrf();
     $action = (string) ($_POST['_action'] ?? '');
+
+    if ($action === 'collect_advance' && $canPay) {
+        if (!$financialExtensionsReady) {
+            flash_set('billing_error', 'Advance collection is not ready. Please refresh and retry.', 'danger');
+            redirect('modules/billing/index.php');
+        }
+
+        $jobCardId = post_int('job_card_id');
+        $amount = max(0.0, billing_round((float) ($_POST['amount'] ?? 0)));
+        $receivedOn = billing_parse_date((string) ($_POST['received_on'] ?? date('Y-m-d')));
+        $paymentMode = billing_normalize_payment_mode((string) ($_POST['payment_mode'] ?? 'CASH'));
+        $referenceNo = post_string('reference_no', 100);
+        $notes = post_string('notes', 255);
+
+        if ($paymentMode === 'MIXED') {
+            $paymentMode = 'CASH';
+        }
+
+        if ($jobCardId <= 0 || $amount <= 0 || $receivedOn === null) {
+            flash_set('billing_error', 'Job card, amount and receive date are required for advance collection.', 'danger');
+            redirect('modules/billing/index.php');
+        }
+
+        $pdo = db();
+        $pdo->beginTransaction();
+        try {
+            $result = billing_collect_job_advance(
+                $pdo,
+                $companyId,
+                $garageId,
+                $jobCardId,
+                $amount,
+                $receivedOn,
+                $paymentMode,
+                $referenceNo !== '' ? $referenceNo : null,
+                $notes !== '' ? $notes : null,
+                $userId > 0 ? $userId : null
+            );
+            $advanceId = (int) ($result['advance_id'] ?? 0);
+
+            log_audit('billing', 'advance_collect', $advanceId, 'Collected advance for job card #' . $jobCardId, [
+                'entity' => 'job_advance',
+                'source' => 'UI',
+                'after' => [
+                    'advance_id' => $advanceId,
+                    'job_card_id' => $jobCardId,
+                    'amount' => $amount,
+                    'payment_mode' => $paymentMode,
+                    'receipt_number' => (string) ($result['receipt_number'] ?? ''),
+                ],
+            ]);
+
+            $pdo->commit();
+            flash_set('billing_success', 'Advance collected successfully. Receipt: ' . (string) ($result['receipt_number'] ?? '-'), 'success');
+        } catch (Throwable $exception) {
+            $pdo->rollBack();
+            flash_set('billing_error', $exception->getMessage(), 'danger');
+        }
+
+        redirect('modules/billing/index.php');
+    }
 
     if ($action === 'create_invoice' && $canCreate) {
         if (!has_permission('job.view')) {
@@ -340,6 +407,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 ]);
             }
 
+            $autoAdjustedAdvance = ['adjusted_total' => 0.0, 'rows' => []];
+            if ($financialExtensionsReady) {
+                $autoAdjustedAdvance = billing_auto_adjust_advances_for_invoice(
+                    $pdo,
+                    $invoiceId,
+                    (int) $job['id'],
+                    $companyId,
+                    $garageId,
+                    (float) ($totals['grand_total'] ?? 0),
+                    $userId > 0 ? $userId : null,
+                    $invoiceDate
+                );
+            }
+
             billing_record_status_history(
                 $pdo,
                 $invoiceId,
@@ -355,6 +436,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'discount_type' => (string) ($totals['discount_type'] ?? 'AMOUNT'),
                     'discount_value' => (float) ($totals['discount_value'] ?? 0),
                     'discount_amount' => (float) ($totals['discount_amount'] ?? 0),
+                    'advance_auto_adjusted' => (float) ($autoAdjustedAdvance['adjusted_total'] ?? 0),
                 ]
             );
 
@@ -375,11 +457,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'metadata' => [
                     'financial_year_label' => (string) ($numberMeta['financial_year_label'] ?? ''),
                     'line_count' => count($invoiceLines),
+                    'advance_auto_adjusted' => (float) ($autoAdjustedAdvance['adjusted_total'] ?? 0),
                 ],
             ]);
 
             $pdo->commit();
-            flash_set('billing_success', 'Draft invoice created: ' . $invoiceNumber, 'success');
+            $successMessage = 'Draft invoice created: ' . $invoiceNumber;
+            if ((float) ($autoAdjustedAdvance['adjusted_total'] ?? 0) > 0.009) {
+                $successMessage .= ' | Advance auto-adjusted: ' . number_format((float) $autoAdjustedAdvance['adjusted_total'], 2);
+            }
+            flash_set('billing_success', $successMessage, 'success');
         } catch (Throwable $exception) {
             $pdo->rollBack();
             flash_set('billing_error', $exception->getMessage(), 'danger');
@@ -462,6 +549,23 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $userId > 0 ? $userId : null,
                 null
             );
+
+            if ($financialExtensionsReady) {
+                billing_record_customer_ledger_entry(
+                    $pdo,
+                    $companyId,
+                    $garageId,
+                    (int) ($invoice['customer_id'] ?? 0),
+                    (string) ($invoice['invoice_date'] ?? date('Y-m-d')),
+                    'INVOICE',
+                    'INVOICE',
+                    $invoiceId,
+                    (float) ($invoice['grand_total'] ?? 0),
+                    0.0,
+                    $userId > 0 ? $userId : null,
+                    'Finalized invoice ' . (string) ($invoice['invoice_number'] ?? '')
+                );
+            }
 
             log_audit('billing', 'finalize', $invoiceId, 'Finalized invoice ' . (string) $invoice['invoice_number'], [
                 'entity' => 'invoice',
@@ -611,7 +715,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         try {
             $invoiceStmt = $pdo->prepare(
-                'SELECT id, invoice_number, grand_total, invoice_status
+                'SELECT id, invoice_number, grand_total, invoice_status, customer_id
                  FROM invoices
                  WHERE id = :invoice_id
                    AND company_id = :company_id
@@ -638,13 +742,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $paidSumStmt->execute(['invoice_id' => $invoiceId]);
             $alreadyPaid = (float) $paidSumStmt->fetchColumn();
             $grandTotal = (float) $invoice['grand_total'];
-            $remaining = $grandTotal - $alreadyPaid;
+            $advanceAdjusted = $financialExtensionsReady ? billing_invoice_advance_adjusted_total($pdo, $invoiceId) : 0.0;
+            $remaining = $grandTotal - $alreadyPaid - $advanceAdjusted;
+            $remaining = max(0.0, billing_round($remaining));
 
             if ($amount > $remaining + 0.01) {
                 throw new RuntimeException('Payment exceeds outstanding amount. Outstanding: ' . number_format(max(0.0, $remaining), 2));
             }
 
             $paymentInsertColumns = ['invoice_id', 'amount', 'paid_on', 'payment_mode', 'reference_no', 'notes', 'received_by'];
+            $outstandingBefore = $remaining;
+            $outstandingAfter = max(0.0, billing_round($remaining - $amount));
+            $receiptMeta = null;
+            if ($financialExtensionsReady && $paymentHasReceiptNumber && $paymentHasReceiptSequence && $paymentHasReceiptFinancialYear) {
+                $receiptMeta = billing_generate_payment_receipt_number($pdo, $companyId, $garageId, $paidOn);
+            }
             $paymentInsertParams = [
                 'invoice_id' => $invoiceId,
                 'amount' => billing_round($amount),
@@ -654,6 +766,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'notes' => $notes !== '' ? $notes : null,
                 'received_by' => $userId > 0 ? $userId : null,
             ];
+            if ($paymentHasReceiptNumber && $paymentHasReceiptSequence && $paymentHasReceiptFinancialYear && $receiptMeta !== null) {
+                $paymentInsertColumns[] = 'receipt_number';
+                $paymentInsertParams['receipt_number'] = (string) $receiptMeta['number'];
+                $paymentInsertColumns[] = 'receipt_sequence_number';
+                $paymentInsertParams['receipt_sequence_number'] = (int) $receiptMeta['sequence_number'];
+                $paymentInsertColumns[] = 'receipt_financial_year_label';
+                $paymentInsertParams['receipt_financial_year_label'] = (string) $receiptMeta['financial_year_label'];
+            }
+            if ($paymentHasOutstandingBefore) {
+                $paymentInsertColumns[] = 'outstanding_before';
+                $paymentInsertParams['outstanding_before'] = $outstandingBefore;
+            }
+            if ($paymentHasOutstandingAfter) {
+                $paymentInsertColumns[] = 'outstanding_after';
+                $paymentInsertParams['outstanding_after'] = $outstandingAfter;
+            }
 
             if ($paymentHasEntryType) {
                 $paymentInsertColumns[] = 'entry_type';
@@ -690,10 +818,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $paymentId = (int) $pdo->lastInsertId();
 
             $newPaid = billing_round($alreadyPaid + $amount);
+            $netSettled = billing_round($newPaid + $advanceAdjusted);
             $paymentStatus = 'PARTIAL';
-            if ($newPaid <= 0.001) {
+            if ($netSettled <= 0.001) {
                 $paymentStatus = 'UNPAID';
-            } elseif ($newPaid >= $grandTotal - 0.01) {
+            } elseif ($netSettled >= $grandTotal - 0.01) {
                 $paymentStatus = 'PAID';
             }
 
@@ -723,6 +852,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'mode' => $paymentMode,
                     'paid_on' => $paidOn,
                     'reference_no' => $referenceNo !== '' ? $referenceNo : null,
+                    'receipt_number' => $receiptMeta !== null ? (string) ($receiptMeta['number'] ?? '') : null,
+                    'outstanding_before' => $outstandingBefore,
+                    'outstanding_after' => $outstandingAfter,
+                    'advance_adjusted' => $advanceAdjusted,
                 ]
             );
 
@@ -739,14 +872,34 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'payment_status' => $paymentStatus,
                     'payment_mode' => (string) ($summaryMode ?? $paymentMode),
                     'paid_amount' => (float) $newPaid,
+                    'advance_adjusted' => (float) $advanceAdjusted,
+                    'settled_total' => (float) $netSettled,
                     'payment_entry_amount' => (float) billing_round($amount),
                 ],
                 'metadata' => [
                     'invoice_number' => (string) ($invoice['invoice_number'] ?? ''),
                     'payment_id' => $paymentId,
+                    'receipt_number' => $receiptMeta !== null ? (string) ($receiptMeta['number'] ?? '') : null,
                     'reference_no' => $referenceNo !== '' ? $referenceNo : null,
                 ],
             ]);
+
+            if ($financialExtensionsReady) {
+                billing_record_customer_ledger_entry(
+                    $pdo,
+                    $companyId,
+                    $garageId,
+                    (int) ($invoice['customer_id'] ?? 0),
+                    $paidOn,
+                    'PAYMENT',
+                    'PAYMENT',
+                    $paymentId,
+                    0.0,
+                    billing_round($amount),
+                    $userId > 0 ? $userId : null,
+                    'Payment received for invoice ' . (string) ($invoice['invoice_number'] ?? '')
+                );
+            }
 
             $pdo->commit();
             flash_set('billing_success', 'Payment recorded successfully.', 'success');
@@ -785,6 +938,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'i.grand_total',
                 'i.invoice_status',
                 'i.payment_status',
+                'i.customer_id',
             ];
             if ($paymentHasEntryType) {
                 $selectFields[] = 'p.entry_type';
@@ -938,11 +1092,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $paidSumStmt->execute(['invoice_id' => $invoiceId]);
             $netPaid = round((float) $paidSumStmt->fetchColumn(), 2);
             $grandTotal = round((float) ($payment['grand_total'] ?? 0), 2);
+            $advanceAdjusted = $financialExtensionsReady ? billing_invoice_advance_adjusted_total($pdo, $invoiceId) : 0.0;
+            $netSettled = billing_round($netPaid + $advanceAdjusted);
 
             $paymentStatus = 'PARTIAL';
-            if ($netPaid <= 0.009) {
+            if ($netSettled <= 0.009) {
                 $paymentStatus = 'UNPAID';
-            } elseif ($netPaid + 0.009 >= $grandTotal) {
+            } elseif ($netSettled + 0.009 >= $grandTotal) {
                 $paymentStatus = 'PAID';
             }
 
@@ -971,6 +1127,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'reversal_amount' => -$paymentAmount,
                     'reversal_date' => $reversalDate,
                     'net_paid_amount' => $netPaid,
+                    'advance_adjusted' => $advanceAdjusted,
+                    'net_settled_amount' => $netSettled,
                 ]
             );
 
@@ -989,12 +1147,31 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'payment_status' => $paymentStatus,
                     'payment_mode' => $summaryMode,
                     'net_paid' => $netPaid,
+                    'advance_adjusted' => $advanceAdjusted,
+                    'net_settled' => $netSettled,
                     'reason' => $reverseReason,
                 ],
                 'metadata' => [
                     'invoice_number' => (string) ($payment['invoice_number'] ?? ''),
                 ],
             ]);
+
+            if ($financialExtensionsReady) {
+                billing_record_customer_ledger_entry(
+                    $pdo,
+                    $companyId,
+                    $garageId,
+                    (int) ($payment['customer_id'] ?? 0),
+                    $reversalDate,
+                    'ADJUSTMENT',
+                    'PAYMENT_REVERSAL',
+                    $reversalId,
+                    $paymentAmount,
+                    0.0,
+                    $userId > 0 ? $userId : null,
+                    'Payment reversal for invoice ' . (string) ($payment['invoice_number'] ?? '')
+                );
+            }
 
             $pdo->commit();
             flash_set('billing_success', 'Payment reversed successfully.', 'success');
@@ -1031,12 +1208,37 @@ $eligibleJobsStmt->execute([
 ]);
 $eligibleJobs = $eligibleJobsStmt->fetchAll();
 
+$advanceJobsStmt = db()->prepare(
+    'SELECT jc.id, jc.job_number, jc.status, jc.opened_at,
+            c.full_name AS customer_name, v.registration_no
+     FROM job_cards jc
+     INNER JOIN customers c ON c.id = jc.customer_id
+     INNER JOIN vehicles v ON v.id = jc.vehicle_id
+     WHERE jc.company_id = :company_id
+       AND jc.garage_id = :garage_id
+       AND jc.status_code = "ACTIVE"
+       AND jc.status <> "CANCELLED"
+       AND (c.status_code IS NULL OR c.status_code <> "DELETED")
+       AND (v.status_code IS NULL OR v.status_code <> "DELETED")
+     ORDER BY jc.id DESC
+     LIMIT 300'
+);
+$advanceJobsStmt->execute([
+    'company_id' => $companyId,
+    'garage_id' => $garageId,
+]);
+$advanceJobs = $advanceJobsStmt->fetchAll();
+
+$advanceAdjustedSql = $financialExtensionsReady
+    ? 'COALESCE((SELECT SUM(aa.adjusted_amount) FROM advance_adjustments aa WHERE aa.invoice_id = i.id), 0)'
+    : '0';
 $invoicesStmt = db()->prepare(
     'SELECT i.id, i.job_card_id, i.invoice_number, i.invoice_date, i.financial_year_label, i.invoice_status, i.tax_regime,
             i.taxable_amount, i.total_tax_amount, i.grand_total, i.payment_status, i.payment_mode, i.cancel_reason,
             i.snapshot_json,
             c.full_name AS live_customer_name, v.registration_no AS live_registration_no, jc.job_number AS live_job_number,
-            COALESCE((SELECT SUM(p.amount) FROM payments p WHERE p.invoice_id = i.id), 0) AS paid_amount
+            COALESCE((SELECT SUM(p.amount) FROM payments p WHERE p.invoice_id = i.id), 0) AS paid_amount,
+            ' . $advanceAdjustedSql . ' AS advance_adjusted_amount
      FROM invoices i
      LEFT JOIN customers c ON c.id = i.customer_id
      LEFT JOIN vehicles v ON v.id = i.vehicle_id
@@ -1106,6 +1308,29 @@ $paymentsStmt->execute([
     'garage_id' => $garageId,
 ]);
 $payments = $paymentsStmt->fetchAll();
+
+$jobAdvances = [];
+if ($financialExtensionsReady) {
+    $advanceStmt = db()->prepare(
+        'SELECT ja.*, jc.job_number, c.full_name AS customer_name, v.registration_no,
+                u.name AS created_by_name
+         FROM job_advances ja
+         LEFT JOIN job_cards jc ON jc.id = ja.job_card_id
+         LEFT JOIN customers c ON c.id = ja.customer_id
+         LEFT JOIN vehicles v ON v.id = jc.vehicle_id
+         LEFT JOIN users u ON u.id = ja.created_by
+         WHERE ja.company_id = :company_id
+           AND ja.garage_id = :garage_id
+           AND ja.status_code = "ACTIVE"
+         ORDER BY ja.id DESC
+         LIMIT 80'
+    );
+    $advanceStmt->execute([
+        'company_id' => $companyId,
+        'garage_id' => $garageId,
+    ]);
+    $jobAdvances = $advanceStmt->fetchAll();
+}
 
 $statusHistoryStmt = db()->prepare(
     'SELECT h.*, i.invoice_number, u.name AS actor_name
@@ -1218,6 +1443,58 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         </div>
       <?php endif; ?>
 
+      <?php if ($canPay && $financialExtensionsReady): ?>
+        <div class="card card-secondary">
+          <div class="card-header"><h3 class="card-title">Advance Collection (Job Card)</h3></div>
+          <form method="post">
+            <div class="card-body row g-3">
+              <?= csrf_field(); ?>
+              <input type="hidden" name="_action" value="collect_advance" />
+              <div class="col-md-4">
+                <label class="form-label">Job Card</label>
+                <select name="job_card_id" class="form-select" required>
+                  <option value="">Select Job Card</option>
+                  <?php foreach ($advanceJobs as $job): ?>
+                    <option value="<?= (int) ($job['id'] ?? 0); ?>">
+                      <?= e((string) ($job['job_number'] ?? '')); ?> | <?= e((string) ($job['customer_name'] ?? '')); ?> | <?= e((string) ($job['registration_no'] ?? '')); ?> | <?= e((string) ($job['status'] ?? '')); ?>
+                    </option>
+                  <?php endforeach; ?>
+                </select>
+              </div>
+              <div class="col-md-2">
+                <label class="form-label">Amount</label>
+                <input type="number" name="amount" min="0.01" step="0.01" class="form-control" required />
+              </div>
+              <div class="col-md-2">
+                <label class="form-label">Received On</label>
+                <input type="date" name="received_on" value="<?= e(date('Y-m-d')); ?>" class="form-control" required />
+              </div>
+              <div class="col-md-2">
+                <label class="form-label">Mode</label>
+                <select name="payment_mode" class="form-select" required>
+                  <option value="CASH">Cash</option>
+                  <option value="UPI">UPI</option>
+                  <option value="CARD">Card</option>
+                  <option value="BANK_TRANSFER">Bank Transfer</option>
+                  <option value="CHEQUE">Cheque</option>
+                </select>
+              </div>
+              <div class="col-md-2">
+                <label class="form-label">Reference</label>
+                <input type="text" name="reference_no" class="form-control" maxlength="100" />
+              </div>
+              <div class="col-md-12">
+                <label class="form-label">Notes</label>
+                <input type="text" name="notes" class="form-control" maxlength="255" placeholder="Optional note for receipt" />
+              </div>
+            </div>
+            <div class="card-footer">
+              <button type="submit" class="btn btn-secondary">Collect Advance</button>
+            </div>
+          </form>
+        </div>
+      <?php endif; ?>
+
       <?php if ($canPay): ?>
         <div class="card card-info">
           <div class="card-header"><h3 class="card-title">Record Payment (Finalized Invoices)</h3></div>
@@ -1232,7 +1509,8 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                   <?php foreach ($invoices as $invoice): ?>
                     <?php
                       $invoiceStatus = (string) ($invoice['invoice_status'] ?? '');
-                      $outstanding = (float) $invoice['grand_total'] - (float) $invoice['paid_amount'];
+                      $outstanding = (float) $invoice['grand_total'] - (float) $invoice['paid_amount'] - (float) ($invoice['advance_adjusted_amount'] ?? 0);
+                      $outstanding = max(0.0, $outstanding);
                     ?>
                     <?php if ($invoiceStatus === 'FINALIZED' && $outstanding > 0.01): ?>
                       <option value="<?= (int) $invoice['id']; ?>">
@@ -1293,6 +1571,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                 <th>Discount</th>
                 <th>Total</th>
                 <th>Paid</th>
+                <th>Advance Adj</th>
                 <th>Outstanding</th>
                 <th>Invoice Status</th>
                 <th>Payment</th>
@@ -1301,18 +1580,19 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             </thead>
             <tbody>
               <?php if (empty($invoices)): ?>
-                <tr><td colspan="15" class="text-center text-muted py-4">No invoices generated.</td></tr>
+                <tr><td colspan="16" class="text-center text-muted py-4">No invoices generated.</td></tr>
               <?php else: ?>
                 <?php foreach ($invoices as $invoice): ?>
                   <?php
                     $paid = (float) $invoice['paid_amount'];
+                    $advanceAdjusted = (float) ($invoice['advance_adjusted_amount'] ?? 0);
                     $total = (float) $invoice['grand_total'];
-                    $outstanding = max(0.0, $total - $paid);
+                    $outstanding = max(0.0, $total - $paid - $advanceAdjusted);
                     $invoiceStatus = (string) ($invoice['invoice_status'] ?? 'DRAFT');
                   ?>
                   <tr>
                     <?php $rowJobCardId = (int) ($invoice['display_job_card_id'] ?? 0); ?>
-                    <td>
+                    <td class="d-flex gap-1 flex-wrap">
                       <a href="<?= e(url('modules/billing/print_invoice.php?id=' . (int) $invoice['id'])); ?>" target="_blank">
                         <?= e((string) $invoice['invoice_number']); ?>
                       </a>
@@ -1340,6 +1620,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                     </td>
                     <td><?= e(format_currency($total)); ?></td>
                     <td><?= e(format_currency($paid)); ?></td>
+                    <td><?= e(format_currency($advanceAdjusted)); ?></td>
                     <td><?= e(format_currency($outstanding)); ?></td>
                     <td>
                       <span class="badge text-bg-<?= e(billing_status_badge_class($invoiceStatus)); ?>">
@@ -1459,6 +1740,62 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         </div>
       </div>
 
+      <?php if ($financialExtensionsReady): ?>
+        <div class="card mt-3">
+          <div class="card-header"><h3 class="card-title">Advance Ledger</h3></div>
+          <div class="card-body table-responsive p-0">
+            <table class="table table-sm table-striped mb-0">
+              <thead>
+                <tr>
+                  <th>Date</th>
+                  <th>Receipt</th>
+                  <th>Job Card</th>
+                  <th>Customer</th>
+                  <th>Vehicle</th>
+                  <th>Mode</th>
+                  <th>Advance</th>
+                  <th>Adjusted</th>
+                  <th>Balance</th>
+                  <th>By</th>
+                  <th>Action</th>
+                </tr>
+              </thead>
+              <tbody>
+                <?php if (empty($jobAdvances)): ?>
+                  <tr><td colspan="11" class="text-center text-muted py-4">No advances collected yet.</td></tr>
+                <?php else: ?>
+                  <?php foreach ($jobAdvances as $advance): ?>
+                    <tr>
+                      <td><?= e((string) ($advance['received_on'] ?? '-')); ?></td>
+                      <td><code><?= e((string) ($advance['receipt_number'] ?? '-')); ?></code></td>
+                      <td>
+                        <?php if ($canViewJobs && (int) ($advance['job_card_id'] ?? 0) > 0): ?>
+                          <a href="<?= e(url('modules/jobs/view.php?id=' . (int) $advance['job_card_id'])); ?>"><?= e((string) ($advance['job_number'] ?? '-')); ?></a>
+                        <?php else: ?>
+                          <?= e((string) ($advance['job_number'] ?? '-')); ?>
+                        <?php endif; ?>
+                      </td>
+                      <td><?= e((string) ($advance['customer_name'] ?? '-')); ?></td>
+                      <td><?= e((string) ($advance['registration_no'] ?? '-')); ?></td>
+                      <td><?= e((string) ($advance['payment_mode'] ?? '-')); ?></td>
+                      <td><?= e(format_currency((float) ($advance['advance_amount'] ?? 0))); ?></td>
+                      <td><?= e(format_currency((float) ($advance['adjusted_amount'] ?? 0))); ?></td>
+                      <td><?= e(format_currency((float) ($advance['balance_amount'] ?? 0))); ?></td>
+                      <td><?= e((string) ($advance['created_by_name'] ?? '-')); ?></td>
+                      <td>
+                        <a class="btn btn-sm btn-outline-primary" href="<?= e(url('modules/billing/print_advance_receipt.php?id=' . (int) ($advance['id'] ?? 0))); ?>" target="_blank">
+                          Print
+                        </a>
+                      </td>
+                    </tr>
+                  <?php endforeach; ?>
+                <?php endif; ?>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      <?php endif; ?>
+
       <div class="card mt-3">
         <div class="card-header"><h3 class="card-title">Recent Payment Entries</h3></div>
         <div class="card-body table-responsive p-0">
@@ -1470,6 +1807,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                 <th>Type</th>
                 <th>Amount</th>
                 <th>Mode</th>
+                <th>Receipt No</th>
                 <th>Reference</th>
                 <th>Received By</th>
                 <th>Action</th>
@@ -1477,7 +1815,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             </thead>
             <tbody>
               <?php if (empty($payments)): ?>
-                <tr><td colspan="8" class="text-center text-muted py-4">No payments recorded.</td></tr>
+                <tr><td colspan="9" class="text-center text-muted py-4">No payments recorded.</td></tr>
               <?php else: ?>
                 <?php foreach ($payments as $payment): ?>
                   <?php
@@ -1500,9 +1838,18 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                     </td>
                     <td><?= e(format_currency((float) $payment['amount'])); ?></td>
                     <td><?= e((string) $payment['payment_mode']); ?></td>
+                    <td>
+                      <?= e((string) (($payment['receipt_number'] ?? '') !== '' ? $payment['receipt_number'] : '-')); ?>
+                      <?php if (($payment['outstanding_before'] ?? null) !== null && ($payment['outstanding_after'] ?? null) !== null): ?>
+                        <div><small class="text-muted"><?= e(format_currency((float) $payment['outstanding_before'])); ?> -> <?= e(format_currency((float) $payment['outstanding_after'])); ?></small></div>
+                      <?php endif; ?>
+                    </td>
                     <td><?= e((string) ($payment['reference_no'] ?? '-')); ?></td>
                     <td><?= e((string) ($payment['received_by_name'] ?? '-')); ?></td>
                     <td>
+                      <?php if ($entryType === 'PAYMENT'): ?>
+                        <a class="btn btn-sm btn-outline-primary" href="<?= e(url('modules/billing/print_payment_receipt.php?id=' . (int) ($payment['id'] ?? 0))); ?>" target="_blank">Receipt</a>
+                      <?php endif; ?>
                       <?php if ($canReverseEntry): ?>
                         <button
                           type="button"
@@ -1512,7 +1859,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                           data-payment-id="<?= (int) $payment['id']; ?>"
                           data-payment-label="#<?= (int) $payment['id']; ?> | <?= e((string) ($payment['invoice_number'] ?? '')); ?> | <?= e((string) ($payment['paid_on'] ?? '')); ?> | <?= e(format_currency((float) ($payment['amount'] ?? 0))); ?>"
                         >Reverse</button>
-                      <?php else: ?>
+                      <?php elseif ($entryType !== 'PAYMENT'): ?>
                         <span class="text-muted">-</span>
                       <?php endif; ?>
                     </td>

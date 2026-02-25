@@ -5,6 +5,7 @@ require_once __DIR__ . '/../../includes/app.php';
 require_login();
 require_permission('job.view');
 require_once __DIR__ . '/workflow.php';
+require_once __DIR__ . '/insurance.php';
 
 $page_title = 'Job Card Details';
 $active_menu = 'jobs';
@@ -21,6 +22,7 @@ $canConditionPhotoUpload = $canEdit || $canCreate;
 $jobCardColumns = table_columns('job_cards');
 $jobOdometerEnabled = in_array('odometer_km', $jobCardColumns, true);
 $jobRecommendationNoteEnabled = job_recommendation_note_feature_ready();
+$jobInsuranceEnabled = job_insurance_feature_ready();
 $jobLaborColumns = table_columns('job_labor');
 $outsourceExpectedReturnSupported = in_array('outsource_expected_return_date', $jobLaborColumns, true);
 $outsourcedModuleReady = table_columns('outsourced_works') !== [] && table_columns('outsourced_work_payments') !== [];
@@ -760,6 +762,185 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         flash_set('job_success', 'Recommendation note saved.', 'success');
         redirect('modules/jobs/view.php?id=' . $jobId . '#job-information');
+    }
+
+    if ($action === 'update_insurance_claim') {
+        if (!$jobInsuranceEnabled) {
+            flash_set('job_error', 'Insurance claim storage is not ready.', 'danger');
+            redirect('modules/jobs/view.php?id=' . $jobId . '#insurance-claim');
+        }
+        if (!$canEdit) {
+            flash_set('job_error', 'You do not have permission to update insurance details.', 'danger');
+            redirect('modules/jobs/view.php?id=' . $jobId . '#insurance-claim');
+        }
+        if (normalize_status_code((string) ($jobForWrite['status_code'] ?? 'ACTIVE')) === 'DELETED') {
+            flash_set('job_error', 'Deleted job cards cannot be modified.', 'danger');
+            redirect('modules/jobs/view.php?id=' . $jobId . '#insurance-claim');
+        }
+
+        $insuranceCompanyName = post_string('insurance_company_name', 150);
+        $insuranceClaimNumber = post_string('insurance_claim_number', 80);
+        $insuranceSurveyorName = post_string('insurance_surveyor_name', 120);
+        $insuranceClaimAmountApproved = job_insurance_parse_amount($_POST['insurance_claim_amount_approved'] ?? null);
+        $insuranceCustomerPayableAmount = job_insurance_parse_amount($_POST['insurance_customer_payable_amount'] ?? null);
+        $insuranceClaimStatus = job_insurance_normalize_status((string) ($_POST['insurance_claim_status'] ?? 'PENDING'));
+
+        $updateStmt = db()->prepare(
+            'UPDATE job_cards
+             SET insurance_company_name = :insurance_company_name,
+                 insurance_claim_number = :insurance_claim_number,
+                 insurance_surveyor_name = :insurance_surveyor_name,
+                 insurance_claim_amount_approved = :insurance_claim_amount_approved,
+                 insurance_customer_payable_amount = :insurance_customer_payable_amount,
+                 insurance_claim_status = :insurance_claim_status,
+                 updated_by = :updated_by
+             WHERE id = :id
+               AND company_id = :company_id
+               AND garage_id = :garage_id
+               AND status_code <> "DELETED"'
+        );
+        $updateStmt->execute([
+            'insurance_company_name' => $insuranceCompanyName !== '' ? $insuranceCompanyName : null,
+            'insurance_claim_number' => $insuranceClaimNumber !== '' ? $insuranceClaimNumber : null,
+            'insurance_surveyor_name' => $insuranceSurveyorName !== '' ? $insuranceSurveyorName : null,
+            'insurance_claim_amount_approved' => $insuranceClaimAmountApproved,
+            'insurance_customer_payable_amount' => $insuranceCustomerPayableAmount,
+            'insurance_claim_status' => $insuranceClaimStatus,
+            'updated_by' => $userId > 0 ? $userId : null,
+            'id' => $jobId,
+            'company_id' => $companyId,
+            'garage_id' => $garageId,
+        ]);
+
+        job_append_history(
+            $jobId,
+            'UPDATE_INSURANCE_CLAIM',
+            null,
+            null,
+            'Insurance claim details updated',
+            [
+                'claim_number' => $insuranceClaimNumber !== '' ? $insuranceClaimNumber : null,
+                'claim_status' => $insuranceClaimStatus,
+                'claim_amount_approved' => $insuranceClaimAmountApproved,
+                'customer_payable_amount' => $insuranceCustomerPayableAmount,
+            ]
+        );
+        log_audit('job_cards', 'update_insurance_claim', $jobId, 'Updated insurance claim details', [
+            'entity' => 'job_card',
+            'source' => 'UI',
+            'before' => [
+                'insurance_company_name' => (string) ($jobForWrite['insurance_company_name'] ?? ''),
+                'insurance_claim_number' => (string) ($jobForWrite['insurance_claim_number'] ?? ''),
+                'insurance_surveyor_name' => (string) ($jobForWrite['insurance_surveyor_name'] ?? ''),
+                'insurance_claim_amount_approved' => $jobForWrite['insurance_claim_amount_approved'] !== null ? (float) $jobForWrite['insurance_claim_amount_approved'] : null,
+                'insurance_customer_payable_amount' => $jobForWrite['insurance_customer_payable_amount'] !== null ? (float) $jobForWrite['insurance_customer_payable_amount'] : null,
+                'insurance_claim_status' => (string) ($jobForWrite['insurance_claim_status'] ?? ''),
+            ],
+            'after' => [
+                'insurance_company_name' => $insuranceCompanyName !== '' ? $insuranceCompanyName : null,
+                'insurance_claim_number' => $insuranceClaimNumber !== '' ? $insuranceClaimNumber : null,
+                'insurance_surveyor_name' => $insuranceSurveyorName !== '' ? $insuranceSurveyorName : null,
+                'insurance_claim_amount_approved' => $insuranceClaimAmountApproved,
+                'insurance_customer_payable_amount' => $insuranceCustomerPayableAmount,
+                'insurance_claim_status' => $insuranceClaimStatus,
+            ],
+        ]);
+
+        flash_set('job_success', 'Insurance claim details saved.', 'success');
+        redirect('modules/jobs/view.php?id=' . $jobId . '#insurance-claim');
+    }
+
+    if ($action === 'upload_insurance_document') {
+        if (!$jobInsuranceEnabled) {
+            flash_set('job_error', 'Insurance document storage is not ready.', 'danger');
+            redirect('modules/jobs/view.php?id=' . $jobId . '#insurance-claim');
+        }
+        if (!$canEdit) {
+            flash_set('job_error', 'You do not have permission to upload insurance documents.', 'danger');
+            redirect('modules/jobs/view.php?id=' . $jobId . '#insurance-claim');
+        }
+        if (normalize_status_code((string) ($jobForWrite['status_code'] ?? 'ACTIVE')) === 'DELETED') {
+            flash_set('job_error', 'Deleted job cards cannot be modified.', 'danger');
+            redirect('modules/jobs/view.php?id=' . $jobId . '#insurance-claim');
+        }
+
+        $note = post_string('insurance_document_note', 255);
+        $uploadResult = job_insurance_store_document_upload(
+            $_FILES['insurance_document'] ?? [],
+            $companyId,
+            $garageId,
+            $jobId,
+            $userId,
+            $note !== '' ? $note : null
+        );
+        if (!(bool) ($uploadResult['ok'] ?? false)) {
+            flash_set('job_error', (string) ($uploadResult['message'] ?? 'Unable to upload insurance document.'), 'danger');
+            redirect('modules/jobs/view.php?id=' . $jobId . '#insurance-claim');
+        }
+
+        $documentId = (int) ($uploadResult['document_id'] ?? 0);
+        job_append_history(
+            $jobId,
+            'UPLOAD_INSURANCE_DOCUMENT',
+            null,
+            null,
+            'Uploaded insurance document',
+            [
+                'document_id' => $documentId > 0 ? $documentId : null,
+                'file_name' => (string) ($uploadResult['file_name'] ?? ''),
+                'file_size_bytes' => (int) ($uploadResult['file_size_bytes'] ?? 0),
+            ]
+        );
+        log_audit('job_cards', 'upload_insurance_document', $jobId, 'Uploaded insurance document', [
+            'entity' => 'job_insurance_documents',
+            'source' => 'UI',
+            'metadata' => [
+                'document_id' => $documentId > 0 ? $documentId : null,
+                'file_name' => (string) ($uploadResult['file_name'] ?? ''),
+            ],
+        ]);
+        flash_set('job_success', 'Insurance document uploaded.', 'success');
+        redirect('modules/jobs/view.php?id=' . $jobId . '#insurance-claim');
+    }
+
+    if ($action === 'delete_insurance_document') {
+        if (!$jobInsuranceEnabled) {
+            flash_set('job_error', 'Insurance document storage is not ready.', 'danger');
+            redirect('modules/jobs/view.php?id=' . $jobId . '#insurance-claim');
+        }
+        if (!$canEdit) {
+            flash_set('job_error', 'You do not have permission to delete insurance documents.', 'danger');
+            redirect('modules/jobs/view.php?id=' . $jobId . '#insurance-claim');
+        }
+
+        $documentId = post_int('insurance_document_id');
+        $deleteResult = job_insurance_delete_document($documentId, $companyId, $garageId);
+        if (!(bool) ($deleteResult['ok'] ?? false)) {
+            flash_set('job_error', (string) ($deleteResult['message'] ?? 'Unable to delete insurance document.'), 'danger');
+            redirect('modules/jobs/view.php?id=' . $jobId . '#insurance-claim');
+        }
+
+        job_append_history(
+            $jobId,
+            'DELETE_INSURANCE_DOCUMENT',
+            null,
+            null,
+            'Deleted insurance document',
+            [
+                'document_id' => $documentId,
+                'file_deleted' => (bool) ($deleteResult['file_deleted'] ?? false),
+            ]
+        );
+        log_audit('job_cards', 'delete_insurance_document', $jobId, 'Deleted insurance document', [
+            'entity' => 'job_insurance_documents',
+            'source' => 'UI',
+            'metadata' => [
+                'document_id' => $documentId,
+                'file_deleted' => (bool) ($deleteResult['file_deleted'] ?? false),
+            ],
+        ]);
+        flash_set('job_success', 'Insurance document deleted.', 'success');
+        redirect('modules/jobs/view.php?id=' . $jobId . '#insurance-claim');
     }
 
     if ($action === 'add_manual_service_reminder') {
@@ -2191,6 +2372,14 @@ $conditionPhotos = $conditionPhotoFeatureReady
 $conditionPhotoCount = count($conditionPhotos);
 $conditionPhotoMaxMb = round(job_condition_photo_max_upload_bytes($companyId, $garageId) / 1048576, 2);
 $conditionPhotoPrompt = get_int('prompt_condition_photos') === 1 && $conditionPhotoCount === 0;
+$insuranceDocuments = $jobInsuranceEnabled
+    ? job_insurance_documents_by_job($companyId, $garageId, $jobId, 120)
+    : [];
+$insuranceDocumentCount = count($insuranceDocuments);
+$insuranceDocMaxMb = $jobInsuranceEnabled ? round(job_insurance_doc_max_upload_bytes($companyId, $garageId) / 1048576, 2) : 0.0;
+$jobInsuranceStatus = $jobInsuranceEnabled
+    ? job_insurance_normalize_status((string) ($job['insurance_claim_status'] ?? 'PENDING'))
+    : 'PENDING';
 
 $nextStatuses = [];
 foreach (job_workflow_statuses(true) as $status) {
@@ -2380,6 +2569,56 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                   </form>
                 <?php endif; ?>
               <?php endif; ?>
+              <?php if ($jobInsuranceEnabled): ?>
+                <hr class="my-3">
+                <div id="insurance-claim">
+                  <p class="mb-2"><strong>Insurance Company:</strong> <?= e((string) ((($job['insurance_company_name'] ?? '') !== '') ? $job['insurance_company_name'] : '-')); ?></p>
+                  <p class="mb-2"><strong>Claim Number:</strong> <?= e((string) ((($job['insurance_claim_number'] ?? '') !== '') ? $job['insurance_claim_number'] : '-')); ?></p>
+                  <p class="mb-2"><strong>Surveyor:</strong> <?= e((string) ((($job['insurance_surveyor_name'] ?? '') !== '') ? $job['insurance_surveyor_name'] : '-')); ?></p>
+                  <p class="mb-2"><strong>Claim Status:</strong> <span class="badge text-bg-<?= e($jobInsuranceStatus === 'SETTLED' ? 'success' : ($jobInsuranceStatus === 'APPROVED' ? 'primary' : ($jobInsuranceStatus === 'REJECTED' ? 'danger' : 'warning'))); ?>"><?= e($jobInsuranceStatus); ?></span></p>
+                  <p class="mb-2"><strong>Claim Amount Approved:</strong> <?= e(format_currency((float) ($job['insurance_claim_amount_approved'] ?? 0))); ?></p>
+                  <p class="mb-3"><strong>Customer Payable Difference:</strong> <?= e(format_currency((float) ($job['insurance_customer_payable_amount'] ?? 0))); ?></p>
+                  <?php if ($canEdit && normalize_status_code((string) ($job['status_code'] ?? 'ACTIVE')) !== 'DELETED'): ?>
+                    <form method="post" class="row g-2">
+                      <?= csrf_field(); ?>
+                      <input type="hidden" name="_action" value="update_insurance_claim">
+                      <div class="col-md-6">
+                        <label class="form-label">Insurance Company</label>
+                        <input type="text" name="insurance_company_name" class="form-control" maxlength="150" value="<?= e((string) ($job['insurance_company_name'] ?? '')); ?>">
+                      </div>
+                      <div class="col-md-6">
+                        <label class="form-label">Claim Number</label>
+                        <input type="text" name="insurance_claim_number" class="form-control" maxlength="80" value="<?= e((string) ($job['insurance_claim_number'] ?? '')); ?>">
+                      </div>
+                      <div class="col-md-6">
+                        <label class="form-label">Surveyor Name</label>
+                        <input type="text" name="insurance_surveyor_name" class="form-control" maxlength="120" value="<?= e((string) ($job['insurance_surveyor_name'] ?? '')); ?>">
+                      </div>
+                      <div class="col-md-6">
+                        <label class="form-label">Claim Status</label>
+                        <select name="insurance_claim_status" class="form-select">
+                          <?php foreach (job_insurance_allowed_statuses() as $claimStatusOption): ?>
+                            <option value="<?= e($claimStatusOption); ?>" <?= $jobInsuranceStatus === $claimStatusOption ? 'selected' : ''; ?>><?= e($claimStatusOption); ?></option>
+                          <?php endforeach; ?>
+                        </select>
+                      </div>
+                      <div class="col-md-6">
+                        <label class="form-label">Claim Amount Approved</label>
+                        <input type="number" name="insurance_claim_amount_approved" class="form-control" step="0.01" min="0"
+                               value="<?= e(($job['insurance_claim_amount_approved'] ?? null) !== null ? number_format((float) $job['insurance_claim_amount_approved'], 2, '.', '') : ''); ?>">
+                      </div>
+                      <div class="col-md-6">
+                        <label class="form-label">Customer Payable Difference</label>
+                        <input type="number" name="insurance_customer_payable_amount" class="form-control" step="0.01" min="0"
+                               value="<?= e(($job['insurance_customer_payable_amount'] ?? null) !== null ? number_format((float) $job['insurance_customer_payable_amount'], 2, '.', '') : ''); ?>">
+                      </div>
+                      <div class="col-12 d-flex justify-content-end">
+                        <button type="submit" class="btn btn-sm btn-outline-primary">Save Insurance Details</button>
+                      </div>
+                    </form>
+                  <?php endif; ?>
+                </div>
+              <?php endif; ?>
               <?php if (!empty($job['cancel_note'])): ?>
                 <div class="alert alert-light border mt-3 mb-0"><strong>Audit Note:</strong> <?= e((string) $job['cancel_note']); ?></div>
               <?php endif; ?>
@@ -2460,6 +2699,77 @@ require_once __DIR__ . '/../../includes/sidebar.php';
               <?php endif; ?>
             </div>
           </div>
+
+          <?php if ($jobInsuranceEnabled): ?>
+            <div class="card card-outline card-info" id="insurance-documents">
+              <div class="card-header d-flex justify-content-between align-items-center">
+                <h3 class="card-title mb-0">Insurance Documents</h3>
+                <span class="badge text-bg-light border"><?= (int) $insuranceDocumentCount; ?></span>
+              </div>
+              <div class="card-body">
+                <p class="text-muted small mb-3">
+                  Upload claim papers, surveyor reports, and insurer approvals. Max file size: <?= e(number_format($insuranceDocMaxMb, 2)); ?> MB per file.
+                </p>
+                <?php if ($canEdit && normalize_status_code((string) ($job['status_code'] ?? 'ACTIVE')) !== 'DELETED'): ?>
+                  <form method="post" enctype="multipart/form-data" class="row g-2 mb-3">
+                    <?= csrf_field(); ?>
+                    <input type="hidden" name="_action" value="upload_insurance_document">
+                    <div class="col-md-7">
+                      <label class="form-label">Select Document</label>
+                      <input type="file" name="insurance_document" class="form-control" accept=".pdf,.jpg,.jpeg,.png,.webp,application/pdf,image/jpeg,image/png,image/webp" required>
+                    </div>
+                    <div class="col-md-5">
+                      <label class="form-label">Note (Optional)</label>
+                      <input type="text" name="insurance_document_note" class="form-control" maxlength="255" placeholder="Survey report, approval letter, etc.">
+                    </div>
+                    <div class="col-12">
+                      <button type="submit" class="btn btn-outline-primary">Upload Insurance Document</button>
+                    </div>
+                  </form>
+                <?php endif; ?>
+
+                <div class="list-group">
+                  <?php if ($insuranceDocuments === []): ?>
+                    <div class="text-muted">No insurance documents uploaded yet.</div>
+                  <?php else: ?>
+                    <?php foreach ($insuranceDocuments as $document): ?>
+                      <?php $documentUrl = job_insurance_doc_url((string) ($document['file_path'] ?? '')); ?>
+                      <div class="list-group-item">
+                        <div class="d-flex justify-content-between align-items-start gap-2">
+                          <div class="me-2">
+                            <?php if ($documentUrl !== null): ?>
+                              <a href="<?= e($documentUrl); ?>" target="_blank"><strong><?= e((string) ($document['file_name'] ?? 'Document')); ?></strong></a>
+                            <?php else: ?>
+                              <strong><?= e((string) ($document['file_name'] ?? 'Document')); ?></strong>
+                              <span class="text-danger small ms-1">(File missing)</span>
+                            <?php endif; ?>
+                            <div class="small text-muted">
+                              Uploaded: <?= e((string) ($document['created_at'] ?? '')); ?>
+                              <?php if (!empty($document['uploaded_by_name'])): ?>
+                                | By <?= e((string) $document['uploaded_by_name']); ?>
+                              <?php endif; ?>
+                              | Size: <?= e(number_format(((float) ($document['file_size_bytes'] ?? 0)) / 1024, 1)); ?> KB
+                            </div>
+                            <?php if (!empty($document['note'])): ?>
+                              <div class="small mt-1"><?= e((string) $document['note']); ?></div>
+                            <?php endif; ?>
+                          </div>
+                          <?php if ($canEdit): ?>
+                            <form method="post" data-confirm="Delete this insurance document?">
+                              <?= csrf_field(); ?>
+                              <input type="hidden" name="_action" value="delete_insurance_document">
+                              <input type="hidden" name="insurance_document_id" value="<?= (int) ($document['id'] ?? 0); ?>">
+                              <button type="submit" class="btn btn-sm btn-outline-danger">Delete</button>
+                            </form>
+                          <?php endif; ?>
+                        </div>
+                      </div>
+                    <?php endforeach; ?>
+                  <?php endif; ?>
+                </div>
+              </div>
+            </div>
+          <?php endif; ?>
 
           <?php if ($canAssign): ?>
             <div class="card card-info">
