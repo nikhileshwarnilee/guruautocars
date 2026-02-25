@@ -587,6 +587,82 @@ function billing_auto_adjust_advances_for_invoice(
     ];
 }
 
+function billing_release_invoice_advance_adjustments(
+    PDO $pdo,
+    int $invoiceId,
+    ?int $updatedBy = null
+): array {
+    if (!billing_financial_extensions_ready() || $invoiceId <= 0) {
+        return ['released_total' => 0.0, 'released_count' => 0, 'rows' => []];
+    }
+
+    $adjustmentStmt = $pdo->prepare(
+        'SELECT aa.id, aa.advance_id, aa.adjusted_amount, ja.receipt_number
+         FROM advance_adjustments aa
+         INNER JOIN job_advances ja ON ja.id = aa.advance_id
+         WHERE aa.invoice_id = :invoice_id
+         ORDER BY aa.id ASC
+         FOR UPDATE'
+    );
+    $adjustmentStmt->execute(['invoice_id' => $invoiceId]);
+    $adjustments = $adjustmentStmt->fetchAll();
+    if ($adjustments === []) {
+        return ['released_total' => 0.0, 'released_count' => 0, 'rows' => []];
+    }
+
+    $advanceUpdateStmt = $pdo->prepare(
+        'UPDATE job_advances
+         SET adjusted_amount = GREATEST(adjusted_amount - :adjusted_amount, 0),
+             balance_amount = balance_amount + :adjusted_amount,
+             updated_by = :updated_by
+         WHERE id = :id'
+    );
+    $deleteAdjustmentStmt = $pdo->prepare(
+        'DELETE FROM advance_adjustments
+         WHERE id = :id
+           AND invoice_id = :invoice_id'
+    );
+
+    $releasedTotal = 0.0;
+    $releasedRows = [];
+    foreach ($adjustments as $adjustment) {
+        $adjustmentId = (int) ($adjustment['id'] ?? 0);
+        $advanceId = (int) ($adjustment['advance_id'] ?? 0);
+        $adjustedAmount = billing_round((float) ($adjustment['adjusted_amount'] ?? 0));
+        if ($adjustmentId <= 0 || $advanceId <= 0 || $adjustedAmount <= 0.009) {
+            continue;
+        }
+
+        $advanceUpdateStmt->execute([
+            'adjusted_amount' => $adjustedAmount,
+            'updated_by' => $updatedBy,
+            'id' => $advanceId,
+        ]);
+        if ((int) $advanceUpdateStmt->rowCount() <= 0) {
+            throw new RuntimeException('Unable to release invoice-linked advance adjustment.');
+        }
+
+        $deleteAdjustmentStmt->execute([
+            'id' => $adjustmentId,
+            'invoice_id' => $invoiceId,
+        ]);
+
+        $releasedTotal = billing_round($releasedTotal + $adjustedAmount);
+        $releasedRows[] = [
+            'adjustment_id' => $adjustmentId,
+            'advance_id' => $advanceId,
+            'receipt_number' => (string) ($adjustment['receipt_number'] ?? ''),
+            'released_amount' => $adjustedAmount,
+        ];
+    }
+
+    return [
+        'released_total' => $releasedTotal,
+        'released_count' => count($releasedRows),
+        'rows' => $releasedRows,
+    ];
+}
+
 function billing_collect_job_advance(
     PDO $pdo,
     int $companyId,

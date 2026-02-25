@@ -195,6 +195,27 @@ function returns_module_ready(bool $refresh = false): bool
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4'
         );
 
+        $pdo->exec(
+            'CREATE TABLE IF NOT EXISTS return_settlements (
+                id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                company_id INT UNSIGNED NOT NULL,
+                garage_id INT UNSIGNED NOT NULL,
+                return_id BIGINT UNSIGNED NOT NULL,
+                settlement_date DATE NOT NULL,
+                settlement_type ENUM("PAY","RECEIVE") NOT NULL,
+                amount DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+                payment_mode VARCHAR(40) NOT NULL DEFAULT "CASH",
+                reference_no VARCHAR(100) NULL,
+                notes VARCHAR(255) NULL,
+                expense_id BIGINT UNSIGNED NULL,
+                status_code ENUM("ACTIVE","DELETED") NOT NULL DEFAULT "ACTIVE",
+                created_by INT UNSIGNED NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                KEY idx_return_settlement_scope (company_id, garage_id, settlement_date, settlement_type),
+                KEY idx_return_settlement_return (return_id, status_code)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4'
+        );
+
         // Cleanup legacy credit-note columns from older versions.
         returns_drop_column_if_exists($pdo, 'returns_rma', 'vendor_credit_note_number');
         returns_drop_column_if_exists($pdo, 'returns_rma', 'credit_note_id');
@@ -328,6 +349,96 @@ function returns_fetch_return_items(PDO $pdo, int $returnId): array
          ORDER BY id ASC'
     );
     $stmt->execute(['return_id' => $returnId]);
+    return $stmt->fetchAll();
+}
+
+function returns_expected_settlement_type(string $returnType): string
+{
+    return returns_normalize_type($returnType) === 'CUSTOMER_RETURN' ? 'PAY' : 'RECEIVE';
+}
+
+function returns_settlement_allowed_statuses(): array
+{
+    return ['APPROVED', 'CLOSED'];
+}
+
+function returns_fetch_settlement_summary(PDO $pdo, int $returnId, int $companyId, int $garageId, float $returnTotal = 0.0): array
+{
+    $returnTotal = max(0.0, returns_round($returnTotal));
+    $emptySummary = [
+        'settlement_count' => 0,
+        'settled_amount' => 0.0,
+        'paid_amount' => 0.0,
+        'received_amount' => 0.0,
+        'balance_amount' => $returnTotal,
+    ];
+
+    if ($returnId <= 0 || $companyId <= 0 || $garageId <= 0) {
+        return $emptySummary;
+    }
+
+    if (table_columns('return_settlements') === []) {
+        return $emptySummary;
+    }
+
+    $stmt = $pdo->prepare(
+        'SELECT COUNT(*) AS settlement_count,
+                COALESCE(SUM(amount), 0) AS settled_amount,
+                COALESCE(SUM(CASE WHEN settlement_type = "PAY" THEN amount ELSE 0 END), 0) AS paid_amount,
+                COALESCE(SUM(CASE WHEN settlement_type = "RECEIVE" THEN amount ELSE 0 END), 0) AS received_amount
+         FROM return_settlements
+         WHERE company_id = :company_id
+           AND garage_id = :garage_id
+           AND return_id = :return_id
+           AND status_code = "ACTIVE"'
+    );
+    $stmt->execute([
+        'company_id' => $companyId,
+        'garage_id' => $garageId,
+        'return_id' => $returnId,
+    ]);
+    $row = $stmt->fetch() ?: [];
+
+    $settledAmount = returns_round((float) ($row['settled_amount'] ?? 0));
+    $paidAmount = returns_round((float) ($row['paid_amount'] ?? 0));
+    $receivedAmount = returns_round((float) ($row['received_amount'] ?? 0));
+    $balanceAmount = returns_round(max(0.0, $returnTotal - $settledAmount));
+
+    return [
+        'settlement_count' => (int) ($row['settlement_count'] ?? 0),
+        'settled_amount' => $settledAmount,
+        'paid_amount' => $paidAmount,
+        'received_amount' => $receivedAmount,
+        'balance_amount' => $balanceAmount,
+    ];
+}
+
+function returns_fetch_settlement_history(PDO $pdo, int $companyId, int $garageId, int $returnId): array
+{
+    if ($returnId <= 0 || $companyId <= 0 || $garageId <= 0) {
+        return [];
+    }
+
+    if (table_columns('return_settlements') === []) {
+        return [];
+    }
+
+    $stmt = $pdo->prepare(
+        'SELECT rs.*, u.name AS created_by_name
+         FROM return_settlements rs
+         LEFT JOIN users u ON u.id = rs.created_by
+         WHERE rs.company_id = :company_id
+           AND rs.garage_id = :garage_id
+           AND rs.return_id = :return_id
+           AND rs.status_code = "ACTIVE"
+         ORDER BY rs.id DESC'
+    );
+    $stmt->execute([
+        'company_id' => $companyId,
+        'garage_id' => $garageId,
+        'return_id' => $returnId,
+    ]);
+
     return $stmt->fetchAll();
 }
 
@@ -610,12 +721,12 @@ function returns_create_rma(
             'INSERT INTO returns_rma
               (company_id, garage_id, return_number, return_sequence_number, financial_year_label, return_type,
                return_date, job_card_id, invoice_id, purchase_id, customer_id, vendor_id,
-               reason_text, reason_detail, approval_status,
+               reason_text, reason_detail, approval_status, approved_by, approved_at,
                taxable_amount, tax_amount, total_amount, notes, status_code, created_by, updated_by)
              VALUES
               (:company_id, :garage_id, :return_number, :return_sequence_number, :financial_year_label, :return_type,
                :return_date, :job_card_id, :invoice_id, :purchase_id, :customer_id, :vendor_id,
-               :reason_text, :reason_detail, "PENDING",
+               :reason_text, :reason_detail, "APPROVED", :approved_by, NOW(),
                :taxable_amount, :tax_amount, :total_amount, :notes, "ACTIVE", :created_by, :updated_by)'
         );
         $insertReturnStmt->execute([
@@ -637,6 +748,7 @@ function returns_create_rma(
             'tax_amount' => returns_round($taxTotal),
             'total_amount' => returns_round($grandTotal),
             'notes' => $notes !== '' ? mb_substr($notes, 0, 255) : null,
+            'approved_by' => $actorUserId > 0 ? $actorUserId : null,
             'created_by' => $actorUserId > 0 ? $actorUserId : null,
             'updated_by' => $actorUserId > 0 ? $actorUserId : null,
         ]);
@@ -665,6 +777,18 @@ function returns_create_rma(
             ]);
         }
 
+        $stockPosting = returns_post_stock_reversal_for_approved_return(
+            $pdo,
+            [
+                'id' => $returnId,
+                'company_id' => $companyId,
+                'garage_id' => $garageId,
+                'return_type' => $returnType,
+            ],
+            $preparedLines,
+            $actorUserId
+        );
+
         $pdo->commit();
 
         return [
@@ -679,6 +803,8 @@ function returns_create_rma(
             'taxable_amount' => returns_round($taxableTotal),
             'tax_amount' => returns_round($taxTotal),
             'total_amount' => returns_round($grandTotal),
+            'approval_status' => 'APPROVED',
+            'stock_posting' => $stockPosting,
         ];
     } catch (Throwable $exception) {
         $pdo->rollBack();
@@ -1080,6 +1206,226 @@ function returns_post_stock_reversal_for_approved_return(PDO $pdo, array $return
         'posted' => $posted,
         'skipped' => $skipped,
     ];
+}
+
+function returns_normalize_settlement_payment_mode(string $paymentMode): string
+{
+    if (function_exists('finance_normalize_payment_mode')) {
+        return finance_normalize_payment_mode($paymentMode);
+    }
+
+    $normalized = strtoupper(trim($paymentMode));
+    return $normalized !== '' ? $normalized : 'CASH';
+}
+
+function returns_settlement_party_name(PDO $pdo, array $returnRow): string
+{
+    $returnType = returns_normalize_type((string) ($returnRow['return_type'] ?? 'CUSTOMER_RETURN'));
+    $companyId = (int) ($returnRow['company_id'] ?? 0);
+
+    if ($returnType === 'CUSTOMER_RETURN') {
+        $customerId = (int) ($returnRow['customer_id'] ?? 0);
+        if ($customerId <= 0) {
+            return 'Customer';
+        }
+
+        $stmt = $pdo->prepare(
+            'SELECT full_name
+             FROM customers
+             WHERE id = :id
+               AND company_id = :company_id
+             LIMIT 1'
+        );
+        $stmt->execute([
+            'id' => $customerId,
+            'company_id' => $companyId,
+        ]);
+        $row = $stmt->fetch();
+        $name = trim((string) ($row['full_name'] ?? ''));
+        return $name !== '' ? $name : 'Customer #' . $customerId;
+    }
+
+    $vendorId = (int) ($returnRow['vendor_id'] ?? 0);
+    if ($vendorId <= 0) {
+        return 'Vendor';
+    }
+
+    $stmt = $pdo->prepare(
+        'SELECT vendor_name
+         FROM vendors
+         WHERE id = :id
+           AND company_id = :company_id
+         LIMIT 1'
+    );
+    $stmt->execute([
+        'id' => $vendorId,
+        'company_id' => $companyId,
+    ]);
+    $row = $stmt->fetch();
+    $name = trim((string) ($row['vendor_name'] ?? ''));
+    return $name !== '' ? $name : 'Vendor #' . $vendorId;
+}
+
+function returns_record_settlement(
+    PDO $pdo,
+    int $returnId,
+    int $companyId,
+    int $garageId,
+    int $actorUserId,
+    string $settlementDate,
+    float $amount,
+    string $paymentMode,
+    string $referenceNo,
+    string $notes
+): array {
+    if (!returns_module_ready()) {
+        throw new RuntimeException('Returns module is not ready.');
+    }
+    if (table_columns('return_settlements') === []) {
+        throw new RuntimeException('Return settlements table is not ready.');
+    }
+    if ($returnId <= 0 || $companyId <= 0 || $garageId <= 0) {
+        throw new RuntimeException('Invalid return scope for settlement.');
+    }
+
+    $settlementDate = returns_parse_date($settlementDate) ?? date('Y-m-d');
+    $amount = returns_round(abs($amount));
+    if ($amount <= 0.009) {
+        throw new RuntimeException('Settlement amount must be greater than zero.');
+    }
+
+    $paymentMode = returns_normalize_settlement_payment_mode($paymentMode);
+    $referenceNo = mb_substr(trim($referenceNo), 0, 100);
+    $notes = mb_substr(trim($notes), 0, 255);
+
+    $pdo->beginTransaction();
+    try {
+        $returnRow = returns_fetch_return_row($pdo, $returnId, $companyId, $garageId, true);
+        if (!$returnRow) {
+            throw new RuntimeException('Return entry not found.');
+        }
+
+        $status = returns_normalize_approval_status((string) ($returnRow['approval_status'] ?? 'PENDING'));
+        if (!in_array($status, returns_settlement_allowed_statuses(), true)) {
+            throw new RuntimeException('Settlement is allowed only for approved returns.');
+        }
+
+        $summaryStmt = $pdo->prepare(
+            'SELECT COALESCE(SUM(amount), 0) AS settled_amount
+             FROM return_settlements
+             WHERE company_id = :company_id
+               AND garage_id = :garage_id
+               AND return_id = :return_id
+               AND status_code = "ACTIVE"
+             FOR UPDATE'
+        );
+        $summaryStmt->execute([
+            'company_id' => $companyId,
+            'garage_id' => $garageId,
+            'return_id' => $returnId,
+        ]);
+        $summaryRow = $summaryStmt->fetch() ?: [];
+        $currentSettled = returns_round((float) ($summaryRow['settled_amount'] ?? 0));
+        $returnTotal = max(0.0, returns_round((float) ($returnRow['total_amount'] ?? 0)));
+        $remaining = returns_round(max(0.0, $returnTotal - $currentSettled));
+
+        if ($remaining <= 0.009) {
+            throw new RuntimeException('This return is already fully settled.');
+        }
+        if ($amount > $remaining + 0.009) {
+            throw new RuntimeException(
+                'Settlement amount exceeds pending balance (' . number_format($remaining, 2) . ').'
+            );
+        }
+
+        $settlementType = returns_expected_settlement_type((string) ($returnRow['return_type'] ?? 'CUSTOMER_RETURN'));
+
+        $insertStmt = $pdo->prepare(
+            'INSERT INTO return_settlements
+              (company_id, garage_id, return_id, settlement_date, settlement_type, amount, payment_mode, reference_no, notes, expense_id, status_code, created_by)
+             VALUES
+              (:company_id, :garage_id, :return_id, :settlement_date, :settlement_type, :amount, :payment_mode, :reference_no, :notes, NULL, "ACTIVE", :created_by)'
+        );
+        $insertStmt->execute([
+            'company_id' => $companyId,
+            'garage_id' => $garageId,
+            'return_id' => $returnId,
+            'settlement_date' => $settlementDate,
+            'settlement_type' => $settlementType,
+            'amount' => $amount,
+            'payment_mode' => $paymentMode,
+            'reference_no' => $referenceNo !== '' ? $referenceNo : null,
+            'notes' => $notes !== '' ? $notes : null,
+            'created_by' => $actorUserId > 0 ? $actorUserId : null,
+        ]);
+        $settlementId = (int) $pdo->lastInsertId();
+
+        $returnNumber = (string) ($returnRow['return_number'] ?? '');
+        $partyName = returns_settlement_party_name($pdo, $returnRow);
+        $categoryName = $settlementType === 'PAY' ? 'Sales Return Refund' : 'Purchase Return Recovery';
+        $sourceType = $settlementType === 'PAY' ? 'RETURN_SETTLEMENT_PAY' : 'RETURN_SETTLEMENT_RECEIVE';
+        $signedAmount = $settlementType === 'PAY' ? abs($amount) : -abs($amount);
+        $entryType = $settlementType === 'PAY' ? 'EXPENSE' : 'REVERSAL';
+        $financeNote = $notes !== ''
+            ? $notes
+            : ($settlementType === 'PAY' ? 'Return refund settlement ' : 'Return receipt settlement ') . $returnNumber;
+
+        $expenseId = null;
+        if (function_exists('finance_record_expense')) {
+            $expenseId = finance_record_expense([
+                'company_id' => $companyId,
+                'garage_id' => $garageId,
+                'category_name' => $categoryName,
+                'expense_date' => $settlementDate,
+                'amount' => $signedAmount,
+                'payment_mode' => $paymentMode,
+                'paid_to' => $partyName,
+                'notes' => $financeNote,
+                'source_type' => $sourceType,
+                'source_id' => $settlementId,
+                'entry_type' => $entryType,
+                'created_by' => $actorUserId > 0 ? $actorUserId : null,
+            ]);
+        }
+
+        if ((int) $expenseId > 0) {
+            $updateSettlementStmt = $pdo->prepare(
+                'UPDATE return_settlements
+                 SET expense_id = :expense_id
+                 WHERE id = :id
+                   AND company_id = :company_id
+                   AND garage_id = :garage_id'
+            );
+            $updateSettlementStmt->execute([
+                'expense_id' => (int) $expenseId,
+                'id' => $settlementId,
+                'company_id' => $companyId,
+                'garage_id' => $garageId,
+            ]);
+        }
+
+        $newSettledAmount = returns_round($currentSettled + $amount);
+        $newBalanceAmount = returns_round(max(0.0, $returnTotal - $newSettledAmount));
+
+        $pdo->commit();
+
+        return [
+            'settlement_id' => $settlementId,
+            'return_id' => $returnId,
+            'return_number' => $returnNumber,
+            'settlement_type' => $settlementType,
+            'settlement_date' => $settlementDate,
+            'amount' => $amount,
+            'payment_mode' => $paymentMode,
+            'reference_no' => $referenceNo,
+            'expense_id' => (int) $expenseId,
+            'settled_amount' => $newSettledAmount,
+            'balance_amount' => $newBalanceAmount,
+        ];
+    } catch (Throwable $exception) {
+        $pdo->rollBack();
+        throw $exception;
+    }
 }
 
 function returns_approve_rma(PDO $pdo, int $returnId, int $companyId, int $garageId, int $actorUserId): array

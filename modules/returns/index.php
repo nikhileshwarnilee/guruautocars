@@ -28,6 +28,7 @@ $canCreate = has_permission('inventory.manage')
 $canApprove = has_permission('inventory.manage')
     || has_permission('invoice.manage')
     || has_permission('purchase.manage');
+$canSettle = $canCreate || $canApprove;
 
 if (!returns_module_ready()) {
     flash_set('return_error', 'Returns module is not ready. Please run DB upgrade safely.', 'danger');
@@ -122,10 +123,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'source_id' => $sourceId,
                     'line_count' => (int) ($result['line_count'] ?? 0),
                     'total_amount' => (float) ($result['total_amount'] ?? 0),
+                    'approval_status' => (string) ($result['approval_status'] ?? 'APPROVED'),
+                    'stock_posted_count' => count((array) (($result['stock_posting'] ?? [])['posted'] ?? [])),
                 ],
             ]);
 
-            flash_set('return_success', 'Return ' . (string) ($result['return_number'] ?? '') . ' created successfully.', 'success');
+            flash_set(
+                'return_success',
+                'Return ' . (string) ($result['return_number'] ?? '') . ' created and approved successfully.',
+                'success'
+            );
             if (!(bool) ($attachmentUpload['ok'] ?? false) && (int) (($attachmentUpload['file_size_bytes'] ?? 0)) > 0) {
                 flash_set('return_warning', (string) ($attachmentUpload['message'] ?? 'Attachment upload failed.'), 'warning');
             }
@@ -197,6 +204,57 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             flash_set('return_error', 'Only approved returns can be closed.', 'danger');
         }
         redirect('modules/returns/index.php?view_id=' . $returnId);
+    }
+
+    if ($action === 'settle_return') {
+        if (!$canSettle) {
+            flash_set('return_error', 'You do not have permission to settle returns.', 'danger');
+            redirect('modules/returns/index.php');
+        }
+
+        $returnId = post_int('return_id');
+        $settlementDate = (string) ($_POST['settlement_date'] ?? date('Y-m-d'));
+        $rawAmount = str_replace([',', ' '], '', trim((string) ($_POST['amount'] ?? '0')));
+        $amount = is_numeric($rawAmount) ? (float) $rawAmount : 0.0;
+        $paymentMode = post_string('payment_mode', 40);
+        $referenceNo = post_string('reference_no', 100);
+        $notes = post_string('notes', 255);
+
+        try {
+            $result = returns_record_settlement(
+                $pdo,
+                $returnId,
+                $companyId,
+                $garageId,
+                $userId,
+                $settlementDate,
+                $amount,
+                $paymentMode,
+                $referenceNo,
+                $notes
+            );
+
+            $settlementType = (string) ($result['settlement_type'] ?? '');
+            $actionLabel = $settlementType === 'RECEIVE' ? 'Receive' : 'Pay';
+            $settlementId = (int) ($result['settlement_id'] ?? 0);
+
+            log_audit('returns', 'settlement', $settlementId, $actionLabel . ' settlement on return ' . (string) ($result['return_number'] ?? ''), [
+                'entity' => 'return_settlement',
+                'source' => 'UI',
+                'metadata' => [
+                    'return_id' => $returnId,
+                    'settlement_type' => $settlementType,
+                    'payment_mode' => (string) ($result['payment_mode'] ?? ''),
+                    'amount' => (float) ($result['amount'] ?? 0),
+                    'expense_id' => (int) ($result['expense_id'] ?? 0),
+                ],
+            ]);
+
+            flash_set('return_success', $actionLabel . ' entry recorded successfully.', 'success');
+        } catch (Throwable $exception) {
+            flash_set('return_error', $exception->getMessage(), 'danger');
+        }
+        redirect('modules/returns/index.php?view_id=' . $returnId . '#settlement-card');
     }
 
     if ($action === 'upload_attachment') {
@@ -277,17 +335,33 @@ if ($query !== '') {
     $params['q'] = '%' . $query . '%';
 }
 
+$returnsSettlementSelectSql = '0.00 AS settled_amount, r.total_amount AS pending_amount';
+$returnsSettlementJoinSql = '';
+if (table_columns('return_settlements') !== []) {
+    $returnsSettlementSelectSql = 'COALESCE(rs.settled_amount, 0) AS settled_amount,
+            GREATEST(r.total_amount - COALESCE(rs.settled_amount, 0), 0) AS pending_amount';
+    $returnsSettlementJoinSql = '
+     LEFT JOIN (
+         SELECT return_id, COALESCE(SUM(amount), 0) AS settled_amount
+         FROM return_settlements
+         WHERE status_code = "ACTIVE"
+         GROUP BY return_id
+     ) rs ON rs.return_id = r.id';
+}
+
 $returnsStmt = db()->prepare(
     'SELECT r.*,
             i.invoice_number,
             p.invoice_number AS purchase_invoice_number,
             c.full_name AS customer_name,
-            v.vendor_name
+            v.vendor_name,
+            ' . $returnsSettlementSelectSql . '
      FROM returns_rma r
      LEFT JOIN invoices i ON i.id = r.invoice_id
      LEFT JOIN purchases p ON p.id = r.purchase_id
      LEFT JOIN customers c ON c.id = r.customer_id
-     LEFT JOIN vendors v ON v.id = r.vendor_id
+     LEFT JOIN vendors v ON v.id = r.vendor_id'
+     . $returnsSettlementJoinSql . '
      WHERE ' . implode(' AND ', $where) . '
      ORDER BY r.id DESC
      LIMIT 300'
@@ -299,11 +373,37 @@ $viewId = get_int('view_id');
 $selectedReturn = null;
 $selectedReturnItems = [];
 $selectedReturnAttachments = [];
+$selectedReturnSettlements = [];
+$selectedReturnSettlementSummary = [
+    'settlement_count' => 0,
+    'settled_amount' => 0.0,
+    'paid_amount' => 0.0,
+    'received_amount' => 0.0,
+    'balance_amount' => 0.0,
+];
+$selectedReturnSettlementType = 'PAY';
+$selectedReturnSettlementActionLabel = 'Pay';
+$selectedReturnCanSettleStatus = false;
+$settlementPaymentModes = function_exists('finance_payment_modes')
+    ? finance_payment_modes()
+    : ['CASH', 'UPI', 'CARD', 'BANK_TRANSFER', 'CHEQUE', 'MIXED', 'ADJUSTMENT'];
 if ($viewId > 0) {
     $selectedReturn = returns_fetch_return_row(db(), $viewId, $companyId, $garageId);
     if (is_array($selectedReturn)) {
         $selectedReturnItems = returns_fetch_return_items(db(), (int) ($selectedReturn['id'] ?? 0));
         $selectedReturnAttachments = returns_fetch_attachments(db(), $companyId, $garageId, (int) ($selectedReturn['id'] ?? 0));
+        $selectedReturnSettlementType = returns_expected_settlement_type((string) ($selectedReturn['return_type'] ?? 'CUSTOMER_RETURN'));
+        $selectedReturnSettlementActionLabel = $selectedReturnSettlementType === 'RECEIVE' ? 'Receive' : 'Pay';
+        $selectedReturnSettlementSummary = returns_fetch_settlement_summary(
+            db(),
+            (int) ($selectedReturn['id'] ?? 0),
+            $companyId,
+            $garageId,
+            (float) ($selectedReturn['total_amount'] ?? 0)
+        );
+        $selectedReturnSettlements = returns_fetch_settlement_history(db(), $companyId, $garageId, (int) ($selectedReturn['id'] ?? 0));
+        $selectedReturnStatus = returns_normalize_approval_status((string) ($selectedReturn['approval_status'] ?? 'PENDING'));
+        $selectedReturnCanSettleStatus = in_array($selectedReturnStatus, returns_settlement_allowed_statuses(), true);
     }
 }
 
@@ -452,7 +552,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
               </div>
             </div>
             <div class="card-footer d-flex justify-content-end">
-              <button type="submit" class="btn btn-primary">Create Return</button>
+              <button type="submit" class="btn btn-primary">Create &amp; Approve Return</button>
             </div>
           </form>
         </div>
@@ -507,19 +607,24 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                   <th>Source</th>
                   <th>Counterparty</th>
                   <th>Approval</th>
-                  <th class="text-end">Amount</th>
+                  <th class="text-end">Total</th>
+                  <th class="text-end">Settled</th>
+                  <th class="text-end">Pending</th>
                   <th style="width: 290px;">Actions</th>
                 </tr>
               </thead>
               <tbody>
                 <?php if ($returnsRows === []): ?>
-                  <tr><td colspan="8" class="text-center text-muted">No returns found.</td></tr>
+                  <tr><td colspan="10" class="text-center text-muted">No returns found.</td></tr>
                 <?php else: ?>
                   <?php foreach ($returnsRows as $row): ?>
                     <?php
                     $returnId = (int) ($row['id'] ?? 0);
                     $isPending = (string) ($row['approval_status'] ?? '') === 'PENDING';
                     $isApproved = (string) ($row['approval_status'] ?? '') === 'APPROVED';
+                    $isClosed = (string) ($row['approval_status'] ?? '') === 'CLOSED';
+                    $canSettleRow = $canSettle && ($isApproved || $isClosed);
+                    $settleLabel = (string) ($row['return_type'] ?? '') === 'VENDOR_RETURN' ? 'Receive' : 'Pay';
                     ?>
                     <tr>
                       <td>
@@ -547,10 +652,15 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                         </span>
                       </td>
                       <td class="text-end"><?= e(format_currency((float) ($row['total_amount'] ?? 0))); ?></td>
+                      <td class="text-end"><?= e(format_currency((float) ($row['settled_amount'] ?? 0))); ?></td>
+                      <td class="text-end"><?= e(format_currency((float) ($row['pending_amount'] ?? 0))); ?></td>
                       <td>
                         <div class="d-flex flex-wrap gap-1">
                           <a href="<?= e(url('modules/returns/print_return.php?id=' . $returnId)); ?>" class="btn btn-sm btn-outline-secondary" target="_blank">Print</a>
                           <a href="<?= e(url('modules/returns/index.php?view_id=' . $returnId)); ?>" class="btn btn-sm btn-outline-primary">View</a>
+                          <?php if ($canSettleRow): ?>
+                            <a href="<?= e(url('modules/returns/index.php?view_id=' . $returnId . '#settlement-card')); ?>" class="btn btn-sm btn-outline-info"><?= e($settleLabel); ?></a>
+                          <?php endif; ?>
                           <?php if ($canApprove && $isPending): ?>
                             <form method="post" class="d-inline">
                               <?= csrf_field(); ?>
@@ -597,6 +707,95 @@ require_once __DIR__ . '/../../includes/sidebar.php';
               <div class="col-md-3"><strong>Date:</strong> <?= e((string) ($selectedReturn['return_date'] ?? '')); ?></div>
               <div class="col-md-3"><strong>Approval:</strong> <?= e((string) ($selectedReturn['approval_status'] ?? '')); ?></div>
               <div class="col-md-3"><strong>Total:</strong> <?= e(format_currency((float) ($selectedReturn['total_amount'] ?? 0))); ?></div>
+            </div>
+
+            <div class="card card-outline card-secondary mb-3" id="settlement-card">
+              <div class="card-header"><h3 class="card-title mb-0">Settlement</h3></div>
+              <div class="card-body">
+                <div class="row g-3 mb-3">
+                  <div class="col-md-3"><strong>Expected Action:</strong> <?= e($selectedReturnSettlementActionLabel); ?></div>
+                  <div class="col-md-3"><strong>Settled:</strong> <?= e(format_currency((float) ($selectedReturnSettlementSummary['settled_amount'] ?? 0))); ?></div>
+                  <div class="col-md-3"><strong>Balance:</strong> <?= e(format_currency((float) ($selectedReturnSettlementSummary['balance_amount'] ?? 0))); ?></div>
+                  <div class="col-md-3"><strong>Entries:</strong> <?= number_format((int) ($selectedReturnSettlementSummary['settlement_count'] ?? 0)); ?></div>
+                </div>
+
+                <?php if ($canSettle && $selectedReturnCanSettleStatus && (float) ($selectedReturnSettlementSummary['balance_amount'] ?? 0) > 0.009): ?>
+                  <form method="post" class="row g-2 align-items-end mb-3">
+                    <?= csrf_field(); ?>
+                    <input type="hidden" name="_action" value="settle_return" />
+                    <input type="hidden" name="return_id" value="<?= (int) ($selectedReturn['id'] ?? 0); ?>" />
+                    <div class="col-md-2">
+                      <label class="form-label">Date</label>
+                      <input type="date" name="settlement_date" class="form-control" value="<?= e(date('Y-m-d')); ?>" required />
+                    </div>
+                    <div class="col-md-2">
+                      <label class="form-label">Amount</label>
+                      <input type="number" name="amount" class="form-control" min="0.01" max="<?= e(number_format((float) ($selectedReturnSettlementSummary['balance_amount'] ?? 0), 2, '.', '')); ?>" step="0.01" required />
+                    </div>
+                    <div class="col-md-2">
+                      <label class="form-label">Mode</label>
+                      <select name="payment_mode" class="form-select" required>
+                        <?php foreach ($settlementPaymentModes as $paymentMode): ?>
+                          <option value="<?= e((string) $paymentMode); ?>"><?= e((string) $paymentMode); ?></option>
+                        <?php endforeach; ?>
+                      </select>
+                    </div>
+                    <div class="col-md-3">
+                      <label class="form-label">Reference</label>
+                      <input type="text" name="reference_no" class="form-control" maxlength="100" placeholder="Cheque/UTR/Ref" />
+                    </div>
+                    <div class="col-md-3">
+                      <label class="form-label">Notes</label>
+                      <input type="text" name="notes" class="form-control" maxlength="255" placeholder="Settlement notes" />
+                    </div>
+                    <div class="col-12">
+                      <button type="submit" class="btn btn-primary"><?= e($selectedReturnSettlementActionLabel); ?> Entry</button>
+                    </div>
+                  </form>
+                <?php elseif (!$selectedReturnCanSettleStatus): ?>
+                  <div class="alert alert-warning mb-3">Settlement is available only for approved or closed returns.</div>
+                <?php else: ?>
+                  <div class="alert alert-success mb-3">This return is fully settled.</div>
+                <?php endif; ?>
+
+                <div class="table-responsive">
+                  <table class="table table-bordered table-sm mb-0">
+                    <thead>
+                      <tr>
+                        <th>ID</th>
+                        <th>Date</th>
+                        <th>Type</th>
+                        <th>Amount</th>
+                        <th>Mode</th>
+                        <th>Reference</th>
+                        <th>Notes</th>
+                        <th>Expense</th>
+                        <th>User</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <?php if ($selectedReturnSettlements === []): ?>
+                        <tr><td colspan="9" class="text-muted text-center">No settlement history yet.</td></tr>
+                      <?php else: ?>
+                        <?php foreach ($selectedReturnSettlements as $settlement): ?>
+                          <?php $settlementType = (string) ($settlement['settlement_type'] ?? ''); ?>
+                          <tr>
+                            <td>#<?= (int) ($settlement['id'] ?? 0); ?></td>
+                            <td><?= e((string) ($settlement['settlement_date'] ?? '-')); ?></td>
+                            <td><?= e($settlementType === 'RECEIVE' ? 'Receive' : 'Pay'); ?></td>
+                            <td><?= e(format_currency((float) ($settlement['amount'] ?? 0))); ?></td>
+                            <td><?= e((string) ($settlement['payment_mode'] ?? '-')); ?></td>
+                            <td><?= e((string) (($settlement['reference_no'] ?? '') !== '' ? $settlement['reference_no'] : '-')); ?></td>
+                            <td><?= e((string) (($settlement['notes'] ?? '') !== '' ? $settlement['notes'] : '-')); ?></td>
+                            <td><?= e((int) ($settlement['expense_id'] ?? 0) > 0 ? ('#' . (int) ($settlement['expense_id'] ?? 0)) : '-'); ?></td>
+                            <td><?= e((string) (($settlement['created_by_name'] ?? '') !== '' ? $settlement['created_by_name'] : '-')); ?></td>
+                          </tr>
+                        <?php endforeach; ?>
+                      <?php endif; ?>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
             </div>
 
             <div class="table-responsive mb-3">

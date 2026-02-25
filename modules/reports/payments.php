@@ -5,11 +5,13 @@ require_once __DIR__ . '/../../includes/app.php';
 require_login();
 require_once __DIR__ . '/shared.php';
 require_once __DIR__ . '/../billing/workflow.php';
+require_once __DIR__ . '/../returns/workflow.php';
 
 reports_require_access();
 $canViewSalesPayments = has_permission('billing.view') || has_permission('invoice.view') || has_permission('reports.financial') || has_permission('financial.reports');
 $canViewPurchasePayments = has_permission('purchase.view') || has_permission('purchase.manage') || has_permission('vendor.payments');
-if (!$canViewSalesPayments && !$canViewPurchasePayments) {
+$canViewReturnSettlements = has_permission('inventory.view') || has_permission('billing.view') || has_permission('purchase.view') || has_permission('report.view');
+if (!$canViewSalesPayments && !$canViewPurchasePayments && !$canViewReturnSettlements) {
     flash_set('access_denied', 'You do not have permission to view payments report.', 'danger');
     redirect('modules/reports/index.php');
 }
@@ -17,6 +19,7 @@ if (!$canViewSalesPayments && !$canViewPurchasePayments) {
 $page_title = 'Payments Report';
 $active_menu = 'reports.payments';
 billing_financial_extensions_ready();
+$returnsModuleReady = returns_module_ready();
 
 $scope = reports_build_scope_context();
 $companyId = (int) $scope['company_id'];
@@ -185,7 +188,92 @@ if ($canViewPurchasePayments && table_columns('purchase_payments') !== []) {
     $purchaseRows = $purchaseRowsStmt->fetchAll();
 }
 
-$allRows = array_merge($salesRows, $purchaseRows);
+$returnSettlementRows = [];
+$returnSettlementSummary = [
+    'payment_count' => 0,
+    'payment_total' => 0.0,
+    'pay_total' => 0.0,
+    'receive_total' => 0.0,
+];
+if ($canViewReturnSettlements && $returnsModuleReady && table_columns('return_settlements') !== []) {
+    $returnParams = [
+        'company_id' => $companyId,
+        'from_date' => $fromDate,
+        'to_date' => $toDate,
+    ];
+    $returnScopeSql = analytics_garage_scope_sql('rs.garage_id', $selectedGarageId, $garageIds, $returnParams, 'pay_return_scope');
+    $returnWhere = [
+        'rs.company_id = :company_id',
+        'rs.status_code = "ACTIVE"',
+        'r.status_code = "ACTIVE"',
+        'rs.settlement_date BETWEEN :from_date AND :to_date',
+    ];
+    if ($paymentModeFilter !== '') {
+        $returnWhere[] = 'rs.payment_mode = :payment_mode';
+        $returnParams['payment_mode'] = $paymentModeFilter;
+    }
+    if ($customerFilter > 0) {
+        $returnWhere[] = 'r.customer_id = :customer_id';
+        $returnParams['customer_id'] = $customerFilter;
+    }
+    if ($vendorFilter > 0) {
+        $returnWhere[] = 'r.vendor_id = :vendor_id';
+        $returnParams['vendor_id'] = $vendorFilter;
+    }
+    if ($invoiceFilter !== '') {
+        $returnWhere[] = '(r.return_number LIKE :invoice_like OR i.invoice_number LIKE :invoice_like OR p.invoice_number LIKE :invoice_like)';
+        $returnParams['invoice_like'] = '%' . $invoiceFilter . '%';
+    }
+    $returnWhereSql = implode(' AND ', $returnWhere);
+
+    $returnSummaryStmt = db()->prepare(
+        'SELECT COUNT(*) AS payment_count,
+                COALESCE(SUM(rs.amount), 0) AS payment_total,
+                COALESCE(SUM(CASE WHEN rs.settlement_type = "PAY" THEN rs.amount ELSE 0 END), 0) AS pay_total,
+                COALESCE(SUM(CASE WHEN rs.settlement_type = "RECEIVE" THEN rs.amount ELSE 0 END), 0) AS receive_total
+         FROM return_settlements rs
+         INNER JOIN returns_rma r ON r.id = rs.return_id
+         LEFT JOIN invoices i ON i.id = r.invoice_id
+         LEFT JOIN purchases p ON p.id = r.purchase_id
+         WHERE ' . $returnWhereSql . ' ' . $returnScopeSql
+    );
+    $returnSummaryStmt->execute($returnParams);
+    $returnSettlementSummary = $returnSummaryStmt->fetch() ?: $returnSettlementSummary;
+
+    $returnRowsStmt = db()->prepare(
+        'SELECT rs.id,
+                rs.settlement_date AS payment_date,
+                rs.settlement_type AS entry_type,
+                rs.payment_mode,
+                rs.amount,
+                rs.reference_no,
+                NULL AS receipt_number,
+                r.return_number AS invoice_number,
+                CASE
+                    WHEN r.return_type = "CUSTOMER_RETURN" THEN COALESCE(c.full_name, "UNASSIGNED")
+                    ELSE COALESCE(v.vendor_name, "UNASSIGNED")
+                END AS party_name,
+                g.name AS garage_name,
+                CASE
+                    WHEN rs.settlement_type = "PAY" THEN "RETURN_PAY"
+                    ELSE "RETURN_RECEIVE"
+                END AS payment_side
+         FROM return_settlements rs
+         INNER JOIN returns_rma r ON r.id = rs.return_id
+         LEFT JOIN invoices i ON i.id = r.invoice_id
+         LEFT JOIN purchases p ON p.id = r.purchase_id
+         LEFT JOIN customers c ON c.id = r.customer_id
+         LEFT JOIN vendors v ON v.id = r.vendor_id
+         LEFT JOIN garages g ON g.id = rs.garage_id
+         WHERE ' . $returnWhereSql . ' ' . $returnScopeSql . '
+         ORDER BY rs.id DESC
+         LIMIT 600'
+    );
+    $returnRowsStmt->execute($returnParams);
+    $returnSettlementRows = $returnRowsStmt->fetchAll();
+}
+
+$allRows = array_merge($salesRows, $purchaseRows, $returnSettlementRows);
 usort($allRows, static function (array $a, array $b): int {
     $dateA = (string) ($a['payment_date'] ?? ($a['paid_on'] ?? ''));
     $dateB = (string) ($b['payment_date'] ?? ($b['paid_on'] ?? ''));
@@ -212,15 +300,17 @@ foreach ($allRows as $row) {
         $dateKey = (string) ($row['payment_date'] ?? ($row['paid_on'] ?? ''));
         if ($dateKey !== '') {
             if (!isset($dailyCash[$dateKey])) {
-                $dailyCash[$dateKey] = ['sales' => 0.0, 'purchase' => 0.0, 'net_cash' => 0.0];
+                $dailyCash[$dateKey] = ['cash_in' => 0.0, 'cash_out' => 0.0, 'net_cash' => 0.0];
             }
+
             $amount = (float) ($row['amount'] ?? 0);
-            if ((string) ($row['payment_side'] ?? '') === 'SALES') {
-                $dailyCash[$dateKey]['sales'] += $amount;
+            $side = (string) ($row['payment_side'] ?? '');
+            if ($side === 'SALES' || $side === 'RETURN_RECEIVE') {
+                $dailyCash[$dateKey]['cash_in'] += $amount;
             } else {
-                $dailyCash[$dateKey]['purchase'] += $amount;
+                $dailyCash[$dateKey]['cash_out'] += $amount;
             }
-            $dailyCash[$dateKey]['net_cash'] = $dailyCash[$dateKey]['sales'] - $dailyCash[$dateKey]['purchase'];
+            $dailyCash[$dateKey]['net_cash'] = $dailyCash[$dateKey]['cash_in'] - $dailyCash[$dateKey]['cash_out'];
         }
     }
 }
@@ -246,7 +336,7 @@ if ($exportKey !== '') {
             (string) ($row['reference_no'] ?? ''),
             (string) ($row['garage_name'] ?? ''),
         ], $allRows);
-        reports_csv_download('payments_ledger_' . $timestamp . '.csv', ['Date', 'Side', 'Invoice', 'Customer/Vendor', 'Mode', 'Entry Type', 'Receipt', 'Amount', 'Reference', 'Garage'], $csvRows);
+        reports_csv_download('payments_ledger_' . $timestamp . '.csv', ['Date', 'Side', 'Document', 'Party', 'Mode', 'Entry Type', 'Receipt', 'Amount', 'Reference', 'Garage'], $csvRows);
     }
     if ($exportKey === 'mode_summary') {
         $csvRows = [];
@@ -258,9 +348,9 @@ if ($exportKey !== '') {
     if ($exportKey === 'daily_cash') {
         $csvRows = [];
         foreach ($dailyCash as $date => $stats) {
-            $csvRows[] = [(string) $date, (float) ($stats['sales'] ?? 0), (float) ($stats['purchase'] ?? 0), (float) ($stats['net_cash'] ?? 0)];
+            $csvRows[] = [(string) $date, (float) ($stats['cash_in'] ?? 0), (float) ($stats['cash_out'] ?? 0), (float) ($stats['net_cash'] ?? 0)];
         }
-        reports_csv_download('payments_daily_cash_' . $timestamp . '.csv', ['Date', 'Sales Cash', 'Purchase Cash', 'Net Cash'], $csvRows);
+        reports_csv_download('payments_daily_cash_' . $timestamp . '.csv', ['Date', 'Cash In', 'Cash Out', 'Net Cash'], $csvRows);
     }
     flash_set('report_error', 'Unknown export requested.', 'warning');
     redirect('modules/reports/payments.php?' . http_build_query(reports_compact_query_params($pageParams)));
@@ -328,7 +418,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             <div class="col-md-2"><label class="form-label">Payment Mode</label><select name="payment_mode" class="form-select"><option value="">All</option><?php foreach ($allowedModes as $mode): ?><option value="<?= e($mode); ?>" <?= $paymentModeFilter === $mode ? 'selected' : ''; ?>><?= e($mode); ?></option><?php endforeach; ?></select></div>
             <div class="col-md-3"><label class="form-label">Customer</label><select name="customer_id" class="form-select" data-searchable-select="1"><option value="0">All Customers</option><?php foreach ($customers as $customer): ?><option value="<?= (int) ($customer['id'] ?? 0); ?>" <?= $customerFilter === (int) ($customer['id'] ?? 0) ? 'selected' : ''; ?>><?= e((string) ($customer['full_name'] ?? '')); ?></option><?php endforeach; ?></select></div>
             <div class="col-md-3"><label class="form-label">Vendor</label><select name="vendor_id" class="form-select" data-searchable-select="1"><option value="0">All Vendors</option><?php foreach ($vendors as $vendor): ?><option value="<?= (int) ($vendor['id'] ?? 0); ?>" <?= $vendorFilter === (int) ($vendor['id'] ?? 0) ? 'selected' : ''; ?>><?= e((string) ($vendor['vendor_name'] ?? '')); ?></option><?php endforeach; ?></select></div>
-            <div class="col-md-2"><label class="form-label">Invoice No</label><input type="text" name="invoice_no" class="form-control" value="<?= e($invoiceFilter); ?>" placeholder="Invoice search"></div>
+            <div class="col-md-2"><label class="form-label">Invoice/Return No</label><input type="text" name="invoice_no" class="form-control" value="<?= e($invoiceFilter); ?>" placeholder="Document search"></div>
             <div class="col-md-2 d-flex gap-2"><button type="submit" class="btn btn-primary">Apply</button><a href="<?= e(url('modules/reports/payments.php')); ?>" class="btn btn-outline-secondary">Reset</a></div>
           </form>
         </div>
@@ -337,18 +427,24 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       <div class="row g-3 mb-3">
         <div class="col-md-3"><div class="small-box text-bg-primary"><div class="inner"><h4><?= e(format_currency((float) ($salesSummary['payment_total'] ?? 0))); ?></h4><p>Sales Payments</p></div><span class="small-box-icon"><i class="bi bi-receipt"></i></span></div></div>
         <div class="col-md-3"><div class="small-box text-bg-warning"><div class="inner"><h4><?= e(format_currency((float) ($purchaseSummary['payment_total'] ?? 0))); ?></h4><p>Purchase Payments</p></div><span class="small-box-icon"><i class="bi bi-bag"></i></span></div></div>
-        <div class="col-md-3"><div class="small-box text-bg-success"><div class="inner"><h4><?= number_format((int) ($salesSummary['payment_count'] ?? 0)); ?></h4><p>Sales Entries</p></div><span class="small-box-icon"><i class="bi bi-list-check"></i></span></div></div>
-        <div class="col-md-3"><div class="small-box text-bg-secondary"><div class="inner"><h4><?= number_format((int) ($purchaseSummary['payment_count'] ?? 0)); ?></h4><p>Purchase Entries</p></div><span class="small-box-icon"><i class="bi bi-list-ul"></i></span></div></div>
+        <div class="col-md-3"><div class="small-box text-bg-success"><div class="inner"><h4><?= e(format_currency((float) ($returnSettlementSummary['receive_total'] ?? 0))); ?></h4><p>Return Receipts</p></div><span class="small-box-icon"><i class="bi bi-arrow-down-circle"></i></span></div></div>
+        <div class="col-md-3"><div class="small-box text-bg-danger"><div class="inner"><h4><?= e(format_currency((float) ($returnSettlementSummary['pay_total'] ?? 0))); ?></h4><p>Return Refunds</p></div><span class="small-box-icon"><i class="bi bi-arrow-up-circle"></i></span></div></div>
+      </div>
+
+      <div class="row g-3 mb-3">
+        <div class="col-md-4"><div class="small-box text-bg-primary"><div class="inner"><h4><?= number_format((int) ($salesSummary['payment_count'] ?? 0)); ?></h4><p>Sales Entries</p></div><span class="small-box-icon"><i class="bi bi-list-check"></i></span></div></div>
+        <div class="col-md-4"><div class="small-box text-bg-secondary"><div class="inner"><h4><?= number_format((int) ($purchaseSummary['payment_count'] ?? 0)); ?></h4><p>Purchase Entries</p></div><span class="small-box-icon"><i class="bi bi-list-ul"></i></span></div></div>
+        <div class="col-md-4"><div class="small-box text-bg-info"><div class="inner"><h4><?= number_format((int) ($returnSettlementSummary['payment_count'] ?? 0)); ?></h4><p>Return Entries</p></div><span class="small-box-icon"><i class="bi bi-arrow-repeat"></i></span></div></div>
       </div>
 
       <div class="card mb-3">
         <div class="card-header d-flex justify-content-between align-items-center">
-          <h3 class="card-title mb-0">Unified Payment Ledger (Sales + Purchases)</h3>
+          <h3 class="card-title mb-0">Unified Payment Ledger (Sales + Purchases + Returns)</h3>
           <a href="<?= e(reports_export_url('modules/reports/payments.php', $pageParams, 'ledger')); ?>" class="btn btn-sm btn-outline-primary">CSV</a>
         </div>
         <div class="card-body table-responsive p-0">
           <table class="table table-sm table-striped mb-0">
-            <thead><tr><th>Date</th><th>Side</th><th>Invoice</th><th>Customer/Vendor</th><th>Mode</th><th>Entry</th><th>Receipt</th><th>Amount</th><th>Reference</th><th>Garage</th></tr></thead>
+            <thead><tr><th>Date</th><th>Side</th><th>Document</th><th>Party</th><th>Mode</th><th>Entry</th><th>Receipt</th><th>Amount</th><th>Reference</th><th>Garage</th></tr></thead>
             <tbody>
               <?php if (empty($allRows)): ?>
                 <tr><td colspan="10" class="text-center text-muted py-4">No payment records found.</td></tr>
@@ -356,11 +452,11 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                 <?php foreach ($allRows as $row): ?>
                   <tr>
                     <td><?= e((string) ($row['payment_date'] ?? ($row['paid_on'] ?? '-'))); ?></td>
-                    <td><?= e((string) ($row['payment_side'] ?? '-')); ?></td>
+                    <td><?= e(str_replace('_', ' ', (string) ($row['payment_side'] ?? '-'))); ?></td>
                     <td><?= e((string) ($row['invoice_number'] ?? '-')); ?></td>
                     <td><?= e((string) ($row['party_name'] ?? '-')); ?></td>
                     <td><?= e((string) ($row['payment_mode'] ?? '-')); ?></td>
-                    <td><?= e((string) ($row['entry_type'] ?? '-')); ?></td>
+                    <td><?= e(str_replace('_', ' ', (string) ($row['entry_type'] ?? '-'))); ?></td>
                     <td><?= e((string) (($row['receipt_number'] ?? '') !== '' ? $row['receipt_number'] : '-')); ?></td>
                     <td><?= e(format_currency((float) ($row['amount'] ?? 0))); ?></td>
                     <td><?= e((string) (($row['reference_no'] ?? '') !== '' ? $row['reference_no'] : '-')); ?></td>
@@ -399,7 +495,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             <div class="card-header d-flex justify-content-between align-items-center"><h3 class="card-title mb-0">Daily Cash Summary</h3><a href="<?= e(reports_export_url('modules/reports/payments.php', $pageParams, 'daily_cash')); ?>" class="btn btn-sm btn-outline-secondary">CSV</a></div>
             <div class="card-body table-responsive p-0">
               <table class="table table-sm table-striped mb-0">
-                <thead><tr><th>Date</th><th>Sales Cash</th><th>Purchase Cash</th><th>Net Cash</th></tr></thead>
+                <thead><tr><th>Date</th><th>Cash In</th><th>Cash Out</th><th>Net Cash</th></tr></thead>
                 <tbody>
                   <?php if (empty($dailyCash)): ?>
                     <tr><td colspan="4" class="text-center text-muted py-4">No cash entries available.</td></tr>
@@ -407,8 +503,8 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                     <?php foreach ($dailyCash as $date => $stats): ?>
                       <tr>
                         <td><?= e((string) $date); ?></td>
-                        <td><?= e(format_currency((float) ($stats['sales'] ?? 0))); ?></td>
-                        <td><?= e(format_currency((float) ($stats['purchase'] ?? 0))); ?></td>
+                        <td><?= e(format_currency((float) ($stats['cash_in'] ?? 0))); ?></td>
+                        <td><?= e(format_currency((float) ($stats['cash_out'] ?? 0))); ?></td>
                         <td><?= e(format_currency((float) ($stats['net_cash'] ?? 0))); ?></td>
                       </tr>
                     <?php endforeach; ?>

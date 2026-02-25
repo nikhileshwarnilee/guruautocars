@@ -97,6 +97,7 @@ $summary = $summaryStmt->fetch() ?: [
 $rowsStmt = db()->prepare(
     'SELECT r.id, r.return_number, r.return_date, r.return_type, r.approval_status,
             r.total_amount,
+            COALESCE(rs.settled_amount, 0) AS settled_amount,
             i.invoice_number,
             p.invoice_number AS purchase_invoice_number,
             c.full_name AS customer_name,
@@ -107,6 +108,12 @@ $rowsStmt = db()->prepare(
      LEFT JOIN purchases p ON p.id = r.purchase_id
      LEFT JOIN customers c ON c.id = r.customer_id
      LEFT JOIN vendors v ON v.id = r.vendor_id
+     LEFT JOIN (
+         SELECT return_id, COALESCE(SUM(amount), 0) AS settled_amount
+         FROM return_settlements
+         WHERE status_code = "ACTIVE"
+         GROUP BY return_id
+     ) rs ON rs.return_id = r.id
      LEFT JOIN garages g ON g.id = r.garage_id
      WHERE ' . $whereSql . '
        ' . $garageScopeSql . '
@@ -115,6 +122,18 @@ $rowsStmt = db()->prepare(
 );
 $rowsStmt->execute($params);
 $rows = $rowsStmt->fetchAll();
+$settledTotal = 0.0;
+$balanceTotal = 0.0;
+foreach ($rows as &$row) {
+    $totalAmount = round((float) ($row['total_amount'] ?? 0), 2);
+    $settledAmount = round((float) ($row['settled_amount'] ?? 0), 2);
+    $balanceAmount = round(max(0.0, $totalAmount - $settledAmount), 2);
+    $row['settled_amount'] = $settledAmount;
+    $row['balance_amount'] = $balanceAmount;
+    $settledTotal += $settledAmount;
+    $balanceTotal += $balanceAmount;
+}
+unset($row);
 
 $exportKey = trim((string) ($_GET['export'] ?? ''));
 if ($exportKey !== '') {
@@ -133,11 +152,13 @@ if ($exportKey !== '') {
             (string) (($row['invoice_number'] ?? '') !== '' ? $row['invoice_number'] : ((($row['purchase_invoice_number'] ?? '') !== '') ? $row['purchase_invoice_number'] : '')),
             (string) (($row['customer_name'] ?? '') !== '' ? $row['customer_name'] : ($row['vendor_name'] ?? '')),
             (float) ($row['total_amount'] ?? 0),
+            (float) ($row['settled_amount'] ?? 0),
+            (float) ($row['balance_amount'] ?? 0),
             (string) ($row['garage_name'] ?? ''),
         ], $rows);
         reports_csv_download(
             'returns_report_' . $timestamp . '.csv',
-            ['Return No', 'Date', 'Type', 'Approval', 'Source Doc', 'Customer/Vendor', 'Amount', 'Garage'],
+            ['Return No', 'Date', 'Type', 'Approval', 'Source Doc', 'Customer/Vendor', 'Amount', 'Settled', 'Balance', 'Garage'],
             $csvRows
         );
     }
@@ -236,6 +257,11 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         <div class="col-md-3"><div class="small-box text-bg-warning"><div class="inner"><h4><?= e(format_currency((float) ($summary['vendor_return_total'] ?? 0))); ?></h4><p>Vendor Returns</p></div><span class="small-box-icon"><i class="bi bi-truck"></i></span></div></div>
       </div>
 
+      <div class="row g-3 mb-3">
+        <div class="col-md-6"><div class="small-box text-bg-success"><div class="inner"><h4><?= e(format_currency($settledTotal)); ?></h4><p>Settled Amount</p></div><span class="small-box-icon"><i class="bi bi-check2-circle"></i></span></div></div>
+        <div class="col-md-6"><div class="small-box text-bg-danger"><div class="inner"><h4><?= e(format_currency($balanceTotal)); ?></h4><p>Pending Balance</p></div><span class="small-box-icon"><i class="bi bi-hourglass-split"></i></span></div></div>
+      </div>
+
       <div class="card">
         <div class="card-header d-flex justify-content-between align-items-center">
           <h3 class="card-title mb-0">Returns Ledger</h3>
@@ -253,11 +279,13 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                 <th>Counterparty</th>
                 <th>Garage</th>
                 <th>Amount</th>
+                <th>Settled</th>
+                <th>Balance</th>
               </tr>
             </thead>
             <tbody>
               <?php if ($rows === []): ?>
-                <tr><td colspan="8" class="text-center text-muted py-4">No returns found in selected scope.</td></tr>
+                <tr><td colspan="10" class="text-center text-muted py-4">No returns found in selected scope.</td></tr>
               <?php else: ?>
                 <?php foreach ($rows as $row): ?>
                   <?php $returnId = (int) ($row['id'] ?? 0); ?>
@@ -270,6 +298,8 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                     <td><?= e((string) (($row['customer_name'] ?? '') !== '' ? $row['customer_name'] : ($row['vendor_name'] ?? '-'))); ?></td>
                     <td><?= e((string) ($row['garage_name'] ?? '-')); ?></td>
                     <td><?= e(format_currency((float) ($row['total_amount'] ?? 0))); ?></td>
+                    <td><?= e(format_currency((float) ($row['settled_amount'] ?? 0))); ?></td>
+                    <td><?= e(format_currency((float) ($row['balance_amount'] ?? 0))); ?></td>
                   </tr>
                 <?php endforeach; ?>
               <?php endif; ?>

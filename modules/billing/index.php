@@ -198,8 +198,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 throw new RuntimeException('Invoice can be generated only from active CLOSED job cards in this garage.');
             }
 
-            $existingInvoiceStmt = $pdo->prepare('SELECT id, invoice_number, invoice_status FROM invoices WHERE job_card_id = :job_id LIMIT 1 FOR UPDATE');
-            $existingInvoiceStmt->execute(['job_id' => $jobCardId]);
+            $existingInvoiceStmt = $pdo->prepare(
+                'SELECT id, invoice_number, invoice_status
+                 FROM invoices
+                 WHERE job_card_id = :job_id
+                   AND company_id = :company_id
+                   AND garage_id = :garage_id
+                   AND invoice_status <> "CANCELLED"
+                 LIMIT 1
+                 FOR UPDATE'
+            );
+            $existingInvoiceStmt->execute([
+                'job_id' => $jobCardId,
+                'company_id' => $companyId,
+                'garage_id' => $garageId,
+            ]);
             $existingInvoice = $existingInvoiceStmt->fetch();
             if ($existingInvoice) {
                 throw new RuntimeException('Invoice already exists for this job card (' . (string) $existingInvoice['invoice_number'] . ').');
@@ -644,6 +657,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 throw new RuntimeException(reversal_chain_message($intro, $steps));
             }
 
+            $releasedAdvance = ['released_total' => 0.0, 'released_count' => 0, 'rows' => []];
+            if ($financialExtensionsReady) {
+                $releasedAdvance = billing_release_invoice_advance_adjustments(
+                    $pdo,
+                    $invoiceId,
+                    $userId > 0 ? $userId : null
+                );
+            }
+
+            $releasedAdvanceTotal = round((float) ($releasedAdvance['released_total'] ?? 0), 2);
+            $releasedAdvanceCount = (int) ($releasedAdvance['released_count'] ?? 0);
             $paymentSummary = (array) ($dependencyReport['payment_summary'] ?? []);
             $paidAmount = round((float) ($paymentSummary['net_paid_amount'] ?? 0), 2);
             $cancelStmt = $pdo->prepare(
@@ -671,6 +695,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $userId > 0 ? $userId : null,
                 [
                     'paid_amount' => $paidAmount,
+                    'advance_released_total' => $releasedAdvanceTotal,
+                    'advance_released_count' => $releasedAdvanceCount,
                     'blockers' => [],
                     'dependency_report' => [
                         'inventory_movements' => (int) ($dependencyReport['inventory_movements'] ?? 0),
@@ -686,19 +712,26 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'invoice_status' => $currentStatus,
                     'payment_status' => (string) ($invoice['payment_status'] ?? 'UNPAID'),
                     'paid_amount' => (float) $paidAmount,
+                    'advance_adjusted' => $releasedAdvanceTotal,
                 ],
                 'after' => [
                     'invoice_status' => 'CANCELLED',
                     'payment_status' => 'CANCELLED',
                     'cancel_reason' => $cancelReason,
+                    'advance_adjusted' => 0.0,
                 ],
                 'metadata' => [
                     'invoice_number' => (string) ($invoice['invoice_number'] ?? ''),
+                    'advance_release_count' => $releasedAdvanceCount,
                 ],
             ]);
 
             $pdo->commit();
-            flash_set('billing_success', 'Invoice cancelled successfully.', 'success');
+            $successMessage = 'Invoice cancelled successfully.';
+            if ($releasedAdvanceTotal > 0.009) {
+                $successMessage .= ' Advance released: ' . number_format($releasedAdvanceTotal, 2) . '.';
+            }
+            flash_set('billing_success', $successMessage, 'success');
         } catch (Throwable $exception) {
             $pdo->rollBack();
             flash_set('billing_error', $exception->getMessage(), 'danger');
