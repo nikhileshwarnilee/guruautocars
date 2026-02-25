@@ -23,6 +23,8 @@ require_once __DIR__ . '/finance.php';
 require_once __DIR__ . '/analytics.php';
 require_once __DIR__ . '/reversal.php';
 
+log_request_access_event();
+
 if (is_logged_in() && ($_POST['_action'] ?? '') === 'switch_garage') {
     require_csrf();
     $garageId = post_int('garage_id');

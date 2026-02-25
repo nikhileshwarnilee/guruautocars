@@ -715,6 +715,184 @@ function audit_default_source_channel(): string
     return 'UI';
 }
 
+function request_client_ip(): string
+{
+    $candidates = [
+        (string) ($_SERVER['HTTP_CF_CONNECTING_IP'] ?? ''),
+        (string) ($_SERVER['HTTP_X_FORWARDED_FOR'] ?? ''),
+        (string) ($_SERVER['HTTP_X_REAL_IP'] ?? ''),
+        (string) ($_SERVER['REMOTE_ADDR'] ?? ''),
+    ];
+
+    foreach ($candidates as $candidateList) {
+        if ($candidateList === '') {
+            continue;
+        }
+
+        $parts = array_map('trim', explode(',', $candidateList));
+        foreach ($parts as $part) {
+            if ($part === '') {
+                continue;
+            }
+
+            if (filter_var($part, FILTER_VALIDATE_IP) !== false) {
+                return mb_substr($part, 0, 45);
+            }
+        }
+    }
+
+    return '';
+}
+
+function request_user_agent(): string
+{
+    $userAgent = trim((string) ($_SERVER['HTTP_USER_AGENT'] ?? ''));
+    return $userAgent !== '' ? mb_substr($userAgent, 0, 255) : '';
+}
+
+function audit_request_path(): string
+{
+    if (PHP_SAPI === 'cli') {
+        return '';
+    }
+
+    $uri = (string) ($_SERVER['REQUEST_URI'] ?? '');
+    if ($uri === '') {
+        return '';
+    }
+
+    $path = (string) parse_url($uri, PHP_URL_PATH);
+    if ($path === '') {
+        return '';
+    }
+
+    if (APP_BASE_URL !== '') {
+        if ($path === APP_BASE_URL) {
+            $path = '';
+        } elseif (str_starts_with($path, APP_BASE_URL . '/')) {
+            $path = substr($path, strlen(APP_BASE_URL) + 1);
+        }
+    }
+
+    return mb_substr(ltrim($path, '/'), 0, 255);
+}
+
+function audit_is_sensitive_field(string $fieldName): bool
+{
+    return (bool) preg_match('/pass(word)?|token|csrf|secret|auth|cookie|session|api[_-]?key/i', $fieldName);
+}
+
+function audit_sanitize_request_fields(array $fields, int $maxFields = 10, int $maxValueLength = 120): ?array
+{
+    if ($fields === []) {
+        return null;
+    }
+
+    $sanitized = [];
+    $count = 0;
+
+    foreach ($fields as $key => $value) {
+        if ($count >= $maxFields) {
+            $sanitized['_truncated'] = true;
+            break;
+        }
+
+        $fieldName = mb_substr(trim((string) $key), 0, 60);
+        if ($fieldName === '') {
+            continue;
+        }
+
+        if (audit_is_sensitive_field($fieldName)) {
+            $sanitized[$fieldName] = '[redacted]';
+            $count++;
+            continue;
+        }
+
+        if (is_scalar($value) || $value === null) {
+            $sanitized[$fieldName] = mb_substr(trim((string) $value), 0, $maxValueLength);
+            $count++;
+            continue;
+        }
+
+        if (is_array($value)) {
+            $sanitized[$fieldName] = '[array:' . count($value) . ']';
+            $count++;
+            continue;
+        }
+
+        $sanitized[$fieldName] = '[complex]';
+        $count++;
+    }
+
+    return $sanitized === [] ? null : $sanitized;
+}
+
+function audit_request_metadata(): array
+{
+    static $cache = null;
+
+    if (is_array($cache)) {
+        return $cache;
+    }
+
+    if (PHP_SAPI === 'cli') {
+        $cache = [];
+        return $cache;
+    }
+
+    $requestMethod = strtoupper(trim((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET')));
+    if ($requestMethod === '') {
+        $requestMethod = 'GET';
+    }
+
+    $requestPath = audit_request_path();
+    $requestQuery = audit_sanitize_request_fields($_GET ?? [], 10, 80);
+    $userAgent = request_user_agent();
+
+    $referrerRaw = trim((string) ($_SERVER['HTTP_REFERER'] ?? ''));
+    $referrerPath = '';
+    if ($referrerRaw !== '') {
+        $parsedReferrerPath = (string) parse_url($referrerRaw, PHP_URL_PATH);
+        $referrerPath = $parsedReferrerPath !== '' ? $parsedReferrerPath : $referrerRaw;
+        $referrerPath = mb_substr($referrerPath, 0, 255);
+    }
+
+    $cache = [
+        'request_method' => $requestMethod,
+        'request_path' => $requestPath !== '' ? $requestPath : null,
+        'request_query' => $requestQuery,
+        'is_ajax' => is_ajax_request() ? 1 : 0,
+        'user_agent' => $userAgent !== '' ? $userAgent : null,
+        'referrer' => $referrerPath !== '' ? $referrerPath : null,
+    ];
+
+    return $cache;
+}
+
+function audit_request_entity(string $requestPath): string
+{
+    $normalized = trim($requestPath, '/');
+    if ($normalized === '') {
+        return 'dashboard';
+    }
+
+    $parts = array_values(array_filter(explode('/', $normalized), static fn (string $part): bool => $part !== ''));
+    if ($parts === []) {
+        return 'dashboard';
+    }
+
+    if (($parts[0] ?? '') === 'modules' && isset($parts[1])) {
+        return mb_substr((string) $parts[1], 0, 80);
+    }
+
+    $fileBase = pathinfo((string) end($parts), PATHINFO_FILENAME);
+    if ($fileBase !== '') {
+        return mb_substr($fileBase, 0, 80);
+    }
+
+    return mb_substr((string) $parts[0], 0, 80);
+}
+
 function audit_light_snapshot(?array $snapshot, int $maxFields = 24): ?array
 {
     if (!is_array($snapshot) || $snapshot === []) {
@@ -822,6 +1000,18 @@ function log_audit(
             $metadata['changes'] = $changes;
         }
 
+        $requestMetadata = audit_request_metadata();
+        if ($requestMetadata !== []) {
+            foreach ($requestMetadata as $metaKey => $metaValue) {
+                if ($metaValue === null || $metaValue === []) {
+                    continue;
+                }
+                if (!array_key_exists($metaKey, $metadata)) {
+                    $metadata[$metaKey] = $metaValue;
+                }
+            }
+        }
+
         $sourceChannel = strtoupper(trim((string) ($context['source_channel'] ?? $context['source'] ?? audit_default_source_channel())));
         if ($sourceChannel === '') {
             $sourceChannel = 'UI';
@@ -833,7 +1023,7 @@ function log_audit(
         $roleKey = trim((string) ($context['role_key'] ?? ($_SESSION['role_key'] ?? '')));
         $entityName = trim((string) ($context['entity_name'] ?? $context['entity'] ?? $module));
         $requestId = trim((string) ($context['request_id'] ?? audit_request_id()));
-        $ipAddress = trim((string) ($_SERVER['REMOTE_ADDR'] ?? ''));
+        $ipAddress = trim((string) ($context['ip_address'] ?? request_client_ip()));
 
         $payload = [
             'company_id' => $companyId > 0 ? $companyId : null,
@@ -857,6 +1047,104 @@ function log_audit(
     } catch (Throwable $exception) {
         // Audit logging should never break business flow.
     }
+}
+
+function log_request_access_event(): void
+{
+    static $isLogged = false;
+
+    if ($isLogged) {
+        return;
+    }
+    $isLogged = true;
+
+    if (PHP_SAPI === 'cli' || !is_logged_in()) {
+        return;
+    }
+
+    $requestMethod = strtoupper(trim((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET')));
+    if (!in_array($requestMethod, ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'], true)) {
+        return;
+    }
+
+    $requestMetadata = audit_request_metadata();
+    $requestPath = trim((string) ($requestMetadata['request_path'] ?? ''));
+    if ($requestPath === '' || str_starts_with($requestPath, 'assets/')) {
+        return;
+    }
+
+    $postAction = '';
+    if (isset($_POST['_action']) && (is_scalar($_POST['_action']) || $_POST['_action'] === null)) {
+        $postAction = mb_substr(trim((string) $_POST['_action']), 0, 80);
+    }
+
+    $queryKeys = [];
+    $requestQuery = $requestMetadata['request_query'] ?? null;
+    if (is_array($requestQuery)) {
+        $queryKeys = array_keys($requestQuery);
+    }
+
+    $minuteBucket = gmdate('YmdHi');
+    $signature = hash(
+        'sha256',
+        $requestMethod
+        . '|' . $requestPath
+        . '|' . $postAction
+        . '|' . implode(',', $queryKeys)
+        . '|' . (!empty($requestMetadata['is_ajax']) ? '1' : '0')
+    );
+
+    $loggedIndex = $_SESSION['_audit_request_seen'] ?? [];
+    if (is_array($loggedIndex) && (($loggedIndex[$signature] ?? null) === $minuteBucket)) {
+        return;
+    }
+
+    if (!is_array($loggedIndex)) {
+        $loggedIndex = [];
+    }
+
+    $loggedIndex[$signature] = $minuteBucket;
+    if (count($loggedIndex) > 300) {
+        $loggedIndex = array_slice($loggedIndex, -200, null, true);
+    }
+    $_SESSION['_audit_request_seen'] = $loggedIndex;
+
+    $referenceId = null;
+    $candidateReference = $_GET['id'] ?? $_POST['id'] ?? null;
+    if (filter_var($candidateReference, FILTER_VALIDATE_INT) !== false) {
+        $referenceId = (int) $candidateReference;
+    }
+
+    $details = $requestMethod . ' /' . ltrim($requestPath, '/');
+    if ($postAction !== '') {
+        $details .= ' [action=' . $postAction . ']';
+    }
+
+    $metadata = [
+        'post_action' => $postAction !== '' ? $postAction : null,
+        'query' => is_array($requestQuery) && $requestQuery !== [] ? $requestQuery : null,
+        'minute_bucket' => $minuteBucket,
+    ];
+    $metadata = array_filter(
+        $metadata,
+        static fn ($value): bool => $value !== null && $value !== [] && $value !== ''
+    );
+
+    log_audit(
+        'access',
+        'request_' . strtolower($requestMethod),
+        $referenceId,
+        $details,
+        [
+            'entity' => 'http_request:' . audit_request_entity($requestPath),
+            'source' => !empty($requestMetadata['is_ajax']) ? 'API' : 'UI',
+            'company_id' => active_company_id(),
+            'garage_id' => active_garage_id(),
+            'user_id' => (int) ($_SESSION['user_id'] ?? 0),
+            'role_key' => (string) ($_SESSION['role_key'] ?? ''),
+            'metadata' => $metadata,
+        ]
+    );
 }
 
 function log_data_export(
