@@ -1565,3 +1565,437 @@ function returns_close_rma(PDO $pdo, int $returnId, int $companyId, int $garageI
 
     return $stmt->rowCount() > 0;
 }
+
+function returns_reverse_stock_for_deleted_return(PDO $pdo, array $returnRow, array $returnItems, int $actorUserId): array
+{
+    $returnType = returns_normalize_type((string) ($returnRow['return_type'] ?? 'CUSTOMER_RETURN'));
+    $companyId = (int) ($returnRow['company_id'] ?? 0);
+    $garageId = (int) ($returnRow['garage_id'] ?? 0);
+    $returnId = (int) ($returnRow['id'] ?? 0);
+
+    if ($companyId <= 0 || $garageId <= 0 || $returnId <= 0) {
+        throw new RuntimeException('Invalid return context for stock reversal undo.');
+    }
+
+    $forwardMovementType = $returnType === 'CUSTOMER_RETURN' ? 'IN' : 'OUT';
+    $reverseMovementType = $forwardMovementType === 'IN' ? 'OUT' : 'IN';
+    $referenceType = $returnType;
+
+    $partTotals = [];
+    foreach ($returnItems as $item) {
+        $partId = (int) ($item['part_id'] ?? 0);
+        $qty = returns_round((float) ($item['quantity'] ?? 0));
+        if ($partId <= 0 || $qty <= 0.009) {
+            continue;
+        }
+
+        if (!isset($partTotals[$partId])) {
+            $partTotals[$partId] = 0.0;
+        }
+        $partTotals[$partId] = returns_round($partTotals[$partId] + $qty);
+    }
+
+    if ($partTotals === []) {
+        return ['posted' => [], 'skipped' => []];
+    }
+
+    $posted = [];
+    $skipped = [];
+
+    $linkSelectStmt = $pdo->prepare(
+        'SELECT id, quantity, reversal_movement_uid
+         FROM stock_reversal_links
+         WHERE company_id = :company_id
+           AND garage_id = :garage_id
+           AND reversal_context_type = :context_type
+           AND reversal_context_id = :context_id
+           AND part_id = :part_id
+           AND movement_type = :movement_type
+         LIMIT 1'
+    );
+
+    $stockSelectStmt = $pdo->prepare(
+        'SELECT quantity
+         FROM garage_inventory
+         WHERE garage_id = :garage_id
+           AND part_id = :part_id
+         FOR UPDATE'
+    );
+
+    $stockInsertStmt = $pdo->prepare(
+        'INSERT INTO garage_inventory (garage_id, part_id, quantity)
+         VALUES (:garage_id, :part_id, 0)'
+    );
+
+    $stockUpdateStmt = $pdo->prepare(
+        'UPDATE garage_inventory
+         SET quantity = :quantity
+         WHERE garage_id = :garage_id
+           AND part_id = :part_id'
+    );
+
+    $movementInsertStmt = $pdo->prepare(
+        'INSERT INTO inventory_movements
+          (company_id, garage_id, part_id, movement_type, quantity, reference_type, reference_id, movement_uid, notes, created_by)
+         VALUES
+          (:company_id, :garage_id, :part_id, :movement_type, :quantity, :reference_type, :reference_id, :movement_uid, :notes, :created_by)'
+    );
+
+    $linkInsertStmt = $pdo->prepare(
+        'INSERT INTO stock_reversal_links
+          (company_id, garage_id, reversal_context_type, reversal_context_id, part_id, movement_type, quantity, original_movement_uid, reversal_movement_uid, audit_reference, created_by)
+         VALUES
+          (:company_id, :garage_id, :context_type, :context_id, :part_id, :movement_type, :quantity, :original_movement_uid, :reversal_movement_uid, :audit_reference, :created_by)'
+    );
+
+    foreach ($partTotals as $partId => $requestedQuantity) {
+        $linkSelectStmt->execute([
+            'company_id' => $companyId,
+            'garage_id' => $garageId,
+            'context_type' => $referenceType,
+            'context_id' => $returnId,
+            'part_id' => $partId,
+            'movement_type' => $forwardMovementType,
+        ]);
+        $forwardLink = $linkSelectStmt->fetch();
+        if (!$forwardLink) {
+            $skipped[] = [
+                'part_id' => (int) $partId,
+                'quantity' => $requestedQuantity,
+                'reason' => 'no_forward_posting',
+            ];
+            continue;
+        }
+
+        $linkSelectStmt->execute([
+            'company_id' => $companyId,
+            'garage_id' => $garageId,
+            'context_type' => $referenceType,
+            'context_id' => $returnId,
+            'part_id' => $partId,
+            'movement_type' => $reverseMovementType,
+        ]);
+        $reverseLink = $linkSelectStmt->fetch();
+        if ($reverseLink) {
+            $skipped[] = [
+                'part_id' => (int) $partId,
+                'quantity' => returns_round((float) ($forwardLink['quantity'] ?? $requestedQuantity)),
+                'movement_uid' => (string) ($reverseLink['reversal_movement_uid'] ?? ''),
+                'reason' => 'already_reversed',
+            ];
+            continue;
+        }
+
+        $quantity = returns_round((float) ($forwardLink['quantity'] ?? $requestedQuantity));
+        if ($quantity <= 0.009) {
+            $skipped[] = [
+                'part_id' => (int) $partId,
+                'quantity' => 0.0,
+                'reason' => 'invalid_forward_quantity',
+            ];
+            continue;
+        }
+
+        $stockSelectStmt->execute([
+            'garage_id' => $garageId,
+            'part_id' => $partId,
+        ]);
+        $stockRow = $stockSelectStmt->fetch();
+
+        $currentQty = 0.0;
+        if (!$stockRow) {
+            $stockInsertStmt->execute([
+                'garage_id' => $garageId,
+                'part_id' => $partId,
+            ]);
+        } else {
+            $currentQty = returns_round((float) ($stockRow['quantity'] ?? 0));
+        }
+
+        $nextQty = $reverseMovementType === 'IN'
+            ? returns_round($currentQty + $quantity)
+            : returns_round($currentQty - $quantity);
+
+        $stockUpdateStmt->execute([
+            'quantity' => $nextQty,
+            'garage_id' => $garageId,
+            'part_id' => $partId,
+        ]);
+
+        $movementUid = sprintf('rma-del-%d-%d-%s', $returnId, $partId, strtolower($reverseMovementType));
+
+        $movementInsertStmt->execute([
+            'company_id' => $companyId,
+            'garage_id' => $garageId,
+            'part_id' => $partId,
+            'movement_type' => $reverseMovementType,
+            'quantity' => $quantity,
+            'reference_type' => $referenceType,
+            'reference_id' => $returnId,
+            'movement_uid' => $movementUid,
+            'notes' => 'Stock reverse on return delete #' . $returnId,
+            'created_by' => $actorUserId > 0 ? $actorUserId : null,
+        ]);
+
+        $originalMovementUid = trim((string) ($forwardLink['reversal_movement_uid'] ?? ''));
+        $linkInsertStmt->execute([
+            'company_id' => $companyId,
+            'garage_id' => $garageId,
+            'context_type' => $referenceType,
+            'context_id' => $returnId,
+            'part_id' => $partId,
+            'movement_type' => $reverseMovementType,
+            'quantity' => $quantity,
+            'original_movement_uid' => $originalMovementUid !== '' ? $originalMovementUid : null,
+            'reversal_movement_uid' => $movementUid,
+            'audit_reference' => 'returns:delete:' . $returnId,
+            'created_by' => $actorUserId > 0 ? $actorUserId : null,
+        ]);
+
+        $posted[] = [
+            'part_id' => (int) $partId,
+            'movement_type' => $reverseMovementType,
+            'quantity' => $quantity,
+            'previous_stock' => $currentQty,
+            'next_stock' => $nextQty,
+            'movement_uid' => $movementUid,
+        ];
+    }
+
+    return [
+        'posted' => $posted,
+        'skipped' => $skipped,
+    ];
+}
+
+function returns_reverse_settlement(PDO $pdo, int $settlementId, int $companyId, int $garageId, int $actorUserId): array
+{
+    if (!returns_module_ready()) {
+        throw new RuntimeException('Returns module is not ready.');
+    }
+    if (table_columns('return_settlements') === []) {
+        throw new RuntimeException('Return settlements table is not ready.');
+    }
+    if ($settlementId <= 0 || $companyId <= 0 || $garageId <= 0) {
+        throw new RuntimeException('Invalid settlement scope.');
+    }
+
+    $pdo->beginTransaction();
+    try {
+        $settlementStmt = $pdo->prepare(
+            'SELECT rs.*, r.return_number, r.return_type, r.approval_status, r.total_amount AS return_total,
+                    r.customer_id, r.vendor_id
+             FROM return_settlements rs
+             INNER JOIN returns_rma r ON r.id = rs.return_id
+             WHERE rs.id = :id
+               AND rs.company_id = :company_id
+               AND rs.garage_id = :garage_id
+               AND rs.status_code = "ACTIVE"
+               AND r.company_id = :company_id
+               AND r.garage_id = :garage_id
+               AND r.status_code = "ACTIVE"
+             LIMIT 1
+             FOR UPDATE'
+        );
+        $settlementStmt->execute([
+            'id' => $settlementId,
+            'company_id' => $companyId,
+            'garage_id' => $garageId,
+        ]);
+        $settlementRow = $settlementStmt->fetch();
+        if (!$settlementRow) {
+            throw new RuntimeException('Settlement entry not found.');
+        }
+
+        $returnStatus = returns_normalize_approval_status((string) ($settlementRow['approval_status'] ?? 'PENDING'));
+        if (!in_array($returnStatus, returns_settlement_allowed_statuses(), true)) {
+            throw new RuntimeException('Settlement reversal is allowed only for approved or closed returns.');
+        }
+
+        $returnId = (int) ($settlementRow['return_id'] ?? 0);
+        $amount = returns_round((float) ($settlementRow['amount'] ?? 0));
+        $settlementType = strtoupper(trim((string) ($settlementRow['settlement_type'] ?? 'PAY')));
+        if (!in_array($settlementType, ['PAY', 'RECEIVE'], true)) {
+            $settlementType = returns_expected_settlement_type((string) ($settlementRow['return_type'] ?? 'CUSTOMER_RETURN'));
+        }
+
+        $expenseId = (int) ($settlementRow['expense_id'] ?? 0);
+        $financeReversalExpenseId = 0;
+        if ($expenseId > 0 && function_exists('finance_record_expense')) {
+            $existingReversalStmt = $pdo->prepare(
+                'SELECT id
+                 FROM expenses
+                 WHERE reversed_expense_id = :expense_id
+                 LIMIT 1'
+            );
+            $existingReversalStmt->execute(['expense_id' => $expenseId]);
+            $existingFinanceReversal = $existingReversalStmt->fetch();
+            if ($existingFinanceReversal) {
+                $financeReversalExpenseId = (int) ($existingFinanceReversal['id'] ?? 0);
+            } else {
+                $returnNumber = (string) ($settlementRow['return_number'] ?? ('#' . $returnId));
+                $partyName = returns_settlement_party_name($pdo, $settlementRow);
+                $reverseCategory = $settlementType === 'PAY' ? 'Sales Return Refund' : 'Purchase Return Recovery';
+                $reverseSourceType = $settlementType === 'PAY'
+                    ? 'RETURN_SETTLEMENT_PAY_REV'
+                    : 'RETURN_SETTLEMENT_RECEIVE_REV';
+                $reverseAmount = $settlementType === 'PAY' ? -abs($amount) : abs($amount);
+                $reverseEntryType = $settlementType === 'PAY' ? 'REVERSAL' : 'EXPENSE';
+                $reverseNote = 'Reversed return settlement #' . $settlementId . ' for ' . $returnNumber;
+
+                $financeReversalExpenseId = (int) (finance_record_expense([
+                    'company_id' => $companyId,
+                    'garage_id' => $garageId,
+                    'category_name' => $reverseCategory,
+                    'expense_date' => date('Y-m-d'),
+                    'amount' => $reverseAmount,
+                    'payment_mode' => 'ADJUSTMENT',
+                    'paid_to' => $partyName,
+                    'notes' => $reverseNote,
+                    'source_type' => $reverseSourceType,
+                    'source_id' => $settlementId,
+                    'entry_type' => $reverseEntryType,
+                    'reversed_expense_id' => $expenseId,
+                    'created_by' => $actorUserId > 0 ? $actorUserId : null,
+                ]) ?? 0);
+
+                if ($financeReversalExpenseId <= 0) {
+                    throw new RuntimeException('Unable to reverse linked finance entry for this settlement.');
+                }
+            }
+        }
+
+        $deleteStmt = $pdo->prepare(
+            'UPDATE return_settlements
+             SET status_code = "DELETED"
+             WHERE id = :id
+               AND company_id = :company_id
+               AND garage_id = :garage_id
+               AND status_code = "ACTIVE"'
+        );
+        $deleteStmt->execute([
+            'id' => $settlementId,
+            'company_id' => $companyId,
+            'garage_id' => $garageId,
+        ]);
+        if ($deleteStmt->rowCount() <= 0) {
+            throw new RuntimeException('Settlement entry is already reversed.');
+        }
+
+        $summary = returns_fetch_settlement_summary(
+            $pdo,
+            $returnId,
+            $companyId,
+            $garageId,
+            (float) ($settlementRow['return_total'] ?? 0)
+        );
+
+        $pdo->commit();
+
+        return [
+            'settlement_id' => $settlementId,
+            'return_id' => $returnId,
+            'return_number' => (string) ($settlementRow['return_number'] ?? ''),
+            'settlement_type' => $settlementType,
+            'amount' => $amount,
+            'expense_id' => $expenseId,
+            'finance_reversal_expense_id' => $financeReversalExpenseId,
+            'settlement_summary' => $summary,
+        ];
+    } catch (Throwable $exception) {
+        $pdo->rollBack();
+        throw $exception;
+    }
+}
+
+function returns_delete_rma(PDO $pdo, int $returnId, int $companyId, int $garageId, int $actorUserId): array
+{
+    if (!returns_module_ready()) {
+        throw new RuntimeException('Returns module is not ready.');
+    }
+    if ($returnId <= 0 || $companyId <= 0 || $garageId <= 0) {
+        throw new RuntimeException('Invalid return scope.');
+    }
+
+    $pdo->beginTransaction();
+    try {
+        $returnRow = returns_fetch_return_row($pdo, $returnId, $companyId, $garageId, true);
+        if (!$returnRow) {
+            throw new RuntimeException('Return entry not found.');
+        }
+
+        if (table_columns('return_settlements') !== []) {
+            $activeSettlementStmt = $pdo->prepare(
+                'SELECT COUNT(*) AS active_count, COALESCE(SUM(amount), 0) AS active_amount
+                 FROM return_settlements
+                 WHERE company_id = :company_id
+                   AND garage_id = :garage_id
+                   AND return_id = :return_id
+                   AND status_code = "ACTIVE"
+                 FOR UPDATE'
+            );
+            $activeSettlementStmt->execute([
+                'company_id' => $companyId,
+                'garage_id' => $garageId,
+                'return_id' => $returnId,
+            ]);
+            $activeSettlementRow = $activeSettlementStmt->fetch() ?: [];
+            $activeSettlementCount = (int) ($activeSettlementRow['active_count'] ?? 0);
+            if ($activeSettlementCount > 0) {
+                throw new RuntimeException('Reverse all active settlement entries before deleting this return.');
+            }
+        }
+
+        $returnItems = returns_fetch_return_items($pdo, $returnId);
+        $stockReversal = returns_reverse_stock_for_deleted_return($pdo, $returnRow, $returnItems, $actorUserId);
+
+        if (table_columns('return_attachments') !== []) {
+            $attachmentDeleteStmt = $pdo->prepare(
+                'UPDATE return_attachments
+                 SET status_code = "DELETED",
+                     deleted_at = COALESCE(deleted_at, NOW())
+                 WHERE company_id = :company_id
+                   AND garage_id = :garage_id
+                   AND return_id = :return_id
+                   AND status_code = "ACTIVE"'
+            );
+            $attachmentDeleteStmt->execute([
+                'company_id' => $companyId,
+                'garage_id' => $garageId,
+                'return_id' => $returnId,
+            ]);
+        }
+
+        $deleteStmt = $pdo->prepare(
+            'UPDATE returns_rma
+             SET status_code = "DELETED",
+                 updated_by = :updated_by
+             WHERE id = :id
+               AND company_id = :company_id
+               AND garage_id = :garage_id
+               AND status_code = "ACTIVE"'
+        );
+        $deleteStmt->execute([
+            'updated_by' => $actorUserId > 0 ? $actorUserId : null,
+            'id' => $returnId,
+            'company_id' => $companyId,
+            'garage_id' => $garageId,
+        ]);
+        if ($deleteStmt->rowCount() <= 0) {
+            throw new RuntimeException('Return entry could not be deleted.');
+        }
+
+        $pdo->commit();
+
+        return [
+            'return_id' => $returnId,
+            'return_number' => (string) ($returnRow['return_number'] ?? ''),
+            'return_type' => (string) ($returnRow['return_type'] ?? ''),
+            'approval_status' => (string) ($returnRow['approval_status'] ?? ''),
+            'stock_reversal' => $stockReversal,
+        ];
+    } catch (Throwable $exception) {
+        $pdo->rollBack();
+        throw $exception;
+    }
+}

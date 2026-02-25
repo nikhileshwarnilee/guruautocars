@@ -29,6 +29,7 @@ $canApprove = has_permission('inventory.manage')
     || has_permission('invoice.manage')
     || has_permission('purchase.manage');
 $canSettle = $canCreate || $canApprove;
+$canDeleteReturn = $canApprove;
 
 if (!returns_module_ready()) {
     flash_set('return_error', 'Returns module is not ready. Please run DB upgrade safely.', 'danger');
@@ -255,6 +256,64 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             flash_set('return_error', $exception->getMessage(), 'danger');
         }
         redirect('modules/returns/index.php?view_id=' . $returnId . '#settlement-card');
+    }
+
+    if ($action === 'reverse_settlement') {
+        if (!$canSettle) {
+            flash_set('return_error', 'You do not have permission to reverse return settlements.', 'danger');
+            redirect('modules/returns/index.php');
+        }
+
+        $settlementId = post_int('settlement_id');
+        $returnId = post_int('return_id');
+        try {
+            $result = returns_reverse_settlement($pdo, $settlementId, $companyId, $garageId, $userId);
+            $returnId = (int) ($result['return_id'] ?? $returnId);
+            log_audit('returns', 'settlement_reverse', $settlementId, 'Reversed return settlement #' . $settlementId, [
+                'entity' => 'return_settlement',
+                'source' => 'UI',
+                'metadata' => [
+                    'return_id' => $returnId,
+                    'return_number' => (string) ($result['return_number'] ?? ''),
+                    'settlement_type' => (string) ($result['settlement_type'] ?? ''),
+                    'amount' => (float) ($result['amount'] ?? 0),
+                    'expense_id' => (int) ($result['expense_id'] ?? 0),
+                    'finance_reversal_expense_id' => (int) ($result['finance_reversal_expense_id'] ?? 0),
+                ],
+            ]);
+            flash_set('return_success', 'Settlement entry reversed.', 'success');
+        } catch (Throwable $exception) {
+            flash_set('return_error', $exception->getMessage(), 'danger');
+        }
+
+        redirect('modules/returns/index.php' . ($returnId > 0 ? ('?view_id=' . $returnId . '#settlement-card') : ''));
+    }
+
+    if ($action === 'delete_return') {
+        if (!$canDeleteReturn) {
+            flash_set('return_error', 'You do not have permission to delete returns.', 'danger');
+            redirect('modules/returns/index.php');
+        }
+
+        $returnId = post_int('return_id');
+        try {
+            $result = returns_delete_rma($pdo, $returnId, $companyId, $garageId, $userId);
+            log_audit('returns', 'delete', $returnId, 'Deleted return ' . (string) ($result['return_number'] ?? ''), [
+                'entity' => 'returns_rma',
+                'source' => 'UI',
+                'metadata' => [
+                    'return_type' => (string) ($result['return_type'] ?? ''),
+                    'approval_status' => (string) ($result['approval_status'] ?? ''),
+                    'stock_reversal_posted_count' => count((array) (($result['stock_reversal'] ?? [])['posted'] ?? [])),
+                    'stock_reversal_skipped_count' => count((array) (($result['stock_reversal'] ?? [])['skipped'] ?? [])),
+                ],
+            ]);
+            flash_set('return_success', 'Return deleted successfully.', 'success');
+            redirect('modules/returns/index.php');
+        } catch (Throwable $exception) {
+            flash_set('return_error', $exception->getMessage(), 'danger');
+            redirect('modules/returns/index.php?view_id=' . $returnId);
+        }
     }
 
     if ($action === 'upload_attachment') {
@@ -535,6 +594,30 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                   </tbody>
                 </table>
               </div>
+              <div id="return-live-totals" class="border rounded p-2 mt-2 bg-light d-none">
+                <div class="row g-2">
+                  <div class="col-6 col-md-2">
+                    <small class="text-muted d-block">Lines</small>
+                    <strong id="return-live-lines">0</strong>
+                  </div>
+                  <div class="col-6 col-md-2">
+                    <small class="text-muted d-block">Total Qty</small>
+                    <strong id="return-live-qty">0.00</strong>
+                  </div>
+                  <div class="col-6 col-md-3">
+                    <small class="text-muted d-block">Taxable Amount</small>
+                    <strong id="return-live-taxable">INR 0.00</strong>
+                  </div>
+                  <div class="col-6 col-md-2">
+                    <small class="text-muted d-block">GST Amount</small>
+                    <strong id="return-live-tax">INR 0.00</strong>
+                  </div>
+                  <div class="col-12 col-md-3">
+                    <small class="text-muted d-block">Grand Total</small>
+                    <strong id="return-live-total">INR 0.00</strong>
+                  </div>
+                </div>
+              </div>
 
               <div class="row g-3 mt-2">
                 <div class="col-md-6">
@@ -684,6 +767,14 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                               <button type="submit" class="btn btn-sm btn-outline-dark">Close</button>
                             </form>
                           <?php endif; ?>
+                          <?php if ($canDeleteReturn): ?>
+                            <form method="post" class="d-inline" data-confirm="Delete this return? Stock entries will be reversed. Reverse all settlement entries first.">
+                              <?= csrf_field(); ?>
+                              <input type="hidden" name="_action" value="delete_return" />
+                              <input type="hidden" name="return_id" value="<?= $returnId; ?>" />
+                              <button type="submit" class="btn btn-sm btn-outline-danger">Delete</button>
+                            </form>
+                          <?php endif; ?>
                         </div>
                       </td>
                     </tr>
@@ -699,7 +790,17 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         <div class="card card-outline card-info">
           <div class="card-header d-flex justify-content-between align-items-center">
             <h3 class="card-title mb-0">Return Details: <?= e((string) ($selectedReturn['return_number'] ?? '')); ?></h3>
-            <a href="<?= e(url('modules/returns/print_return.php?id=' . (int) ($selectedReturn['id'] ?? 0))); ?>" target="_blank" class="btn btn-sm btn-outline-secondary">Print</a>
+            <div class="d-flex gap-1">
+              <a href="<?= e(url('modules/returns/print_return.php?id=' . (int) ($selectedReturn['id'] ?? 0))); ?>" target="_blank" class="btn btn-sm btn-outline-secondary">Print</a>
+              <?php if ($canDeleteReturn): ?>
+                <form method="post" data-confirm="Delete this return? Stock entries will be reversed. Reverse all settlement entries first.">
+                  <?= csrf_field(); ?>
+                  <input type="hidden" name="_action" value="delete_return" />
+                  <input type="hidden" name="return_id" value="<?= (int) ($selectedReturn['id'] ?? 0); ?>" />
+                  <button type="submit" class="btn btn-sm btn-outline-danger">Delete Return</button>
+                </form>
+              <?php endif; ?>
+            </div>
           </div>
           <div class="card-body">
             <div class="row g-3 mb-3">
@@ -771,11 +872,12 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                         <th>Notes</th>
                         <th>Expense</th>
                         <th>User</th>
+                        <th>Actions</th>
                       </tr>
                     </thead>
                     <tbody>
                       <?php if ($selectedReturnSettlements === []): ?>
-                        <tr><td colspan="9" class="text-muted text-center">No settlement history yet.</td></tr>
+                        <tr><td colspan="10" class="text-muted text-center">No settlement history yet.</td></tr>
                       <?php else: ?>
                         <?php foreach ($selectedReturnSettlements as $settlement): ?>
                           <?php $settlementType = (string) ($settlement['settlement_type'] ?? ''); ?>
@@ -789,6 +891,19 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                             <td><?= e((string) (($settlement['notes'] ?? '') !== '' ? $settlement['notes'] : '-')); ?></td>
                             <td><?= e((int) ($settlement['expense_id'] ?? 0) > 0 ? ('#' . (int) ($settlement['expense_id'] ?? 0)) : '-'); ?></td>
                             <td><?= e((string) (($settlement['created_by_name'] ?? '') !== '' ? $settlement['created_by_name'] : '-')); ?></td>
+                            <td>
+                              <?php if ($canSettle && $selectedReturnCanSettleStatus): ?>
+                                <form method="post" class="d-inline" data-confirm="Reverse this settlement entry? This will update pending balance and create finance reversal if linked.">
+                                  <?= csrf_field(); ?>
+                                  <input type="hidden" name="_action" value="reverse_settlement" />
+                                  <input type="hidden" name="return_id" value="<?= (int) ($selectedReturn['id'] ?? 0); ?>" />
+                                  <input type="hidden" name="settlement_id" value="<?= (int) ($settlement['id'] ?? 0); ?>" />
+                                  <button type="submit" class="btn btn-sm btn-outline-danger">Reverse</button>
+                                </form>
+                              <?php else: ?>
+                                <span class="text-muted">-</span>
+                              <?php endif; ?>
+                            </td>
                           </tr>
                         <?php endforeach; ?>
                       <?php endif; ?>
@@ -887,10 +1002,112 @@ require_once __DIR__ . '/../../includes/sidebar.php';
     var purchaseSelect = document.getElementById('purchase-source-select');
     var summary = document.getElementById('return-source-summary');
     var lineTable = document.getElementById('return-line-table');
+    var liveTotalsWrap = document.getElementById('return-live-totals');
+    var liveLinesEl = document.getElementById('return-live-lines');
+    var liveQtyEl = document.getElementById('return-live-qty');
+    var liveTaxableEl = document.getElementById('return-live-taxable');
+    var liveTaxEl = document.getElementById('return-live-tax');
+    var liveTotalEl = document.getElementById('return-live-total');
     var itemsApiUrl = <?= json_encode($itemsApiUrl, JSON_UNESCAPED_UNICODE | JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_AMP); ?>;
 
     if (!typeSelect || !invoiceWrap || !purchaseWrap || !lineTable) {
       return;
+    }
+
+    function round2(value) {
+      return Math.round((Number(value) || 0) * 100) / 100;
+    }
+
+    function parseNumber(value) {
+      var parsed = Number(String(value || '').replace(/,/g, '').trim());
+      return isFinite(parsed) ? parsed : 0;
+    }
+
+    function formatCurrency(value) {
+      return 'INR ' + round2(value).toFixed(2);
+    }
+
+    function resetLiveTotals() {
+      if (!liveTotalsWrap) {
+        return;
+      }
+      liveTotalsWrap.classList.add('d-none');
+      if (liveLinesEl) {
+        liveLinesEl.textContent = '0';
+      }
+      if (liveQtyEl) {
+        liveQtyEl.textContent = '0.00';
+      }
+      if (liveTaxableEl) {
+        liveTaxableEl.textContent = formatCurrency(0);
+      }
+      if (liveTaxEl) {
+        liveTaxEl.textContent = formatCurrency(0);
+      }
+      if (liveTotalEl) {
+        liveTotalEl.textContent = formatCurrency(0);
+      }
+    }
+
+    function refreshLiveTotals() {
+      if (!liveTotalsWrap) {
+        return;
+      }
+
+      var quantityInputs = lineTable.querySelectorAll('input[name="item_quantity[]"]');
+      if (!quantityInputs || quantityInputs.length === 0) {
+        resetLiveTotals();
+        return;
+      }
+
+      var lines = 0;
+      var qtyTotal = 0;
+      var taxableTotal = 0;
+      var taxTotal = 0;
+      var grandTotal = 0;
+
+      quantityInputs.forEach(function (input) {
+        var qty = round2(Math.max(0, parseNumber(input.value)));
+        var maxQty = round2(Math.max(0, parseNumber(input.getAttribute('max'))));
+        if (maxQty > 0 && qty > maxQty) {
+          qty = maxQty;
+          input.value = qty.toFixed(2);
+        }
+
+        if (qty <= 0.009) {
+          return;
+        }
+
+        var row = input.closest('tr');
+        var unitPrice = row ? round2(Math.max(0, parseNumber(row.getAttribute('data-unit-price')))) : 0;
+        var gstRate = row ? round2(Math.max(0, parseNumber(row.getAttribute('data-gst-rate')))) : 0;
+        var taxable = round2(qty * unitPrice);
+        var tax = round2(taxable * gstRate / 100);
+        var lineTotal = round2(taxable + tax);
+
+        lines += 1;
+        qtyTotal = round2(qtyTotal + qty);
+        taxableTotal = round2(taxableTotal + taxable);
+        taxTotal = round2(taxTotal + tax);
+        grandTotal = round2(grandTotal + lineTotal);
+      });
+
+      liveTotalsWrap.classList.remove('d-none');
+      if (liveLinesEl) {
+        liveLinesEl.textContent = String(lines);
+      }
+      if (liveQtyEl) {
+        liveQtyEl.textContent = qtyTotal.toFixed(2);
+      }
+      if (liveTaxableEl) {
+        liveTaxableEl.textContent = formatCurrency(taxableTotal);
+      }
+      if (liveTaxEl) {
+        liveTaxEl.textContent = formatCurrency(taxTotal);
+      }
+      if (liveTotalEl) {
+        liveTotalEl.textContent = formatCurrency(grandTotal);
+      }
     }
 
     function renderEmpty(message) {
@@ -899,6 +1116,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         return;
       }
       tbody.innerHTML = '<tr><td colspan=\"7\" class=\"text-muted\">' + message + '</td></tr>';
+      resetLiveTotals();
     }
 
     function updateSourceVisibility() {
@@ -915,6 +1133,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       summary.classList.add('d-none');
       summary.innerHTML = '';
       renderEmpty('Select source document to load line items.');
+      resetLiveTotals();
     }
 
     function selectedSourceId() {
@@ -938,6 +1157,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         summary.classList.add('d-none');
         summary.innerHTML = '';
         renderEmpty('Select source document to load line items.');
+        resetLiveTotals();
         return;
       }
 
@@ -977,25 +1197,29 @@ require_once __DIR__ . '/../../includes/sidebar.php';
           items.forEach(function (item) {
             var maxQty = Number(item.max_returnable_qty || 0);
             var disabled = maxQty <= 0 ? 'disabled' : '';
+            var unitPrice = Number(item.unit_price || 0);
+            var gstRate = Number(item.gst_rate || 0);
             var rowHtml = '' +
-              '<tr>' +
+              '<tr data-unit-price=\"' + esc(unitPrice.toFixed(2)) + '\" data-gst-rate=\"' + esc(gstRate.toFixed(2)) + '\">' +
               '<td>' + esc(item.description || '') +
                 '<input type=\"hidden\" name=\"item_source_id[]\" value=\"' + esc(item.source_item_id || 0) + '\">' +
               '</td>' +
               '<td class=\"text-end\">' + esc(Number(item.source_qty || 0).toFixed(2)) + '</td>' +
               '<td class=\"text-end\">' + esc(Number(item.reserved_qty || 0).toFixed(2)) + '</td>' +
               '<td class=\"text-end\">' + esc(maxQty.toFixed(2)) + '</td>' +
-              '<td class=\"text-end\">' + esc(Number(item.unit_price || 0).toFixed(2)) + '</td>' +
-              '<td class=\"text-end\">' + esc(Number(item.gst_rate || 0).toFixed(2)) + '</td>' +
+              '<td class=\"text-end\">' + esc(unitPrice.toFixed(2)) + '</td>' +
+              '<td class=\"text-end\">' + esc(gstRate.toFixed(2)) + '</td>' +
               '<td><input type=\"number\" step=\"0.01\" min=\"0\" max=\"' + esc(maxQty.toFixed(2)) + '\" class=\"form-control form-control-sm\" name=\"item_quantity[]\" value=\"0\" ' + disabled + '></td>' +
               '</tr>';
             tbody.insertAdjacentHTML('beforeend', rowHtml);
           });
+          refreshLiveTotals();
         })
         .catch(function (error) {
           summary.classList.remove('d-none');
           summary.textContent = error && error.message ? error.message : 'Unable to load source lines.';
           renderEmpty('Unable to load source lines.');
+          resetLiveTotals();
         });
     }
 
@@ -1006,6 +1230,18 @@ require_once __DIR__ . '/../../includes/sidebar.php';
     if (purchaseSelect) {
       purchaseSelect.addEventListener('change', loadItems);
     }
+    lineTable.addEventListener('input', function (event) {
+      var target = event && event.target;
+      if (target && target.name === 'item_quantity[]') {
+        refreshLiveTotals();
+      }
+    });
+    lineTable.addEventListener('change', function (event) {
+      var target = event && event.target;
+      if (target && target.name === 'item_quantity[]') {
+        refreshLiveTotals();
+      }
+    });
 
     updateSourceVisibility();
   })();
