@@ -260,8 +260,8 @@ $moduleCards = [
         'metric' => number_format($inStockSkuCount),
     ],
     [
-        'title' => 'Billing & GST Reports',
-        'description' => 'Finalized-invoice revenue, GST summaries, and receivables.',
+        'title' => 'Sales Report',
+        'description' => 'Finalized sales revenue, collections, receivables, and customer-wise performance.',
         'path' => 'modules/reports/billing_gst.php',
         'icon' => 'bi bi-receipt',
         'badge' => 'Finalized Invoices',

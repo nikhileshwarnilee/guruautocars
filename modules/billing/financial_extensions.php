@@ -663,7 +663,7 @@ function billing_collect_job_advance(
     }
 
     $jobStmt = $pdo->prepare(
-        'SELECT jc.id, jc.customer_id, jc.job_number
+        'SELECT jc.id, jc.customer_id, jc.job_number, jc.status
          FROM job_cards jc
          WHERE jc.id = :job_card_id
            AND jc.company_id = :company_id
@@ -680,6 +680,26 @@ function billing_collect_job_advance(
     $job = $jobStmt->fetch();
     if (!$job) {
         throw new RuntimeException('Job card not found for advance collection.');
+    }
+
+    $draftInvoiceStmt = $pdo->prepare(
+        'SELECT i.id
+         FROM invoices i
+         WHERE i.job_card_id = :job_card_id
+           AND i.company_id = :company_id
+           AND i.garage_id = :garage_id
+           AND i.invoice_status IN ("DRAFT", "FINALIZED")
+         LIMIT 1
+         FOR UPDATE'
+    );
+    $draftInvoiceStmt->execute([
+        'job_card_id' => $jobCardId,
+        'company_id' => $companyId,
+        'garage_id' => $garageId,
+    ]);
+    $hasDraftOrFinalizedInvoice = (bool) $draftInvoiceStmt->fetch();
+    if (strtoupper(trim((string) ($job['status'] ?? ''))) === 'CLOSED' && $hasDraftOrFinalizedInvoice) {
+        throw new RuntimeException('Advance collection is blocked for CLOSED job cards with DRAFT or FINALIZED invoices.');
     }
 
     $receiptMeta = billing_generate_advance_receipt_number($pdo, $companyId, $garageId, $receivedOn);

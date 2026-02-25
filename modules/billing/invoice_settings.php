@@ -330,6 +330,12 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                 <label class="form-check-label" for="show_paid_outstanding">Show Paid and Outstanding in final totals</label>
               </div>
             </div>
+            <div class="col-md-6">
+              <div class="form-check">
+                <input class="form-check-input" type="checkbox" id="show_advance_adjustment_history" name="show_advance_adjustment_history" <?= !empty($printSettings['show_advance_adjustment_history']) ? 'checked' : ''; ?> <?= $canManageSettings ? '' : 'disabled'; ?> />
+                <label class="form-check-label" for="show_advance_adjustment_history">Show Advance Adjustment History in print</label>
+              </div>
+            </div>
 
             <div class="col-12">
               <small class="text-muted">Controls apply to invoice print/PDF in the currently active garage.</small>

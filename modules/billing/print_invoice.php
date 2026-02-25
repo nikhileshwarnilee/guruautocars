@@ -101,6 +101,7 @@ $showCustomerGstinBySetting = !empty($invoicePrintSettings['show_customer_gstin'
 $showRecommendationNote = !empty($invoicePrintSettings['show_recommendation_note']);
 $showNextServiceReminders = !empty($invoicePrintSettings['show_next_service_reminders']);
 $showPaidOutstandingRows = !empty($invoicePrintSettings['show_paid_outstanding']);
+$showAdvanceAdjustmentHistory = !empty($invoicePrintSettings['show_advance_adjustment_history']);
 $discountMeta = billing_discount_meta_from_snapshot($snapshot);
 $discountType = (string) ($discountMeta['type'] ?? 'AMOUNT');
 $discountValue = (float) ($discountMeta['value'] ?? 0);
@@ -759,7 +760,7 @@ if ($companyLogoUrl === null) {
           </div>
         </div>
 
-        <?php if (!empty($advanceAdjustmentHistory)): ?>
+        <?php if ($showAdvanceAdjustmentHistory && !empty($advanceAdjustmentHistory)): ?>
           <div class="section-title">Advance Adjustment History</div>
           <table class="line-table">
             <thead>

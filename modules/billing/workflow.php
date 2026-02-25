@@ -297,6 +297,7 @@ function billing_invoice_print_default_settings(): array
         'show_recommendation_note' => true,
         'show_next_service_reminders' => true,
         'show_paid_outstanding' => true,
+        'show_advance_adjustment_history' => true,
     ];
 }
 

@@ -351,9 +351,9 @@ if ($sidebarBrandName === '') {
               </li>
               <?php if ($canViewFinancialReports): ?>
                 <li class="nav-item">
-                  <a href="<?= e(url('modules/reports/billing_gst.php')); ?>" class="nav-link <?= e(is_active_menu('reports.billing', $activeMenu)); ?>">
+                  <a href="<?= e(url('modules/reports/billing_gst.php')); ?>" class="nav-link <?= e(($activeMenu === 'reports.sales' || $activeMenu === 'reports.billing') ? 'active' : ''); ?>">
                     <i class="nav-icon bi bi-receipt-cutoff"></i>
-                    <p>Billing & GST</p>
+                    <p>Sales Report</p>
                   </a>
                 </li>
                 <li class="nav-item">

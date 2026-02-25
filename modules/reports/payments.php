@@ -105,7 +105,7 @@ if ($canViewSalesPayments) {
                 COALESCE(SUM(p.amount), 0) AS payment_total
          FROM payments p
          INNER JOIN invoices i ON i.id = p.invoice_id
-         WHERE ' . $salesWhereSql . '\n           ' . $salesScopeSql
+         WHERE ' . $salesWhereSql . ' ' . $salesScopeSql
     );
     $salesSummaryStmt->execute($salesParams);
     $salesSummary = $salesSummaryStmt->fetch() ?: $salesSummary;
@@ -121,7 +121,7 @@ if ($canViewSalesPayments) {
          INNER JOIN invoices i ON i.id = p.invoice_id
          LEFT JOIN customers c ON c.id = i.customer_id
          LEFT JOIN garages g ON g.id = i.garage_id
-         WHERE ' . $salesWhereSql . '\n           ' . $salesScopeSql . '
+         WHERE ' . $salesWhereSql . ' ' . $salesScopeSql . '
          ORDER BY p.id DESC
          LIMIT 600'
     );
@@ -161,7 +161,7 @@ if ($canViewPurchasePayments && table_columns('purchase_payments') !== []) {
                 COALESCE(SUM(pp.amount), 0) AS payment_total
          FROM purchase_payments pp
          INNER JOIN purchases p ON p.id = pp.purchase_id
-         WHERE ' . $purchaseWhereSql . '\n           ' . $purchaseScopeSql
+         WHERE ' . $purchaseWhereSql . ' ' . $purchaseScopeSql
     );
     $purchaseSummaryStmt->execute($purchaseParams);
     $purchaseSummary = $purchaseSummaryStmt->fetch() ?: $purchaseSummary;
@@ -177,7 +177,7 @@ if ($canViewPurchasePayments && table_columns('purchase_payments') !== []) {
          INNER JOIN purchases p ON p.id = pp.purchase_id
          LEFT JOIN vendors v ON v.id = p.vendor_id
          LEFT JOIN garages g ON g.id = pp.garage_id
-         WHERE ' . $purchaseWhereSql . '\n           ' . $purchaseScopeSql . '
+         WHERE ' . $purchaseWhereSql . ' ' . $purchaseScopeSql . '
          ORDER BY pp.id DESC
          LIMIT 600'
     );

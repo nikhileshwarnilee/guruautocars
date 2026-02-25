@@ -748,7 +748,8 @@ function buildBreadcrumbMap(dashboardUrl) {
     'reports.inventory': [home, { label: 'Reports' }, { label: 'Inventory Reports' }],
     'reports.inventory_valuation': [home, { label: 'Reports' }, { label: 'Inventory Valuation' }],
     'reports.returns': [home, { label: 'Reports' }, { label: 'Returns Report' }],
-    'reports.billing': [home, { label: 'Reports' }, { label: 'Billing & GST' }],
+    'reports.billing': [home, { label: 'Reports' }, { label: 'Sales Report' }],
+    'reports.sales': [home, { label: 'Reports' }, { label: 'Sales Report' }],
     'reports.payments': [home, { label: 'Reports' }, { label: 'Payments Report' }],
     'reports.advance_collections': [home, { label: 'Reports' }, { label: 'Advance Collections' }],
     'reports.profit_loss': [home, { label: 'Reports' }, { label: 'Profit & Loss' }],
@@ -4182,7 +4183,13 @@ function resolveTableEnhancementMode(table) {
     return 'skip';
   }
 
-  if (isMasterInsightsTable(table) || hasTableBodyControls(table)) {
+  // Master insights tables are server-paginated/searchable via their own filter form.
+  // Do not attach local table search, which only scans current page rows.
+  if (isMasterInsightsTable(table)) {
+    return 'skip';
+  }
+
+  if (hasTableBodyControls(table)) {
     return 'search-only';
   }
 

@@ -60,6 +60,20 @@ function billing_snapshot_value(array $snapshot, string $section, string $key): 
     return is_string($value) ? $value : '';
 }
 
+function billing_sort_timestamp(?string $dateTime, ?string $fallbackDate = null): int
+{
+    $value = trim((string) $dateTime);
+    if ($value === '') {
+        $value = trim((string) $fallbackDate);
+    }
+    if ($value === '') {
+        return 0;
+    }
+
+    $timestamp = strtotime($value);
+    return $timestamp === false ? 0 : (int) $timestamp;
+}
+
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     require_csrf();
     $action = (string) ($_POST['_action'] ?? '');
@@ -1182,6 +1196,120 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         redirect('modules/billing/index.php');
     }
+
+    if ($action === 'delete_advance' && $canPay) {
+        if (!$financialExtensionsReady) {
+            flash_set('billing_error', 'Advance management is not ready. Please refresh and retry.', 'danger');
+            redirect('modules/billing/index.php');
+        }
+
+        $advanceId = post_int('advance_id');
+        $deleteReason = post_string('delete_reason', 255);
+        if ($advanceId <= 0 || $deleteReason === '') {
+            flash_set('billing_error', 'Advance receipt and reason are required for deletion.', 'danger');
+            redirect('modules/billing/index.php');
+        }
+
+        $pdo = db();
+        $pdo->beginTransaction();
+
+        try {
+            $advanceStmt = $pdo->prepare(
+                'SELECT ja.id, ja.job_card_id, ja.receipt_number, ja.advance_amount, ja.adjusted_amount, ja.balance_amount,
+                        ja.notes, ja.status_code, ja.received_on, jc.job_number
+                 FROM job_advances ja
+                 LEFT JOIN job_cards jc ON jc.id = ja.job_card_id
+                 WHERE ja.id = :advance_id
+                   AND ja.company_id = :company_id
+                   AND ja.garage_id = :garage_id
+                 LIMIT 1
+                 FOR UPDATE'
+            );
+            $advanceStmt->execute([
+                'advance_id' => $advanceId,
+                'company_id' => $companyId,
+                'garage_id' => $garageId,
+            ]);
+            $advance = $advanceStmt->fetch();
+            if (!$advance) {
+                throw new RuntimeException('Advance receipt not found for this scope.');
+            }
+
+            $statusCode = strtoupper(trim((string) ($advance['status_code'] ?? 'ACTIVE')));
+            if ($statusCode !== 'ACTIVE') {
+                throw new RuntimeException('Advance receipt is already reversed/deleted.');
+            }
+
+            $adjustedAmount = billing_round((float) ($advance['adjusted_amount'] ?? 0));
+            if ($adjustedAmount > 0.009) {
+                throw new RuntimeException('Adjusted advance cannot be deleted. Reverse invoice-side advance adjustment first.');
+            }
+
+            $adjustmentCountStmt = $pdo->prepare(
+                'SELECT COUNT(*) FROM advance_adjustments WHERE advance_id = :advance_id'
+            );
+            $adjustmentCountStmt->execute(['advance_id' => $advanceId]);
+            $adjustmentCount = (int) ($adjustmentCountStmt->fetchColumn() ?? 0);
+            if ($adjustmentCount > 0) {
+                throw new RuntimeException('Advance has adjustment history and cannot be deleted.');
+            }
+
+            $existingNotes = trim((string) ($advance['notes'] ?? ''));
+            $reasonNote = 'Deleted: ' . $deleteReason;
+            $updatedNotes = $existingNotes === '' ? $reasonNote : ($existingNotes . ' | ' . $reasonNote);
+            if (mb_strlen($updatedNotes) > 255) {
+                $updatedNotes = mb_substr($updatedNotes, 0, 255);
+            }
+
+            $deleteStmt = $pdo->prepare(
+                'UPDATE job_advances
+                 SET status_code = "DELETED",
+                     notes = :notes,
+                     updated_by = :updated_by
+                 WHERE id = :id'
+            );
+            $deleteStmt->execute([
+                'notes' => $updatedNotes,
+                'updated_by' => $userId > 0 ? $userId : null,
+                'id' => $advanceId,
+            ]);
+
+            log_audit(
+                'billing',
+                'advance_delete',
+                $advanceId,
+                'Deleted advance receipt ' . (string) ($advance['receipt_number'] ?? ''),
+                [
+                    'entity' => 'job_advance',
+                    'source' => 'UI',
+                    'before' => [
+                        'status_code' => 'ACTIVE',
+                        'advance_amount' => (float) ($advance['advance_amount'] ?? 0),
+                        'adjusted_amount' => (float) ($advance['adjusted_amount'] ?? 0),
+                        'balance_amount' => (float) ($advance['balance_amount'] ?? 0),
+                    ],
+                    'after' => [
+                        'status_code' => 'DELETED',
+                        'delete_reason' => $deleteReason,
+                    ],
+                    'metadata' => [
+                        'job_card_id' => (int) ($advance['job_card_id'] ?? 0),
+                        'job_number' => (string) ($advance['job_number'] ?? ''),
+                        'receipt_number' => (string) ($advance['receipt_number'] ?? ''),
+                        'received_on' => (string) ($advance['received_on'] ?? ''),
+                    ],
+                ]
+            );
+
+            $pdo->commit();
+            flash_set('billing_success', 'Advance receipt deleted successfully.', 'success');
+        } catch (Throwable $exception) {
+            $pdo->rollBack();
+            flash_set('billing_error', $exception->getMessage(), 'danger');
+        }
+
+        redirect('modules/billing/index.php');
+    }
 }
 
 $eligibleJobsStmt = db()->prepare(
@@ -1218,6 +1346,17 @@ $advanceJobsStmt = db()->prepare(
        AND jc.garage_id = :garage_id
        AND jc.status_code = "ACTIVE"
        AND jc.status <> "CANCELLED"
+       AND NOT (
+            jc.status = "CLOSED"
+            AND EXISTS (
+                SELECT 1
+                FROM invoices i
+                WHERE i.job_card_id = jc.id
+                  AND i.company_id = jc.company_id
+                  AND i.garage_id = jc.garage_id
+                  AND i.invoice_status IN ("DRAFT", "FINALIZED")
+            )
+       )
        AND (c.status_code IS NULL OR c.status_code <> "DELETED")
        AND (v.status_code IS NULL OR v.status_code <> "DELETED")
      ORDER BY jc.id DESC
@@ -1309,27 +1448,30 @@ $paymentsStmt->execute([
 ]);
 $payments = $paymentsStmt->fetchAll();
 
+$advanceActivityRows = [];
 $jobAdvances = [];
 if ($financialExtensionsReady) {
     $advanceStmt = db()->prepare(
         'SELECT ja.*, jc.job_number, c.full_name AS customer_name, v.registration_no,
-                u.name AS created_by_name
+                cu.name AS created_by_name, uu.name AS updated_by_name
          FROM job_advances ja
          LEFT JOIN job_cards jc ON jc.id = ja.job_card_id
          LEFT JOIN customers c ON c.id = ja.customer_id
          LEFT JOIN vehicles v ON v.id = jc.vehicle_id
-         LEFT JOIN users u ON u.id = ja.created_by
+         LEFT JOIN users cu ON cu.id = ja.created_by
+         LEFT JOIN users uu ON uu.id = ja.updated_by
          WHERE ja.company_id = :company_id
            AND ja.garage_id = :garage_id
-           AND ja.status_code = "ACTIVE"
+           AND ja.status_code IN ("ACTIVE", "DELETED")
          ORDER BY ja.id DESC
-         LIMIT 80'
+         LIMIT 160'
     );
     $advanceStmt->execute([
         'company_id' => $companyId,
         'garage_id' => $garageId,
     ]);
-    $jobAdvances = $advanceStmt->fetchAll();
+    $advanceActivityRows = $advanceStmt->fetchAll();
+    $jobAdvances = $advanceActivityRows;
 }
 
 $statusHistoryStmt = db()->prepare(
@@ -1348,8 +1490,10 @@ $statusHistoryStmt->execute([
 ]);
 $statusHistory = $statusHistoryStmt->fetchAll();
 
+$paymentHistoryReceiptSelect = $paymentHasReceiptNumber ? ', p.receipt_number' : ', NULL AS receipt_number';
 $paymentHistoryStmt = db()->prepare(
-    'SELECT ph.*, i.invoice_number, p.amount AS payment_amount, p.payment_mode, p.paid_on, u.name AS actor_name
+    'SELECT ph.*, i.invoice_number, p.amount AS payment_amount, p.payment_mode, p.paid_on' . $paymentHistoryReceiptSelect . ',
+            u.name AS actor_name
      FROM invoice_payment_history ph
      INNER JOIN invoices i ON i.id = ph.invoice_id
      LEFT JOIN payments p ON p.id = ph.payment_id
@@ -1364,6 +1508,155 @@ $paymentHistoryStmt->execute([
     'garage_id' => $garageId,
 ]);
 $paymentHistory = $paymentHistoryStmt->fetchAll();
+$paymentHistoryRows = [];
+foreach ($paymentHistory as $entry) {
+    $payloadReceiptNumber = '';
+    $payloadRaw = trim((string) ($entry['payload_json'] ?? ''));
+    if ($payloadRaw !== '') {
+        $payload = json_decode($payloadRaw, true);
+        if (is_array($payload)) {
+            $payloadReceiptNumber = trim((string) ($payload['receipt_number'] ?? ''));
+        }
+    }
+
+    $historyReceipt = trim((string) ($entry['receipt_number'] ?? ''));
+    if ($historyReceipt === '') {
+        $historyReceipt = $payloadReceiptNumber;
+    }
+
+    $paymentHistoryRows[] = [
+        'entry_type' => strtoupper(trim((string) ($entry['action_type'] ?? 'PAYMENT_EVENT'))),
+        'event_time' => (string) ($entry['created_at'] ?? ''),
+        'event_ts' => billing_sort_timestamp((string) ($entry['created_at'] ?? '')),
+        'document_label' => (string) ($entry['invoice_number'] ?? '-'),
+        'paid_on' => (string) ($entry['paid_on'] ?? '-'),
+        'mode' => (string) ($entry['payment_mode'] ?? '-'),
+        'amount' => (float) ($entry['payment_amount'] ?? 0),
+        'receipt_number' => $historyReceipt !== '' ? $historyReceipt : '-',
+        'actor_name' => (string) ($entry['actor_name'] ?? 'System'),
+    ];
+}
+foreach ($advanceActivityRows as $advance) {
+    $advanceStatus = strtoupper(trim((string) ($advance['status_code'] ?? 'ACTIVE')));
+    $advanceDeleted = $advanceStatus === 'DELETED';
+    $actorName = $advanceDeleted
+        ? (string) (($advance['updated_by_name'] ?? '') !== '' ? $advance['updated_by_name'] : ($advance['created_by_name'] ?? 'System'))
+        : (string) (($advance['created_by_name'] ?? '') !== '' ? $advance['created_by_name'] : 'System');
+    $eventTime = $advanceDeleted
+        ? (string) (($advance['updated_at'] ?? '') !== '' ? $advance['updated_at'] : ($advance['created_at'] ?? ''))
+        : (string) ($advance['created_at'] ?? '');
+    $jobLabel = (string) ($advance['job_number'] ?? '');
+    if ($jobLabel === '') {
+        $jobLabel = 'Job #' . (int) ($advance['job_card_id'] ?? 0);
+    }
+
+    $paymentHistoryRows[] = [
+        'entry_type' => $advanceDeleted ? 'ADVANCE_DELETED' : 'ADVANCE_RECEIVED',
+        'event_time' => $eventTime,
+        'event_ts' => billing_sort_timestamp($eventTime, (string) ($advance['received_on'] ?? '')),
+        'document_label' => $jobLabel,
+        'paid_on' => (string) ($advance['received_on'] ?? '-'),
+        'mode' => (string) ($advance['payment_mode'] ?? '-'),
+        'amount' => $advanceDeleted ? -(float) ($advance['advance_amount'] ?? 0) : (float) ($advance['advance_amount'] ?? 0),
+        'receipt_number' => (string) (($advance['receipt_number'] ?? '') !== '' ? $advance['receipt_number'] : '-'),
+        'actor_name' => $actorName,
+    ];
+}
+usort($paymentHistoryRows, static function (array $left, array $right): int {
+    $leftTs = (int) ($left['event_ts'] ?? 0);
+    $rightTs = (int) ($right['event_ts'] ?? 0);
+    if ($leftTs === $rightTs) {
+        return strcmp((string) ($right['event_time'] ?? ''), (string) ($left['event_time'] ?? ''));
+    }
+    return $rightTs <=> $leftTs;
+});
+$paymentHistoryRows = array_slice($paymentHistoryRows, 0, 80);
+
+$recentPaymentEntries = [];
+foreach ($payments as $payment) {
+    $entryType = strtoupper((string) ($payment['entry_type'] ?? ((float) ($payment['amount'] ?? 0) < 0 ? 'REVERSAL' : 'PAYMENT')));
+    $isMarkedReversed = $paymentHasIsReversed && (int) ($payment['is_reversed'] ?? 0) === 1;
+    $hasLinkedReversal = $paymentHasReversedPaymentId && (int) ($payment['reversal_id'] ?? 0) > 0;
+    $alreadyReversed = $isMarkedReversed || $hasLinkedReversal;
+    $canReverseEntry = $canPay && $entryType === 'PAYMENT' && (float) ($payment['amount'] ?? 0) > 0.009 && !$alreadyReversed;
+
+    $recentPaymentEntries[] = [
+        'source_type' => 'PAYMENT',
+        'entry_id' => (int) ($payment['id'] ?? 0),
+        'entry_type' => $entryType,
+        'badge_class' => $entryType === 'REVERSAL' ? 'danger' : 'success',
+        'event_ts' => billing_sort_timestamp((string) ($payment['created_at'] ?? ''), (string) ($payment['paid_on'] ?? '')),
+        'display_date' => (string) ($payment['paid_on'] ?? '-'),
+        'document_label' => (string) ($payment['invoice_number'] ?? '-'),
+        'job_card_id' => 0,
+        'amount' => (float) ($payment['amount'] ?? 0),
+        'mode' => (string) ($payment['payment_mode'] ?? '-'),
+        'receipt_number' => (string) (($payment['receipt_number'] ?? '') !== '' ? $payment['receipt_number'] : '-'),
+        'reference_no' => (string) (($payment['reference_no'] ?? '') !== '' ? $payment['reference_no'] : '-'),
+        'actor_name' => (string) (($payment['received_by_name'] ?? '') !== '' ? $payment['received_by_name'] : '-'),
+        'can_reverse' => $canReverseEntry,
+        'already_reversed' => $alreadyReversed,
+        'print_url' => $entryType === 'PAYMENT' ? url('modules/billing/print_payment_receipt.php?id=' . (int) ($payment['id'] ?? 0)) : null,
+        'outstanding_before' => $payment['outstanding_before'] ?? null,
+        'outstanding_after' => $payment['outstanding_after'] ?? null,
+        'adjusted_amount' => 0.0,
+        'status_code' => '',
+    ];
+}
+foreach ($advanceActivityRows as $advance) {
+    $advanceStatus = strtoupper(trim((string) ($advance['status_code'] ?? 'ACTIVE')));
+    $advanceDeleted = $advanceStatus === 'DELETED';
+    $adjustedAmount = (float) ($advance['adjusted_amount'] ?? 0);
+    $canDeleteAdvance = $canPay && !$advanceDeleted && $adjustedAmount <= 0.009;
+    $actorName = $advanceDeleted
+        ? (string) (($advance['updated_by_name'] ?? '') !== '' ? $advance['updated_by_name'] : ($advance['created_by_name'] ?? '-'))
+        : (string) (($advance['created_by_name'] ?? '') !== '' ? $advance['created_by_name'] : '-');
+
+    $jobLabel = (string) ($advance['job_number'] ?? '');
+    if ($jobLabel === '') {
+        $jobLabel = 'Job #' . (int) ($advance['job_card_id'] ?? 0);
+    }
+
+    $displayDate = (string) ($advance['received_on'] ?? '-');
+    if ($advanceDeleted) {
+        $displayDate = (string) (($advance['updated_at'] ?? '') !== '' ? $advance['updated_at'] : $displayDate);
+    }
+
+    $recentPaymentEntries[] = [
+        'source_type' => 'ADVANCE',
+        'entry_id' => (int) ($advance['id'] ?? 0),
+        'entry_type' => $advanceDeleted ? 'ADVANCE_DELETED' : 'ADVANCE',
+        'badge_class' => $advanceDeleted ? 'secondary' : 'warning',
+        'event_ts' => billing_sort_timestamp(
+            $advanceDeleted ? (string) ($advance['updated_at'] ?? '') : (string) ($advance['created_at'] ?? ''),
+            (string) ($advance['received_on'] ?? '')
+        ),
+        'display_date' => $displayDate,
+        'document_label' => $jobLabel,
+        'job_card_id' => (int) ($advance['job_card_id'] ?? 0),
+        'amount' => $advanceDeleted ? -(float) ($advance['advance_amount'] ?? 0) : (float) ($advance['advance_amount'] ?? 0),
+        'mode' => (string) ($advance['payment_mode'] ?? '-'),
+        'receipt_number' => (string) (($advance['receipt_number'] ?? '') !== '' ? $advance['receipt_number'] : '-'),
+        'reference_no' => (string) (($advance['reference_no'] ?? '') !== '' ? $advance['reference_no'] : '-'),
+        'actor_name' => $actorName,
+        'can_reverse' => $canDeleteAdvance,
+        'already_reversed' => $advanceDeleted,
+        'print_url' => url('modules/billing/print_advance_receipt.php?id=' . (int) ($advance['id'] ?? 0)),
+        'outstanding_before' => null,
+        'outstanding_after' => null,
+        'adjusted_amount' => $adjustedAmount,
+        'status_code' => $advanceStatus,
+    ];
+}
+usort($recentPaymentEntries, static function (array $left, array $right): int {
+    $leftTs = (int) ($left['event_ts'] ?? 0);
+    $rightTs = (int) ($right['event_ts'] ?? 0);
+    if ($leftTs === $rightTs) {
+        return ((int) ($right['entry_id'] ?? 0)) <=> ((int) ($left['entry_id'] ?? 0));
+    }
+    return $rightTs <=> $leftTs;
+});
+$recentPaymentEntries = array_slice($recentPaymentEntries, 0, 120);
 
 require_once __DIR__ . '/../../includes/header.php';
 require_once __DIR__ . '/../../includes/sidebar.php';
@@ -1711,24 +2004,33 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                 <thead>
                   <tr>
                     <th>Date</th>
-                    <th>Invoice</th>
+                    <th>Entry</th>
+                    <th>Invoice / Job</th>
                     <th>Paid On</th>
                     <th>Mode</th>
                     <th>Amount</th>
+                    <th>Receipt</th>
                     <th>By</th>
                   </tr>
                 </thead>
                 <tbody>
-                  <?php if (empty($paymentHistory)): ?>
-                    <tr><td colspan="6" class="text-center text-muted py-4">No payment history found.</td></tr>
+                  <?php if (empty($paymentHistoryRows)): ?>
+                    <tr><td colspan="8" class="text-center text-muted py-4">No payment history found.</td></tr>
                   <?php else: ?>
-                    <?php foreach ($paymentHistory as $entry): ?>
+                    <?php foreach ($paymentHistoryRows as $entry): ?>
                       <tr>
-                        <td><?= e((string) $entry['created_at']); ?></td>
-                        <td><?= e((string) $entry['invoice_number']); ?></td>
+                        <td><?= e((string) ($entry['event_time'] ?? '-')); ?></td>
+                        <td>
+                          <?php $historyEntryType = strtoupper((string) ($entry['entry_type'] ?? 'PAYMENT_EVENT')); ?>
+                          <span class="badge text-bg-<?= e(str_contains($historyEntryType, 'DELETE') || str_contains($historyEntryType, 'REVERSE') ? 'danger' : 'success'); ?>">
+                            <?= e($historyEntryType); ?>
+                          </span>
+                        </td>
+                        <td><?= e((string) ($entry['document_label'] ?? '-')); ?></td>
                         <td><?= e((string) ($entry['paid_on'] ?? '-')); ?></td>
-                        <td><?= e((string) ($entry['payment_mode'] ?? '-')); ?></td>
-                        <td><?= e(format_currency((float) ($entry['payment_amount'] ?? 0))); ?></td>
+                        <td><?= e((string) ($entry['mode'] ?? '-')); ?></td>
+                        <td><?= e(format_currency((float) ($entry['amount'] ?? 0))); ?></td>
+                        <td><?= e((string) ($entry['receipt_number'] ?? '-')); ?></td>
                         <td><?= e((string) ($entry['actor_name'] ?? 'System')); ?></td>
                       </tr>
                     <?php endforeach; ?>
@@ -1756,15 +2058,28 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                   <th>Advance</th>
                   <th>Adjusted</th>
                   <th>Balance</th>
+                  <th>Status</th>
                   <th>By</th>
                   <th>Action</th>
                 </tr>
               </thead>
               <tbody>
                 <?php if (empty($jobAdvances)): ?>
-                  <tr><td colspan="11" class="text-center text-muted py-4">No advances collected yet.</td></tr>
+                  <tr><td colspan="12" class="text-center text-muted py-4">No advances collected yet.</td></tr>
                 <?php else: ?>
                   <?php foreach ($jobAdvances as $advance): ?>
+                    <?php
+                      $advanceStatusCode = strtoupper((string) ($advance['status_code'] ?? 'ACTIVE'));
+                      $advanceAdjustedAmount = (float) ($advance['adjusted_amount'] ?? 0);
+                      $advanceDeleted = $advanceStatusCode === 'DELETED';
+                      $canDeleteAdvance = $canPay && !$advanceDeleted && $advanceAdjustedAmount <= 0.009;
+                      $advanceActionActor = $advanceDeleted
+                          ? (string) (($advance['updated_by_name'] ?? '') !== '' ? $advance['updated_by_name'] : ($advance['created_by_name'] ?? '-'))
+                          : (string) (($advance['created_by_name'] ?? '') !== '' ? $advance['created_by_name'] : '-');
+                      $advanceLabel = (string) ($advance['receipt_number'] ?? '-') . ' | '
+                          . (string) ($advance['job_number'] ?? ('Job #' . (int) ($advance['job_card_id'] ?? 0))) . ' | '
+                          . format_currency((float) ($advance['advance_amount'] ?? 0));
+                    ?>
                     <tr>
                       <td><?= e((string) ($advance['received_on'] ?? '-')); ?></td>
                       <td><code><?= e((string) ($advance['receipt_number'] ?? '-')); ?></code></td>
@@ -1779,13 +2094,32 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                       <td><?= e((string) ($advance['registration_no'] ?? '-')); ?></td>
                       <td><?= e((string) ($advance['payment_mode'] ?? '-')); ?></td>
                       <td><?= e(format_currency((float) ($advance['advance_amount'] ?? 0))); ?></td>
-                      <td><?= e(format_currency((float) ($advance['adjusted_amount'] ?? 0))); ?></td>
+                      <td><?= e(format_currency($advanceAdjustedAmount)); ?></td>
                       <td><?= e(format_currency((float) ($advance['balance_amount'] ?? 0))); ?></td>
-                      <td><?= e((string) ($advance['created_by_name'] ?? '-')); ?></td>
+                      <td>
+                        <span class="badge text-bg-<?= e($advanceDeleted ? 'secondary' : 'success'); ?>">
+                          <?= e($advanceStatusCode); ?>
+                        </span>
+                      </td>
+                      <td><?= e($advanceActionActor); ?></td>
                       <td>
                         <a class="btn btn-sm btn-outline-primary" href="<?= e(url('modules/billing/print_advance_receipt.php?id=' . (int) ($advance['id'] ?? 0))); ?>" target="_blank">
                           Print
                         </a>
+                        <?php if ($canDeleteAdvance): ?>
+                          <button
+                            type="button"
+                            class="btn btn-sm btn-outline-danger js-advance-delete-btn"
+                            data-bs-toggle="modal"
+                            data-bs-target="#advanceDeleteModal"
+                            data-advance-id="<?= (int) ($advance['id'] ?? 0); ?>"
+                            data-advance-label="<?= e($advanceLabel); ?>"
+                          >Delete</button>
+                        <?php elseif ($advanceDeleted): ?>
+                          <span class="text-muted ms-1">Deleted</span>
+                        <?php elseif ($advanceAdjustedAmount > 0.009): ?>
+                          <span class="text-muted ms-1">Adjusted, locked</span>
+                        <?php endif; ?>
                       </td>
                     </tr>
                   <?php endforeach; ?>
@@ -1803,7 +2137,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             <thead>
               <tr>
                 <th>Date</th>
-                <th>Invoice</th>
+                <th>Invoice / Job</th>
                 <th>Type</th>
                 <th>Amount</th>
                 <th>Mode</th>
@@ -1814,52 +2148,81 @@ require_once __DIR__ . '/../../includes/sidebar.php';
               </tr>
             </thead>
             <tbody>
-              <?php if (empty($payments)): ?>
-                <tr><td colspan="9" class="text-center text-muted py-4">No payments recorded.</td></tr>
+              <?php if (empty($recentPaymentEntries)): ?>
+                <tr><td colspan="9" class="text-center text-muted py-4">No payment or advance entries recorded.</td></tr>
               <?php else: ?>
-                <?php foreach ($payments as $payment): ?>
+                <?php foreach ($recentPaymentEntries as $payment): ?>
                   <?php
-                    $entryType = strtoupper((string) ($payment['entry_type'] ?? ((float) ($payment['amount'] ?? 0) < 0 ? 'REVERSAL' : 'PAYMENT')));
-                    $isMarkedReversed = $paymentHasIsReversed && (int) ($payment['is_reversed'] ?? 0) === 1;
-                    $hasLinkedReversal = $paymentHasReversedPaymentId && (int) ($payment['reversal_id'] ?? 0) > 0;
-                    $alreadyReversed = $isMarkedReversed || $hasLinkedReversal;
-                    $canReverseEntry = $canPay && $entryType === 'PAYMENT' && (float) ($payment['amount'] ?? 0) > 0.009 && !$alreadyReversed;
+                    $sourceType = strtoupper((string) ($payment['source_type'] ?? 'PAYMENT'));
+                    $isAdvanceEntry = $sourceType === 'ADVANCE';
+                    $entryType = strtoupper((string) ($payment['entry_type'] ?? 'PAYMENT'));
+                    $alreadyReversed = (bool) ($payment['already_reversed'] ?? false);
+                    $canReverseEntry = (bool) ($payment['can_reverse'] ?? false);
+                    $adjustedAmount = (float) ($payment['adjusted_amount'] ?? 0);
+                    $entryId = (int) ($payment['entry_id'] ?? 0);
+                    $entryLabel = (string) ($payment['receipt_number'] ?? '-') . ' | '
+                        . (string) ($payment['document_label'] ?? '-') . ' | '
+                        . format_currency((float) ($payment['amount'] ?? 0));
                   ?>
                   <tr>
-                    <td><?= e((string) $payment['paid_on']); ?></td>
-                    <td><?= e((string) $payment['invoice_number']); ?></td>
+                    <td><?= e((string) ($payment['display_date'] ?? '-')); ?></td>
                     <td>
-                      <span class="badge text-bg-<?= e($entryType === 'REVERSAL' ? 'danger' : 'success'); ?>">
+                      <?php if ($isAdvanceEntry && $canViewJobs && (int) ($payment['job_card_id'] ?? 0) > 0): ?>
+                        <a href="<?= e(url('modules/jobs/view.php?id=' . (int) ($payment['job_card_id'] ?? 0))); ?>">
+                          <?= e((string) ($payment['document_label'] ?? '-')); ?>
+                        </a>
+                      <?php else: ?>
+                        <?= e((string) ($payment['document_label'] ?? '-')); ?>
+                      <?php endif; ?>
+                    </td>
+                    <td>
+                      <span class="badge text-bg-<?= e((string) ($payment['badge_class'] ?? 'secondary')); ?>">
                         <?= e($entryType); ?>
                       </span>
-                      <?php if ($alreadyReversed && $entryType === 'PAYMENT'): ?>
+                      <?php if (!$isAdvanceEntry && $alreadyReversed && $entryType === 'PAYMENT'): ?>
                         <div><small class="text-muted">Reversed</small></div>
+                      <?php endif; ?>
+                      <?php if ($isAdvanceEntry && $adjustedAmount > 0.009): ?>
+                        <div><small class="text-muted">Adjusted: <?= e(format_currency($adjustedAmount)); ?></small></div>
                       <?php endif; ?>
                     </td>
                     <td><?= e(format_currency((float) $payment['amount'])); ?></td>
-                    <td><?= e((string) $payment['payment_mode']); ?></td>
+                    <td><?= e((string) ($payment['mode'] ?? '-')); ?></td>
                     <td>
                       <?= e((string) (($payment['receipt_number'] ?? '') !== '' ? $payment['receipt_number'] : '-')); ?>
-                      <?php if (($payment['outstanding_before'] ?? null) !== null && ($payment['outstanding_after'] ?? null) !== null): ?>
+                      <?php if (!$isAdvanceEntry && ($payment['outstanding_before'] ?? null) !== null && ($payment['outstanding_after'] ?? null) !== null): ?>
                         <div><small class="text-muted"><?= e(format_currency((float) $payment['outstanding_before'])); ?> -> <?= e(format_currency((float) $payment['outstanding_after'])); ?></small></div>
                       <?php endif; ?>
                     </td>
                     <td><?= e((string) ($payment['reference_no'] ?? '-')); ?></td>
-                    <td><?= e((string) ($payment['received_by_name'] ?? '-')); ?></td>
+                    <td><?= e((string) ($payment['actor_name'] ?? '-')); ?></td>
                     <td>
-                      <?php if ($entryType === 'PAYMENT'): ?>
-                        <a class="btn btn-sm btn-outline-primary" href="<?= e(url('modules/billing/print_payment_receipt.php?id=' . (int) ($payment['id'] ?? 0))); ?>" target="_blank">Receipt</a>
+                      <?php if (!empty($payment['print_url'])): ?>
+                        <a class="btn btn-sm btn-outline-primary" href="<?= e((string) $payment['print_url']); ?>" target="_blank"><?= $isAdvanceEntry ? 'Print' : 'Receipt'; ?></a>
                       <?php endif; ?>
-                      <?php if ($canReverseEntry): ?>
+                      <?php if (!$isAdvanceEntry && $canReverseEntry): ?>
                         <button
                           type="button"
                           class="btn btn-sm btn-outline-danger js-payment-reverse-btn"
                           data-bs-toggle="modal"
                           data-bs-target="#paymentReverseModal"
-                          data-payment-id="<?= (int) $payment['id']; ?>"
-                          data-payment-label="#<?= (int) $payment['id']; ?> | <?= e((string) ($payment['invoice_number'] ?? '')); ?> | <?= e((string) ($payment['paid_on'] ?? '')); ?> | <?= e(format_currency((float) ($payment['amount'] ?? 0))); ?>"
+                          data-payment-id="<?= $entryId; ?>"
+                          data-payment-label="#<?= $entryId; ?> | <?= e((string) ($payment['document_label'] ?? '')); ?> | <?= e((string) ($payment['display_date'] ?? '')); ?> | <?= e(format_currency((float) ($payment['amount'] ?? 0))); ?>"
                         >Reverse</button>
-                      <?php elseif ($entryType !== 'PAYMENT'): ?>
+                      <?php elseif ($isAdvanceEntry && $canReverseEntry): ?>
+                        <button
+                          type="button"
+                          class="btn btn-sm btn-outline-danger js-advance-delete-btn"
+                          data-bs-toggle="modal"
+                          data-bs-target="#advanceDeleteModal"
+                          data-advance-id="<?= $entryId; ?>"
+                          data-advance-label="<?= e($entryLabel); ?>"
+                        >Delete</button>
+                      <?php elseif ($isAdvanceEntry && $alreadyReversed): ?>
+                        <span class="text-muted">Deleted</span>
+                      <?php elseif ($isAdvanceEntry && $adjustedAmount > 0.009): ?>
+                        <span class="text-muted">Adjusted, locked</span>
+                      <?php elseif (!$isAdvanceEntry && $entryType !== 'PAYMENT'): ?>
                         <span class="text-muted">-</span>
                       <?php endif; ?>
                     </td>
@@ -1939,6 +2302,37 @@ require_once __DIR__ . '/../../includes/sidebar.php';
   </div>
 </div>
 
+<div class="modal fade" id="advanceDeleteModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <form method="post">
+        <div class="modal-header bg-danger-subtle">
+          <h5 class="modal-title">Delete Advance Receipt</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+        </div>
+        <div class="modal-body">
+          <?= csrf_field(); ?>
+          <input type="hidden" name="_action" value="delete_advance" />
+          <input type="hidden" name="advance_id" id="delete-advance-id" />
+          <div class="mb-3">
+            <label class="form-label">Advance Entry</label>
+            <input type="text" id="delete-advance-label" class="form-control" readonly />
+          </div>
+          <div class="mb-0">
+            <label class="form-label">Deletion Reason</label>
+            <textarea name="delete_reason" id="delete-advance-reason" class="form-control" rows="3" maxlength="255" required></textarea>
+            <small class="text-muted">Only unadjusted advance receipts can be deleted.</small>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Close</button>
+          <button type="submit" class="btn btn-danger">Confirm Delete</button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+
 <script>
   (function () {
     function setValue(id, value) {
@@ -1962,6 +2356,13 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         setValue('reverse-payment-id', reverseTrigger.getAttribute('data-payment-id'));
         setValue('reverse-payment-label', reverseTrigger.getAttribute('data-payment-label'));
         setValue('reverse-payment-reason', '');
+      }
+
+      var deleteAdvanceTrigger = event.target.closest('.js-advance-delete-btn');
+      if (deleteAdvanceTrigger) {
+        setValue('delete-advance-id', deleteAdvanceTrigger.getAttribute('data-advance-id'));
+        setValue('delete-advance-label', deleteAdvanceTrigger.getAttribute('data-advance-label'));
+        setValue('delete-advance-reason', '');
       }
     });
   })();

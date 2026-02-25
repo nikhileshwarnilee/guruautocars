@@ -21,7 +21,7 @@ if ($creditNoteId <= 0 || !billing_financial_extensions_ready()) {
 
 $noteStmt = db()->prepare(
     'SELECT cn.*,
-            c.company_name, c.gstin AS company_gstin, c.address_line1 AS company_address, c.city AS company_city, c.state AS company_state,
+            c.name AS company_name, c.gstin AS company_gstin, c.address_line1 AS company_address, c.city AS company_city, c.state AS company_state,
             g.name AS garage_name,
             i.invoice_number, i.invoice_date,
             cu.full_name AS customer_name, cu.phone AS customer_phone, cu.gstin AS customer_gstin, cu.address_line1 AS customer_address,

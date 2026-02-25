@@ -268,8 +268,8 @@ function reports_module_links(): array
 
     if (reports_can_view_financial()) {
         array_splice($links, 3, 0, [[
-            'menu_key' => 'reports.billing',
-            'label' => 'Billing & GST',
+            'menu_key' => 'reports.sales',
+            'label' => 'Sales Report',
             'icon' => 'bi bi-receipt',
             'path' => 'modules/reports/billing_gst.php',
         ], [

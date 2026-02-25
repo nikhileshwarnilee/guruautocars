@@ -70,7 +70,7 @@ $stockStmt = db()->prepare(
      FROM inventory_movements im
      INNER JOIN parts p ON p.id = im.part_id
      LEFT JOIN part_categories pc ON pc.id = p.category_id
-     WHERE ' . $stockWhereSql . '\n       ' . $stockScopeSql . '
+     WHERE ' . $stockWhereSql . ' ' . $stockScopeSql . '
      GROUP BY p.id, p.part_name, p.part_sku, p.unit, p.purchase_price, category_name
      HAVING stock_qty > 0
      ORDER BY p.part_name ASC'
@@ -85,12 +85,17 @@ $purchaseValueMap = [];
 $purchaseLotsMap = [];
 $purchaseHistoryMap = [];
 if (!empty($partIds)) {
-    $inPlaceholders = implode(',', array_fill(0, count($partIds), '?'));
-
     $purchaseParams = [
         'company_id' => $companyId,
         'as_on_date' => $asOnDate,
     ];
+    $purchasePartPlaceholders = [];
+    foreach ($partIds as $index => $partId) {
+        $key = 'part_id_' . $index;
+        $purchaseParams[$key] = (int) $partId;
+        $purchasePartPlaceholders[] = ':' . $key;
+    }
+    $inPlaceholders = implode(', ', $purchasePartPlaceholders);
     $purchaseScopeSql = analytics_garage_scope_sql('pu.garage_id', $selectedGarageId, $garageIds, $purchaseParams, 'val_purchase_scope');
     $purchaseStmt = db()->prepare(
         'SELECT pi.part_id, pu.purchase_date, pi.quantity, pi.unit_cost
@@ -99,10 +104,10 @@ if (!empty($partIds)) {
          WHERE pu.company_id = :company_id
            AND pu.purchase_status = "FINALIZED"
            AND pu.purchase_date <= :as_on_date
-           AND pi.part_id IN (' . $inPlaceholders . ')\n           ' . $purchaseScopeSql . '
+           AND pi.part_id IN (' . $inPlaceholders . ') ' . $purchaseScopeSql . '
          ORDER BY pi.part_id ASC, pu.purchase_date ASC, pi.id ASC'
     );
-    $purchaseStmt->execute(array_merge($purchaseParams, $partIds));
+    $purchaseStmt->execute($purchaseParams);
     foreach ($purchaseStmt->fetchAll() as $row) {
         $partId = (int) ($row['part_id'] ?? 0);
         $qty = (float) ($row['quantity'] ?? 0);
@@ -127,12 +132,17 @@ if (!empty($partIds)) {
 
 $outQtyMap = [];
 if (!empty($partIds)) {
-    $inPlaceholders = implode(',', array_fill(0, count($partIds), '?'));
-
     $outParams = [
         'company_id' => $companyId,
         'as_on_dt' => $asOnDate . ' 23:59:59',
     ];
+    $outPartPlaceholders = [];
+    foreach ($partIds as $index => $partId) {
+        $key = 'out_part_id_' . $index;
+        $outParams[$key] = (int) $partId;
+        $outPartPlaceholders[] = ':' . $key;
+    }
+    $inPlaceholders = implode(', ', $outPartPlaceholders);
     $outScopeSql = analytics_garage_scope_sql('im.garage_id', $selectedGarageId, $garageIds, $outParams, 'val_out_scope');
     $outStmt = db()->prepare(
         'SELECT im.part_id, COALESCE(SUM(ABS(im.quantity)), 0) AS out_qty
@@ -140,10 +150,10 @@ if (!empty($partIds)) {
          WHERE im.company_id = :company_id
            AND im.created_at <= :as_on_dt
            AND im.movement_type = "OUT"
-           AND im.part_id IN (' . $inPlaceholders . ')\n           ' . $outScopeSql . '
+           AND im.part_id IN (' . $inPlaceholders . ') ' . $outScopeSql . '
          GROUP BY im.part_id'
     );
-    $outStmt->execute(array_merge($outParams, $partIds));
+    $outStmt->execute($outParams);
     foreach ($outStmt->fetchAll() as $row) {
         $outQtyMap[(int) ($row['part_id'] ?? 0)] = (float) ($row['out_qty'] ?? 0);
     }

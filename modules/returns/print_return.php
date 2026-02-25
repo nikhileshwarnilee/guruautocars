@@ -26,7 +26,7 @@ if ($returnId <= 0 || !returns_module_ready()) {
 
 $returnStmt = db()->prepare(
     'SELECT r.*,
-            c.company_name, c.gstin AS company_gstin, c.address_line1 AS company_address, c.city AS company_city, c.state AS company_state,
+            c.name AS company_name, c.gstin AS company_gstin, c.address_line1 AS company_address, c.city AS company_city, c.state AS company_state,
             g.name AS garage_name,
             i.invoice_number,
             p.invoice_number AS purchase_invoice_number,

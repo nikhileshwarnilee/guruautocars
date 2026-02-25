@@ -7,8 +7,8 @@ require_once __DIR__ . '/shared.php';
 
 reports_require_access();
 
-$page_title = 'Billing & GST Reports';
-$active_menu = 'reports.billing';
+$page_title = 'Sales Reports';
+$active_menu = 'reports.sales';
 
 $scope = reports_build_scope_context();
 $companyId = (int) $scope['company_id'];
@@ -31,14 +31,23 @@ $baseParams = $scope['base_params'];
 $revenueDaily = [];
 $revenueMonthly = [];
 $revenueGarageWise = [];
-$gstSummary = ['invoice_count' => 0, 'taxable_total' => 0, 'cgst_total' => 0, 'sgst_total' => 0, 'igst_total' => 0, 'tax_total' => 0, 'grand_total' => 0];
+$collectionMonthly = [];
+$topCustomers = [];
+$invoiceStatusSummary = [];
 $paymentModeSummary = [];
 $outstandingReceivables = [];
-$gstMonthlyBreakdownRows = [];
-$creditNoteRows = [];
-$creditNoteSummary = ['note_count' => 0, 'taxable_total' => 0, 'cgst_total' => 0, 'sgst_total' => 0, 'igst_total' => 0, 'tax_total' => 0, 'grand_total' => 0];
+$receivableAging = ['labels' => ['Current (0-30)', '31-60', '61-90', '90+'], 'values' => [0.0, 0.0, 0.0, 0.0]];
+$salesSummary = [
+    'invoice_count' => 0,
+    'revenue_total' => 0.0,
+    'collected_total' => 0.0,
+    'outstanding_total' => 0.0,
+    'outstanding_invoices' => 0,
+    'avg_invoice_value' => 0.0,
+    'collection_rate' => 0.0,
+];
 
-function billing_gst_discount_meta_from_snapshot(array $snapshot): array
+function sales_report_discount_meta_from_snapshot(array $snapshot): array
 {
     $billing = is_array($snapshot['billing'] ?? null) ? $snapshot['billing'] : [];
     $type = strtoupper(trim((string) ($billing['discount_type'] ?? 'AMOUNT')));
@@ -51,6 +60,16 @@ function billing_gst_discount_meta_from_snapshot(array $snapshot): array
         'value' => round(max(0.0, (float) ($billing['discount_value'] ?? 0)), 2),
         'amount' => round(max(0.0, (float) ($billing['discount_amount'] ?? 0)), 2),
     ];
+}
+
+function sales_invoice_status_badge_class(string $status): string
+{
+    return match (strtoupper(trim($status))) {
+        'DRAFT' => 'secondary',
+        'FINALIZED' => 'success',
+        'CANCELLED' => 'danger',
+        default => 'light',
+    };
 }
 
 if ($canViewFinancial) {
@@ -109,30 +128,65 @@ if ($canViewFinancial) {
     $revenueGarageStmt->execute($revenueGarageParams);
     $revenueGarageWise = $revenueGarageStmt->fetchAll();
 
-    $gstParams = ['company_id' => $companyId, 'from_date' => $fromDate, 'to_date' => $toDate];
-    $gstScopeSql = analytics_garage_scope_sql('i.garage_id', $selectedGarageId, $garageIds, $gstParams, 'gst_scope');
-    $gstStmt = db()->prepare(
+    $salesSummaryParams = ['company_id' => $companyId, 'from_date' => $fromDate, 'to_date' => $toDate];
+    $salesSummaryScopeSql = analytics_garage_scope_sql('i.garage_id', $selectedGarageId, $garageIds, $salesSummaryParams, 'sales_summary_scope');
+    $salesSummaryStmt = db()->prepare(
         'SELECT COUNT(*) AS invoice_count,
-                COALESCE(SUM(i.taxable_amount), 0) AS taxable_total,
-                COALESCE(SUM(i.cgst_amount), 0) AS cgst_total,
-                COALESCE(SUM(i.sgst_amount), 0) AS sgst_total,
-                COALESCE(SUM(i.igst_amount), 0) AS igst_total,
-                COALESCE(SUM(i.total_tax_amount), 0) AS tax_total,
-                COALESCE(SUM(i.grand_total), 0) AS grand_total
+                COALESCE(SUM(i.grand_total), 0) AS revenue_total,
+                COALESCE(SUM(LEAST(COALESCE(paid.total_paid, 0), i.grand_total)), 0) AS collected_total,
+                COALESCE(SUM(GREATEST(i.grand_total - COALESCE(paid.total_paid, 0), 0)), 0) AS outstanding_total,
+                COALESCE(SUM(CASE WHEN (i.grand_total - COALESCE(paid.total_paid, 0)) > 0.01 THEN 1 ELSE 0 END), 0) AS outstanding_invoices
          FROM invoices i
+         INNER JOIN job_cards jc ON jc.id = i.job_card_id
+         LEFT JOIN (
+            SELECT invoice_id, SUM(amount) AS total_paid
+            FROM payments
+            GROUP BY invoice_id
+         ) paid ON paid.invoice_id = i.id
+         WHERE i.company_id = :company_id
+           AND i.invoice_status = "FINALIZED"
+           AND jc.status = "CLOSED"
+           AND jc.status_code = "ACTIVE"
+           ' . $salesSummaryScopeSql . '
+           AND i.invoice_date BETWEEN :from_date AND :to_date'
+    );
+    $salesSummaryStmt->execute($salesSummaryParams);
+    $salesSummaryRow = $salesSummaryStmt->fetch() ?: [];
+    $salesSummary['invoice_count'] = (int) ($salesSummaryRow['invoice_count'] ?? 0);
+    $salesSummary['revenue_total'] = (float) ($salesSummaryRow['revenue_total'] ?? 0);
+    $salesSummary['collected_total'] = (float) ($salesSummaryRow['collected_total'] ?? 0);
+    $salesSummary['outstanding_total'] = (float) ($salesSummaryRow['outstanding_total'] ?? 0);
+    $salesSummary['outstanding_invoices'] = (int) ($salesSummaryRow['outstanding_invoices'] ?? 0);
+    if ($salesSummary['invoice_count'] > 0) {
+        $salesSummary['avg_invoice_value'] = round($salesSummary['revenue_total'] / (float) $salesSummary['invoice_count'], 2);
+    }
+    if ($salesSummary['revenue_total'] > 0.009) {
+        $salesSummary['collection_rate'] = round(($salesSummary['collected_total'] / $salesSummary['revenue_total']) * 100, 2);
+    }
+
+    $collectionMonthlyParams = ['company_id' => $companyId, 'from_date' => $fromDate, 'to_date' => $toDate];
+    $collectionMonthlyScopeSql = analytics_garage_scope_sql('i.garage_id', $selectedGarageId, $garageIds, $collectionMonthlyParams, 'sales_collection_scope');
+    $collectionMonthlyStmt = db()->prepare(
+        'SELECT DATE_FORMAT(p.paid_on, "%Y-%m") AS collection_month,
+                COUNT(p.id) AS payment_count,
+                COALESCE(SUM(p.amount), 0) AS collected_amount
+         FROM payments p
+         INNER JOIN invoices i ON i.id = p.invoice_id
          INNER JOIN job_cards jc ON jc.id = i.job_card_id
          WHERE i.company_id = :company_id
            AND i.invoice_status = "FINALIZED"
            AND jc.status = "CLOSED"
            AND jc.status_code = "ACTIVE"
-           ' . $gstScopeSql . '
-           AND i.invoice_date BETWEEN :from_date AND :to_date'
+           ' . $collectionMonthlyScopeSql . '
+           AND p.paid_on BETWEEN :from_date AND :to_date
+         GROUP BY DATE_FORMAT(p.paid_on, "%Y-%m")
+         ORDER BY collection_month ASC'
     );
-    $gstStmt->execute($gstParams);
-    $gstSummary = $gstStmt->fetch() ?: $gstSummary;
+    $collectionMonthlyStmt->execute($collectionMonthlyParams);
+    $collectionMonthly = $collectionMonthlyStmt->fetchAll();
 
     $paymentModeParams = ['company_id' => $companyId, 'from_date' => $fromDate, 'to_date' => $toDate];
-    $paymentModeScopeSql = analytics_garage_scope_sql('i.garage_id', $selectedGarageId, $garageIds, $paymentModeParams, 'pay_scope');
+    $paymentModeScopeSql = analytics_garage_scope_sql('i.garage_id', $selectedGarageId, $garageIds, $paymentModeParams, 'sales_payment_scope');
     $paymentModeStmt = db()->prepare(
         'SELECT p.payment_mode, COUNT(p.id) AS payment_count, COALESCE(SUM(p.amount), 0) AS collected_amount
          FROM payments p
@@ -150,19 +204,111 @@ if ($canViewFinancial) {
     $paymentModeStmt->execute($paymentModeParams);
     $paymentModeSummary = $paymentModeStmt->fetchAll();
 
+    $invoiceStatusParams = ['company_id' => $companyId, 'from_date' => $fromDate, 'to_date' => $toDate];
+    $invoiceStatusScopeSql = analytics_garage_scope_sql('i.garage_id', $selectedGarageId, $garageIds, $invoiceStatusParams, 'sales_inv_status_scope');
+    $invoiceStatusStmt = db()->prepare(
+        'SELECT i.invoice_status,
+                COUNT(*) AS invoice_count,
+                COALESCE(SUM(i.grand_total), 0) AS total_amount
+         FROM invoices i
+         WHERE i.company_id = :company_id
+           ' . $invoiceStatusScopeSql . '
+           AND i.invoice_date BETWEEN :from_date AND :to_date
+         GROUP BY i.invoice_status
+         ORDER BY FIELD(i.invoice_status, "DRAFT", "FINALIZED", "CANCELLED"), i.invoice_status'
+    );
+    $invoiceStatusStmt->execute($invoiceStatusParams);
+    $invoiceStatusSummary = $invoiceStatusStmt->fetchAll();
+
+    $topCustomerParams = ['company_id' => $companyId, 'from_date' => $fromDate, 'to_date' => $toDate];
+    $topCustomerScopeSql = analytics_garage_scope_sql('i.garage_id', $selectedGarageId, $garageIds, $topCustomerParams, 'sales_top_customer_scope');
+    $topCustomerStmt = db()->prepare(
+        'SELECT c.id AS customer_id,
+                c.full_name AS customer_name,
+                c.phone AS customer_phone,
+                COUNT(*) AS invoice_count,
+                COALESCE(SUM(i.grand_total), 0) AS billed_total,
+                COALESCE(SUM(LEAST(COALESCE(paid.total_paid, 0), i.grand_total)), 0) AS collected_total,
+                COALESCE(SUM(GREATEST(i.grand_total - COALESCE(paid.total_paid, 0), 0)), 0) AS outstanding_total
+         FROM invoices i
+         INNER JOIN job_cards jc ON jc.id = i.job_card_id
+         INNER JOIN customers c ON c.id = i.customer_id
+         LEFT JOIN (
+            SELECT invoice_id, SUM(amount) AS total_paid
+            FROM payments
+            GROUP BY invoice_id
+         ) paid ON paid.invoice_id = i.id
+         WHERE i.company_id = :company_id
+           AND i.invoice_status = "FINALIZED"
+           AND jc.status = "CLOSED"
+           AND jc.status_code = "ACTIVE"
+           ' . $topCustomerScopeSql . '
+           AND i.invoice_date BETWEEN :from_date AND :to_date
+         GROUP BY c.id, c.full_name, c.phone
+         ORDER BY billed_total DESC
+         LIMIT 25'
+    );
+    $topCustomerStmt->execute($topCustomerParams);
+    $topCustomers = $topCustomerStmt->fetchAll();
+    foreach ($topCustomers as &$row) {
+        $billed = (float) ($row['billed_total'] ?? 0);
+        $collected = (float) ($row['collected_total'] ?? 0);
+        $row['collection_rate'] = $billed > 0.009 ? round(($collected / $billed) * 100, 2) : 0.0;
+    }
+    unset($row);
+
+    $receivableAgingParams = ['company_id' => $companyId, 'from_date' => $fromDate, 'to_date' => $toDate];
+    $receivableAgingScopeSql = analytics_garage_scope_sql('i.garage_id', $selectedGarageId, $garageIds, $receivableAgingParams, 'sales_recv_aging_scope');
+    $receivableAgingStmt = db()->prepare(
+        'SELECT
+            COALESCE(SUM(CASE WHEN recv.overdue_days <= 30 THEN recv.outstanding_amount ELSE 0 END), 0) AS bucket_0_30,
+            COALESCE(SUM(CASE WHEN recv.overdue_days BETWEEN 31 AND 60 THEN recv.outstanding_amount ELSE 0 END), 0) AS bucket_31_60,
+            COALESCE(SUM(CASE WHEN recv.overdue_days BETWEEN 61 AND 90 THEN recv.outstanding_amount ELSE 0 END), 0) AS bucket_61_90,
+            COALESCE(SUM(CASE WHEN recv.overdue_days > 90 THEN recv.outstanding_amount ELSE 0 END), 0) AS bucket_90_plus
+         FROM (
+            SELECT
+                CASE WHEN i.due_date IS NOT NULL AND i.due_date < CURDATE() THEN DATEDIFF(CURDATE(), i.due_date) ELSE 0 END AS overdue_days,
+                GREATEST(i.grand_total - COALESCE(paid.total_paid, 0), 0) AS outstanding_amount
+            FROM invoices i
+            INNER JOIN job_cards jc ON jc.id = i.job_card_id
+            LEFT JOIN (
+                SELECT invoice_id, SUM(amount) AS total_paid
+                FROM payments
+                GROUP BY invoice_id
+            ) paid ON paid.invoice_id = i.id
+            WHERE i.company_id = :company_id
+              AND i.invoice_status = "FINALIZED"
+              AND jc.status = "CLOSED"
+              AND jc.status_code = "ACTIVE"
+              ' . $receivableAgingScopeSql . '
+              AND i.invoice_date BETWEEN :from_date AND :to_date
+              AND (i.grand_total - COALESCE(paid.total_paid, 0)) > 0.01
+         ) recv'
+    );
+    $receivableAgingStmt->execute($receivableAgingParams);
+    $agingRow = $receivableAgingStmt->fetch() ?: [];
+    $receivableAging['values'] = [
+        (float) ($agingRow['bucket_0_30'] ?? 0),
+        (float) ($agingRow['bucket_31_60'] ?? 0),
+        (float) ($agingRow['bucket_61_90'] ?? 0),
+        (float) ($agingRow['bucket_90_plus'] ?? 0),
+    ];
+
     $receivableParams = ['company_id' => $companyId, 'from_date' => $fromDate, 'to_date' => $toDate];
-    $receivableScopeSql = analytics_garage_scope_sql('i.garage_id', $selectedGarageId, $garageIds, $receivableParams, 'recv_scope');
+    $receivableScopeSql = analytics_garage_scope_sql('i.garage_id', $selectedGarageId, $garageIds, $receivableParams, 'sales_recv_scope');
     $receivableStmt = db()->prepare(
         'SELECT i.invoice_number, i.invoice_date, i.due_date, c.full_name AS customer_name,
-                i.grand_total,
                 i.snapshot_json,
-                COALESCE(paid.total_paid, 0) AS paid_amount,
-                (i.grand_total - COALESCE(paid.total_paid, 0)) AS outstanding_amount,
+                GREATEST(i.grand_total - COALESCE(paid.total_paid, 0), 0) AS outstanding_amount,
                 CASE WHEN i.due_date IS NOT NULL AND i.due_date < CURDATE() THEN DATEDIFF(CURDATE(), i.due_date) ELSE 0 END AS overdue_days
          FROM invoices i
          INNER JOIN job_cards jc ON jc.id = i.job_card_id
          INNER JOIN customers c ON c.id = i.customer_id
-         LEFT JOIN (SELECT invoice_id, SUM(amount) AS total_paid FROM payments GROUP BY invoice_id) paid ON paid.invoice_id = i.id
+         LEFT JOIN (
+            SELECT invoice_id, SUM(amount) AS total_paid
+            FROM payments
+            GROUP BY invoice_id
+         ) paid ON paid.invoice_id = i.id
          WHERE i.company_id = :company_id
            AND i.invoice_status = "FINALIZED"
            AND jc.status = "CLOSED"
@@ -171,7 +317,7 @@ if ($canViewFinancial) {
            AND i.invoice_date BETWEEN :from_date AND :to_date
            AND (i.grand_total - COALESCE(paid.total_paid, 0)) > 0.01
          ORDER BY overdue_days DESC, outstanding_amount DESC
-         LIMIT 100'
+         LIMIT 150'
     );
     $receivableStmt->execute($receivableParams);
     $outstandingReceivables = $receivableStmt->fetchAll();
@@ -180,7 +326,7 @@ if ($canViewFinancial) {
         if (!is_array($snapshot)) {
             $snapshot = [];
         }
-        $discountMeta = billing_gst_discount_meta_from_snapshot($snapshot);
+        $discountMeta = sales_report_discount_meta_from_snapshot($snapshot);
         $discountAmount = (float) ($discountMeta['amount'] ?? 0);
         $discountType = (string) ($discountMeta['type'] ?? 'AMOUNT');
         $discountValue = (float) ($discountMeta['value'] ?? 0);
@@ -194,105 +340,25 @@ if ($canViewFinancial) {
         }
     }
     unset($row);
-
-    $gstMonthlyParams = ['company_id' => $companyId, 'from_date' => $fromDate, 'to_date' => $toDate];
-    $gstMonthlyScopeSql = analytics_garage_scope_sql('i.garage_id', $selectedGarageId, $garageIds, $gstMonthlyParams, 'gst_month_scope');
-    $gstMonthlyStmt = db()->prepare(
-        'SELECT DATE_FORMAT(i.invoice_date, "%Y-%m") AS tax_month,
-                COALESCE(SUM(i.cgst_amount), 0) AS cgst_total,
-                COALESCE(SUM(i.sgst_amount), 0) AS sgst_total,
-                COALESCE(SUM(i.igst_amount), 0) AS igst_total
-         FROM invoices i
-         INNER JOIN job_cards jc ON jc.id = i.job_card_id
-         WHERE i.company_id = :company_id
-           AND i.invoice_status = "FINALIZED"
-           AND jc.status = "CLOSED"
-           AND jc.status_code = "ACTIVE"
-           ' . $gstMonthlyScopeSql . '
-           AND i.invoice_date BETWEEN :from_date AND :to_date
-         GROUP BY DATE_FORMAT(i.invoice_date, "%Y-%m")
-         ORDER BY tax_month ASC'
-    );
-    $gstMonthlyStmt->execute($gstMonthlyParams);
-    $gstMonthlyBreakdownRows = $gstMonthlyStmt->fetchAll();
-
-    if (table_columns('credit_notes') !== []) {
-        $creditParams = ['company_id' => $companyId, 'from_date' => $fromDate, 'to_date' => $toDate];
-        $creditScopeSql = analytics_garage_scope_sql('cn.garage_id', $selectedGarageId, $garageIds, $creditParams, 'bill_credit_scope');
-        $creditStmt = db()->prepare(
-            'SELECT cn.credit_note_number,
-                    cn.credit_note_date,
-                    cu.full_name AS customer_name,
-                    cu.gstin AS customer_gstin,
-                    cn.taxable_amount,
-                    cn.cgst_amount,
-                    cn.sgst_amount,
-                    cn.igst_amount,
-                    cn.total_tax_amount,
-                    cn.total_amount
-             FROM credit_notes cn
-             LEFT JOIN customers cu ON cu.id = cn.customer_id
-             WHERE cn.company_id = :company_id
-               AND cn.status_code = "ACTIVE"
-               ' . $creditScopeSql . '
-               AND cn.credit_note_date BETWEEN :from_date AND :to_date
-             ORDER BY cn.credit_note_date DESC, cn.id DESC
-             LIMIT 200'
-        );
-        $creditStmt->execute($creditParams);
-        $creditNoteRows = $creditStmt->fetchAll();
-
-        foreach ($creditNoteRows as $row) {
-            $creditNoteSummary['note_count'] += 1;
-            $creditNoteSummary['taxable_total'] += (float) ($row['taxable_amount'] ?? 0);
-            $creditNoteSummary['cgst_total'] += (float) ($row['cgst_amount'] ?? 0);
-            $creditNoteSummary['sgst_total'] += (float) ($row['sgst_amount'] ?? 0);
-            $creditNoteSummary['igst_total'] += (float) ($row['igst_amount'] ?? 0);
-            $creditNoteSummary['tax_total'] += (float) ($row['total_tax_amount'] ?? 0);
-            $creditNoteSummary['grand_total'] += (float) ($row['total_amount'] ?? 0);
-        }
-    }
 }
 
-$totalOutstanding = array_reduce($outstandingReceivables, static fn (float $sum, array $row): float => $sum + (float) ($row['outstanding_amount'] ?? 0), 0.0);
-$netRevenueAfterCredit = (float) ($gstSummary['grand_total'] ?? 0) - (float) ($creditNoteSummary['grand_total'] ?? 0);
-$netTaxAfterCredit = (float) ($gstSummary['tax_total'] ?? 0) - (float) ($creditNoteSummary['tax_total'] ?? 0);
+$totalPaymentEntries = array_reduce(
+    $paymentModeSummary,
+    static fn (int $sum, array $row): int => $sum + (int) ($row['payment_count'] ?? 0),
+    0
+);
 
-$gstMonthLabels = array_map(static fn (array $row): string => (string) ($row['tax_month'] ?? ''), $gstMonthlyBreakdownRows);
 $chartPayload = [
-    'gst_breakdown' => [
-        'labels' => $gstMonthLabels,
-        'cgst' => array_map(static fn (array $row): float => (float) ($row['cgst_total'] ?? 0), $gstMonthlyBreakdownRows),
-        'sgst' => array_map(static fn (array $row): float => (float) ($row['sgst_total'] ?? 0), $gstMonthlyBreakdownRows),
-        'igst' => array_map(static fn (array $row): float => (float) ($row['igst_total'] ?? 0), $gstMonthlyBreakdownRows),
-    ],
     'monthly_sales' => [
         'labels' => array_map(static fn (array $row): string => (string) ($row['revenue_month'] ?? ''), $revenueMonthly),
         'values' => array_map(static fn (array $row): float => (float) ($row['revenue_total'] ?? 0), $revenueMonthly),
     ],
-    'receivable_aging' => [
-        'labels' => ['Current (0-30)', '31-60', '61-90', '90+'],
-        'values' => [0.0, 0.0, 0.0, 0.0],
+    'monthly_collections' => [
+        'labels' => array_map(static fn (array $row): string => (string) ($row['collection_month'] ?? ''), $collectionMonthly),
+        'values' => array_map(static fn (array $row): float => (float) ($row['collected_amount'] ?? 0), $collectionMonthly),
     ],
-    'credit_note_totals' => [
-        'count' => (int) ($creditNoteSummary['note_count'] ?? 0),
-        'tax_total' => (float) ($creditNoteSummary['tax_total'] ?? 0),
-        'grand_total' => (float) ($creditNoteSummary['grand_total'] ?? 0),
-    ],
+    'receivable_aging' => $receivableAging,
 ];
-foreach ($outstandingReceivables as $row) {
-    $overdue = (int) ($row['overdue_days'] ?? 0);
-    $amount = (float) ($row['outstanding_amount'] ?? 0);
-    if ($overdue <= 30) {
-        $chartPayload['receivable_aging']['values'][0] += $amount;
-    } elseif ($overdue <= 60) {
-        $chartPayload['receivable_aging']['values'][1] += $amount;
-    } elseif ($overdue <= 90) {
-        $chartPayload['receivable_aging']['values'][2] += $amount;
-    } else {
-        $chartPayload['receivable_aging']['values'][3] += $amount;
-    }
-}
 $chartPayloadJson = json_encode(
     $chartPayload,
     JSON_UNESCAPED_UNICODE
@@ -316,56 +382,53 @@ if ($exportKey !== '') {
     $timestamp = date('Ymd_His');
     switch ($exportKey) {
         case 'revenue_daily':
+        case 'daily_sales':
             $rows = array_map(static fn (array $row): array => [(string) ($row['invoice_date'] ?? ''), (int) ($row['invoice_count'] ?? 0), (float) ($row['revenue_total'] ?? 0)], $revenueDaily);
-            reports_csv_download('billing_revenue_daily_' . $timestamp . '.csv', ['Date', 'Invoices', 'Revenue'], $rows);
+            reports_csv_download('sales_daily_' . $timestamp . '.csv', ['Date', 'Invoices', 'Sales'], $rows);
 
         case 'revenue_monthly':
+        case 'monthly_sales':
             $rows = array_map(static fn (array $row): array => [(string) ($row['revenue_month'] ?? ''), (int) ($row['invoice_count'] ?? 0), (float) ($row['revenue_total'] ?? 0)], $revenueMonthly);
-            reports_csv_download('billing_revenue_monthly_' . $timestamp . '.csv', ['Month', 'Invoices', 'Revenue'], $rows);
+            reports_csv_download('sales_monthly_' . $timestamp . '.csv', ['Month', 'Invoices', 'Sales'], $rows);
+
+        case 'monthly_collections':
+            $rows = array_map(static fn (array $row): array => [(string) ($row['collection_month'] ?? ''), (int) ($row['payment_count'] ?? 0), (float) ($row['collected_amount'] ?? 0)], $collectionMonthly);
+            reports_csv_download('sales_monthly_collections_' . $timestamp . '.csv', ['Month', 'Entries', 'Collected'], $rows);
 
         case 'revenue_garage':
+        case 'garage_sales':
             $rows = array_map(static fn (array $row): array => [(string) ($row['garage_name'] ?? ''), (int) ($row['invoice_count'] ?? 0), (float) ($row['revenue_total'] ?? 0)], $revenueGarageWise);
-            reports_csv_download('billing_revenue_garage_' . $timestamp . '.csv', ['Garage', 'Invoices', 'Revenue'], $rows);
-
-        case 'gst_summary':
-            $rows = [[
-                (int) ($gstSummary['invoice_count'] ?? 0),
-                (float) ($gstSummary['taxable_total'] ?? 0),
-                (float) ($gstSummary['cgst_total'] ?? 0),
-                (float) ($gstSummary['sgst_total'] ?? 0),
-                (float) ($gstSummary['igst_total'] ?? 0),
-                (float) ($gstSummary['tax_total'] ?? 0),
-                (float) ($gstSummary['grand_total'] ?? 0),
-            ]];
-            reports_csv_download('billing_gst_summary_' . $timestamp . '.csv', ['Invoices', 'Taxable', 'CGST', 'SGST', 'IGST', 'Total GST', 'Grand Total'], $rows);
-
-        case 'credit_notes':
-            $rows = array_map(
-                static fn (array $row): array => [
-                    (string) ($row['credit_note_number'] ?? ''),
-                    (string) ($row['credit_note_date'] ?? ''),
-                    (string) ($row['customer_name'] ?? ''),
-                    (string) ($row['customer_gstin'] ?? ''),
-                    (float) ($row['taxable_amount'] ?? 0),
-                    (float) ($row['cgst_amount'] ?? 0),
-                    (float) ($row['sgst_amount'] ?? 0),
-                    (float) ($row['igst_amount'] ?? 0),
-                    (float) ($row['total_tax_amount'] ?? 0),
-                    (float) ($row['total_amount'] ?? 0),
-                ],
-                $creditNoteRows
-            );
-            reports_csv_download('billing_credit_notes_' . $timestamp . '.csv', ['Credit Note', 'Date', 'Customer', 'GSTIN', 'Taxable', 'CGST', 'SGST', 'IGST', 'Total GST', 'Total'], $rows);
+            reports_csv_download('sales_garage_wise_' . $timestamp . '.csv', ['Garage', 'Invoices', 'Sales'], $rows);
 
         case 'payment_modes':
             $rows = array_map(static fn (array $row): array => [(string) ($row['payment_mode'] ?? ''), (int) ($row['payment_count'] ?? 0), (float) ($row['collected_amount'] ?? 0)], $paymentModeSummary);
-            reports_csv_download('billing_payment_modes_' . $timestamp . '.csv', ['Payment Mode', 'Entries', 'Collected'], $rows);
+            reports_csv_download('sales_payment_modes_' . $timestamp . '.csv', ['Payment Mode', 'Entries', 'Collected'], $rows);
+
+        case 'invoice_status':
+            $rows = array_map(static fn (array $row): array => [(string) ($row['invoice_status'] ?? ''), (int) ($row['invoice_count'] ?? 0), (float) ($row['total_amount'] ?? 0)], $invoiceStatusSummary);
+            reports_csv_download('sales_invoice_status_' . $timestamp . '.csv', ['Status', 'Invoices', 'Amount'], $rows);
+
+        case 'top_customers':
+            $rows = array_map(
+                static fn (array $row): array => [
+                    (string) ($row['customer_name'] ?? ''),
+                    (string) ($row['customer_phone'] ?? ''),
+                    (int) ($row['invoice_count'] ?? 0),
+                    (float) ($row['billed_total'] ?? 0),
+                    (float) ($row['collected_total'] ?? 0),
+                    (float) ($row['outstanding_total'] ?? 0),
+                    (float) ($row['collection_rate'] ?? 0),
+                ],
+                $topCustomers
+            );
+            reports_csv_download('sales_top_customers_' . $timestamp . '.csv', ['Customer', 'Phone', 'Invoices', 'Billed', 'Collected', 'Outstanding', 'Collection %'], $rows);
 
         case 'receivables':
             $rows = array_map(
                 static fn (array $row): array => [
                     (string) ($row['invoice_number'] ?? ''),
                     (string) ($row['invoice_date'] ?? ''),
+                    (string) ($row['due_date'] ?? ''),
                     (string) ($row['customer_name'] ?? ''),
                     (float) ($row['discount_amount'] ?? 0),
                     (float) ($row['outstanding_amount'] ?? 0),
@@ -373,7 +436,7 @@ if ($exportKey !== '') {
                 ],
                 $outstandingReceivables
             );
-            reports_csv_download('billing_receivables_' . $timestamp . '.csv', ['Invoice', 'Date', 'Customer', 'Discount', 'Outstanding', 'Overdue Days'], $rows);
+            reports_csv_download('sales_receivables_' . $timestamp . '.csv', ['Invoice', 'Invoice Date', 'Due Date', 'Customer', 'Discount', 'Outstanding', 'Overdue Days'], $rows);
 
         default:
             flash_set('report_error', 'Unknown export requested.', 'warning');
@@ -389,12 +452,12 @@ require_once __DIR__ . '/../../includes/sidebar.php';
   <div class="app-content-header">
     <div class="container-fluid">
       <div class="row">
-        <div class="col-sm-6"><h3 class="mb-0">Billing & GST Reports</h3></div>
+        <div class="col-sm-6"><h3 class="mb-0">Sales Reports</h3></div>
         <div class="col-sm-6">
           <ol class="breadcrumb float-sm-end">
             <li class="breadcrumb-item"><a href="<?= e(url('dashboard.php')); ?>">Home</a></li>
             <li class="breadcrumb-item"><a href="<?= e(url('modules/reports/index.php')); ?>">Reports</a></li>
-            <li class="breadcrumb-item active">Billing & GST</li>
+            <li class="breadcrumb-item active">Sales</li>
           </ol>
         </div>
       </div>
@@ -421,7 +484,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         <div class="card-body">
           <form
             method="get"
-            id="billing-report-filter-form"
+            id="sales-report-filter-form"
             class="row g-2 align-items-end"
             data-date-filter-form="1"
             data-date-range-start="<?= e((string) $scope['date_range_start']); ?>"
@@ -482,12 +545,12 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             <span class="badge text-bg-light border me-2">Garage: <?= e($scopeGarageLabel); ?></span>
             <span class="badge text-bg-light border me-2">FY: <?= e($fyLabel); ?></span>
             <span class="badge text-bg-light border me-2">Range: <?= e($fromDate); ?> to <?= e($toDate); ?></span>
-            <span class="badge text-bg-success">Trusted Data: Finalized Invoices Only</span>
+            <span class="badge text-bg-success">Trusted Data: Finalized Invoices with Closed Jobs</span>
           </div>
         </div>
       </div>
 
-      <div id="billing-report-content">
+      <div id="sales-report-content">
         <script type="application/json" data-chart-payload><?= $chartPayloadJson ?: '{}'; ?></script>
 
       <?php if (!$canViewFinancial): ?>
@@ -501,7 +564,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
               <span class="info-box-icon text-bg-primary"><i class="bi bi-receipt"></i></span>
               <div class="info-box-content">
                 <span class="info-box-text">Finalized Invoices</span>
-                <span class="info-box-number"><?= number_format((int) ($gstSummary['invoice_count'] ?? 0)); ?></span>
+                <span class="info-box-number"><?= number_format((int) ($salesSummary['invoice_count'] ?? 0)); ?></span>
               </div>
             </div>
           </div>
@@ -509,17 +572,17 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             <div class="info-box">
               <span class="info-box-icon text-bg-success"><i class="bi bi-currency-rupee"></i></span>
               <div class="info-box-content">
-                <span class="info-box-text">Finalized Revenue</span>
-                <span class="info-box-number"><?= e(format_currency((float) ($gstSummary['grand_total'] ?? 0))); ?></span>
+                <span class="info-box-text">Finalized Sales</span>
+                <span class="info-box-number"><?= e(format_currency((float) ($salesSummary['revenue_total'] ?? 0))); ?></span>
               </div>
             </div>
           </div>
           <div class="col-md-3">
             <div class="info-box">
-              <span class="info-box-icon text-bg-warning"><i class="bi bi-file-earmark-text"></i></span>
+              <span class="info-box-icon text-bg-info"><i class="bi bi-wallet2"></i></span>
               <div class="info-box-content">
-                <span class="info-box-text">Total GST</span>
-                <span class="info-box-number"><?= e(format_currency((float) ($gstSummary['tax_total'] ?? 0))); ?></span>
+                <span class="info-box-text">Collections</span>
+                <span class="info-box-number"><?= e(format_currency((float) ($salesSummary['collected_total'] ?? 0))); ?></span>
               </div>
             </div>
           </div>
@@ -528,56 +591,65 @@ require_once __DIR__ . '/../../includes/sidebar.php';
               <span class="info-box-icon text-bg-danger"><i class="bi bi-exclamation-diamond"></i></span>
               <div class="info-box-content">
                 <span class="info-box-text">Outstanding</span>
-                <span class="info-box-number"><?= e(format_currency($totalOutstanding)); ?></span>
+                <span class="info-box-number"><?= e(format_currency((float) ($salesSummary['outstanding_total'] ?? 0))); ?></span>
               </div>
             </div>
           </div>
         </div>
 
         <div class="row g-3 mb-3">
-          <div class="col-md-4">
+          <div class="col-md-3">
             <div class="info-box">
-              <span class="info-box-icon text-bg-warning"><i class="bi bi-arrow-counterclockwise"></i></span>
+              <span class="info-box-icon text-bg-warning"><i class="bi bi-123"></i></span>
               <div class="info-box-content">
-                <span class="info-box-text">Credit Note Reversal</span>
-                <span class="info-box-number"><?= e(format_currency((float) ($creditNoteSummary['grand_total'] ?? 0))); ?></span>
+                <span class="info-box-text">Average Invoice</span>
+                <span class="info-box-number"><?= e(format_currency((float) ($salesSummary['avg_invoice_value'] ?? 0))); ?></span>
               </div>
             </div>
           </div>
-          <div class="col-md-4">
+          <div class="col-md-3">
             <div class="info-box">
-              <span class="info-box-icon text-bg-success"><i class="bi bi-graph-up-arrow"></i></span>
+              <span class="info-box-icon text-bg-secondary"><i class="bi bi-percent"></i></span>
               <div class="info-box-content">
-                <span class="info-box-text">Net Revenue (After CN)</span>
-                <span class="info-box-number"><?= e(format_currency($netRevenueAfterCredit)); ?></span>
+                <span class="info-box-text">Collection Rate</span>
+                <span class="info-box-number"><?= e(number_format((float) ($salesSummary['collection_rate'] ?? 0), 2)); ?>%</span>
               </div>
             </div>
           </div>
-          <div class="col-md-4">
+          <div class="col-md-3">
             <div class="info-box">
-              <span class="info-box-icon text-bg-primary"><i class="bi bi-journal-check"></i></span>
+              <span class="info-box-icon text-bg-danger"><i class="bi bi-file-earmark-minus"></i></span>
               <div class="info-box-content">
-                <span class="info-box-text">Net GST (After CN)</span>
-                <span class="info-box-number"><?= e(format_currency($netTaxAfterCredit)); ?></span>
+                <span class="info-box-text">Outstanding Invoices</span>
+                <span class="info-box-number"><?= number_format((int) ($salesSummary['outstanding_invoices'] ?? 0)); ?></span>
+              </div>
+            </div>
+          </div>
+          <div class="col-md-3">
+            <div class="info-box">
+              <span class="info-box-icon text-bg-primary"><i class="bi bi-cash-stack"></i></span>
+              <div class="info-box-content">
+                <span class="info-box-text">Payment Entries</span>
+                <span class="info-box-number"><?= number_format($totalPaymentEntries); ?></span>
               </div>
             </div>
           </div>
         </div>
 
         <div class="row g-3 mb-3">
-          <div class="col-lg-6">
-            <div class="card h-100">
-              <div class="card-header"><h3 class="card-title mb-0">GST Tax Breakdown (CGST / SGST / IGST)</h3></div>
-              <div class="card-body">
-                <div class="gac-chart-wrap"><canvas id="billing-chart-gst-breakdown"></canvas></div>
-              </div>
-            </div>
-          </div>
           <div class="col-lg-6">
             <div class="card h-100">
               <div class="card-header"><h3 class="card-title mb-0">Monthly Sales Trend</h3></div>
               <div class="card-body">
-                <div class="gac-chart-wrap"><canvas id="billing-chart-sales-trend"></canvas></div>
+                <div class="gac-chart-wrap"><canvas id="sales-chart-sales-trend"></canvas></div>
+              </div>
+            </div>
+          </div>
+          <div class="col-lg-6">
+            <div class="card h-100">
+              <div class="card-header"><h3 class="card-title mb-0">Monthly Collection Trend</h3></div>
+              <div class="card-body">
+                <div class="gac-chart-wrap"><canvas id="sales-chart-collection-trend"></canvas></div>
               </div>
             </div>
           </div>
@@ -585,22 +657,24 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             <div class="card h-100">
               <div class="card-header"><h3 class="card-title mb-0">Receivable Aging Distribution</h3></div>
               <div class="card-body">
-                <div class="gac-chart-wrap"><canvas id="billing-chart-receivable-aging"></canvas></div>
+                <div class="gac-chart-wrap"><canvas id="sales-chart-receivable-aging"></canvas></div>
               </div>
             </div>
           </div>
         </div>
 
         <div class="row g-3 mb-3">
-          <div class="col-lg-4">
+          <div class="col-lg-3">
             <div class="card h-100">
               <div class="card-header d-flex justify-content-between align-items-center">
-                <h3 class="card-title mb-0">Revenue Daily</h3>
-                <a href="<?= e(reports_export_url('modules/reports/billing_gst.php', $baseParams, 'revenue_daily')); ?>" class="btn btn-sm btn-outline-success">CSV</a>
+                <h3 class="card-title mb-0">Sales Daily</h3>
+                <?php if ($canExportData): ?>
+                  <a href="<?= e(reports_export_url('modules/reports/billing_gst.php', $baseParams, 'daily_sales')); ?>" class="btn btn-sm btn-outline-success">CSV</a>
+                <?php endif; ?>
               </div>
               <div class="card-body p-0 table-responsive">
                 <table class="table table-sm table-striped mb-0">
-                  <thead><tr><th>Date</th><th>Invoices</th><th>Revenue</th></tr></thead>
+                  <thead><tr><th>Date</th><th>Invoices</th><th>Sales</th></tr></thead>
                   <tbody>
                     <?php if (empty($revenueDaily)): ?>
                       <tr><td colspan="3" class="text-center text-muted py-4">No rows.</td></tr>
@@ -613,15 +687,17 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             </div>
           </div>
 
-          <div class="col-lg-4">
+          <div class="col-lg-3">
             <div class="card h-100">
               <div class="card-header d-flex justify-content-between align-items-center">
-                <h3 class="card-title mb-0">Revenue Monthly</h3>
-                <a href="<?= e(reports_export_url('modules/reports/billing_gst.php', $baseParams, 'revenue_monthly')); ?>" class="btn btn-sm btn-outline-primary">CSV</a>
+                <h3 class="card-title mb-0">Sales Monthly</h3>
+                <?php if ($canExportData): ?>
+                  <a href="<?= e(reports_export_url('modules/reports/billing_gst.php', $baseParams, 'monthly_sales')); ?>" class="btn btn-sm btn-outline-primary">CSV</a>
+                <?php endif; ?>
               </div>
               <div class="card-body p-0 table-responsive">
                 <table class="table table-sm table-striped mb-0">
-                  <thead><tr><th>Month</th><th>Invoices</th><th>Revenue</th></tr></thead>
+                  <thead><tr><th>Month</th><th>Invoices</th><th>Sales</th></tr></thead>
                   <tbody>
                     <?php if (empty($revenueMonthly)): ?>
                       <tr><td colspan="3" class="text-center text-muted py-4">No rows.</td></tr>
@@ -634,15 +710,40 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             </div>
           </div>
 
-          <div class="col-lg-4">
+          <div class="col-lg-3">
             <div class="card h-100">
               <div class="card-header d-flex justify-content-between align-items-center">
-                <h3 class="card-title mb-0">Revenue Garage-wise</h3>
-                <a href="<?= e(reports_export_url('modules/reports/billing_gst.php', $baseParams, 'revenue_garage')); ?>" class="btn btn-sm btn-outline-info">CSV</a>
+                <h3 class="card-title mb-0">Collections Monthly</h3>
+                <?php if ($canExportData): ?>
+                  <a href="<?= e(reports_export_url('modules/reports/billing_gst.php', $baseParams, 'monthly_collections')); ?>" class="btn btn-sm btn-outline-info">CSV</a>
+                <?php endif; ?>
               </div>
               <div class="card-body p-0 table-responsive">
                 <table class="table table-sm table-striped mb-0">
-                  <thead><tr><th>Garage</th><th>Invoices</th><th>Revenue</th></tr></thead>
+                  <thead><tr><th>Month</th><th>Entries</th><th>Collected</th></tr></thead>
+                  <tbody>
+                    <?php if (empty($collectionMonthly)): ?>
+                      <tr><td colspan="3" class="text-center text-muted py-4">No rows.</td></tr>
+                    <?php else: foreach ($collectionMonthly as $row): ?>
+                      <tr><td><?= e((string) ($row['collection_month'] ?? '')); ?></td><td><?= (int) ($row['payment_count'] ?? 0); ?></td><td><?= e(format_currency((float) ($row['collected_amount'] ?? 0))); ?></td></tr>
+                    <?php endforeach; endif; ?>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+
+          <div class="col-lg-3">
+            <div class="card h-100">
+              <div class="card-header d-flex justify-content-between align-items-center">
+                <h3 class="card-title mb-0">Sales Garage-wise</h3>
+                <?php if ($canExportData): ?>
+                  <a href="<?= e(reports_export_url('modules/reports/billing_gst.php', $baseParams, 'garage_sales')); ?>" class="btn btn-sm btn-outline-secondary">CSV</a>
+                <?php endif; ?>
+              </div>
+              <div class="card-body p-0 table-responsive">
+                <table class="table table-sm table-striped mb-0">
+                  <thead><tr><th>Garage</th><th>Invoices</th><th>Sales</th></tr></thead>
                   <tbody>
                     <?php if (empty($revenueGarageWise)): ?>
                       <tr><td colspan="3" class="text-center text-muted py-4">No rows.</td></tr>
@@ -660,18 +761,27 @@ require_once __DIR__ . '/../../includes/sidebar.php';
           <div class="col-lg-4">
             <div class="card h-100">
               <div class="card-header d-flex justify-content-between align-items-center">
-                <h3 class="card-title mb-0">GST Summary</h3>
-                <a href="<?= e(reports_export_url('modules/reports/billing_gst.php', $baseParams, 'gst_summary')); ?>" class="btn btn-sm btn-outline-warning">CSV</a>
+                <h3 class="card-title mb-0">Invoice Status Snapshot</h3>
+                <?php if ($canExportData): ?>
+                  <a href="<?= e(reports_export_url('modules/reports/billing_gst.php', $baseParams, 'invoice_status')); ?>" class="btn btn-sm btn-outline-primary">CSV</a>
+                <?php endif; ?>
               </div>
-              <div class="card-body">
-                <div><strong>Invoices:</strong> <?= (int) ($gstSummary['invoice_count'] ?? 0); ?></div>
-                <div><strong>Taxable:</strong> <?= e(format_currency((float) ($gstSummary['taxable_total'] ?? 0))); ?></div>
-                <div><strong>CGST:</strong> <?= e(format_currency((float) ($gstSummary['cgst_total'] ?? 0))); ?></div>
-                <div><strong>SGST:</strong> <?= e(format_currency((float) ($gstSummary['sgst_total'] ?? 0))); ?></div>
-                <div><strong>IGST:</strong> <?= e(format_currency((float) ($gstSummary['igst_total'] ?? 0))); ?></div>
-                <div><strong>Total GST:</strong> <?= e(format_currency((float) ($gstSummary['tax_total'] ?? 0))); ?></div>
-                <div><strong>Credit Note GST:</strong> <?= e(format_currency((float) ($creditNoteSummary['tax_total'] ?? 0))); ?></div>
-                <div><strong>Net GST:</strong> <?= e(format_currency($netTaxAfterCredit)); ?></div>
+              <div class="card-body p-0 table-responsive">
+                <table class="table table-sm table-striped mb-0">
+                  <thead><tr><th>Status</th><th>Invoices</th><th>Amount</th></tr></thead>
+                  <tbody>
+                    <?php if (empty($invoiceStatusSummary)): ?>
+                      <tr><td colspan="3" class="text-center text-muted py-4">No rows.</td></tr>
+                    <?php else: foreach ($invoiceStatusSummary as $row): ?>
+                      <?php $status = strtoupper(trim((string) ($row['invoice_status'] ?? 'UNKNOWN'))); ?>
+                      <tr>
+                        <td><span class="badge text-bg-<?= e(sales_invoice_status_badge_class($status)); ?>"><?= e($status); ?></span></td>
+                        <td><?= (int) ($row['invoice_count'] ?? 0); ?></td>
+                        <td><?= e(format_currency((float) ($row['total_amount'] ?? 0))); ?></td>
+                      </tr>
+                    <?php endforeach; endif; ?>
+                  </tbody>
+                </table>
               </div>
             </div>
           </div>
@@ -680,7 +790,9 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             <div class="card h-100">
               <div class="card-header d-flex justify-content-between align-items-center">
                 <h3 class="card-title mb-0">Payment Mode Summary</h3>
-                <a href="<?= e(reports_export_url('modules/reports/billing_gst.php', $baseParams, 'payment_modes')); ?>" class="btn btn-sm btn-outline-secondary">CSV</a>
+                <?php if ($canExportData): ?>
+                  <a href="<?= e(reports_export_url('modules/reports/billing_gst.php', $baseParams, 'payment_modes')); ?>" class="btn btn-sm btn-outline-secondary">CSV</a>
+                <?php endif; ?>
               </div>
               <div class="card-body p-0 table-responsive">
                 <table class="table table-sm table-striped mb-0">
@@ -700,27 +812,26 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 
         <div class="card mb-3">
           <div class="card-header d-flex justify-content-between align-items-center">
-            <h3 class="card-title mb-0">Credit Note GST Register</h3>
-            <a href="<?= e(reports_export_url('modules/reports/billing_gst.php', $baseParams, 'credit_notes')); ?>" class="btn btn-sm btn-outline-warning">CSV</a>
+            <h3 class="card-title mb-0">Top Customers by Sales</h3>
+            <?php if ($canExportData): ?>
+              <a href="<?= e(reports_export_url('modules/reports/billing_gst.php', $baseParams, 'top_customers')); ?>" class="btn btn-sm btn-outline-success">CSV</a>
+            <?php endif; ?>
           </div>
           <div class="card-body p-0 table-responsive">
             <table class="table table-sm table-striped mb-0">
-              <thead><tr><th>Credit Note</th><th>Date</th><th>Customer</th><th>GSTIN</th><th>Taxable</th><th>CGST</th><th>SGST</th><th>IGST</th><th>Total GST</th><th>Total</th></tr></thead>
+              <thead><tr><th>Customer</th><th>Phone</th><th>Invoices</th><th>Billed</th><th>Collected</th><th>Outstanding</th><th>Collection %</th></tr></thead>
               <tbody>
-                <?php if (empty($creditNoteRows)): ?>
-                  <tr><td colspan="10" class="text-center text-muted py-4">No credit notes in selected range.</td></tr>
-                <?php else: foreach ($creditNoteRows as $row): ?>
+                <?php if (empty($topCustomers)): ?>
+                  <tr><td colspan="7" class="text-center text-muted py-4">No customer rows.</td></tr>
+                <?php else: foreach ($topCustomers as $row): ?>
                   <tr>
-                    <td><?= e((string) ($row['credit_note_number'] ?? '')); ?></td>
-                    <td><?= e((string) ($row['credit_note_date'] ?? '')); ?></td>
                     <td><?= e((string) ($row['customer_name'] ?? '')); ?></td>
-                    <td><?= e((string) ($row['customer_gstin'] ?? '-')); ?></td>
-                    <td><?= e(format_currency((float) ($row['taxable_amount'] ?? 0))); ?></td>
-                    <td><?= e(format_currency((float) ($row['cgst_amount'] ?? 0))); ?></td>
-                    <td><?= e(format_currency((float) ($row['sgst_amount'] ?? 0))); ?></td>
-                    <td><?= e(format_currency((float) ($row['igst_amount'] ?? 0))); ?></td>
-                    <td><?= e(format_currency((float) ($row['total_tax_amount'] ?? 0))); ?></td>
-                    <td><?= e(format_currency((float) ($row['total_amount'] ?? 0))); ?></td>
+                    <td><?= e((string) ($row['customer_phone'] ?? '-')); ?></td>
+                    <td><?= (int) ($row['invoice_count'] ?? 0); ?></td>
+                    <td><?= e(format_currency((float) ($row['billed_total'] ?? 0))); ?></td>
+                    <td><?= e(format_currency((float) ($row['collected_total'] ?? 0))); ?></td>
+                    <td><?= e(format_currency((float) ($row['outstanding_total'] ?? 0))); ?></td>
+                    <td><?= e(number_format((float) ($row['collection_rate'] ?? 0), 2)); ?>%</td>
                   </tr>
                 <?php endforeach; endif; ?>
               </tbody>
@@ -730,19 +841,25 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 
         <div class="card mb-3">
           <div class="card-header d-flex justify-content-between align-items-center">
-            <h3 class="card-title mb-0">Outstanding Receivables</h3>
-            <a href="<?= e(reports_export_url('modules/reports/billing_gst.php', $baseParams, 'receivables')); ?>" class="btn btn-sm btn-outline-primary">CSV</a>
+            <div>
+              <h3 class="card-title mb-0">Outstanding Receivables</h3>
+              <small class="text-muted">Top 150 receivables by overdue days and amount</small>
+            </div>
+            <?php if ($canExportData): ?>
+              <a href="<?= e(reports_export_url('modules/reports/billing_gst.php', $baseParams, 'receivables')); ?>" class="btn btn-sm btn-outline-primary">CSV</a>
+            <?php endif; ?>
           </div>
           <div class="card-body p-0 table-responsive">
             <table class="table table-sm table-striped mb-0">
-              <thead><tr><th>Invoice</th><th>Date</th><th>Customer</th><th>Discount</th><th>Outstanding</th><th>Overdue</th></tr></thead>
+              <thead><tr><th>Invoice</th><th>Invoice Date</th><th>Due Date</th><th>Customer</th><th>Discount</th><th>Outstanding</th><th>Overdue</th></tr></thead>
               <tbody>
                 <?php if (empty($outstandingReceivables)): ?>
-                  <tr><td colspan="6" class="text-center text-muted py-4">No outstanding receivables.</td></tr>
+                  <tr><td colspan="7" class="text-center text-muted py-4">No outstanding receivables.</td></tr>
                 <?php else: foreach ($outstandingReceivables as $row): ?>
                   <tr>
                     <td><?= e((string) ($row['invoice_number'] ?? '')); ?></td>
                     <td><?= e((string) ($row['invoice_date'] ?? '')); ?></td>
+                    <td><?= e((string) ($row['due_date'] ?? '-')); ?></td>
                     <td><?= e((string) ($row['customer_name'] ?? '')); ?></td>
                     <td>
                       <?= e(format_currency((float) ($row['discount_amount'] ?? 0))); ?>
@@ -770,50 +887,21 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       return;
     }
 
-    var form = document.getElementById('billing-report-filter-form');
-    var content = document.getElementById('billing-report-content');
+    var form = document.getElementById('sales-report-filter-form');
+    var content = document.getElementById('sales-report-content');
     if (!form || !content) {
       return;
     }
 
-    var charts = window.GacCharts.createRegistry('billing-report');
+    var charts = window.GacCharts.createRegistry('sales-report');
 
     function renderCharts() {
       var payload = window.GacCharts.parsePayload(content);
-      if (!payload || !payload.gst_breakdown) {
+      if (!payload) {
         return;
       }
 
-      charts.render('#billing-chart-gst-breakdown', {
-        type: 'bar',
-        data: {
-          labels: payload.gst_breakdown.labels || [],
-          datasets: [{
-            label: 'CGST',
-            data: payload.gst_breakdown.cgst || [],
-            backgroundColor: window.GacCharts.palette.blue
-          }, {
-            label: 'SGST',
-            data: payload.gst_breakdown.sgst || [],
-            backgroundColor: window.GacCharts.palette.green
-          }, {
-            label: 'IGST',
-            data: payload.gst_breakdown.igst || [],
-            backgroundColor: window.GacCharts.palette.orange
-          }]
-        },
-        options: {
-          responsive: true,
-          maintainAspectRatio: false,
-          scales: {
-            x: { stacked: true },
-            y: { stacked: true, beginAtZero: true }
-          },
-          plugins: { legend: { position: 'bottom' } }
-        }
-      }, { emptyMessage: 'No GST tax rows for selected range.' });
-
-      charts.render('#billing-chart-sales-trend', {
+      charts.render('#sales-chart-sales-trend', {
         type: 'line',
         data: {
           labels: payload.monthly_sales ? payload.monthly_sales.labels : [],
@@ -829,7 +917,23 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         options: window.GacCharts.commonOptions()
       }, { emptyMessage: 'No monthly sales rows in selected range.' });
 
-      charts.render('#billing-chart-receivable-aging', {
+      charts.render('#sales-chart-collection-trend', {
+        type: 'line',
+        data: {
+          labels: payload.monthly_collections ? payload.monthly_collections.labels : [],
+          datasets: [{
+            label: 'Collections',
+            data: payload.monthly_collections ? payload.monthly_collections.values : [],
+            borderColor: window.GacCharts.palette.green,
+            backgroundColor: window.GacCharts.palette.green + '33',
+            fill: true,
+            tension: 0.25
+          }]
+        },
+        options: window.GacCharts.commonOptions()
+      }, { emptyMessage: 'No monthly collection rows in selected range.' });
+
+      charts.render('#sales-chart-receivable-aging', {
         type: 'bar',
         data: {
           labels: payload.receivable_aging ? payload.receivable_aging.labels : [],
@@ -854,7 +958,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       form: form,
       target: content,
       mode: 'full',
-      sourceSelector: '#billing-report-content',
+      sourceSelector: '#sales-report-content',
       afterUpdate: function () {
         renderCharts();
       }

@@ -76,7 +76,7 @@ $summaryStmt = db()->prepare(
             COALESCE(SUM(ja.adjusted_amount), 0) AS adjusted_amount,
             COALESCE(SUM(ja.balance_amount), 0) AS balance_amount
      FROM job_advances ja
-     WHERE ' . $whereSql . '\n       ' . $garageScopeSql
+     WHERE ' . $whereSql . ' ' . $garageScopeSql
 );
 $summaryStmt->execute($params);
 $summary = $summaryStmt->fetch() ?: [
@@ -100,7 +100,7 @@ $rowsStmt = db()->prepare(
      LEFT JOIN vehicles v ON v.id = jc.vehicle_id
      LEFT JOIN garages g ON g.id = ja.garage_id
      LEFT JOIN users u ON u.id = ja.created_by
-     WHERE ' . $whereSql . '\n       ' . $garageScopeSql . '
+     WHERE ' . $whereSql . ' ' . $garageScopeSql . '
      ORDER BY ja.id DESC
      LIMIT 500'
 );

@@ -2348,11 +2348,13 @@ $partsTotal = (float) ($totals['parts_total'] ?? 0);
 $estimatedTotal = round($laborTotal + $partsTotal, 2);
 
 $invoiceStmt = db()->prepare(
-    'SELECT id, invoice_number, grand_total, payment_status, invoice_status
-     FROM invoices
-     WHERE job_card_id = :job_id
-       AND company_id = :company_id
-       AND garage_id = :garage_id
+    'SELECT i.id, i.invoice_number, i.grand_total, i.payment_status, i.invoice_status,
+            COALESCE((SELECT SUM(p.amount) FROM payments p WHERE p.invoice_id = i.id), 0) AS paid_amount
+     FROM invoices i
+     WHERE i.job_card_id = :job_id
+       AND i.company_id = :company_id
+       AND i.garage_id = :garage_id
+     ORDER BY i.id DESC
      LIMIT 1'
 );
 $invoiceStmt->execute([
@@ -2361,6 +2363,45 @@ $invoiceStmt->execute([
     'garage_id' => $garageId,
 ]);
 $invoice = $invoiceStmt->fetch() ?: null;
+$advanceSummary = [
+    'advance_amount' => 0.0,
+    'adjusted_amount' => 0.0,
+    'balance_amount' => 0.0,
+    'receipt_count' => 0,
+];
+if (table_columns('job_advances') !== []) {
+    $advanceStmt = db()->prepare(
+        'SELECT COALESCE(SUM(advance_amount), 0) AS advance_amount,
+                COALESCE(SUM(adjusted_amount), 0) AS adjusted_amount,
+                COALESCE(SUM(balance_amount), 0) AS balance_amount,
+                COUNT(*) AS receipt_count
+         FROM job_advances
+         WHERE company_id = :company_id
+           AND garage_id = :garage_id
+           AND job_card_id = :job_id
+           AND status_code = "ACTIVE"'
+    );
+    $advanceStmt->execute([
+        'company_id' => $companyId,
+        'garage_id' => $garageId,
+        'job_id' => $jobId,
+    ]);
+    $advanceRow = $advanceStmt->fetch() ?: [];
+    $advanceSummary['advance_amount'] = round((float) ($advanceRow['advance_amount'] ?? 0), 2);
+    $advanceSummary['adjusted_amount'] = round((float) ($advanceRow['adjusted_amount'] ?? 0), 2);
+    $advanceSummary['balance_amount'] = round((float) ($advanceRow['balance_amount'] ?? 0), 2);
+    $advanceSummary['receipt_count'] = (int) ($advanceRow['receipt_count'] ?? 0);
+}
+$invoiceTotalAmount = $invoice ? round((float) ($invoice['grand_total'] ?? 0), 2) : $estimatedTotal;
+if ($invoiceTotalAmount <= 0.009) {
+    $invoiceTotalAmount = $estimatedTotal;
+}
+$invoiceReceivedAmount = $invoice ? round((float) ($invoice['paid_amount'] ?? 0), 2) : 0.0;
+$advanceReceivedAmount = (float) ($advanceSummary['advance_amount'] ?? 0);
+$advanceReceiptCount = (int) ($advanceSummary['receipt_count'] ?? 0);
+$advanceReceiptLabel = $advanceReceiptCount === 1 ? 'receipt' : 'receipts';
+$totalReceivedAmount = round($invoiceReceivedAmount + $advanceReceivedAmount, 2);
+$pendingAmount = max(0.0, round($invoiceTotalAmount - $totalReceivedAmount, 2));
 $canPrintJob = has_permission('job.print') || has_permission('job.manage') || has_permission('job.view');
 $jobPrintRestricted = $jobStatus === 'CANCELLED' || normalize_status_code((string) ($job['status_code'] ?? 'ACTIVE')) === 'DELETED';
 $canPrintRestricted = has_permission('job.print.cancelled') || has_permission('job.manage');
@@ -2499,7 +2540,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       <?php endif; ?>
 
       <div class="row g-3 mb-3">
-        <div class="col-md-3">
+        <div class="col-lg-2 col-md-4">
           <div class="small-box text-bg-<?= e(job_status_badge_class((string) $job['status'])); ?>">
             <div class="inner">
               <h4><?= e((string) $job['status']); ?></h4>
@@ -2508,7 +2549,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             <span class="small-box-icon"><i class="bi bi-diagram-3"></i></span>
           </div>
         </div>
-        <div class="col-md-3">
+        <div class="col-lg-2 col-md-4">
           <div class="small-box text-bg-success">
             <div class="inner">
               <h4><?= e(format_currency($laborTotal)); ?></h4>
@@ -2517,7 +2558,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             <span class="small-box-icon"><i class="bi bi-tools"></i></span>
           </div>
         </div>
-        <div class="col-md-3">
+        <div class="col-lg-2 col-md-4">
           <div class="small-box text-bg-warning">
             <div class="inner">
               <h4><?= e(format_currency($partsTotal)); ?></h4>
@@ -2526,13 +2567,34 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             <span class="small-box-icon"><i class="bi bi-box-seam"></i></span>
           </div>
         </div>
-        <div class="col-md-3">
+        <div class="col-lg-2 col-md-4">
           <div class="small-box text-bg-danger">
             <div class="inner">
               <h4><?= e(format_currency($estimatedTotal)); ?></h4>
               <p>Estimated Total</p>
             </div>
             <span class="small-box-icon"><i class="bi bi-cash-stack"></i></span>
+          </div>
+        </div>
+        <div class="col-lg-2 col-md-4">
+          <div class="small-box text-bg-info">
+            <div class="inner">
+              <h4><?= e(format_currency($totalReceivedAmount)); ?></h4>
+              <p>Received Amount</p>
+              <?php if ($advanceReceivedAmount > 0.009): ?>
+                <small>Advance: <?= e(format_currency($advanceReceivedAmount)); ?></small>
+              <?php endif; ?>
+            </div>
+            <span class="small-box-icon"><i class="bi bi-wallet2"></i></span>
+          </div>
+        </div>
+        <div class="col-lg-2 col-md-4">
+          <div class="small-box text-bg-primary">
+            <div class="inner">
+              <h4><?= e(format_currency($pendingAmount)); ?></h4>
+              <p>Pending Amount</p>
+            </div>
+            <span class="small-box-icon"><i class="bi bi-hourglass-split"></i></span>
           </div>
         </div>
       </div>
@@ -2549,6 +2611,9 @@ require_once __DIR__ . '/../../includes/sidebar.php';
               <p class="mb-2"><strong>Service Advisor:</strong> <?= e((string) ($job['advisor_name'] ?? '-')); ?></p>
               <p class="mb-2"><strong>Assigned Staff:</strong> <?= e((string) (($job['assigned_staff'] ?? '') !== '' ? $job['assigned_staff'] : 'Unassigned')); ?></p>
               <p class="mb-2"><strong>Customer:</strong> <?= e((string) $job['customer_name']); ?> (<?= e((string) $job['customer_phone']); ?>)</p>
+              <?php if ($advanceReceivedAmount > 0.009): ?>
+                <p class="mb-2"><strong>Advance Received:</strong> <?= e(format_currency($advanceReceivedAmount)); ?> (<?= e(number_format($advanceReceiptCount)); ?> <?= e($advanceReceiptLabel); ?>)</p>
+              <?php endif; ?>
               <p class="mb-2"><strong>Vehicle:</strong> <?= e((string) $job['registration_no']); ?> | <?= e((string) $job['brand']); ?> <?= e((string) $job['model']); ?> <?= e((string) ($job['variant'] ?? '')); ?></p>
               <?php if ($jobOdometerEnabled): ?>
                 <p class="mb-2"><strong>Odometer:</strong> <?= e(number_format((float) ($job['odometer_km'] ?? 0), 0)); ?> KM</p>
@@ -3034,7 +3099,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                     <label class="form-label">Expected Return</label>
                     <input id="add-labor-expected-return" type="date" name="outsource_expected_return_date" class="form-control" <?= $jobLocked ? 'disabled' : ''; ?>>
                   </div>
-                  <div class="col-md-1">
+                  <div class="col-md-2">
                     <label class="form-label">Qty</label>
                     <input type="number" step="0.01" min="0.01" name="quantity" class="form-control" value="1" required <?= $jobLocked ? 'disabled' : ''; ?>>
                   </div>
@@ -3306,9 +3371,9 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                     <small class="text-muted d-block mt-1">Keyboard: <kbd>/</kbd> search, <kbd>Alt+1</kbd>/<kbd>Alt+2</kbd>/<kbd>Alt+3</kbd> mode.</small>
                     <small id="add-part-stock-hint" class="text-muted d-block mt-1"></small>
                   </div>
-                  <div class="col-md-1">
+                  <div class="col-md-2">
                     <label class="form-label">Qty</label>
-                    <input id="add-part-qty" type="number" step="0.01" min="0.01" name="quantity" class="form-control" value="1" required <?= $jobLocked ? 'disabled' : ''; ?>>
+                    <input id="add-part-qty" type="number" step="1" min="1" name="quantity" class="form-control" value="1" required <?= $jobLocked ? 'disabled' : ''; ?>>
                   </div>
                   <div class="col-md-2">
                     <label class="form-label">Rate</label>
@@ -3392,7 +3457,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                               <input type="hidden" name="_action" value="update_part">
                               <input type="hidden" name="job_part_id" value="<?= (int) $line['id']; ?>">
                               <div class="col-md-3">
-                                <input type="number" step="<?= $lineAllowsDecimal ? '0.01' : '1'; ?>" min="0.01" name="quantity" class="form-control form-control-sm" value="<?= e((string) $line['quantity']); ?>" required>
+                                <input type="number" step="<?= $lineAllowsDecimal ? '0.01' : '1'; ?>" min="<?= $lineAllowsDecimal ? '0.01' : '1'; ?>" name="quantity" class="form-control form-control-sm" value="<?= e((string) $line['quantity']); ?>" required>
                                 <small class="text-muted"><?= e($lineUnitCode); ?><?= $lineAllowsDecimal ? ' (decimal allowed)' : ' (whole only)'; ?></small>
                               </div>
                               <div class="col-md-3">
@@ -3980,10 +4045,16 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       var unitLabel = selected.getAttribute('data-unit-label') || unitCode;
       var allowDecimal = (selected.getAttribute('data-allow-decimal') || '1') === '1';
       partQty.step = allowDecimal ? '0.01' : '1';
+      partQty.min = allowDecimal ? '0.01' : '1';
       if (!allowDecimal) {
         var currentQty = readNumber(partQty.value || 0);
         var wholeQty = Math.max(1, Math.round(currentQty));
         partQty.value = String(wholeQty);
+      } else {
+        var decimalQty = readNumber(partQty.value || 0);
+        if (decimalQty < 0.01) {
+          partQty.value = '1';
+        }
       }
       var visCompatible = (selected.getAttribute('data-vis-compatible') || '0') === '1';
       var unitRule = allowDecimal ? 'decimal quantity allowed' : 'whole quantity only';
