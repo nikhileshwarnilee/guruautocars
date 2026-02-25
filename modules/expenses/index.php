@@ -230,24 +230,90 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             redirect('modules/expenses/index.php');
         }
 
-        $stmt = db()->prepare(
-            'UPDATE expense_categories
-             SET status_code = "INACTIVE",
-                  updated_by = :updated_by
-             WHERE id = :id AND company_id = :company_id AND garage_id = :garage_id'
-        );
-        $stmt->execute([
-            'updated_by' => $_SESSION['user_id'] ?? null,
-            'id' => $categoryId,
-            'company_id' => $companyId,
-            'garage_id' => $garageId,
-        ]);
-        log_audit('expenses', 'category_inactivate', $categoryId, 'Inactivated expense category', [
-            'entity' => 'expense_category',
-            'company_id' => $companyId,
-            'garage_id' => $garageId,
-        ]);
-        flash_set('expense_success', 'Category deleted.', 'success');
+        $pdo = db();
+        $pdo->beginTransaction();
+        try {
+            $safeDeleteValidation = safe_delete_validate_post_confirmation('expense_category', $categoryId, [
+                'operation' => 'delete',
+                'reason_field' => 'deletion_reason',
+            ]);
+            $deletionReason = (string) ($safeDeleteValidation['reason'] ?? '');
+
+            $catStmt = $pdo->prepare(
+                'SELECT id, category_name, status_code
+                 FROM expense_categories
+                 WHERE id = :id AND company_id = :company_id AND garage_id = :garage_id
+                 LIMIT 1
+                 FOR UPDATE'
+            );
+            $catStmt->execute([
+                'id' => $categoryId,
+                'company_id' => $companyId,
+                'garage_id' => $garageId,
+            ]);
+            $category = $catStmt->fetch();
+            if (!$category) {
+                throw new RuntimeException('Category not found.');
+            }
+            $statusCode = strtoupper(trim((string) ($category['status_code'] ?? 'ACTIVE')));
+            if (in_array($statusCode, ['INACTIVE', 'DELETED'], true)) {
+                throw new RuntimeException('Category is already inactive.');
+            }
+
+            $categoryColumns = table_columns('expense_categories');
+            $setParts = [
+                'status_code = "INACTIVE"',
+                'updated_by = :updated_by',
+            ];
+            $params = [
+                'updated_by' => $_SESSION['user_id'] ?? null,
+                'id' => $categoryId,
+                'company_id' => $companyId,
+                'garage_id' => $garageId,
+            ];
+            if (in_array('deleted_at', $categoryColumns, true)) {
+                $setParts[] = 'deleted_at = COALESCE(deleted_at, NOW())';
+            }
+            if (in_array('deleted_by', $categoryColumns, true)) {
+                $setParts[] = 'deleted_by = :deleted_by';
+                $params['deleted_by'] = $_SESSION['user_id'] ?? null;
+            }
+            if (in_array('deletion_reason', $categoryColumns, true)) {
+                $setParts[] = 'deletion_reason = :deletion_reason';
+                $params['deletion_reason'] = $deletionReason !== '' ? $deletionReason : null;
+            }
+
+            $stmt = $pdo->prepare(
+                'UPDATE expense_categories
+                 SET ' . implode(', ', $setParts) . '
+                 WHERE id = :id AND company_id = :company_id AND garage_id = :garage_id'
+            );
+            $stmt->execute($params);
+
+            log_audit('expenses', 'category_inactivate', $categoryId, 'Inactivated expense category', [
+                'entity' => 'expense_category',
+                'company_id' => $companyId,
+                'garage_id' => $garageId,
+                'metadata' => [
+                    'category_name' => (string) ($category['category_name'] ?? ''),
+                    'deletion_reason' => $deletionReason,
+                ],
+            ]);
+            $pdo->commit();
+            safe_delete_log_cascade('expense_category', 'delete', $categoryId, $safeDeleteValidation, [
+                'metadata' => [
+                    'company_id' => $companyId,
+                    'garage_id' => $garageId,
+                    'category_name' => (string) ($category['category_name'] ?? ''),
+                ],
+            ]);
+            flash_set('expense_success', 'Category deleted.', 'success');
+        } catch (Throwable $exception) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+            flash_set('expense_error', $exception->getMessage(), 'danger');
+        }
         redirect('modules/expenses/index.php');
     }
 
@@ -424,6 +490,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $pdo = db();
         $pdo->beginTransaction();
         try {
+            $safeDeleteValidation = safe_delete_validate_post_confirmation('expense', $expenseId, [
+                'operation' => 'reverse',
+                'reason_field' => 'reverse_reason',
+            ]);
             $expStmt = $pdo->prepare(
                 'SELECT * FROM expenses WHERE id = :id AND company_id = :company_id AND garage_id = :garage_id FOR UPDATE'
             );
@@ -474,9 +544,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             log_audit('expenses', 'reverse', $expenseId, 'Expense reversed', [
                 'entity' => 'expense',
                 'source' => 'MANUAL',
-                'after' => ['reversal_id' => (int) $pdo->lastInsertId()],
+                'after' => [
+                    'reversal_id' => (int) $pdo->lastInsertId(),
+                    'reverse_reason' => $reverseReason,
+                ],
             ]);
             $pdo->commit();
+            safe_delete_log_cascade('expense', 'reverse', $expenseId, $safeDeleteValidation, [
+                'reversal_references' => ['EXPREV#' . $reversalId],
+                'metadata' => [
+                    'company_id' => $companyId,
+                    'garage_id' => $garageId,
+                    'reversal_id' => $reversalId,
+                ],
+            ]);
             flash_set('expense_success', 'Expense reversed.', 'success');
         } catch (Throwable $exception) {
             $pdo->rollBack();
@@ -891,7 +972,13 @@ include __DIR__ . '/../../includes/sidebar.php';
           <h5 class="modal-title">Record Expense</h5>
           <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
         </div>
-        <form method="post" class="ajax-form">
+        <form method="post"
+              class="ajax-form"
+              data-safe-delete
+              data-safe-delete-entity="expense"
+              data-safe-delete-record-field="expense_id"
+              data-safe-delete-operation="reverse"
+              data-safe-delete-reason-field="reverse_reason">
           <div class="modal-body">
             <?= csrf_field(); ?>
             <input type="hidden" name="_action" value="record_expense" />
@@ -1070,7 +1157,13 @@ include __DIR__ . '/../../includes/sidebar.php';
                         </select>
                         <button type="submit" class="btn btn-sm btn-outline-primary">Update</button>
                       </form>
-                      <form method="post" class="ajax-form mt-1" data-confirm="Inactivate this category?">
+                      <form method="post"
+                            class="ajax-form mt-1"
+                            data-safe-delete
+                            data-safe-delete-entity="expense_category"
+                            data-safe-delete-record-field="category_id"
+                            data-safe-delete-operation="delete"
+                            data-safe-delete-reason-field="deletion_reason">
                         <?= csrf_field(); ?>
                         <input type="hidden" name="_action" value="delete_category" />
                         <input type="hidden" name="category_id" value="<?= (int) $category['id'] ?>" />

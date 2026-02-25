@@ -753,6 +753,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $pdo = db();
         $pdo->beginTransaction();
         try {
+            $safeDeleteValidation = safe_delete_validate_post_confirmation('outsourced_payment', $paymentId, [
+                'operation' => 'reverse',
+                'reason_field' => 'reverse_reason',
+            ]);
             $paymentStmt = $pdo->prepare(
                 'SELECT p.*,
                         ow.current_status,
@@ -886,6 +890,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             ow_sync_job_labor_payable($pdo, $workId, $companyId, $garageId, $userId);
 
             $pdo->commit();
+            safe_delete_log_cascade('outsourced_payment', 'reverse', $paymentId, $safeDeleteValidation, [
+                'reversal_references' => ['OWPAYREV#' . $reversalId],
+                'metadata' => [
+                    'company_id' => $companyId,
+                    'garage_id' => $garageId,
+                    'work_id' => $workId,
+                    'reversal_id' => $reversalId,
+                ],
+            ]);
             log_audit('outsourced_works', 'payment_reverse', $workId, 'Reversed outsourced payment #' . $paymentId);
             flash_set('outsource_success', 'Payment reversed successfully.', 'success');
         } catch (Throwable $exception) {
@@ -1560,7 +1573,12 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             <div class="col-lg-7">
               <div class="card card-success h-100">
                 <div class="card-header"><h3 class="card-title">Record Outsourced Payment</h3></div>
-                <form method="post">
+                <form method="post"
+                      data-safe-delete
+                      data-safe-delete-entity="outsourced_payment"
+                      data-safe-delete-record-field="payment_id"
+                      data-safe-delete-operation="reverse"
+                      data-safe-delete-reason-field="reverse_reason">
                   <div class="card-body row g-2">
                     <?= csrf_field(); ?>
                     <input type="hidden" name="_action" value="add_payment" />

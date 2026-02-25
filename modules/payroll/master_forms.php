@@ -526,7 +526,14 @@ include __DIR__ . '/../../includes/sidebar.php';
   <div class="modal-dialog modal-lg">
     <div class="modal-content">
       <div class="modal-header"><h5 class="modal-title" id="structure-modal-title">Create Salary Structure</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
-      <form method="post" action="<?= e(url('modules/payroll/index.php')); ?>" class="ajax-form">
+      <form method="post"
+            action="<?= e(url('modules/payroll/index.php')); ?>"
+            class="ajax-form"
+            data-safe-delete
+            data-safe-delete-entity="payroll_loan_payment"
+            data-safe-delete-record-field="payment_id"
+            data-safe-delete-operation="reverse"
+            data-safe-delete-reason-field="reverse_reason">
         <div class="modal-body">
           <?= csrf_field(); ?>
           <input type="hidden" name="_action" value="save_structure" />
@@ -784,6 +791,8 @@ include __DIR__ . '/../../includes/sidebar.php';
         var entryId = reverseBtn.getAttribute('data-id') || '';
         if (idField === 'structure') {
           setValue('master-reverse-structure-id', entryId);
+          setValue('master-safe-delete-entity', 'payroll_salary_structure');
+          setValue('master-safe-delete-record-id', entryId);
         }
         if (idField === 'advance') {
           setValue('master-reverse-advance-id', entryId);

@@ -489,25 +489,90 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
       redirect($masterFormReturn);
     }
 
-    $stmt = db()->prepare(
-      'UPDATE payroll_salary_structures
-       SET status_code = "INACTIVE",
-         updated_by = :updated_by
-       WHERE id = :id AND company_id = :company_id AND garage_id = :garage_id'
-    );
-    $stmt->execute([
-      'updated_by' => $_SESSION['user_id'] ?? null,
-      'id' => $structureId,
-      'company_id' => $companyId,
-      'garage_id' => $garageId,
-    ]);
+    $pdo = db();
+    $pdo->beginTransaction();
+    try {
+      $safeDeleteValidation = safe_delete_validate_post_confirmation('payroll_salary_structure', $structureId, [
+        'operation' => 'delete',
+        'reason_field' => 'deletion_reason',
+      ]);
+      $deletionReason = (string) ($safeDeleteValidation['reason'] ?? '');
 
-    log_audit('payroll', 'salary_structure_inactivate', $structureId, 'Inactivated salary structure', [
-      'entity' => 'salary_structure',
-      'company_id' => $companyId,
-      'garage_id' => $garageId,
-    ]);
-    flash_set('payroll_success', 'Salary structure removed.', 'success');
+      $structureStmt = $pdo->prepare(
+        'SELECT id, user_id, status_code
+         FROM payroll_salary_structures
+         WHERE id = :id AND company_id = :company_id AND garage_id = :garage_id
+         LIMIT 1
+         FOR UPDATE'
+      );
+      $structureStmt->execute([
+        'id' => $structureId,
+        'company_id' => $companyId,
+        'garage_id' => $garageId,
+      ]);
+      $structure = $structureStmt->fetch();
+      if (!$structure) {
+        throw new RuntimeException('Salary structure not found.');
+      }
+      $currentStatus = strtoupper(trim((string) ($structure['status_code'] ?? 'ACTIVE')));
+      if (in_array($currentStatus, ['INACTIVE', 'DELETED'], true)) {
+        throw new RuntimeException('Salary structure is already inactive.');
+      }
+
+      $structureColumns = table_columns('payroll_salary_structures');
+      $setParts = [
+        'status_code = "INACTIVE"',
+        'updated_by = :updated_by',
+      ];
+      $params = [
+        'updated_by' => $_SESSION['user_id'] ?? null,
+        'id' => $structureId,
+        'company_id' => $companyId,
+        'garage_id' => $garageId,
+      ];
+      if (in_array('deleted_at', $structureColumns, true)) {
+        $setParts[] = 'deleted_at = COALESCE(deleted_at, NOW())';
+      }
+      if (in_array('deleted_by', $structureColumns, true)) {
+        $setParts[] = 'deleted_by = :deleted_by';
+        $params['deleted_by'] = $_SESSION['user_id'] ?? null;
+      }
+      if (in_array('deletion_reason', $structureColumns, true)) {
+        $setParts[] = 'deletion_reason = :deletion_reason';
+        $params['deletion_reason'] = $deletionReason !== '' ? $deletionReason : null;
+      }
+
+      $stmt = $pdo->prepare(
+        'UPDATE payroll_salary_structures
+         SET ' . implode(', ', $setParts) . '
+         WHERE id = :id AND company_id = :company_id AND garage_id = :garage_id'
+      );
+      $stmt->execute($params);
+
+      log_audit('payroll', 'salary_structure_inactivate', $structureId, 'Inactivated salary structure', [
+        'entity' => 'salary_structure',
+        'company_id' => $companyId,
+        'garage_id' => $garageId,
+        'metadata' => [
+          'user_id' => (int) ($structure['user_id'] ?? 0),
+          'deletion_reason' => $deletionReason,
+        ],
+      ]);
+      $pdo->commit();
+      safe_delete_log_cascade('payroll_salary_structure', 'delete', $structureId, $safeDeleteValidation, [
+        'metadata' => [
+          'company_id' => $companyId,
+          'garage_id' => $garageId,
+          'user_id' => (int) ($structure['user_id'] ?? 0),
+        ],
+      ]);
+      flash_set('payroll_success', 'Salary structure removed.', 'success');
+    } catch (Throwable $exception) {
+      if ($pdo->inTransaction()) {
+        $pdo->rollBack();
+      }
+      flash_set('payroll_error', $exception->getMessage(), 'danger');
+    }
     redirect($masterFormReturn);
   }
 
@@ -990,6 +1055,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $pdo = db();
         $pdo->beginTransaction();
         try {
+            $safeDeleteValidation = safe_delete_validate_post_confirmation('payroll_loan_payment', $paymentId, [
+                'operation' => 'reverse',
+                'reason_field' => 'reverse_reason',
+            ]);
             $paymentStmt = $pdo->prepare(
                 'SELECT lp.*, pl.id AS loan_id, pl.total_amount
                  FROM payroll_loan_payments lp
@@ -1082,6 +1151,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 ],
             ]);
             $pdo->commit();
+            safe_delete_log_cascade('payroll_loan_payment', 'reverse', $paymentId, $safeDeleteValidation, [
+                'reversal_references' => ['PLPAYREV#' . $reversalId],
+                'metadata' => [
+                    'company_id' => $companyId,
+                    'garage_id' => $garageId,
+                    'loan_id' => (int) ($payment['loan_id'] ?? 0),
+                    'reversal_id' => $reversalId,
+                ],
+            ]);
             flash_set('payroll_success', 'Loan payment reversed.', 'success');
         } catch (Throwable $exception) {
             $pdo->rollBack();
@@ -1363,6 +1441,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $pdo = db();
         $pdo->beginTransaction();
         try {
+            $safeDeleteValidation = safe_delete_validate_post_confirmation('payroll_salary_entry', $itemId, [
+                'operation' => 'reverse',
+                'reason_field' => 'reverse_reason',
+            ]);
             $itemStmt = $pdo->prepare(
                 'SELECT psi.*, pss.id AS sheet_id, pss.status AS sheet_status
                  FROM payroll_salary_items psi
@@ -1464,6 +1546,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             ]);
 
             $pdo->commit();
+            safe_delete_log_cascade('payroll_salary_entry', 'reverse', $itemId, $safeDeleteValidation, [
+                'metadata' => [
+                    'company_id' => $companyId,
+                    'garage_id' => $garageId,
+                    'sheet_id' => (int) ($item['sheet_id'] ?? 0),
+                ],
+            ]);
             flash_set('payroll_success', 'Salary entry reversed successfully.', 'success');
         } catch (Throwable $exception) {
             $pdo->rollBack();
@@ -1615,6 +1704,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $pdo = db();
         $pdo->beginTransaction();
         try {
+            $safeDeleteValidation = safe_delete_validate_post_confirmation('payroll_salary_payment', $paymentId, [
+                'operation' => 'reverse',
+                'reason_field' => 'reverse_reason',
+            ]);
             $paymentStmt = $pdo->prepare(
                 'SELECT psp.*, psi.net_payable, pss.id AS sheet_id, pss.salary_month
                  FROM payroll_salary_payments psp
@@ -1733,6 +1826,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             );
 
             $pdo->commit();
+            safe_delete_log_cascade('payroll_salary_payment', 'reverse', $paymentId, $safeDeleteValidation, [
+                'reversal_references' => ['PSPAYREV#' . $reversalId],
+                'metadata' => [
+                    'company_id' => $companyId,
+                    'garage_id' => $garageId,
+                    'salary_item_id' => (int) ($payment['salary_item_id'] ?? 0),
+                    'sheet_id' => (int) ($payment['sheet_id'] ?? 0),
+                    'reversal_id' => $reversalId,
+                ],
+            ]);
 
             flash_set('payroll_success', 'Salary payment reversed.', 'success');
         } catch (Throwable $exception) {
@@ -2364,7 +2467,13 @@ include __DIR__ . '/../../includes/sidebar.php';
           <h5 class="modal-title">Edit Salary Row</h5>
           <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
         </div>
-        <form method="post" class="ajax-form">
+        <form method="post"
+              class="ajax-form"
+              data-safe-delete
+              data-safe-delete-entity="payroll_salary_entry"
+              data-safe-delete-record-field="item_id"
+              data-safe-delete-operation="reverse"
+              data-safe-delete-reason-field="reverse_reason">
           <div class="modal-body">
             <?= csrf_field(); ?>
             <input type="hidden" name="_action" value="update_item" />
@@ -2429,7 +2538,13 @@ include __DIR__ . '/../../includes/sidebar.php';
           <h5 class="modal-title">Record Salary Payment</h5>
           <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
         </div>
-        <form method="post" class="ajax-form">
+        <form method="post"
+              class="ajax-form"
+              data-safe-delete
+              data-safe-delete-entity="payroll_salary_payment"
+              data-safe-delete-record-field="payment_id"
+              data-safe-delete-operation="reverse"
+              data-safe-delete-reason-field="reverse_reason">
           <div class="modal-body">
             <?= csrf_field(); ?>
             <input type="hidden" name="_action" value="add_salary_payment" />

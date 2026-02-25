@@ -1768,7 +1768,7 @@ function returns_reverse_stock_for_deleted_return(PDO $pdo, array $returnRow, ar
     ];
 }
 
-function returns_reverse_settlement(PDO $pdo, int $settlementId, int $companyId, int $garageId, int $actorUserId): array
+function returns_reverse_settlement(PDO $pdo, int $settlementId, int $companyId, int $garageId, int $actorUserId, string $reverseReason = ''): array
 {
     if (!returns_module_ready()) {
         throw new RuntimeException('Returns module is not ready.');
@@ -1842,6 +1842,9 @@ function returns_reverse_settlement(PDO $pdo, int $settlementId, int $companyId,
                 $reverseAmount = $settlementType === 'PAY' ? -abs($amount) : abs($amount);
                 $reverseEntryType = $settlementType === 'PAY' ? 'REVERSAL' : 'EXPENSE';
                 $reverseNote = 'Reversed return settlement #' . $settlementId . ' for ' . $returnNumber;
+                if (trim($reverseReason) !== '') {
+                    $reverseNote .= ' | ' . trim($reverseReason);
+                }
 
                 $financeReversalExpenseId = (int) (finance_record_expense([
                     'company_id' => $companyId,
@@ -1865,19 +1868,34 @@ function returns_reverse_settlement(PDO $pdo, int $settlementId, int $companyId,
             }
         }
 
+        $settlementColumns = table_columns('return_settlements');
+        $deleteSetParts = ['status_code = "DELETED"'];
+        $deleteParams = [
+            'id' => $settlementId,
+            'company_id' => $companyId,
+            'garage_id' => $garageId,
+        ];
+        if (in_array('deleted_at', $settlementColumns, true)) {
+            $deleteSetParts[] = 'deleted_at = COALESCE(deleted_at, NOW())';
+        }
+        if (in_array('deleted_by', $settlementColumns, true)) {
+            $deleteSetParts[] = 'deleted_by = :deleted_by';
+            $deleteParams['deleted_by'] = $actorUserId > 0 ? $actorUserId : null;
+        }
+        if (in_array('deletion_reason', $settlementColumns, true)) {
+            $deleteSetParts[] = 'deletion_reason = :deletion_reason';
+            $deleteParams['deletion_reason'] = trim($reverseReason) !== '' ? trim($reverseReason) : null;
+        }
+
         $deleteStmt = $pdo->prepare(
             'UPDATE return_settlements
-             SET status_code = "DELETED"
+             SET ' . implode(', ', $deleteSetParts) . '
              WHERE id = :id
                AND company_id = :company_id
                AND garage_id = :garage_id
                AND status_code = "ACTIVE"'
         );
-        $deleteStmt->execute([
-            'id' => $settlementId,
-            'company_id' => $companyId,
-            'garage_id' => $garageId,
-        ]);
+        $deleteStmt->execute($deleteParams);
         if ($deleteStmt->rowCount() <= 0) {
             throw new RuntimeException('Settlement entry is already reversed.');
         }
@@ -1900,6 +1918,7 @@ function returns_reverse_settlement(PDO $pdo, int $settlementId, int $companyId,
             'amount' => $amount,
             'expense_id' => $expenseId,
             'finance_reversal_expense_id' => $financeReversalExpenseId,
+            'reverse_reason' => trim($reverseReason),
             'settlement_summary' => $summary,
         ];
     } catch (Throwable $exception) {

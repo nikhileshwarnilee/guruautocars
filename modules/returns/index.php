@@ -266,9 +266,29 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         $settlementId = post_int('settlement_id');
         $returnId = post_int('return_id');
+        $reverseReason = post_string('reverse_reason', 255);
+        if ($settlementId <= 0 || $reverseReason === '') {
+            flash_set('return_error', 'Settlement and reversal reason are required.', 'danger');
+            redirect('modules/returns/index.php' . ($returnId > 0 ? ('?view_id=' . $returnId . '#settlement-card') : ''));
+        }
         try {
-            $result = returns_reverse_settlement($pdo, $settlementId, $companyId, $garageId, $userId);
+            $safeDeleteValidation = safe_delete_validate_post_confirmation('return_settlement', $settlementId, [
+                'operation' => 'reverse',
+                'reason_field' => 'reverse_reason',
+            ]);
+            $result = returns_reverse_settlement($pdo, $settlementId, $companyId, $garageId, $userId, $reverseReason);
             $returnId = (int) ($result['return_id'] ?? $returnId);
+            safe_delete_log_cascade('return_settlement', 'reverse', $settlementId, $safeDeleteValidation, [
+                'reversal_references' => array_values(array_filter([
+                    (int) ($result['finance_reversal_expense_id'] ?? 0) > 0 ? ('EXP#' . (int) ($result['finance_reversal_expense_id'] ?? 0)) : '',
+                ])),
+                'metadata' => [
+                    'company_id' => $companyId,
+                    'garage_id' => $garageId,
+                    'return_id' => $returnId,
+                    'reverse_reason' => $reverseReason,
+                ],
+            ]);
             log_audit('returns', 'settlement_reverse', $settlementId, 'Reversed return settlement #' . $settlementId, [
                 'entity' => 'return_settlement',
                 'source' => 'UI',
@@ -279,6 +299,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'amount' => (float) ($result['amount'] ?? 0),
                     'expense_id' => (int) ($result['expense_id'] ?? 0),
                     'finance_reversal_expense_id' => (int) ($result['finance_reversal_expense_id'] ?? 0),
+                    'reverse_reason' => $reverseReason,
                 ],
             ]);
             flash_set('return_success', 'Settlement entry reversed.', 'success');
@@ -919,7 +940,13 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                             <td><?= e((string) (($settlement['created_by_name'] ?? '') !== '' ? $settlement['created_by_name'] : '-')); ?></td>
                             <td>
                               <?php if ($canSettle && $selectedReturnCanSettleStatus): ?>
-                                <form method="post" class="d-inline" data-confirm="Reverse this settlement entry? This will update pending balance and create finance reversal if linked.">
+                                <form method="post"
+                                      class="d-inline"
+                                      data-safe-delete
+                                      data-safe-delete-entity="return_settlement"
+                                      data-safe-delete-record-field="settlement_id"
+                                      data-safe-delete-operation="reverse"
+                                      data-safe-delete-reason-field="reverse_reason">
                                   <?= csrf_field(); ?>
                                   <input type="hidden" name="_action" value="reverse_settlement" />
                                   <input type="hidden" name="return_id" value="<?= (int) ($selectedReturn['id'] ?? 0); ?>" />

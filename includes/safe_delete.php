@@ -2121,3 +2121,989 @@ function safe_delete_analyze_payroll_loan(PDO $pdo, int $loanId, array $scope, a
 
     return safe_delete_summary_finalize($summary);
 }
+
+function safe_delete_analyze_return_settlement(PDO $pdo, int $settlementId, array $scope, array $options = []): array
+{
+    $summary = safe_delete_summary_base('return_settlement', $settlementId, (string) ($options['operation'] ?? 'reverse'));
+    if (!safe_delete_table_exists('return_settlements') || !safe_delete_table_exists('returns_rma')) {
+        throw new RuntimeException('Return settlement tables are not available.');
+    }
+
+    $settlementCols = table_columns('return_settlements');
+    $returnCols = table_columns('returns_rma');
+    $select = ['rs.id', 'rs.return_id'];
+    foreach (['settlement_date', 'settlement_type', 'amount', 'payment_mode', 'reference_no', 'notes', 'expense_id', 'status_code'] as $col) {
+        if (in_array($col, $settlementCols, true)) {
+            $select[] = 'rs.' . $col;
+        }
+    }
+    foreach (['return_number', 'return_type', 'approval_status', 'total_amount'] as $col) {
+        if (in_array($col, $returnCols, true)) {
+            $select[] = 'r.' . $col;
+        }
+    }
+
+    $sql = 'SELECT ' . implode(', ', $select)
+        . ' FROM return_settlements rs'
+        . ' INNER JOIN returns_rma r ON r.id = rs.return_id'
+        . ' WHERE rs.id = :id';
+    $params = ['id' => $settlementId];
+    if (($scope['company_id'] ?? 0) > 0 && in_array('company_id', $settlementCols, true)) {
+        $sql .= ' AND rs.company_id = :company_id';
+        $params['company_id'] = (int) $scope['company_id'];
+    }
+    if (($scope['garage_id'] ?? 0) > 0 && in_array('garage_id', $settlementCols, true)) {
+        $sql .= ' AND rs.garage_id = :garage_id';
+        $params['garage_id'] = (int) $scope['garage_id'];
+    }
+    $sql .= ' LIMIT 1';
+    $row = safe_delete_fetch_row($pdo, $sql, $params);
+    if (!is_array($row)) {
+        throw new RuntimeException('Return settlement not found for this scope.');
+    }
+
+    $amount = abs(round((float) ($row['amount'] ?? 0), 2));
+    $settlementType = strtoupper(trim((string) ($row['settlement_type'] ?? '')));
+    $returnLabel = safe_delete_row_reference($row, ['return_number'], 'RET', 'return_id');
+    $mainRef = 'Settlement #' . $settlementId . ' (' . ($settlementType !== '' ? $settlementType : 'ENTRY') . ')';
+    $summary['main_record'] = [
+        'label' => $mainRef . ' for ' . $returnLabel,
+        'reference' => $mainRef,
+        'date' => safe_delete_pick_date($row, ['settlement_date']),
+        'amount' => $amount,
+        'status' => (string) ($row['status_code'] ?? ''),
+        'note' => $returnLabel . ' | ' . (string) ($row['approval_status'] ?? ''),
+    ];
+
+    $summary['groups'][] = safe_delete_make_group('return_record', 'Return Record', 1, [
+        safe_delete_make_item(
+            $returnLabel,
+            null,
+            safe_delete_pick_amount($row, ['total_amount']),
+            (string) ($row['approval_status'] ?? ''),
+            (string) ($row['return_type'] ?? '')
+        ),
+    ], 0.0);
+
+    $expenseId = (int) ($row['expense_id'] ?? 0);
+    if ($expenseId > 0 && safe_delete_table_exists('expenses')) {
+        $expenseRows = [];
+        $expenseImpact = 0.0;
+        foreach (safe_delete_fetch_rows(
+            $pdo,
+            'SELECT id'
+            . (safe_delete_table_has_column('expenses', 'expense_date') ? ', expense_date' : '')
+            . (safe_delete_table_has_column('expenses', 'amount') ? ', amount' : '')
+            . (safe_delete_table_has_column('expenses', 'entry_type') ? ', entry_type' : '')
+            . (safe_delete_table_has_column('expenses', 'source_type') ? ', source_type' : '')
+            . (safe_delete_table_has_column('expenses', 'status_code') ? ', status_code' : '')
+            . ' FROM expenses WHERE id = :id',
+            ['id' => $expenseId]
+        ) as $expRow) {
+            $amt = abs(round((float) ($expRow['amount'] ?? 0), 2));
+            $expenseImpact += $amt;
+            $expenseRows[] = safe_delete_make_item(
+                'Expense #' . (int) ($expRow['id'] ?? 0),
+                safe_delete_pick_date($expRow, ['expense_date']),
+                $amt,
+                (string) (($expRow['entry_type'] ?? '') ?: ($expRow['status_code'] ?? '')),
+                (string) ($expRow['source_type'] ?? '')
+            );
+        }
+        $summary['groups'][] = safe_delete_make_group('linked_expense', 'Linked Finance Expense', count($expenseRows), $expenseRows, $expenseImpact);
+
+        if (safe_delete_table_has_column('expenses', 'reversed_expense_id')) {
+            $revRows = [];
+            foreach (safe_delete_fetch_rows(
+                $pdo,
+                'SELECT id'
+                . (safe_delete_table_has_column('expenses', 'expense_date') ? ', expense_date' : '')
+                . (safe_delete_table_has_column('expenses', 'amount') ? ', amount' : '')
+                . (safe_delete_table_has_column('expenses', 'entry_type') ? ', entry_type' : '')
+                . ' FROM expenses WHERE reversed_expense_id = :expense_id ORDER BY id DESC',
+                ['expense_id' => $expenseId]
+            ) as $revRow) {
+                $revRows[] = safe_delete_make_item(
+                    'Expense #' . (int) ($revRow['id'] ?? 0),
+                    safe_delete_pick_date($revRow, ['expense_date']),
+                    abs(round((float) ($revRow['amount'] ?? 0), 2)),
+                    (string) ($revRow['entry_type'] ?? '')
+                );
+            }
+            if ($revRows !== []) {
+                $summary['groups'][] = safe_delete_make_group('finance_reversal', 'Existing Finance Reversal', count($revRows), $revRows, 0.0);
+                $summary['warnings'][] = 'Linked finance reversal already exists and will be reused if applicable.';
+            }
+        }
+    }
+
+    $statusCode = strtoupper(trim((string) ($row['status_code'] ?? 'ACTIVE')));
+    if ($statusCode !== '' && $statusCode !== 'ACTIVE') {
+        $summary['blockers'][] = 'Settlement entry is already reversed/deleted.';
+    }
+    $approvalStatus = strtoupper(trim((string) ($row['approval_status'] ?? '')));
+    if (!in_array($approvalStatus, ['APPROVED', 'CLOSED'], true)) {
+        $summary['blockers'][] = 'Settlement reversal is allowed only for APPROVED or CLOSED returns.';
+    }
+    if ($amount <= 0.0) {
+        $summary['blockers'][] = 'Settlement amount is invalid for reversal.';
+    }
+
+    $summary['can_proceed'] = $summary['blockers'] === [];
+    $summary['recommended_action'] = $summary['can_proceed'] ? 'FINANCIAL_REVERSAL' : 'BLOCK';
+    $summary['execution_mode'] = $summary['can_proceed'] ? 'financial_reversal' : 'block';
+
+    return safe_delete_summary_finalize($summary);
+}
+
+function safe_delete_analyze_expense(PDO $pdo, int $expenseId, array $scope, array $options = []): array
+{
+    $summary = safe_delete_summary_base('expense', $expenseId, (string) ($options['operation'] ?? 'reverse'));
+    $expenseCols = table_columns('expenses');
+    if ($expenseCols === []) {
+        throw new RuntimeException('Expenses table is not available.');
+    }
+
+    $select = ['e.id'];
+    foreach ([
+        'company_id', 'garage_id', 'category_id', 'expense_date', 'amount', 'paid_to', 'payment_mode',
+        'notes', 'source_type', 'source_id', 'entry_type', 'reversed_expense_id', 'status_code'
+    ] as $col) {
+        if (in_array($col, $expenseCols, true)) {
+            $select[] = 'e.' . $col;
+        }
+    }
+    $joinCategory = safe_delete_table_exists('expense_categories')
+        && safe_delete_table_has_column('expense_categories', 'category_name')
+        && in_array('category_id', $expenseCols, true);
+    if ($joinCategory) {
+        $select[] = 'c.category_name';
+    }
+
+    $sql = 'SELECT ' . implode(', ', $select) . ' FROM expenses e';
+    if ($joinCategory) {
+        $sql .= ' LEFT JOIN expense_categories c ON c.id = e.category_id';
+    }
+    $sql .= ' WHERE e.id = :id';
+    $params = ['id' => $expenseId];
+    if (($scope['company_id'] ?? 0) > 0 && in_array('company_id', $expenseCols, true)) {
+        $sql .= ' AND e.company_id = :company_id';
+        $params['company_id'] = (int) $scope['company_id'];
+    }
+    if (($scope['garage_id'] ?? 0) > 0 && in_array('garage_id', $expenseCols, true)) {
+        $sql .= ' AND e.garage_id = :garage_id';
+        $params['garage_id'] = (int) $scope['garage_id'];
+    }
+    $sql .= ' LIMIT 1';
+    $row = safe_delete_fetch_row($pdo, $sql, $params);
+    if (!is_array($row)) {
+        throw new RuntimeException('Expense not found for this scope.');
+    }
+
+    $amount = abs(round((float) ($row['amount'] ?? 0), 2));
+    $entryType = strtoupper(trim((string) ($row['entry_type'] ?? '')));
+    $sourceType = strtoupper(trim((string) ($row['source_type'] ?? '')));
+    $categoryName = trim((string) ($row['category_name'] ?? ''));
+
+    $summary['main_record'] = [
+        'label' => 'Expense #' . $expenseId,
+        'reference' => 'Expense #' . $expenseId,
+        'date' => safe_delete_pick_date($row, ['expense_date']),
+        'amount' => $amount,
+        'status' => (string) (($row['entry_type'] ?? '') ?: ($row['status_code'] ?? '')),
+        'note' => ($categoryName !== '' ? $categoryName : 'Uncategorized')
+            . ((string) ($row['paid_to'] ?? '') !== '' ? (' | Paid To: ' . (string) $row['paid_to']) : ''),
+    ];
+
+    $summary['groups'][] = safe_delete_make_group('expense_context', 'Expense Context', 1, [
+        safe_delete_make_item(
+            $categoryName !== '' ? $categoryName : 'Category',
+            null,
+            $amount,
+            (string) ($row['payment_mode'] ?? ''),
+            (string) ($row['source_type'] ?? '')
+        ),
+    ], $amount);
+
+    $reversalRows = [];
+    $reversalImpact = 0.0;
+    if (in_array('reversed_expense_id', $expenseCols, true)) {
+        $sql = 'SELECT id'
+            . (in_array('expense_date', $expenseCols, true) ? ', expense_date' : '')
+            . (in_array('amount', $expenseCols, true) ? ', amount' : '')
+            . (in_array('entry_type', $expenseCols, true) ? ', entry_type' : '')
+            . (in_array('source_type', $expenseCols, true) ? ', source_type' : '')
+            . ' FROM expenses WHERE reversed_expense_id = :expense_id';
+        $params = ['expense_id' => $expenseId];
+        if (($scope['company_id'] ?? 0) > 0 && in_array('company_id', $expenseCols, true)) {
+            $sql .= ' AND company_id = :company_id';
+            $params['company_id'] = (int) $scope['company_id'];
+        }
+        if (($scope['garage_id'] ?? 0) > 0 && in_array('garage_id', $expenseCols, true)) {
+            $sql .= ' AND garage_id = :garage_id';
+            $params['garage_id'] = (int) $scope['garage_id'];
+        }
+        $sql .= ' ORDER BY id DESC';
+        foreach (safe_delete_fetch_rows($pdo, $sql, $params) as $revRow) {
+            $amt = abs(round((float) ($revRow['amount'] ?? 0), 2));
+            $reversalImpact += $amt;
+            $reversalRows[] = safe_delete_make_item(
+                'Expense #' . (int) ($revRow['id'] ?? 0),
+                safe_delete_pick_date($revRow, ['expense_date']),
+                $amt,
+                (string) ($revRow['entry_type'] ?? ''),
+                (string) ($revRow['source_type'] ?? '')
+            );
+        }
+    }
+    $summary['groups'][] = safe_delete_make_group('expense_reversals', 'Existing Reversals', count($reversalRows), $reversalRows, $reversalImpact);
+
+    if ($entryType !== 'EXPENSE') {
+        $summary['blockers'][] = 'Only original EXPENSE entries can be reversed.';
+    }
+    if (round((float) ($row['amount'] ?? 0), 2) <= 0.0) {
+        $summary['blockers'][] = 'Only positive expense entries can be reversed.';
+    }
+    if ((int) ($row['reversed_expense_id'] ?? 0) > 0) {
+        $summary['blockers'][] = 'Reversal entries cannot be reversed again.';
+    }
+    if ($reversalRows !== []) {
+        $summary['blockers'][] = 'Expense is already reversed.';
+    }
+    if (!in_array($sourceType, ['', 'MANUAL_EXPENSE', 'MANUAL_EXPENSE_REV'], true)) {
+        $summary['blockers'][] = 'Linked/system expense entries must be reversed from their source module.';
+        $summary['warnings'][] = 'Source type: ' . $sourceType;
+    }
+    if (strtoupper(trim((string) ($row['status_code'] ?? 'ACTIVE'))) === 'DELETED') {
+        $summary['blockers'][] = 'Expense is already deleted.';
+    }
+
+    $summary['can_proceed'] = $summary['blockers'] === [];
+    $summary['recommended_action'] = $summary['can_proceed'] ? 'FINANCIAL_REVERSAL' : 'BLOCK';
+    $summary['execution_mode'] = $summary['can_proceed'] ? 'financial_reversal' : 'block';
+
+    return safe_delete_summary_finalize($summary);
+}
+
+function safe_delete_analyze_expense_category(PDO $pdo, int $categoryId, array $scope, array $options = []): array
+{
+    $summary = safe_delete_summary_base('expense_category', $categoryId, (string) ($options['operation'] ?? 'delete'));
+    if (!safe_delete_table_exists('expense_categories')) {
+        throw new RuntimeException('Expense categories table is not available.');
+    }
+
+    $catCols = table_columns('expense_categories');
+    $sql = 'SELECT id'
+        . (in_array('category_name', $catCols, true) ? ', category_name' : '')
+        . (in_array('status_code', $catCols, true) ? ', status_code' : '')
+        . ' FROM expense_categories WHERE id = :id';
+    $params = ['id' => $categoryId];
+    if (($scope['company_id'] ?? 0) > 0 && in_array('company_id', $catCols, true)) {
+        $sql .= ' AND company_id = :company_id';
+        $params['company_id'] = (int) $scope['company_id'];
+    }
+    if (($scope['garage_id'] ?? 0) > 0 && in_array('garage_id', $catCols, true)) {
+        $sql .= ' AND garage_id = :garage_id';
+        $params['garage_id'] = (int) $scope['garage_id'];
+    }
+    $sql .= ' LIMIT 1';
+    $category = safe_delete_fetch_row($pdo, $sql, $params);
+    if (!is_array($category)) {
+        throw new RuntimeException('Expense category not found for this scope.');
+    }
+
+    $summary['main_record'] = [
+        'label' => 'Expense Category ' . safe_delete_row_reference($category, ['category_name'], 'CAT'),
+        'reference' => safe_delete_row_reference($category, ['category_name'], 'CAT'),
+        'date' => null,
+        'amount' => null,
+        'status' => (string) ($category['status_code'] ?? ''),
+        'note' => 'Inactivate only (history retained)',
+    ];
+
+    $expenseRows = [];
+    $expenseImpact = 0.0;
+    if (safe_delete_table_exists('expenses') && safe_delete_table_has_column('expenses', 'category_id')) {
+        $expenseCols = table_columns('expenses');
+        $sql = 'SELECT id'
+            . (in_array('expense_date', $expenseCols, true) ? ', expense_date' : '')
+            . (in_array('amount', $expenseCols, true) ? ', amount' : '')
+            . (in_array('entry_type', $expenseCols, true) ? ', entry_type' : '')
+            . (in_array('source_type', $expenseCols, true) ? ', source_type' : '')
+            . ' FROM expenses WHERE category_id = :category_id';
+        $params = ['category_id' => $categoryId];
+        if (($scope['company_id'] ?? 0) > 0 && in_array('company_id', $expenseCols, true)) {
+            $sql .= ' AND company_id = :company_id';
+            $params['company_id'] = (int) $scope['company_id'];
+        }
+        if (($scope['garage_id'] ?? 0) > 0 && in_array('garage_id', $expenseCols, true)) {
+            $sql .= ' AND garage_id = :garage_id';
+            $params['garage_id'] = (int) $scope['garage_id'];
+        }
+        $sql .= ' ORDER BY id DESC';
+        foreach (safe_delete_fetch_rows($pdo, $sql, $params) as $row) {
+            $amt = abs(round((float) ($row['amount'] ?? 0), 2));
+            $expenseImpact += $amt;
+            $expenseRows[] = safe_delete_make_item(
+                'Expense #' . (int) ($row['id'] ?? 0),
+                safe_delete_pick_date($row, ['expense_date']),
+                $amt,
+                (string) ($row['entry_type'] ?? ''),
+                (string) ($row['source_type'] ?? '')
+            );
+        }
+    }
+    $summary['groups'][] = safe_delete_make_group('expenses', 'Linked Expenses', count($expenseRows), $expenseRows, $expenseImpact);
+    if ($expenseRows !== []) {
+        $summary['warnings'][] = 'Category has historical usage. It will be inactivated only.';
+    }
+
+    $status = strtoupper(trim((string) ($category['status_code'] ?? 'ACTIVE')));
+    if (in_array($status, ['INACTIVE', 'DELETED'], true)) {
+        $summary['blockers'][] = 'Expense category is already inactive.';
+    }
+
+    $summary['can_proceed'] = $summary['blockers'] === [];
+    $summary['recommended_action'] = $summary['can_proceed'] ? 'DISABLE_ONLY' : 'BLOCK';
+    $summary['execution_mode'] = $summary['can_proceed'] ? 'disable_only' : 'block';
+
+    return safe_delete_summary_finalize($summary);
+}
+
+function safe_delete_analyze_outsourced_payment(PDO $pdo, int $paymentId, array $scope, array $options = []): array
+{
+    $summary = safe_delete_summary_base('outsourced_payment', $paymentId, (string) ($options['operation'] ?? 'reverse'));
+    if (!safe_delete_table_exists('outsourced_work_payments') || !safe_delete_table_exists('outsourced_works')) {
+        throw new RuntimeException('Outsourced payment tables are not available.');
+    }
+
+    $paymentCols = table_columns('outsourced_work_payments');
+    $workCols = table_columns('outsourced_works');
+    $joinJob = safe_delete_table_exists('job_cards')
+        && safe_delete_table_has_column('outsourced_works', 'job_card_id')
+        && safe_delete_table_has_column('job_cards', 'job_number');
+
+    $select = ['p.id', 'p.outsourced_work_id'];
+    foreach (['payment_date', 'entry_type', 'amount', 'payment_mode', 'reference_no', 'notes', 'reversed_payment_id'] as $col) {
+        if (in_array($col, $paymentCols, true)) {
+            $select[] = 'p.' . $col;
+        }
+    }
+    foreach (['current_status', 'agreed_cost'] as $col) {
+        if (in_array($col, $workCols, true)) {
+            $select[] = 'ow.' . $col;
+        }
+    }
+    if ($joinJob) {
+        $select[] = 'jc.job_number';
+    }
+
+    $sql = 'SELECT ' . implode(', ', $select)
+        . ' FROM outsourced_work_payments p'
+        . ' INNER JOIN outsourced_works ow ON ow.id = p.outsourced_work_id';
+    if ($joinJob) {
+        $sql .= ' LEFT JOIN job_cards jc ON jc.id = ow.job_card_id';
+    }
+    $sql .= ' WHERE p.id = :id';
+    $params = ['id' => $paymentId];
+    if (($scope['company_id'] ?? 0) > 0 && in_array('company_id', $paymentCols, true)) {
+        $sql .= ' AND p.company_id = :company_id';
+        $params['company_id'] = (int) $scope['company_id'];
+    }
+    if (($scope['garage_id'] ?? 0) > 0 && in_array('garage_id', $paymentCols, true)) {
+        $sql .= ' AND p.garage_id = :garage_id';
+        $params['garage_id'] = (int) $scope['garage_id'];
+    }
+    $sql .= ' LIMIT 1';
+    $row = safe_delete_fetch_row($pdo, $sql, $params);
+    if (!is_array($row)) {
+        throw new RuntimeException('Outsourced payment not found for this scope.');
+    }
+
+    $amount = abs(round((float) ($row['amount'] ?? 0), 2));
+    $workLabel = 'Outsourced Work #' . (int) ($row['outsourced_work_id'] ?? 0);
+    if (trim((string) ($row['job_number'] ?? '')) !== '') {
+        $workLabel .= ' | ' . (string) $row['job_number'];
+    }
+
+    $summary['main_record'] = [
+        'label' => 'Outsourced Payment #' . $paymentId,
+        'reference' => safe_delete_row_reference($row, ['reference_no'], 'OWPAY'),
+        'date' => safe_delete_pick_date($row, ['payment_date']),
+        'amount' => $amount,
+        'status' => (string) ($row['entry_type'] ?? ''),
+        'note' => $workLabel . ((string) ($row['payment_mode'] ?? '') !== '' ? (' | ' . (string) $row['payment_mode']) : ''),
+    ];
+
+    $summary['groups'][] = safe_delete_make_group('outsourced_work', 'Outsourced Work', 1, [
+        safe_delete_make_item(
+            $workLabel,
+            null,
+            safe_delete_pick_amount($row, ['agreed_cost']),
+            (string) ($row['current_status'] ?? '')
+        ),
+    ], 0.0);
+
+    $reversalRows = [];
+    if (in_array('reversed_payment_id', $paymentCols, true)) {
+        $sql = 'SELECT id'
+            . (in_array('payment_date', $paymentCols, true) ? ', payment_date' : '')
+            . (in_array('amount', $paymentCols, true) ? ', amount' : '')
+            . (in_array('entry_type', $paymentCols, true) ? ', entry_type' : '')
+            . (in_array('reference_no', $paymentCols, true) ? ', reference_no' : '')
+            . ' FROM outsourced_work_payments WHERE reversed_payment_id = :payment_id';
+        $params = ['payment_id' => $paymentId];
+        if (($scope['company_id'] ?? 0) > 0 && in_array('company_id', $paymentCols, true)) {
+            $sql .= ' AND company_id = :company_id';
+            $params['company_id'] = (int) $scope['company_id'];
+        }
+        if (($scope['garage_id'] ?? 0) > 0 && in_array('garage_id', $paymentCols, true)) {
+            $sql .= ' AND garage_id = :garage_id';
+            $params['garage_id'] = (int) $scope['garage_id'];
+        }
+        $sql .= ' ORDER BY id DESC';
+        foreach (safe_delete_fetch_rows($pdo, $sql, $params) as $revRow) {
+            $reversalRows[] = safe_delete_make_item(
+                safe_delete_row_reference($revRow, ['reference_no'], 'OWREV'),
+                safe_delete_pick_date($revRow, ['payment_date']),
+                abs(round((float) ($revRow['amount'] ?? 0), 2)),
+                (string) ($revRow['entry_type'] ?? '')
+            );
+        }
+    }
+    $summary['groups'][] = safe_delete_make_group('payment_reversals', 'Existing Payment Reversal', count($reversalRows), $reversalRows, 0.0);
+
+    if (safe_delete_table_exists('expenses') && safe_delete_table_has_column('expenses', 'source_id') && safe_delete_table_has_column('expenses', 'source_type')) {
+        $financeRows = [];
+        $financeImpact = 0.0;
+        foreach (safe_delete_fetch_rows(
+            $pdo,
+            'SELECT id'
+            . (safe_delete_table_has_column('expenses', 'expense_date') ? ', expense_date' : '')
+            . (safe_delete_table_has_column('expenses', 'amount') ? ', amount' : '')
+            . (safe_delete_table_has_column('expenses', 'entry_type') ? ', entry_type' : '')
+            . ' FROM expenses
+               WHERE source_id = :source_id
+                 AND source_type IN ("OUTSOURCED_PAYMENT", "OUTSOURCED_PAYMENT_REV")
+               ORDER BY id DESC',
+            ['source_id' => $paymentId]
+        ) as $financeRow) {
+            $amt = abs(round((float) ($financeRow['amount'] ?? 0), 2));
+            $financeImpact += $amt;
+            $financeRows[] = safe_delete_make_item(
+                'Expense #' . (int) ($financeRow['id'] ?? 0),
+                safe_delete_pick_date($financeRow, ['expense_date']),
+                $amt,
+                (string) ($financeRow['entry_type'] ?? '')
+            );
+        }
+        if ($financeRows !== []) {
+            $summary['groups'][] = safe_delete_make_group('finance_entries', 'Linked Expense Entries', count($financeRows), $financeRows, $financeImpact);
+        }
+    }
+
+    if (strtoupper(trim((string) ($row['entry_type'] ?? ''))) !== 'PAYMENT') {
+        $summary['blockers'][] = 'Only outsourced PAYMENT entries can be reversed.';
+    }
+    if (round((float) ($row['amount'] ?? 0), 2) <= 0.0) {
+        $summary['blockers'][] = 'Only positive outsourced payment entries can be reversed.';
+    }
+    if ($reversalRows !== []) {
+        $summary['blockers'][] = 'This outsourced payment is already reversed.';
+    }
+
+    $summary['can_proceed'] = $summary['blockers'] === [];
+    $summary['recommended_action'] = $summary['can_proceed'] ? 'FINANCIAL_REVERSAL' : 'BLOCK';
+    $summary['execution_mode'] = $summary['can_proceed'] ? 'financial_reversal' : 'block';
+
+    return safe_delete_summary_finalize($summary);
+}
+
+function safe_delete_analyze_payroll_salary_structure(PDO $pdo, int $structureId, array $scope, array $options = []): array
+{
+    $summary = safe_delete_summary_base('payroll_salary_structure', $structureId, (string) ($options['operation'] ?? 'delete'));
+    if (!safe_delete_table_exists('payroll_salary_structures')) {
+        throw new RuntimeException('Payroll salary structures table is not available.');
+    }
+
+    $cols = table_columns('payroll_salary_structures');
+    $joinUsers = safe_delete_table_exists('users') && safe_delete_table_has_column('users', 'name');
+    $select = ['pss.id', 'pss.user_id'];
+    foreach (['salary_type', 'base_amount', 'commission_rate', 'overtime_rate', 'status_code'] as $col) {
+        if (in_array($col, $cols, true)) {
+            $select[] = 'pss.' . $col;
+        }
+    }
+    if ($joinUsers) {
+        $select[] = 'u.name';
+    }
+
+    $sql = 'SELECT ' . implode(', ', $select) . ' FROM payroll_salary_structures pss';
+    if ($joinUsers) {
+        $sql .= ' LEFT JOIN users u ON u.id = pss.user_id';
+    }
+    $sql .= ' WHERE pss.id = :id';
+    $params = ['id' => $structureId];
+    if (($scope['company_id'] ?? 0) > 0 && in_array('company_id', $cols, true)) {
+        $sql .= ' AND pss.company_id = :company_id';
+        $params['company_id'] = (int) $scope['company_id'];
+    }
+    if (($scope['garage_id'] ?? 0) > 0 && in_array('garage_id', $cols, true)) {
+        $sql .= ' AND pss.garage_id = :garage_id';
+        $params['garage_id'] = (int) $scope['garage_id'];
+    }
+    $sql .= ' LIMIT 1';
+    $row = safe_delete_fetch_row($pdo, $sql, $params);
+    if (!is_array($row)) {
+        throw new RuntimeException('Payroll salary structure not found for this scope.');
+    }
+
+    $staffLabel = trim((string) ($row['name'] ?? '')) !== ''
+        ? (string) $row['name']
+        : ('User #' . (int) ($row['user_id'] ?? 0));
+    $summary['main_record'] = [
+        'label' => 'Salary Structure #' . $structureId . ' - ' . $staffLabel,
+        'reference' => 'Structure #' . $structureId,
+        'date' => null,
+        'amount' => safe_delete_pick_amount($row, ['base_amount']),
+        'status' => (string) ($row['status_code'] ?? ''),
+        'note' => (string) ($row['salary_type'] ?? ''),
+    ];
+
+    if (safe_delete_table_exists('payroll_salary_items') && safe_delete_table_has_column('payroll_salary_items', 'user_id')) {
+        $itemRows = [];
+        $impact = 0.0;
+        $itemCols = table_columns('payroll_salary_items');
+        $joinSheet = safe_delete_table_exists('payroll_salary_sheets') && safe_delete_table_has_column('payroll_salary_items', 'sheet_id') && safe_delete_table_has_column('payroll_salary_sheets', 'salary_month');
+        $sql = 'SELECT psi.id'
+            . (in_array('net_payable', $itemCols, true) ? ', psi.net_payable' : '')
+            . (in_array('paid_amount', $itemCols, true) ? ', psi.paid_amount' : '')
+            . (in_array('status', $itemCols, true) ? ', psi.status' : '')
+            . ($joinSheet ? ', psh.salary_month' : '')
+            . ' FROM payroll_salary_items psi';
+        if ($joinSheet) {
+            $sql .= ' LEFT JOIN payroll_salary_sheets psh ON psh.id = psi.sheet_id';
+        }
+        $sql .= ' WHERE psi.user_id = :user_id';
+        $params = ['user_id' => (int) ($row['user_id'] ?? 0)];
+        if (($scope['company_id'] ?? 0) > 0 && in_array('company_id', $itemCols, true)) {
+            $sql .= ' AND psi.company_id = :company_id';
+            $params['company_id'] = (int) $scope['company_id'];
+        }
+        if (($scope['garage_id'] ?? 0) > 0 && in_array('garage_id', $itemCols, true)) {
+            $sql .= ' AND psi.garage_id = :garage_id';
+            $params['garage_id'] = (int) $scope['garage_id'];
+        }
+        $sql .= ' ORDER BY psi.id DESC';
+        foreach (safe_delete_fetch_rows($pdo, $sql, $params) as $itemRow) {
+            $amt = abs(round((float) ($itemRow['net_payable'] ?? 0), 2));
+            $impact += $amt;
+            $note = trim((string) ($itemRow['salary_month'] ?? ''));
+            $paid = round((float) ($itemRow['paid_amount'] ?? 0), 2);
+            if ($paid > 0.0) {
+                $note = trim($note . ($note !== '' ? ' | ' : '') . 'Paid: ' . number_format($paid, 2));
+            }
+            $itemRows[] = safe_delete_make_item(
+                'Salary Row #' . (int) ($itemRow['id'] ?? 0),
+                null,
+                $amt,
+                (string) ($itemRow['status'] ?? ''),
+                $note !== '' ? $note : null
+            );
+        }
+        $summary['groups'][] = safe_delete_make_group('salary_history', 'Salary History For Staff', count($itemRows), $itemRows, $impact);
+        if ($itemRows !== []) {
+            $summary['warnings'][] = 'Structure has payroll history. It will be inactivated only.';
+        }
+    }
+
+    $status = strtoupper(trim((string) ($row['status_code'] ?? 'ACTIVE')));
+    if (in_array($status, ['INACTIVE', 'DELETED'], true)) {
+        $summary['blockers'][] = 'Salary structure is already inactive.';
+    }
+
+    $summary['can_proceed'] = $summary['blockers'] === [];
+    $summary['recommended_action'] = $summary['can_proceed'] ? 'DISABLE_ONLY' : 'BLOCK';
+    $summary['execution_mode'] = $summary['can_proceed'] ? 'disable_only' : 'block';
+
+    return safe_delete_summary_finalize($summary);
+}
+
+function safe_delete_analyze_payroll_loan_payment(PDO $pdo, int $paymentId, array $scope, array $options = []): array
+{
+    $summary = safe_delete_summary_base('payroll_loan_payment', $paymentId, (string) ($options['operation'] ?? 'reverse'));
+    if (!safe_delete_table_exists('payroll_loan_payments') || !safe_delete_table_exists('payroll_loans')) {
+        throw new RuntimeException('Payroll loan payment tables are not available.');
+    }
+
+    $payCols = table_columns('payroll_loan_payments');
+    $loanCols = table_columns('payroll_loans');
+    $select = ['lp.id', 'lp.loan_id'];
+    foreach (['payment_date', 'entry_type', 'amount', 'reference_no', 'notes', 'reversed_payment_id', 'salary_item_id'] as $col) {
+        if (in_array($col, $payCols, true)) {
+            $select[] = 'lp.' . $col;
+        }
+    }
+    foreach (['total_amount', 'paid_amount', 'status'] as $col) {
+        if (in_array($col, $loanCols, true)) {
+            $select[] = 'pl.' . $col;
+        }
+    }
+
+    $sql = 'SELECT ' . implode(', ', $select)
+        . ' FROM payroll_loan_payments lp
+           INNER JOIN payroll_loans pl ON pl.id = lp.loan_id
+           WHERE lp.id = :id';
+    $params = ['id' => $paymentId];
+    if (($scope['company_id'] ?? 0) > 0 && in_array('company_id', $payCols, true)) {
+        $sql .= ' AND lp.company_id = :company_id';
+        $params['company_id'] = (int) $scope['company_id'];
+    }
+    if (($scope['garage_id'] ?? 0) > 0 && in_array('garage_id', $payCols, true)) {
+        $sql .= ' AND lp.garage_id = :garage_id';
+        $params['garage_id'] = (int) $scope['garage_id'];
+    }
+    $sql .= ' LIMIT 1';
+    $row = safe_delete_fetch_row($pdo, $sql, $params);
+    if (!is_array($row)) {
+        throw new RuntimeException('Payroll loan payment not found for this scope.');
+    }
+
+    $amount = abs(round((float) ($row['amount'] ?? 0), 2));
+    $summary['main_record'] = [
+        'label' => 'Loan Payment #' . $paymentId,
+        'reference' => safe_delete_row_reference($row, ['reference_no'], 'LPMT'),
+        'date' => safe_delete_pick_date($row, ['payment_date']),
+        'amount' => $amount,
+        'status' => (string) ($row['entry_type'] ?? ''),
+        'note' => 'Loan #' . (int) ($row['loan_id'] ?? 0),
+    ];
+
+    $summary['groups'][] = safe_delete_make_group('loan_context', 'Loan Context', 1, [
+        safe_delete_make_item(
+            'Loan #' . (int) ($row['loan_id'] ?? 0),
+            null,
+            safe_delete_pick_amount($row, ['total_amount']),
+            (string) ($row['status'] ?? ''),
+            'Paid: ' . number_format((float) ($row['paid_amount'] ?? 0), 2)
+        ),
+    ], 0.0);
+
+    $reversalRows = [];
+    if (in_array('reversed_payment_id', $payCols, true)) {
+        $sql = 'SELECT id'
+            . (in_array('payment_date', $payCols, true) ? ', payment_date' : '')
+            . (in_array('amount', $payCols, true) ? ', amount' : '')
+            . (in_array('entry_type', $payCols, true) ? ', entry_type' : '')
+            . (in_array('reference_no', $payCols, true) ? ', reference_no' : '')
+            . ' FROM payroll_loan_payments WHERE reversed_payment_id = :payment_id';
+        $params = ['payment_id' => $paymentId];
+        if (($scope['company_id'] ?? 0) > 0 && in_array('company_id', $payCols, true)) {
+            $sql .= ' AND company_id = :company_id';
+            $params['company_id'] = (int) $scope['company_id'];
+        }
+        if (($scope['garage_id'] ?? 0) > 0 && in_array('garage_id', $payCols, true)) {
+            $sql .= ' AND garage_id = :garage_id';
+            $params['garage_id'] = (int) $scope['garage_id'];
+        }
+        $sql .= ' ORDER BY id DESC';
+        foreach (safe_delete_fetch_rows($pdo, $sql, $params) as $revRow) {
+            $reversalRows[] = safe_delete_make_item(
+                safe_delete_row_reference($revRow, ['reference_no'], 'LREV'),
+                safe_delete_pick_date($revRow, ['payment_date']),
+                abs(round((float) ($revRow['amount'] ?? 0), 2)),
+                (string) ($revRow['entry_type'] ?? '')
+            );
+        }
+    }
+    $summary['groups'][] = safe_delete_make_group('payment_reversals', 'Existing Reversal', count($reversalRows), $reversalRows, 0.0);
+
+    if (strtoupper(trim((string) ($row['entry_type'] ?? ''))) !== 'MANUAL') {
+        $summary['blockers'][] = 'Only manual loan payments can be reversed from this screen.';
+    }
+    if (round((float) ($row['amount'] ?? 0), 2) <= 0.0) {
+        $summary['blockers'][] = 'Only positive loan payment entries can be reversed.';
+    }
+    if ($reversalRows !== []) {
+        $summary['blockers'][] = 'This loan payment is already reversed.';
+    }
+
+    $summary['can_proceed'] = $summary['blockers'] === [];
+    $summary['recommended_action'] = $summary['can_proceed'] ? 'FINANCIAL_REVERSAL' : 'BLOCK';
+    $summary['execution_mode'] = $summary['can_proceed'] ? 'financial_reversal' : 'block';
+
+    return safe_delete_summary_finalize($summary);
+}
+
+function safe_delete_analyze_payroll_salary_entry(PDO $pdo, int $itemId, array $scope, array $options = []): array
+{
+    $summary = safe_delete_summary_base('payroll_salary_entry', $itemId, (string) ($options['operation'] ?? 'reverse'));
+    if (!safe_delete_table_exists('payroll_salary_items') || !safe_delete_table_exists('payroll_salary_sheets')) {
+        throw new RuntimeException('Payroll salary tables are not available.');
+    }
+
+    $itemCols = table_columns('payroll_salary_items');
+    $sheetCols = table_columns('payroll_salary_sheets');
+    $select = ['psi.id', 'psi.sheet_id'];
+    foreach ([
+        'user_id', 'gross_amount', 'net_payable', 'paid_amount', 'status', 'deductions_applied',
+        'advance_deduction', 'loan_deduction', 'manual_deduction', 'notes'
+    ] as $col) {
+        if (in_array($col, $itemCols, true)) {
+            $select[] = 'psi.' . $col;
+        }
+    }
+    foreach (['salary_month', 'status'] as $col) {
+        if (in_array($col, $sheetCols, true)) {
+            $select[] = 'psh.' . $col . ' AS sheet_' . $col;
+        }
+    }
+
+    $sql = 'SELECT ' . implode(', ', $select)
+        . ' FROM payroll_salary_items psi
+           INNER JOIN payroll_salary_sheets psh ON psh.id = psi.sheet_id
+           WHERE psi.id = :id';
+    $params = ['id' => $itemId];
+    if (($scope['company_id'] ?? 0) > 0 && in_array('company_id', $sheetCols, true)) {
+        $sql .= ' AND psh.company_id = :company_id';
+        $params['company_id'] = (int) $scope['company_id'];
+    }
+    if (($scope['garage_id'] ?? 0) > 0 && in_array('garage_id', $sheetCols, true)) {
+        $sql .= ' AND psh.garage_id = :garage_id';
+        $params['garage_id'] = (int) $scope['garage_id'];
+    }
+    $sql .= ' LIMIT 1';
+    $row = safe_delete_fetch_row($pdo, $sql, $params);
+    if (!is_array($row)) {
+        throw new RuntimeException('Payroll salary entry not found for this scope.');
+    }
+
+    $gross = round((float) ($row['gross_amount'] ?? 0), 2);
+    $net = round((float) ($row['net_payable'] ?? 0), 2);
+    $paid = round((float) ($row['paid_amount'] ?? 0), 2);
+    $sheetStatus = strtoupper(trim((string) ($row['sheet_status'] ?? '')));
+
+    $summary['main_record'] = [
+        'label' => 'Salary Entry #' . $itemId,
+        'reference' => 'Salary Row #' . $itemId,
+        'date' => (string) ($row['sheet_salary_month'] ?? ''),
+        'amount' => abs($net),
+        'status' => (string) (($row['status'] ?? '') ?: $sheetStatus),
+        'note' => 'Sheet #' . (int) ($row['sheet_id'] ?? 0) . ' | User #' . (int) ($row['user_id'] ?? 0),
+    ];
+
+    $summary['groups'][] = safe_delete_make_group('salary_values', 'Salary Values', 1, [
+        safe_delete_make_item(
+            'Gross/Net/Paid',
+            null,
+            abs($net),
+            (string) ($row['status'] ?? ''),
+            'Gross: ' . number_format($gross, 2)
+                . ' | Paid: ' . number_format($paid, 2)
+                . ' | Adv Ded: ' . number_format((float) ($row['advance_deduction'] ?? 0), 2)
+                . ' | Loan Ded: ' . number_format((float) ($row['loan_deduction'] ?? 0), 2)
+        ),
+    ], abs($net));
+
+    $activePaymentCount = 0;
+    $paymentRows = [];
+    if (safe_delete_table_exists('payroll_salary_payments')) {
+        $payCols = table_columns('payroll_salary_payments');
+        $sql = 'SELECT p.id'
+            . (in_array('payment_date', $payCols, true) ? ', p.payment_date' : '')
+            . (in_array('amount', $payCols, true) ? ', p.amount' : '')
+            . (in_array('entry_type', $payCols, true) ? ', p.entry_type' : '')
+            . (in_array('reference_no', $payCols, true) ? ', p.reference_no' : '')
+            . ', r.id AS reversal_id'
+            . ' FROM payroll_salary_payments p
+               LEFT JOIN payroll_salary_payments r ON r.reversed_payment_id = p.id
+               WHERE p.salary_item_id = :salary_item_id';
+        $params = ['salary_item_id' => $itemId];
+        if (($scope['company_id'] ?? 0) > 0 && in_array('company_id', $payCols, true)) {
+            $sql .= ' AND p.company_id = :company_id';
+            $params['company_id'] = (int) $scope['company_id'];
+        }
+        if (($scope['garage_id'] ?? 0) > 0 && in_array('garage_id', $payCols, true)) {
+            $sql .= ' AND p.garage_id = :garage_id';
+            $params['garage_id'] = (int) $scope['garage_id'];
+        }
+        $sql .= ' ORDER BY p.id DESC';
+        foreach (safe_delete_fetch_rows($pdo, $sql, $params) as $payRow) {
+            $isActivePayment = strtoupper(trim((string) ($payRow['entry_type'] ?? ''))) === 'PAYMENT'
+                && round((float) ($payRow['amount'] ?? 0), 2) > 0.0
+                && (int) ($payRow['reversal_id'] ?? 0) <= 0;
+            if ($isActivePayment) {
+                $activePaymentCount++;
+            }
+            $paymentRows[] = safe_delete_make_item(
+                safe_delete_row_reference($payRow, ['reference_no'], 'SPMT'),
+                safe_delete_pick_date($payRow, ['payment_date']),
+                abs(round((float) ($payRow['amount'] ?? 0), 2)),
+                (string) ($payRow['entry_type'] ?? ''),
+                $isActivePayment ? 'ACTIVE PAYMENT' : ((int) ($payRow['reversal_id'] ?? 0) > 0 ? 'REVERSED' : null)
+            );
+        }
+    }
+    $summary['groups'][] = safe_delete_make_group('salary_payments', 'Salary Payment History', count($paymentRows), $paymentRows, abs($paid));
+
+    if (safe_delete_table_exists('payroll_loan_payments') && safe_delete_table_has_column('payroll_loan_payments', 'salary_item_id')) {
+        $loanDedRows = [];
+        foreach (safe_delete_fetch_rows(
+            $pdo,
+            'SELECT id'
+            . (safe_delete_table_has_column('payroll_loan_payments', 'payment_date') ? ', payment_date' : '')
+            . (safe_delete_table_has_column('payroll_loan_payments', 'amount') ? ', amount' : '')
+            . (safe_delete_table_has_column('payroll_loan_payments', 'entry_type') ? ', entry_type' : '')
+            . ' FROM payroll_loan_payments WHERE salary_item_id = :salary_item_id ORDER BY id DESC',
+            ['salary_item_id' => $itemId]
+        ) as $loanPayRow) {
+            $loanDedRows[] = safe_delete_make_item(
+                'Loan Pay #' . (int) ($loanPayRow['id'] ?? 0),
+                safe_delete_pick_date($loanPayRow, ['payment_date']),
+                abs(round((float) ($loanPayRow['amount'] ?? 0), 2)),
+                (string) ($loanPayRow['entry_type'] ?? '')
+            );
+        }
+        if ($loanDedRows !== []) {
+            $summary['groups'][] = safe_delete_make_group('loan_deductions', 'Linked Loan Deductions', count($loanDedRows), $loanDedRows, 0.0);
+        }
+    }
+
+    if ($sheetStatus === 'LOCKED') {
+        $summary['blockers'][] = 'Unlock by reversing payments before reversing this salary row.';
+    }
+    if ($net > 0.001 && ($paid + 0.009) >= $net) {
+        $summary['blockers'][] = 'Fully settled salary rows cannot be reversed directly.';
+    }
+    if ($paid > 0.009) {
+        $summary['blockers'][] = 'Reverse salary payments before reversing salary entry.';
+    }
+    if ((int) ($row['deductions_applied'] ?? 0) === 1) {
+        $summary['blockers'][] = 'This row has applied deductions. Reverse linked deductions first.';
+    }
+    if ($activePaymentCount > 0) {
+        $summary['blockers'][] = 'Open payment history exists. Reverse those payments first.';
+    }
+    if (abs($gross) <= 0.001 && abs($net) <= 0.001 && abs($paid) <= 0.001) {
+        $summary['warnings'][] = 'Salary row already appears zeroed/reversed.';
+    }
+
+    $summary['can_proceed'] = $summary['blockers'] === [];
+    $summary['recommended_action'] = $summary['can_proceed'] ? 'FINANCIAL_REVERSAL' : 'BLOCK';
+    $summary['execution_mode'] = $summary['can_proceed'] ? 'financial_reversal' : 'block';
+
+    return safe_delete_summary_finalize($summary);
+}
+
+function safe_delete_analyze_payroll_salary_payment(PDO $pdo, int $paymentId, array $scope, array $options = []): array
+{
+    $summary = safe_delete_summary_base('payroll_salary_payment', $paymentId, (string) ($options['operation'] ?? 'reverse'));
+    if (!safe_delete_table_exists('payroll_salary_payments') || !safe_delete_table_exists('payroll_salary_items') || !safe_delete_table_exists('payroll_salary_sheets')) {
+        throw new RuntimeException('Payroll salary payment tables are not available.');
+    }
+
+    $payCols = table_columns('payroll_salary_payments');
+    $itemCols = table_columns('payroll_salary_items');
+    $sheetCols = table_columns('payroll_salary_sheets');
+    $select = ['psp.id', 'psp.salary_item_id', 'psp.sheet_id', 'psp.user_id'];
+    foreach (['payment_date', 'entry_type', 'amount', 'payment_mode', 'reference_no', 'notes', 'reversed_payment_id'] as $col) {
+        if (in_array($col, $payCols, true)) {
+            $select[] = 'psp.' . $col;
+        }
+    }
+    foreach (['net_payable', 'paid_amount', 'status'] as $col) {
+        if (in_array($col, $itemCols, true)) {
+            $select[] = 'psi.' . $col;
+        }
+    }
+    foreach (['salary_month', 'status'] as $col) {
+        if (in_array($col, $sheetCols, true)) {
+            $select[] = 'psh.' . $col . ' AS sheet_' . $col;
+        }
+    }
+
+    $sql = 'SELECT ' . implode(', ', $select)
+        . ' FROM payroll_salary_payments psp
+           INNER JOIN payroll_salary_items psi ON psi.id = psp.salary_item_id
+           INNER JOIN payroll_salary_sheets psh ON psh.id = psp.sheet_id
+           WHERE psp.id = :id';
+    $params = ['id' => $paymentId];
+    if (($scope['company_id'] ?? 0) > 0 && in_array('company_id', $payCols, true)) {
+        $sql .= ' AND psp.company_id = :company_id';
+        $params['company_id'] = (int) $scope['company_id'];
+    }
+    if (($scope['garage_id'] ?? 0) > 0 && in_array('garage_id', $payCols, true)) {
+        $sql .= ' AND psp.garage_id = :garage_id';
+        $params['garage_id'] = (int) $scope['garage_id'];
+    }
+    $sql .= ' LIMIT 1';
+    $row = safe_delete_fetch_row($pdo, $sql, $params);
+    if (!is_array($row)) {
+        throw new RuntimeException('Payroll salary payment not found for this scope.');
+    }
+
+    $amount = abs(round((float) ($row['amount'] ?? 0), 2));
+    $summary['main_record'] = [
+        'label' => 'Salary Payment #' . $paymentId,
+        'reference' => safe_delete_row_reference($row, ['reference_no'], 'PAY'),
+        'date' => safe_delete_pick_date($row, ['payment_date']),
+        'amount' => $amount,
+        'status' => (string) ($row['entry_type'] ?? ''),
+        'note' => 'Salary Row #' . (int) ($row['salary_item_id'] ?? 0) . ' | Sheet ' . (string) ($row['sheet_salary_month'] ?? ''),
+    ];
+
+    $summary['groups'][] = safe_delete_make_group('salary_entry', 'Salary Entry', 1, [
+        safe_delete_make_item(
+            'Salary Row #' . (int) ($row['salary_item_id'] ?? 0),
+            (string) ($row['sheet_salary_month'] ?? ''),
+            abs(round((float) ($row['net_payable'] ?? 0), 2)),
+            (string) (($row['status'] ?? '') ?: ($row['sheet_status'] ?? '')),
+            'Current paid: ' . number_format((float) ($row['paid_amount'] ?? 0), 2)
+        ),
+    ], 0.0);
+
+    $reversalRows = [];
+    if (in_array('reversed_payment_id', $payCols, true)) {
+        $sql = 'SELECT id'
+            . (in_array('payment_date', $payCols, true) ? ', payment_date' : '')
+            . (in_array('amount', $payCols, true) ? ', amount' : '')
+            . (in_array('entry_type', $payCols, true) ? ', entry_type' : '')
+            . (in_array('reference_no', $payCols, true) ? ', reference_no' : '')
+            . ' FROM payroll_salary_payments WHERE reversed_payment_id = :payment_id';
+        $params = ['payment_id' => $paymentId];
+        if (($scope['company_id'] ?? 0) > 0 && in_array('company_id', $payCols, true)) {
+            $sql .= ' AND company_id = :company_id';
+            $params['company_id'] = (int) $scope['company_id'];
+        }
+        if (($scope['garage_id'] ?? 0) > 0 && in_array('garage_id', $payCols, true)) {
+            $sql .= ' AND garage_id = :garage_id';
+            $params['garage_id'] = (int) $scope['garage_id'];
+        }
+        $sql .= ' ORDER BY id DESC';
+        foreach (safe_delete_fetch_rows($pdo, $sql, $params) as $revRow) {
+            $reversalRows[] = safe_delete_make_item(
+                safe_delete_row_reference($revRow, ['reference_no'], 'SREV'),
+                safe_delete_pick_date($revRow, ['payment_date']),
+                abs(round((float) ($revRow['amount'] ?? 0), 2)),
+                (string) ($revRow['entry_type'] ?? '')
+            );
+        }
+    }
+    $summary['groups'][] = safe_delete_make_group('payment_reversals', 'Existing Reversal', count($reversalRows), $reversalRows, 0.0);
+
+    if (strtoupper(trim((string) ($row['entry_type'] ?? ''))) !== 'PAYMENT') {
+        $summary['blockers'][] = 'Only salary PAYMENT entries can be reversed.';
+    }
+    if (round((float) ($row['amount'] ?? 0), 2) <= 0.0) {
+        $summary['blockers'][] = 'Only positive salary payment entries can be reversed.';
+    }
+    if ($reversalRows !== []) {
+        $summary['blockers'][] = 'This salary payment is already reversed.';
+    }
+
+    $summary['can_proceed'] = $summary['blockers'] === [];
+    $summary['recommended_action'] = $summary['can_proceed'] ? 'FINANCIAL_REVERSAL' : 'BLOCK';
+    $summary['execution_mode'] = $summary['can_proceed'] ? 'financial_reversal' : 'block';
+
+    return safe_delete_summary_finalize($summary);
+}
