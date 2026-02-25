@@ -633,8 +633,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         $pdo = db();
         $pdo->beginTransaction();
+        $safeDeleteValidation = null;
 
         try {
+            $safeDeleteValidation = safe_delete_validate_post_confirmation('invoice', $invoiceId, [
+                'operation' => 'cancel',
+                'reason_field' => 'cancel_reason',
+            ]);
             $dependencyReport = reversal_invoice_cancel_dependency_report($pdo, $invoiceId, $companyId, $garageId);
             $invoice = $dependencyReport['invoice'] ?? null;
             if (!is_array($invoice)) {
@@ -727,6 +732,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             ]);
 
             $pdo->commit();
+            safe_delete_log_cascade('invoice', 'cancel', $invoiceId, (array) $safeDeleteValidation, [
+                'metadata' => [
+                    'invoice_number' => (string) ($invoice['invoice_number'] ?? ''),
+                    'cancel_reason' => $cancelReason,
+                ],
+            ]);
             $successMessage = 'Invoice cancelled successfully.';
             if ($releasedAdvanceTotal > 0.009) {
                 $successMessage .= ' Advance released: ' . number_format($releasedAdvanceTotal, 2) . '.';
@@ -970,8 +981,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         $pdo = db();
         $pdo->beginTransaction();
+        $safeDeleteValidation = null;
 
         try {
+            $safeDeleteValidation = safe_delete_validate_post_confirmation('invoice_payment', $paymentId, [
+                'operation' => 'reverse',
+                'reason_field' => 'reverse_reason',
+            ]);
             $selectFields = [
                 'p.id',
                 'p.invoice_id',
@@ -1221,6 +1237,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
 
             $pdo->commit();
+            safe_delete_log_cascade('invoice_payment', 'reverse', $paymentId, (array) $safeDeleteValidation, [
+                'reversal_references' => ['REV-' . $paymentId, (string) $reversalId],
+                'metadata' => [
+                    'invoice_id' => $invoiceId,
+                    'invoice_number' => (string) ($payment['invoice_number'] ?? ''),
+                    'reversal_id' => $reversalId,
+                ],
+            ]);
             flash_set('billing_success', 'Payment reversed successfully.', 'success');
         } catch (Throwable $exception) {
             $pdo->rollBack();
@@ -1245,8 +1269,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         $pdo = db();
         $pdo->beginTransaction();
+        $safeDeleteValidation = null;
 
         try {
+            $safeDeleteValidation = safe_delete_validate_post_confirmation('billing_advance', $advanceId, [
+                'operation' => 'delete',
+                'reason_field' => 'delete_reason',
+            ]);
             $advanceStmt = $pdo->prepare(
                 'SELECT ja.id, ja.job_card_id, ja.receipt_number, ja.advance_amount, ja.adjusted_amount, ja.balance_amount,
                         ja.notes, ja.status_code, ja.received_on, jc.job_number
@@ -1294,18 +1323,35 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $updatedNotes = mb_substr($updatedNotes, 0, 255);
             }
 
-            $deleteStmt = $pdo->prepare(
-                'UPDATE job_advances
-                 SET status_code = "DELETED",
-                     notes = :notes,
-                     updated_by = :updated_by
-                 WHERE id = :id'
-            );
-            $deleteStmt->execute([
+            $jobAdvanceColumns = table_columns('job_advances');
+            $deleteSetParts = [
+                'status_code = "DELETED"',
+                'notes = :notes',
+                'updated_by = :updated_by',
+            ];
+            $deleteParams = [
                 'notes' => $updatedNotes,
                 'updated_by' => $userId > 0 ? $userId : null,
                 'id' => $advanceId,
-            ]);
+            ];
+            if (in_array('deleted_at', $jobAdvanceColumns, true)) {
+                $deleteSetParts[] = 'deleted_at = COALESCE(deleted_at, NOW())';
+            }
+            if (in_array('deleted_by', $jobAdvanceColumns, true)) {
+                $deleteSetParts[] = 'deleted_by = :deleted_by';
+                $deleteParams['deleted_by'] = $userId > 0 ? $userId : null;
+            }
+            if (in_array('deletion_reason', $jobAdvanceColumns, true)) {
+                $deleteSetParts[] = 'deletion_reason = :deletion_reason';
+                $deleteParams['deletion_reason'] = $deleteReason;
+            }
+
+            $deleteStmt = $pdo->prepare(
+                'UPDATE job_advances
+                 SET ' . implode(', ', $deleteSetParts) . '
+                 WHERE id = :id'
+            );
+            $deleteStmt->execute($deleteParams);
 
             log_audit(
                 'billing',
@@ -1335,6 +1381,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             );
 
             $pdo->commit();
+            safe_delete_log_cascade('billing_advance', 'delete', $advanceId, (array) $safeDeleteValidation, [
+                'metadata' => [
+                    'receipt_number' => (string) ($advance['receipt_number'] ?? ''),
+                    'job_card_id' => (int) ($advance['job_card_id'] ?? 0),
+                    'job_number' => (string) ($advance['job_number'] ?? ''),
+                ],
+            ]);
             flash_set('billing_success', 'Advance receipt deleted successfully.', 'success');
         } catch (Throwable $exception) {
             $pdo->rollBack();
@@ -2273,7 +2326,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 <div class="modal fade" id="cancelInvoiceModal" tabindex="-1" aria-hidden="true">
   <div class="modal-dialog">
     <div class="modal-content">
-      <form method="post">
+      <form method="post" data-safe-delete data-safe-delete-entity="invoice" data-safe-delete-record-field="invoice_id" data-safe-delete-operation="cancel" data-safe-delete-reason-field="cancel_reason">
         <div class="modal-header bg-danger-subtle">
           <h5 class="modal-title">Cancel Invoice</h5>
           <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
@@ -2304,7 +2357,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 <div class="modal fade" id="paymentReverseModal" tabindex="-1" aria-hidden="true">
   <div class="modal-dialog">
     <div class="modal-content">
-      <form method="post">
+      <form method="post" data-safe-delete data-safe-delete-entity="invoice_payment" data-safe-delete-record-field="payment_id" data-safe-delete-operation="reverse" data-safe-delete-reason-field="reverse_reason">
         <div class="modal-header bg-danger-subtle">
           <h5 class="modal-title">Reverse Payment</h5>
           <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
@@ -2338,7 +2391,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 <div class="modal fade" id="advanceDeleteModal" tabindex="-1" aria-hidden="true">
   <div class="modal-dialog">
     <div class="modal-content">
-      <form method="post">
+      <form method="post" data-safe-delete data-safe-delete-entity="billing_advance" data-safe-delete-record-field="advance_id" data-safe-delete-operation="delete" data-safe-delete-reason-field="delete_reason">
         <div class="modal-header bg-danger-subtle">
           <h5 class="modal-title">Delete Advance Receipt</h5>
           <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
@@ -2402,3 +2455,4 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 </script>
 
 <?php require_once __DIR__ . '/../../includes/footer.php'; ?>
+

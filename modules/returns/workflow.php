@@ -1908,7 +1908,7 @@ function returns_reverse_settlement(PDO $pdo, int $settlementId, int $companyId,
     }
 }
 
-function returns_delete_rma(PDO $pdo, int $returnId, int $companyId, int $garageId, int $actorUserId): array
+function returns_delete_rma(PDO $pdo, int $returnId, int $companyId, int $garageId, int $actorUserId, string $deleteReason = ''): array
 {
     if (!returns_module_ready()) {
         throw new RuntimeException('Returns module is not ready.');
@@ -1966,21 +1966,38 @@ function returns_delete_rma(PDO $pdo, int $returnId, int $companyId, int $garage
             ]);
         }
 
+        $returnColumns = table_columns('returns_rma');
+        $deleteSets = [
+            'status_code = "DELETED"',
+            'updated_by = :updated_by',
+        ];
+        $deleteParams = [
+            'updated_by' => $actorUserId > 0 ? $actorUserId : null,
+            'id' => $returnId,
+            'company_id' => $companyId,
+            'garage_id' => $garageId,
+        ];
+        if (in_array('deleted_at', $returnColumns, true)) {
+            $deleteSets[] = 'deleted_at = COALESCE(deleted_at, NOW())';
+        }
+        if (in_array('deleted_by', $returnColumns, true)) {
+            $deleteSets[] = 'deleted_by = :deleted_by';
+            $deleteParams['deleted_by'] = $actorUserId > 0 ? $actorUserId : null;
+        }
+        if (in_array('deletion_reason', $returnColumns, true)) {
+            $deleteSets[] = 'deletion_reason = :deletion_reason';
+            $deleteParams['deletion_reason'] = trim($deleteReason) !== '' ? mb_substr($deleteReason, 0, 255) : null;
+        }
+
         $deleteStmt = $pdo->prepare(
             'UPDATE returns_rma
-             SET status_code = "DELETED",
-                 updated_by = :updated_by
+             SET ' . implode(', ', $deleteSets) . '
              WHERE id = :id
                AND company_id = :company_id
                AND garage_id = :garage_id
                AND status_code = "ACTIVE"'
         );
-        $deleteStmt->execute([
-            'updated_by' => $actorUserId > 0 ? $actorUserId : null,
-            'id' => $returnId,
-            'company_id' => $companyId,
-            'garage_id' => $garageId,
-        ]);
+        $deleteStmt->execute($deleteParams);
         if ($deleteStmt->rowCount() <= 0) {
             throw new RuntimeException('Return entry could not be deleted.');
         }
@@ -1992,6 +2009,7 @@ function returns_delete_rma(PDO $pdo, int $returnId, int $companyId, int $garage
             'return_number' => (string) ($returnRow['return_number'] ?? ''),
             'return_type' => (string) ($returnRow['return_type'] ?? ''),
             'approval_status' => (string) ($returnRow['approval_status'] ?? ''),
+            'delete_reason' => $deleteReason,
             'stock_reversal' => $stockReversal,
         ];
     } catch (Throwable $exception) {

@@ -1339,7 +1339,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         $pdo = db();
         $pdo->beginTransaction();
+        $safeDeleteValidation = null;
         try {
+            $safeDeleteValidation = safe_delete_validate_post_confirmation('job_card', $jobId, [
+                'operation' => 'delete',
+                'reason_field' => 'delete_note',
+            ]);
             $dependencyReport = reversal_job_delete_dependency_report($pdo, $jobId, $companyId, $garageId);
             $jobReportRow = $dependencyReport['job'] ?? null;
             if (!is_array($jobReportRow)) {
@@ -1384,23 +1389,37 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
             }
 
-            $deleteStmt = $pdo->prepare(
-                'UPDATE job_cards
-                 SET status_code = "DELETED",
-                     deleted_at = NOW(),
-                     cancel_note = :cancel_note,
-                     updated_by = :updated_by
-                 WHERE id = :id
-                   AND company_id = :company_id
-                   AND garage_id = :garage_id'
-            );
-            $deleteStmt->execute([
+            $jobCardColumns = table_columns('job_cards');
+            $deleteSetParts = [
+                'status_code = "DELETED"',
+                'deleted_at = NOW()',
+                'cancel_note = :cancel_note',
+                'updated_by = :updated_by',
+            ];
+            $deleteParams = [
                 'cancel_note' => $deleteNote,
                 'updated_by' => $userId > 0 ? $userId : null,
                 'id' => $jobId,
                 'company_id' => $companyId,
                 'garage_id' => $garageId,
-            ]);
+            ];
+            if (in_array('deleted_by', $jobCardColumns, true)) {
+                $deleteSetParts[] = 'deleted_by = :deleted_by';
+                $deleteParams['deleted_by'] = $userId > 0 ? $userId : null;
+            }
+            if (in_array('deletion_reason', $jobCardColumns, true)) {
+                $deleteSetParts[] = 'deletion_reason = :deletion_reason';
+                $deleteParams['deletion_reason'] = $deleteNote;
+            }
+
+            $deleteStmt = $pdo->prepare(
+                'UPDATE job_cards
+                 SET ' . implode(', ', $deleteSetParts) . '
+                 WHERE id = :id
+                   AND company_id = :company_id
+                   AND garage_id = :garage_id'
+            );
+            $deleteStmt->execute($deleteParams);
 
             job_append_history(
                 $jobId,
@@ -1427,6 +1446,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             ]);
 
             $pdo->commit();
+            safe_delete_log_cascade('job_card', 'delete', $jobId, (array) $safeDeleteValidation, [
+                'metadata' => [
+                    'job_number' => (string) ($jobForWrite['job_number'] ?? ''),
+                    'inventory_movements' => (int) ($dependencyReport['inventory_movements'] ?? 0),
+                    'cancellable_outsourced_count' => count($cancellableOutsourcedIds),
+                ],
+            ]);
             flash_set('job_success', 'Job card soft deleted with safe dependency checks.', 'success');
             redirect('modules/jobs/index.php');
         } catch (Throwable $exception) {
@@ -3655,7 +3681,12 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 <div class="modal fade" id="jobDeleteModal" tabindex="-1" aria-hidden="true">
   <div class="modal-dialog">
     <div class="modal-content">
-      <form method="post">
+      <form method="post"
+            data-safe-delete
+            data-safe-delete-entity="job_card"
+            data-safe-delete-record-field="job_id"
+            data-safe-delete-operation="delete"
+            data-safe-delete-reason-field="delete_note">
         <div class="modal-header bg-danger-subtle">
           <h5 class="modal-title">Soft Delete Job Card</h5>
           <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
@@ -3663,6 +3694,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         <div class="modal-body">
           <?= csrf_field(); ?>
           <input type="hidden" name="_action" value="soft_delete">
+          <input type="hidden" name="job_id" value="<?= (int) $jobId; ?>">
           <div class="mb-3">
             <label class="form-label">Job Reference</label>
             <input type="text" class="form-control" readonly value="<?= e((string) ($job['job_number'] ?? ('#' . $jobId))); ?>">

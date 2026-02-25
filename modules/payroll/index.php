@@ -641,6 +641,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $pdo = db();
         $pdo->beginTransaction();
         try {
+          $safeDeleteValidation = safe_delete_validate_post_confirmation('payroll_advance', $advanceId, [
+            'operation' => 'delete',
+            'reason_field' => 'deletion_reason',
+          ]);
+          $deletionReason = (string) ($safeDeleteValidation['reason'] ?? '');
           $advStmt = $pdo->prepare(
             'SELECT applied_amount FROM payroll_advances WHERE id = :id AND company_id = :company_id AND garage_id = :garage_id FOR UPDATE'
           );
@@ -658,16 +663,35 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             throw new RuntimeException('Cannot delete an advance that is already applied.');
           }
 
+          $advanceColumns = table_columns('payroll_advances');
+          $setParts = ['status = "DELETED"'];
+          $deleteParams = ['id' => $advanceId];
+          if (in_array('deleted_at', $advanceColumns, true)) {
+            $setParts[] = 'deleted_at = COALESCE(deleted_at, NOW())';
+          }
+          if (in_array('deleted_by', $advanceColumns, true)) {
+            $setParts[] = 'deleted_by = :deleted_by';
+            $deleteParams['deleted_by'] = $_SESSION['user_id'] ?? null;
+          }
+          if (in_array('deletion_reason', $advanceColumns, true)) {
+            $setParts[] = 'deletion_reason = :deletion_reason';
+            $deleteParams['deletion_reason'] = $deletionReason !== '' ? $deletionReason : null;
+          }
+
           $deleteStmt = $pdo->prepare(
-            'UPDATE payroll_advances SET status = "DELETED" WHERE id = :id'
+            'UPDATE payroll_advances SET ' . implode(', ', $setParts) . ' WHERE id = :id'
           );
-          $deleteStmt->execute(['id' => $advanceId]);
+          $deleteStmt->execute($deleteParams);
           log_audit('payroll', 'advance_delete', $advanceId, 'Soft deleted staff advance', [
             'entity' => 'payroll_advance',
             'company_id' => $companyId,
             'garage_id' => $garageId,
+            'metadata' => ['deletion_reason' => $deletionReason],
           ]);
           $pdo->commit();
+          safe_delete_log_cascade('payroll_advance', 'delete', $advanceId, $safeDeleteValidation, [
+            'metadata' => ['company_id' => $companyId, 'garage_id' => $garageId],
+          ]);
           flash_set('payroll_success', 'Advance deleted.', 'success');
         } catch (Throwable $exception) {
           $pdo->rollBack();
@@ -815,6 +839,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $pdo = db();
         $pdo->beginTransaction();
         try {
+          $safeDeleteValidation = safe_delete_validate_post_confirmation('payroll_loan', $loanId, [
+            'operation' => 'delete',
+            'reason_field' => 'deletion_reason',
+          ]);
+          $deletionReason = (string) ($safeDeleteValidation['reason'] ?? '');
           $loanStmt = $pdo->prepare(
             'SELECT paid_amount FROM payroll_loans WHERE id = :id AND company_id = :company_id AND garage_id = :garage_id FOR UPDATE'
           );
@@ -832,14 +861,33 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             throw new RuntimeException('Cannot delete a loan that has payments.');
           }
 
-          $deleteStmt = $pdo->prepare('UPDATE payroll_loans SET status = "DELETED" WHERE id = :id');
-          $deleteStmt->execute(['id' => $loanId]);
+          $loanColumns = table_columns('payroll_loans');
+          $setParts = ['status = "DELETED"'];
+          $deleteParams = ['id' => $loanId];
+          if (in_array('deleted_at', $loanColumns, true)) {
+            $setParts[] = 'deleted_at = COALESCE(deleted_at, NOW())';
+          }
+          if (in_array('deleted_by', $loanColumns, true)) {
+            $setParts[] = 'deleted_by = :deleted_by';
+            $deleteParams['deleted_by'] = $_SESSION['user_id'] ?? null;
+          }
+          if (in_array('deletion_reason', $loanColumns, true)) {
+            $setParts[] = 'deletion_reason = :deletion_reason';
+            $deleteParams['deletion_reason'] = $deletionReason !== '' ? $deletionReason : null;
+          }
+
+          $deleteStmt = $pdo->prepare('UPDATE payroll_loans SET ' . implode(', ', $setParts) . ' WHERE id = :id');
+          $deleteStmt->execute($deleteParams);
           log_audit('payroll', 'loan_delete', $loanId, 'Soft deleted staff loan', [
             'entity' => 'payroll_loan',
             'company_id' => $companyId,
             'garage_id' => $garageId,
+            'metadata' => ['deletion_reason' => $deletionReason],
           ]);
           $pdo->commit();
+          safe_delete_log_cascade('payroll_loan', 'delete', $loanId, $safeDeleteValidation, [
+            'metadata' => ['company_id' => $companyId, 'garage_id' => $garageId],
+          ]);
           flash_set('payroll_success', 'Loan deleted.', 'success');
         } catch (Throwable $exception) {
           $pdo->rollBack();

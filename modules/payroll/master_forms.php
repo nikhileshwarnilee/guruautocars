@@ -597,11 +597,20 @@ include __DIR__ . '/../../includes/sidebar.php';
   <div class="modal-dialog">
     <div class="modal-content">
       <div class="modal-header"><h5 class="modal-title">Reverse Entry</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
-      <form method="post" action="<?= e(url('modules/payroll/index.php')); ?>" class="ajax-form">
+      <form method="post"
+            action="<?= e(url('modules/payroll/index.php')); ?>"
+            class="ajax-form"
+            data-safe-delete
+            data-safe-delete-entity-field="safe_delete_entity"
+            data-safe-delete-record-field="safe_delete_record_id"
+            data-safe-delete-operation="delete"
+            data-safe-delete-reason-field="deletion_reason">
         <div class="modal-body">
           <?= csrf_field(); ?>
           <input type="hidden" name="_action" id="master-reverse-action" />
           <input type="hidden" name="return_to" value="<?= e($returnTo) ?>" />
+          <input type="hidden" name="safe_delete_entity" id="master-safe-delete-entity" />
+          <input type="hidden" name="safe_delete_record_id" id="master-safe-delete-record-id" />
           <input type="hidden" name="structure_id" id="master-reverse-structure-id" />
           <input type="hidden" name="advance_id" id="master-reverse-advance-id" />
           <input type="hidden" name="loan_id" id="master-reverse-loan-id" />
@@ -766,6 +775,8 @@ include __DIR__ . '/../../includes/sidebar.php';
       var reverseBtn = event.target.closest('.js-master-reverse-btn');
       if (reverseBtn && !reverseBtn.disabled) {
         setValue('master-reverse-action', reverseBtn.getAttribute('data-action'));
+        setValue('master-safe-delete-entity', '');
+        setValue('master-safe-delete-record-id', '');
         setValue('master-reverse-structure-id', '');
         setValue('master-reverse-advance-id', '');
         setValue('master-reverse-loan-id', '');
@@ -776,9 +787,13 @@ include __DIR__ . '/../../includes/sidebar.php';
         }
         if (idField === 'advance') {
           setValue('master-reverse-advance-id', entryId);
+          setValue('master-safe-delete-entity', 'payroll_advance');
+          setValue('master-safe-delete-record-id', entryId);
         }
         if (idField === 'loan') {
           setValue('master-reverse-loan-id', entryId);
+          setValue('master-safe-delete-entity', 'payroll_loan');
+          setValue('master-safe-delete-record-id', entryId);
         }
         setValue('master-reverse-label', reverseBtn.getAttribute('data-label'));
         setText('master-reverse-hint', reverseBtn.getAttribute('data-hint'));

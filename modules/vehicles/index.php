@@ -438,28 +438,63 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             redirect('modules/vehicles/index.php');
         }
 
-        $isActive = $nextStatus === 'ACTIVE' ? 1 : 0;
-        $stmt = db()->prepare(
-            'UPDATE vehicles
-             SET is_active = :is_active,
-                 status_code = :status_code,
-                 deleted_at = CASE WHEN :status_code = "DELETED" THEN NOW() ELSE NULL END
-             WHERE id = :id
-               AND company_id = :company_id'
-        );
-        $stmt->execute([
-            'is_active' => $isActive,
-            'status_code' => $nextStatus,
-            'id' => $vehicleId,
-            'company_id' => $companyId,
-        ]);
+        try {
+            $safeDeleteValidation = null;
+            $deletionReason = '';
+            if ($nextStatus === 'DELETED') {
+                $safeDeleteValidation = safe_delete_validate_post_confirmation('vehicle', $vehicleId, [
+                    'operation' => 'delete',
+                    'reason_field' => 'deletion_reason',
+                ]);
+                $deletionReason = (string) ($safeDeleteValidation['reason'] ?? '');
+            }
 
-        add_vehicle_history($vehicleId, 'STATUS', 'Status changed to ' . $nextStatus, [
-            'status_code' => $nextStatus,
-        ]);
-        log_audit('vehicles', 'status', $vehicleId, 'Changed vehicle status to ' . $nextStatus);
+            $isActive = $nextStatus === 'ACTIVE' ? 1 : 0;
+            $vehicleColumns = table_columns('vehicles');
+            $setParts = [
+                'is_active = :is_active',
+                'status_code = :status_code',
+                'deleted_at = CASE WHEN :status_code = "DELETED" THEN NOW() ELSE NULL END',
+            ];
+            $params = [
+                'is_active' => $isActive,
+                'status_code' => $nextStatus,
+                'id' => $vehicleId,
+                'company_id' => $companyId,
+            ];
+            if (in_array('deleted_by', $vehicleColumns, true)) {
+                $setParts[] = 'deleted_by = CASE WHEN :status_code = "DELETED" THEN :deleted_by ELSE NULL END';
+                $params['deleted_by'] = (int) ($_SESSION['user_id'] ?? 0) > 0 ? (int) $_SESSION['user_id'] : null;
+            }
+            if (in_array('deletion_reason', $vehicleColumns, true)) {
+                $setParts[] = 'deletion_reason = CASE WHEN :status_code = "DELETED" THEN :deletion_reason ELSE NULL END';
+                $params['deletion_reason'] = $deletionReason !== '' ? $deletionReason : null;
+            }
 
-        flash_set('vehicle_success', 'Vehicle status updated.', 'success');
+            $stmt = db()->prepare(
+                'UPDATE vehicles
+                 SET ' . implode(', ', $setParts) . '
+                 WHERE id = :id
+                   AND company_id = :company_id'
+            );
+            $stmt->execute($params);
+
+            $historyMeta = ['status_code' => $nextStatus];
+            if ($deletionReason !== '') {
+                $historyMeta['deletion_reason'] = $deletionReason;
+            }
+            add_vehicle_history($vehicleId, 'STATUS', 'Status changed to ' . $nextStatus, $historyMeta);
+            log_audit('vehicles', 'status', $vehicleId, 'Changed vehicle status to ' . $nextStatus);
+            if (is_array($safeDeleteValidation)) {
+                safe_delete_log_cascade('vehicle', 'delete', $vehicleId, $safeDeleteValidation, [
+                    'metadata' => ['vehicle_id' => $vehicleId],
+                ]);
+            }
+
+            flash_set('vehicle_success', 'Vehicle status updated.', 'success');
+        } catch (Throwable $exception) {
+            flash_set('vehicle_error', $exception->getMessage(), 'danger');
+        }
         redirect('modules/vehicles/index.php');
     }
 }
@@ -1088,7 +1123,12 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                             <input type="hidden" name="next_status" value="<?= e(((string) $vehicle['status_code'] === 'ACTIVE') ? 'INACTIVE' : 'ACTIVE'); ?>" />
                             <button type="submit" class="btn btn-sm btn-outline-secondary"><?= ((string) $vehicle['status_code'] === 'ACTIVE') ? 'Inactivate' : 'Activate'; ?></button>
                           </form>
-                          <form method="post" class="d-inline" data-confirm="Soft delete this vehicle?">
+                          <form method="post" class="d-inline"
+                                data-safe-delete
+                                data-safe-delete-entity="vehicle"
+                                data-safe-delete-record-field="vehicle_id"
+                                data-safe-delete-operation="delete"
+                                data-safe-delete-reason-field="deletion_reason">
                             <?= csrf_field(); ?>
                             <input type="hidden" name="_action" value="change_status" />
                             <input type="hidden" name="vehicle_id" value="<?= (int) $vehicle['id']; ?>" />

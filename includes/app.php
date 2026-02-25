@@ -22,6 +22,7 @@ require_once __DIR__ . '/auth.php';
 require_once __DIR__ . '/finance.php';
 require_once __DIR__ . '/analytics.php';
 require_once __DIR__ . '/reversal.php';
+require_once __DIR__ . '/safe_delete.php';
 
 log_request_access_event();
 

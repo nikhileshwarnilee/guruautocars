@@ -9,6 +9,7 @@ function gacBoot() {
   runInitTask(initSidebarUiEnhancements, 'initSidebarUiEnhancements');
   runInitTask(ensurePageBreadcrumbs, 'ensurePageBreadcrumbs');
   runInitTask(initFlashNotifications, 'initFlashNotifications');
+  runInitTask(initSafeDeleteFlow, 'initSafeDeleteFlow');
   runInitTask(bindConfirmForms, 'bindConfirmForms');
   runInitTask(initAjaxFormEngine, 'initAjaxFormEngine');
   runInitTask(initGlobalVehicleSearch, 'initGlobalVehicleSearch');
@@ -783,12 +784,641 @@ function bindConfirmForms() {
     }
     dangerousForms[i].setAttribute('data-confirm-bound', '1');
     dangerousForms[i].addEventListener('submit', function (event) {
+      if (this.hasAttribute('data-safe-delete')) {
+        return;
+      }
       var message = this.getAttribute('data-confirm') || 'Are you sure?';
       if (!window.confirm(message)) {
         event.preventDefault();
       }
     });
   }
+}
+
+function initSafeDeleteFlow() {
+  if (!document.body || document.body.getAttribute('data-gac-safe-delete-init') === '1') {
+    return;
+  }
+  document.body.setAttribute('data-gac-safe-delete-init', '1');
+
+  var modalEl = document.getElementById('gac-safe-delete-modal');
+  if (!modalEl) {
+    return;
+  }
+
+  var state = {
+    modalEl: modalEl,
+    modal: null,
+    form: null,
+    meta: null,
+    previewToken: '',
+    summary: null,
+    pendingRequest: false,
+    loadingEl: document.getElementById('gac-safe-delete-loading'),
+    contentEl: document.getElementById('gac-safe-delete-content'),
+    alertEl: document.getElementById('gac-safe-delete-alert'),
+    submitBtn: document.getElementById('gac-safe-delete-submit-btn'),
+    recordLabelEl: document.getElementById('gac-safe-delete-record-label'),
+    recordMetaEl: document.getElementById('gac-safe-delete-record-meta'),
+    totalDepsEl: document.getElementById('gac-safe-delete-total-deps'),
+    finImpactEl: document.getElementById('gac-safe-delete-fin-impact'),
+    blockersWrapEl: document.getElementById('gac-safe-delete-blockers'),
+    blockersListEl: document.getElementById('gac-safe-delete-blockers-list'),
+    warningsWrapEl: document.getElementById('gac-safe-delete-warnings'),
+    warningsListEl: document.getElementById('gac-safe-delete-warnings-list'),
+    groupsEl: document.getElementById('gac-safe-delete-groups'),
+    confirmTextEl: document.getElementById('gac-safe-delete-confirm-text'),
+    confirmCheckEl: document.getElementById('gac-safe-delete-confirm-check'),
+    reasonWrapEl: document.getElementById('gac-safe-delete-reason-wrap'),
+    reasonEl: document.getElementById('gac-safe-delete-reason')
+  };
+
+  if (window.bootstrap && typeof window.bootstrap.Modal === 'function') {
+    state.modal = window.bootstrap.Modal.getOrCreateInstance(modalEl);
+  }
+
+  function formatCurrency(amount) {
+    var value = Number(amount);
+    if (!Number.isFinite(value)) {
+      value = 0;
+    }
+    return 'INR ' + value.toLocaleString('en-IN', {
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2
+    });
+  }
+
+  function formatNumber(value) {
+    var numeric = Number(value);
+    if (!Number.isFinite(numeric)) {
+      numeric = 0;
+    }
+    return Math.round(numeric).toLocaleString('en-IN');
+  }
+
+  function readFieldValue(form, fieldName) {
+    if (!form || !fieldName || !form.elements) {
+      return '';
+    }
+    var field = form.elements.namedItem(fieldName);
+    if (!field) {
+      return '';
+    }
+    if (typeof field.value === 'string') {
+      return field.value;
+    }
+    if (field.length && field[0] && typeof field[0].value === 'string') {
+      for (var i = 0; i < field.length; i++) {
+        if (field[i] && field[i].checked) {
+          return field[i].value || '';
+        }
+      }
+      return field[0].value || '';
+    }
+    return '';
+  }
+
+  function ensureHiddenField(form, name) {
+    if (!form || !name) {
+      return null;
+    }
+    var field = form.elements ? form.elements.namedItem(name) : null;
+    if (field && typeof field.value !== 'undefined') {
+      return field;
+    }
+    var hidden = document.createElement('input');
+    hidden.type = 'hidden';
+    hidden.name = name;
+    form.appendChild(hidden);
+    return hidden;
+  }
+
+  function resolveActionLabel(operation) {
+    var op = String(operation || '').toLowerCase();
+    if (op === 'cancel') {
+      return 'Confirm Cancel';
+    }
+    if (op === 'reverse' || op === 'reversal') {
+      return 'Confirm Reversal';
+    }
+    return 'Confirm Delete';
+  }
+
+  function setAlert(message, type) {
+    if (!state.alertEl) {
+      return;
+    }
+    var text = String(message || '').trim();
+    state.alertEl.className = 'alert';
+    if (!text) {
+      state.alertEl.classList.add('d-none');
+      state.alertEl.textContent = '';
+      return;
+    }
+    state.alertEl.classList.remove('d-none');
+    state.alertEl.classList.add(type === 'danger' ? 'alert-danger' : (type === 'warning' ? 'alert-warning' : 'alert-info'));
+    state.alertEl.textContent = text;
+  }
+
+  function setLoading(isLoading) {
+    if (state.loadingEl) {
+      state.loadingEl.classList[isLoading ? 'remove' : 'add']('d-none');
+    }
+    if (state.contentEl) {
+      state.contentEl.classList[isLoading ? 'add' : 'remove']('d-none');
+    }
+    state.pendingRequest = !!isLoading;
+    syncSubmitEnabled();
+  }
+
+  function clearList(listEl) {
+    if (!listEl) {
+      return;
+    }
+    while (listEl.firstChild) {
+      listEl.removeChild(listEl.firstChild);
+    }
+  }
+
+  function renderStringList(listEl, values) {
+    clearList(listEl);
+    if (!listEl || !values || !values.length) {
+      return;
+    }
+    for (var i = 0; i < values.length; i++) {
+      var li = document.createElement('li');
+      li.textContent = String(values[i] || '');
+      listEl.appendChild(li);
+    }
+  }
+
+  function renderGroups(groups, severity) {
+    if (!state.groupsEl) {
+      return;
+    }
+    clearList(state.groupsEl);
+
+    var list = Array.isArray(groups) ? groups : [];
+    for (var i = 0; i < list.length; i++) {
+      var group = list[i];
+      if (!group || Number(group.count || 0) <= 0) {
+        continue;
+      }
+
+      var details = document.createElement('details');
+      details.className = 'border rounded p-2';
+      if (i < 2) {
+        details.open = true;
+      }
+
+      var summaryEl = document.createElement('summary');
+      summaryEl.className = 'd-flex flex-wrap align-items-center gap-2';
+
+      var title = document.createElement('span');
+      title.className = 'fw-semibold';
+      title.textContent = String(group.label || 'Dependencies') + ' (' + formatNumber(group.count || 0) + ')';
+      summaryEl.appendChild(title);
+
+      var impactValue = Number(group.financial_impact || 0);
+      if (Number.isFinite(impactValue) && Math.abs(impactValue) > 0.0001) {
+        var impactBadge = document.createElement('span');
+        impactBadge.className = 'badge text-bg-light border';
+        impactBadge.textContent = formatCurrency(impactValue);
+        summaryEl.appendChild(impactBadge);
+      }
+
+      if (group.warning) {
+        var warnBadge = document.createElement('span');
+        warnBadge.className = 'badge text-bg-danger';
+        warnBadge.textContent = 'Warning';
+        summaryEl.appendChild(warnBadge);
+      } else if (severity === 'high') {
+        var highBadge = document.createElement('span');
+        highBadge.className = 'badge text-bg-warning';
+        highBadge.textContent = 'High impact';
+        summaryEl.appendChild(highBadge);
+      }
+
+      details.appendChild(summaryEl);
+
+      var body = document.createElement('div');
+      body.className = 'mt-2';
+
+      if (group.warning) {
+        var warnText = document.createElement('div');
+        warnText.className = 'small text-danger mb-2';
+        warnText.textContent = String(group.warning);
+        body.appendChild(warnText);
+      }
+
+      var items = Array.isArray(group.items) ? group.items : [];
+      if (items.length > 0) {
+        var listWrap = document.createElement('div');
+        listWrap.className = 'table-responsive';
+
+        var table = document.createElement('table');
+        table.className = 'table table-sm mb-0';
+        var thead = document.createElement('thead');
+        thead.innerHTML = '<tr><th>Reference</th><th>Date</th><th class="text-end">Amount</th><th>Status</th><th>Note</th></tr>';
+        table.appendChild(thead);
+
+        var tbody = document.createElement('tbody');
+        for (var j = 0; j < items.length; j++) {
+          var item = items[j] || {};
+          var tr = document.createElement('tr');
+          var amountText = '';
+          if (item.amount !== null && typeof item.amount !== 'undefined' && item.amount !== '') {
+            amountText = formatCurrency(item.amount);
+          }
+          tr.innerHTML =
+            '<td>' + escapeHtml(item.reference || '') + '</td>' +
+            '<td>' + escapeHtml(item.date || '') + '</td>' +
+            '<td class="text-end">' + escapeHtml(amountText) + '</td>' +
+            '<td>' + escapeHtml(item.status || '') + '</td>' +
+            '<td>' + escapeHtml(item.note || '') + '</td>';
+          tbody.appendChild(tr);
+        }
+        table.appendChild(tbody);
+        listWrap.appendChild(table);
+        body.appendChild(listWrap);
+      }
+
+      var remaining = Number(group.remaining_count || 0);
+      if (Number.isFinite(remaining) && remaining > 0) {
+        var more = document.createElement('div');
+        more.className = 'small text-muted mt-2';
+        more.textContent = '+' + formatNumber(remaining) + ' more item(s) not shown in preview.';
+        body.appendChild(more);
+      }
+
+      details.appendChild(body);
+      state.groupsEl.appendChild(details);
+    }
+
+    if (!state.groupsEl.firstChild) {
+      var none = document.createElement('div');
+      none.className = 'text-muted small';
+      none.textContent = 'No dependent records found.';
+      state.groupsEl.appendChild(none);
+    }
+  }
+
+  function escapeHtml(value) {
+    var text = String(value || '');
+    return text
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/\"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  function renderSummary(summary) {
+    state.summary = summary || null;
+    var data = state.summary || {};
+    var main = data.main_record || {};
+    var blockers = Array.isArray(data.blockers) ? data.blockers : [];
+    var warnings = Array.isArray(data.warnings) ? data.warnings : [];
+
+    if (state.recordLabelEl) {
+      state.recordLabelEl.textContent = String(main.label || main.reference || (data.entity_label || 'Record'));
+    }
+    if (state.recordMetaEl) {
+      var metaParts = [];
+      if (main.date) {
+        metaParts.push(String(main.date));
+      }
+      if (main.status) {
+        metaParts.push(String(main.status));
+      }
+      if (main.amount !== null && typeof main.amount !== 'undefined') {
+        metaParts.push(formatCurrency(main.amount));
+      }
+      if (main.note) {
+        metaParts.push(String(main.note));
+      }
+      state.recordMetaEl.textContent = metaParts.join(' | ');
+    }
+    if (state.totalDepsEl) {
+      state.totalDepsEl.textContent = formatNumber(data.total_dependencies || 0);
+    }
+    if (state.finImpactEl) {
+      state.finImpactEl.textContent = formatCurrency(data.total_financial_impact || 0);
+    }
+
+    if (state.blockersWrapEl) {
+      state.blockersWrapEl.classList[blockers.length ? 'remove' : 'add']('d-none');
+    }
+    if (state.warningsWrapEl) {
+      state.warningsWrapEl.classList[warnings.length ? 'remove' : 'add']('d-none');
+    }
+    renderStringList(state.blockersListEl, blockers);
+    renderStringList(state.warningsListEl, warnings);
+    renderGroups(data.groups || [], data.severity || 'normal');
+
+    var highImpact = String(data.severity || '').toLowerCase() === 'high';
+    if (state.finImpactEl && state.finImpactEl.parentElement && state.finImpactEl.parentElement.parentElement) {
+      state.finImpactEl.parentElement.parentElement.classList.toggle('text-danger', highImpact);
+    }
+
+    if (state.submitBtn) {
+      state.submitBtn.textContent = resolveActionLabel(data.operation || (state.meta ? state.meta.operation : 'delete'));
+    }
+
+    syncSubmitEnabled();
+  }
+
+  function resetModalState() {
+    state.form = null;
+    state.meta = null;
+    state.previewToken = '';
+    state.summary = null;
+    setAlert('', 'info');
+    if (state.confirmTextEl) {
+      state.confirmTextEl.value = '';
+    }
+    if (state.confirmCheckEl) {
+      state.confirmCheckEl.checked = false;
+    }
+    if (state.reasonEl) {
+      state.reasonEl.value = '';
+    }
+    if (state.reasonWrapEl) {
+      state.reasonWrapEl.classList.add('d-none');
+    }
+    clearList(state.groupsEl);
+    clearList(state.blockersListEl);
+    clearList(state.warningsListEl);
+    if (state.recordLabelEl) {
+      state.recordLabelEl.textContent = '-';
+    }
+    if (state.recordMetaEl) {
+      state.recordMetaEl.textContent = '';
+    }
+    if (state.totalDepsEl) {
+      state.totalDepsEl.textContent = '0';
+    }
+    if (state.finImpactEl) {
+      state.finImpactEl.textContent = formatCurrency(0);
+    }
+    if (state.blockersWrapEl) {
+      state.blockersWrapEl.classList.add('d-none');
+    }
+    if (state.warningsWrapEl) {
+      state.warningsWrapEl.classList.add('d-none');
+    }
+    setLoading(false);
+    if (state.contentEl) {
+      state.contentEl.classList.add('d-none');
+    }
+    if (state.loadingEl) {
+      state.loadingEl.classList.remove('d-none');
+    }
+    syncSubmitEnabled();
+  }
+
+  function syncSubmitEnabled() {
+    if (!state.submitBtn) {
+      return;
+    }
+    var hasSummary = !!state.summary;
+    var canProceed = hasSummary && state.summary.can_proceed !== false;
+    state.submitBtn.disabled = state.pendingRequest || !hasSummary || !canProceed;
+  }
+
+  function resolveMeta(form) {
+    if (!form) {
+      return null;
+    }
+
+    var entity = String(form.getAttribute('data-safe-delete-entity') || '').trim();
+    var entityField = String(form.getAttribute('data-safe-delete-entity-field') || '').trim();
+    if (!entity && entityField) {
+      entity = String(readFieldValue(form, entityField) || '').trim();
+    }
+
+    var recordField = String(form.getAttribute('data-safe-delete-record-field') || 'id').trim();
+    var recordId = String(readFieldValue(form, recordField) || '').trim();
+
+    var operation = String(form.getAttribute('data-safe-delete-operation') || '').trim();
+    var operationField = String(form.getAttribute('data-safe-delete-operation-field') || '').trim();
+    if (!operation && operationField) {
+      operation = String(readFieldValue(form, operationField) || '').trim();
+    }
+    if (!operation) {
+      operation = 'delete';
+    }
+
+    var reasonField = String(form.getAttribute('data-safe-delete-reason-field') || '').trim();
+    var hasReasonField = !!(reasonField && form.elements && form.elements.namedItem(reasonField));
+    var csrf = String(readFieldValue(form, '_csrf') || '').trim();
+
+    if (!entity || !recordId) {
+      return null;
+    }
+
+    return {
+      entity: entity,
+      recordField: recordField,
+      recordId: recordId,
+      operation: operation,
+      reasonField: reasonField,
+      hasReasonField: hasReasonField,
+      csrf: csrf
+    };
+  }
+
+  function openPreviewForForm(form, resolvedMeta) {
+    var meta = resolvedMeta || resolveMeta(form);
+    if (!meta) {
+      return;
+    }
+    if (!meta.csrf) {
+      window.alert('CSRF token missing for safe delete preview. Refresh and retry.');
+      return;
+    }
+    if (!window.GacSafeDeleteConfig || !window.GacSafeDeleteConfig.endpoint) {
+      window.alert('Safe delete preview endpoint is not configured.');
+      return;
+    }
+
+    state.form = form;
+    state.meta = meta;
+    state.previewToken = '';
+    state.summary = null;
+
+    if (state.reasonWrapEl) {
+      state.reasonWrapEl.classList[meta.hasReasonField ? 'add' : 'remove']('d-none');
+    }
+    if (!meta.hasReasonField && state.reasonEl) {
+      state.reasonEl.value = '';
+    }
+    if (meta.hasReasonField && meta.reasonField && state.reasonEl) {
+      state.reasonEl.value = String(readFieldValue(form, meta.reasonField) || '');
+    }
+
+    setAlert('', 'info');
+    if (state.confirmTextEl) {
+      state.confirmTextEl.value = '';
+    }
+    if (state.confirmCheckEl) {
+      state.confirmCheckEl.checked = false;
+    }
+    if (state.submitBtn) {
+      state.submitBtn.textContent = resolveActionLabel(meta.operation);
+    }
+
+    setLoading(true);
+    if (state.modal) {
+      state.modal.show();
+    } else {
+      modalEl.classList.add('show');
+      modalEl.style.display = 'block';
+    }
+
+    var formData = new FormData();
+    formData.append('_csrf', meta.csrf);
+    formData.append('entity', meta.entity);
+    formData.append('record_id', meta.recordId);
+    formData.append('operation', meta.operation);
+
+    fetch(String(window.GacSafeDeleteConfig.endpoint), {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: {
+        'X-Requested-With': 'XMLHttpRequest',
+        'Accept': 'application/json'
+      },
+      body: formData
+    })
+      .then(function (response) {
+        return response.text().then(function (text) {
+          return {
+            status: response.status,
+            ok: response.ok,
+            payload: safeParseJson(text),
+            raw: text
+          };
+        });
+      })
+      .then(function (result) {
+        var payload = result.payload || null;
+        if (!payload || payload.ok === false) {
+          throw new Error(payload && payload.message ? String(payload.message) : 'Unable to load deletion impact summary.');
+        }
+        state.previewToken = String(payload.preview_token || '');
+        renderSummary(payload.summary || {});
+        setLoading(false);
+        if (!state.previewToken) {
+          setAlert('Preview token was not issued. Retry the action.', 'danger');
+          syncSubmitEnabled();
+          return;
+        }
+        if (state.summary && state.summary.can_proceed === false) {
+          setAlert('Deletion is blocked by dependency rules. Review blockers below.', 'warning');
+        }
+      })
+      .catch(function (error) {
+        setLoading(false);
+        state.summary = null;
+        state.previewToken = '';
+        setAlert(error && error.message ? error.message : 'Unable to load deletion impact summary.', 'danger');
+      });
+  }
+
+  function applyAndSubmit() {
+    if (!state.form || !state.meta) {
+      return;
+    }
+    if (!state.previewToken) {
+      setAlert('Deletion preview token is missing. Reload the summary and retry.', 'danger');
+      return;
+    }
+    if (!state.summary || state.summary.can_proceed === false) {
+      setAlert('This action is blocked and cannot be submitted.', 'danger');
+      return;
+    }
+
+    var typedText = state.confirmTextEl ? String(state.confirmTextEl.value || '').trim() : '';
+    var checked = !!(state.confirmCheckEl && state.confirmCheckEl.checked);
+    if (typedText !== 'CONFIRM' && !checked) {
+      setAlert('Type CONFIRM or tick the checkbox to continue.', 'danger');
+      return;
+    }
+
+    if (state.meta.hasReasonField && state.meta.reasonField) {
+      var formReason = String(readFieldValue(state.form, state.meta.reasonField) || '').trim();
+      if (!formReason) {
+        setAlert('Reason is required before confirmation.', 'danger');
+        return;
+      }
+    }
+
+    if (!state.meta.hasReasonField) {
+      var modalReason = state.reasonEl ? String(state.reasonEl.value || '').trim() : '';
+      if (!modalReason) {
+        setAlert('Deletion / reversal reason is required.', 'danger');
+        return;
+      }
+      var hiddenReasonField = state.meta.reasonField ? state.meta.reasonField : 'deletion_reason';
+      ensureHiddenField(state.form, hiddenReasonField).value = modalReason;
+      state.meta.reasonField = hiddenReasonField;
+    }
+
+    ensureHiddenField(state.form, '_safe_delete_preview_token').value = state.previewToken;
+    ensureHiddenField(state.form, '_safe_delete_confirm_text').value = typedText;
+    ensureHiddenField(state.form, '_safe_delete_confirm_checked').value = checked ? '1' : '0';
+
+    if (!state.form.noValidate && typeof state.form.checkValidity === 'function' && !state.form.checkValidity()) {
+      if (typeof state.form.reportValidity === 'function') {
+        state.form.reportValidity();
+      }
+      return;
+    }
+
+    state.form.setAttribute('data-safe-delete-armed', '1');
+    if (state.modal && typeof state.modal.hide === 'function') {
+      state.modal.hide();
+    }
+
+    if (typeof state.form.requestSubmit === 'function') {
+      state.form.requestSubmit();
+    } else {
+      state.form.submit();
+    }
+  }
+
+  document.addEventListener('submit', function (event) {
+    var form = event.target;
+    if (!form || form.tagName !== 'FORM' || !form.hasAttribute('data-safe-delete')) {
+      return;
+    }
+
+    if (form.getAttribute('data-safe-delete-armed') === '1') {
+      form.removeAttribute('data-safe-delete-armed');
+      return;
+    }
+
+    if (event.defaultPrevented) {
+      return;
+    }
+
+    var previewMeta = resolveMeta(form);
+    if (!previewMeta) {
+      return;
+    }
+
+    event.preventDefault();
+    openPreviewForForm(form, previewMeta);
+  });
+
+  if (state.submitBtn) {
+    state.submitBtn.addEventListener('click', applyAndSubmit);
+  }
+
+  modalEl.addEventListener('hidden.bs.modal', function () {
+    resetModalState();
+  });
 }
 
 function initAjaxFormEngine() {

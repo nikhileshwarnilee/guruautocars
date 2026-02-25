@@ -296,14 +296,30 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
 
         $returnId = post_int('return_id');
+        $deleteReason = post_string('delete_reason', 255);
         try {
-            $result = returns_delete_rma($pdo, $returnId, $companyId, $garageId, $userId);
+            $safeDeleteValidation = safe_delete_validate_post_confirmation('return', $returnId, [
+                'operation' => 'delete',
+                'reason_field' => 'delete_reason',
+            ]);
+            $result = returns_delete_rma($pdo, $returnId, $companyId, $garageId, $userId, $deleteReason);
+            safe_delete_log_cascade('return', 'delete', $returnId, (array) $safeDeleteValidation, [
+                'reversal_references' => array_values(array_map(
+                    static fn (array $row): string => (string) ($row['movement_uid'] ?? ''),
+                    array_values(array_filter((array) (($result['stock_reversal'] ?? [])['posted'] ?? []), static fn ($row): bool => is_array($row)))
+                )),
+                'metadata' => [
+                    'return_number' => (string) ($result['return_number'] ?? ''),
+                    'delete_reason' => $deleteReason,
+                ],
+            ]);
             log_audit('returns', 'delete', $returnId, 'Deleted return ' . (string) ($result['return_number'] ?? ''), [
                 'entity' => 'returns_rma',
                 'source' => 'UI',
                 'metadata' => [
                     'return_type' => (string) ($result['return_type'] ?? ''),
                     'approval_status' => (string) ($result['approval_status'] ?? ''),
+                    'delete_reason' => $deleteReason,
                     'stock_reversal_posted_count' => count((array) (($result['stock_reversal'] ?? [])['posted'] ?? [])),
                     'stock_reversal_skipped_count' => count((array) (($result['stock_reversal'] ?? [])['skipped'] ?? [])),
                 ],
@@ -768,7 +784,12 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                             </form>
                           <?php endif; ?>
                           <?php if ($canDeleteReturn): ?>
-                            <form method="post" class="d-inline" data-confirm="Delete this return? Stock entries will be reversed. Reverse all settlement entries first.">
+                            <form method="post" class="d-inline"
+                                  data-safe-delete
+                                  data-safe-delete-entity="return"
+                                  data-safe-delete-record-field="return_id"
+                                  data-safe-delete-operation="delete"
+                                  data-safe-delete-reason-field="delete_reason">
                               <?= csrf_field(); ?>
                               <input type="hidden" name="_action" value="delete_return" />
                               <input type="hidden" name="return_id" value="<?= $returnId; ?>" />
@@ -793,7 +814,12 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             <div class="d-flex gap-1">
               <a href="<?= e(url('modules/returns/print_return.php?id=' . (int) ($selectedReturn['id'] ?? 0))); ?>" target="_blank" class="btn btn-sm btn-outline-secondary">Print</a>
               <?php if ($canDeleteReturn): ?>
-                <form method="post" data-confirm="Delete this return? Stock entries will be reversed. Reverse all settlement entries first.">
+                <form method="post"
+                      data-safe-delete
+                      data-safe-delete-entity="return"
+                      data-safe-delete-record-field="return_id"
+                      data-safe-delete-operation="delete"
+                      data-safe-delete-reason-field="delete_reason">
                   <?= csrf_field(); ?>
                   <input type="hidden" name="_action" value="delete_return" />
                   <input type="hidden" name="return_id" value="<?= (int) ($selectedReturn['id'] ?? 0); ?>" />

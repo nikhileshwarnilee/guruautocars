@@ -169,26 +169,64 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             redirect('modules/customers/index.php');
         }
 
-        $isActive = $nextStatus === 'ACTIVE' ? 1 : 0;
-        $stmt = db()->prepare(
-            'UPDATE customers
-             SET is_active = :is_active,
-                 status_code = :status_code,
-                 deleted_at = CASE WHEN :status_code = "DELETED" THEN NOW() ELSE NULL END
-             WHERE id = :id
-               AND company_id = :company_id'
-        );
-        $stmt->execute([
-            'is_active' => $isActive,
-            'status_code' => $nextStatus,
-            'id' => $customerId,
-            'company_id' => $companyId,
-        ]);
+        try {
+            $safeDeleteValidation = null;
+            $deletionReason = '';
+            if ($nextStatus === 'DELETED') {
+                $safeDeleteValidation = safe_delete_validate_post_confirmation('customer', $customerId, [
+                    'operation' => 'delete',
+                    'reason_field' => 'deletion_reason',
+                ]);
+                $deletionReason = (string) ($safeDeleteValidation['reason'] ?? '');
+            }
 
-        add_customer_history($customerId, 'STATUS', 'Status changed to ' . $nextStatus, ['status_code' => $nextStatus]);
-        log_audit('customers', 'status', $customerId, 'Changed customer status to ' . $nextStatus);
+            $isActive = $nextStatus === 'ACTIVE' ? 1 : 0;
+            $customerColumns = table_columns('customers');
+            $setParts = [
+                'is_active = :is_active',
+                'status_code = :status_code',
+                'deleted_at = CASE WHEN :status_code = "DELETED" THEN NOW() ELSE NULL END',
+            ];
+            $params = [
+                'is_active' => $isActive,
+                'status_code' => $nextStatus,
+                'id' => $customerId,
+                'company_id' => $companyId,
+            ];
+            if (in_array('deleted_by', $customerColumns, true)) {
+                $setParts[] = 'deleted_by = CASE WHEN :status_code = "DELETED" THEN :deleted_by ELSE NULL END';
+                $params['deleted_by'] = (int) ($_SESSION['user_id'] ?? 0) > 0 ? (int) $_SESSION['user_id'] : null;
+            }
+            if (in_array('deletion_reason', $customerColumns, true)) {
+                $setParts[] = 'deletion_reason = CASE WHEN :status_code = "DELETED" THEN :deletion_reason ELSE NULL END';
+                $params['deletion_reason'] = $deletionReason !== '' ? $deletionReason : null;
+            }
 
-        flash_set('customer_success', 'Customer status updated.', 'success');
+            $stmt = db()->prepare(
+                'UPDATE customers
+                 SET ' . implode(', ', $setParts) . '
+                 WHERE id = :id
+                   AND company_id = :company_id'
+            );
+            $stmt->execute($params);
+
+            $historyMeta = ['status_code' => $nextStatus];
+            if ($deletionReason !== '') {
+                $historyMeta['deletion_reason'] = $deletionReason;
+            }
+            add_customer_history($customerId, 'STATUS', 'Status changed to ' . $nextStatus, $historyMeta);
+            log_audit('customers', 'status', $customerId, 'Changed customer status to ' . $nextStatus);
+            if (is_array($safeDeleteValidation)) {
+                safe_delete_log_cascade('customer', 'delete', $customerId, $safeDeleteValidation, [
+                    'metadata' => ['customer_id' => $customerId],
+                ]);
+            }
+
+            flash_set('customer_success', 'Customer status updated.', 'success');
+        } catch (Throwable $exception) {
+            flash_set('customer_error', $exception->getMessage(), 'danger');
+        }
+
         redirect('modules/customers/index.php');
     }
 }
@@ -530,7 +568,12 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                             <input type="hidden" name="next_status" value="<?= e(((string) $customer['status_code'] === 'ACTIVE') ? 'INACTIVE' : 'ACTIVE'); ?>" />
                             <button type="submit" class="btn btn-sm btn-outline-secondary"><?= ((string) $customer['status_code'] === 'ACTIVE') ? 'Inactivate' : 'Activate'; ?></button>
                           </form>
-                          <form method="post" class="d-inline" data-confirm="Soft delete this customer?">
+                          <form method="post" class="d-inline"
+                                data-safe-delete
+                                data-safe-delete-entity="customer"
+                                data-safe-delete-record-field="customer_id"
+                                data-safe-delete-operation="delete"
+                                data-safe-delete-reason-field="deletion_reason">
                             <?= csrf_field(); ?>
                             <input type="hidden" name="_action" value="change_status" />
                             <input type="hidden" name="customer_id" value="<?= (int) $customer['id']; ?>" />

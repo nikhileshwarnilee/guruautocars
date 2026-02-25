@@ -123,22 +123,54 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if ($action === 'change_status') {
         $vendorId = post_int('vendor_id');
         $nextStatus = normalize_status_code((string) ($_POST['next_status'] ?? 'INACTIVE'));
+        try {
+            $safeDeleteValidation = null;
+            $deletionReason = '';
+            if ($nextStatus === 'DELETED') {
+                $safeDeleteValidation = safe_delete_validate_post_confirmation('vendor', $vendorId, [
+                    'operation' => 'delete',
+                    'reason_field' => 'deletion_reason',
+                ]);
+                $deletionReason = (string) ($safeDeleteValidation['reason'] ?? '');
+            }
 
-        $stmt = db()->prepare(
-            'UPDATE vendors
-             SET status_code = :status_code,
-                 deleted_at = CASE WHEN :status_code = "DELETED" THEN NOW() ELSE NULL END
-             WHERE id = :id
-               AND company_id = :company_id'
-        );
-        $stmt->execute([
-            'status_code' => $nextStatus,
-            'id' => $vendorId,
-            'company_id' => $companyId,
-        ]);
+            $vendorColumns = table_columns('vendors');
+            $setParts = [
+                'status_code = :status_code',
+                'deleted_at = CASE WHEN :status_code = "DELETED" THEN NOW() ELSE NULL END',
+            ];
+            $params = [
+                'status_code' => $nextStatus,
+                'id' => $vendorId,
+                'company_id' => $companyId,
+            ];
+            if (in_array('deleted_by', $vendorColumns, true)) {
+                $setParts[] = 'deleted_by = CASE WHEN :status_code = "DELETED" THEN :deleted_by ELSE NULL END';
+                $params['deleted_by'] = (int) ($_SESSION['user_id'] ?? 0) > 0 ? (int) $_SESSION['user_id'] : null;
+            }
+            if (in_array('deletion_reason', $vendorColumns, true)) {
+                $setParts[] = 'deletion_reason = CASE WHEN :status_code = "DELETED" THEN :deletion_reason ELSE NULL END';
+                $params['deletion_reason'] = $deletionReason !== '' ? $deletionReason : null;
+            }
 
-        log_audit('vendors', 'status', $vendorId, 'Changed vendor status to ' . $nextStatus);
-        flash_set('vendor_success', 'Vendor status updated.', 'success');
+            $stmt = db()->prepare(
+                'UPDATE vendors
+                 SET ' . implode(', ', $setParts) . '
+                 WHERE id = :id
+                   AND company_id = :company_id'
+            );
+            $stmt->execute($params);
+
+            log_audit('vendors', 'status', $vendorId, 'Changed vendor status to ' . $nextStatus);
+            if (is_array($safeDeleteValidation)) {
+                safe_delete_log_cascade('vendor', 'delete', $vendorId, $safeDeleteValidation, [
+                    'metadata' => ['vendor_id' => $vendorId],
+                ]);
+            }
+            flash_set('vendor_success', 'Vendor status updated.', 'success');
+        } catch (Throwable $exception) {
+            flash_set('vendor_error', $exception->getMessage(), 'danger');
+        }
         redirect('modules/vendors/index.php');
     }
 }
@@ -292,7 +324,12 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                           <button type="submit" class="btn btn-sm btn-outline-secondary"><?= ((string) $vendor['status_code'] === 'ACTIVE') ? 'Inactivate' : 'Activate'; ?></button>
                         </form>
                         <?php if ((string) $vendor['status_code'] !== 'DELETED'): ?>
-                          <form method="post" class="d-inline" data-confirm="Soft delete this vendor?">
+                          <form method="post" class="d-inline"
+                                data-safe-delete
+                                data-safe-delete-entity="vendor"
+                                data-safe-delete-record-field="vendor_id"
+                                data-safe-delete-operation="delete"
+                                data-safe-delete-reason-field="deletion_reason">
                             <?= csrf_field(); ?>
                             <input type="hidden" name="_action" value="change_status" />
                             <input type="hidden" name="vendor_id" value="<?= (int) $vendor['id']; ?>" />

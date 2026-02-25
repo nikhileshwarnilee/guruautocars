@@ -80,7 +80,12 @@ function vehicle_master_render_rows(array $vehicles, bool $canManage): string
                   <input type="hidden" name="next_status" value="<?= e($statusCode === 'ACTIVE' ? 'INACTIVE' : 'ACTIVE'); ?>" />
                   <button type="submit" class="btn btn-sm btn-outline-secondary"><?= $statusCode === 'ACTIVE' ? 'Inactivate' : 'Activate'; ?></button>
                 </form>
-                <form method="post" class="d-inline" data-confirm="Soft delete this vehicle?">
+                <form method="post" class="d-inline"
+                      data-safe-delete
+                      data-safe-delete-entity="vehicle"
+                      data-safe-delete-record-field="vehicle_id"
+                      data-safe-delete-operation="delete"
+                      data-safe-delete-reason-field="deletion_reason">
                   <?= csrf_field(); ?>
                   <input type="hidden" name="_action" value="change_status" />
                   <input type="hidden" name="vehicle_id" value="<?= (int) ($vehicle['id'] ?? 0); ?>" />

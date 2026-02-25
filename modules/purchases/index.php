@@ -972,7 +972,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         $pdo = db();
         $pdo->beginTransaction();
+        $safeDeleteValidation = null;
         try {
+            $safeDeleteValidation = safe_delete_validate_post_confirmation('purchase', $purchaseId, [
+                'operation' => 'delete',
+                'reason_field' => 'delete_reason',
+            ]);
             $purchase = pur_fetch_purchase_for_update($pdo, $purchaseId, $companyId, $activeGarageId);
             if (!$purchase) {
                 throw new RuntimeException('Purchase not found for this garage.');
@@ -1268,6 +1273,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 ];
             }
 
+            $stockReversalMovementUids = [];
             foreach ($stockAdjustments as $stockAdjustment) {
                 $partId = (int) $stockAdjustment['part_id'];
                 $qty = round((float) $stockAdjustment['quantity'], 2);
@@ -1277,6 +1283,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'part_id' => $partId,
                 ]);
 
+                $movementUid = 'pur-del-' . hash('sha256', $purchaseId . '|' . $partId . '|' . $qty . '|' . microtime(true));
+                $stockReversalMovementUids[] = $movementUid;
                 pur_insert_movement($pdo, [
                     'company_id' => $companyId,
                     'garage_id' => $activeGarageId,
@@ -1285,31 +1293,47 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'quantity' => $qty,
                     'reference_type' => 'PURCHASE',
                     'reference_id' => $purchaseId,
-                    'movement_uid' => 'pur-del-' . hash('sha256', $purchaseId . '|' . $partId . '|' . $qty . '|' . microtime(true)),
+                    'movement_uid' => $movementUid,
                     'notes' => 'Purchase #' . $purchaseId . ' delete stock reversal. Reason: ' . $deleteReason,
                     'created_by' => $userId,
                 ]);
             }
 
-            $deleteStmt = $pdo->prepare(
-                'UPDATE purchases
-                 SET status_code = "DELETED",
-                     deleted_at = NOW(),
-                     deleted_by = :deleted_by,
-                     delete_reason = :delete_reason
-                 WHERE id = :id
-                   AND company_id = :company_id
-                   AND garage_id = :garage_id'
-            );
-            $deleteStmt->execute([
+            $purchaseColumns = table_columns('purchases');
+            $deleteSetParts = [
+                'status_code = "DELETED"',
+                'deleted_at = NOW()',
+                'deleted_by = :deleted_by',
+                'delete_reason = :delete_reason',
+            ];
+            $deleteParams = [
                 'deleted_by' => $userId > 0 ? $userId : null,
                 'delete_reason' => $deleteReason,
                 'id' => $purchaseId,
                 'company_id' => $companyId,
                 'garage_id' => $activeGarageId,
-            ]);
+            ];
+            if (in_array('deletion_reason', $purchaseColumns, true)) {
+                $deleteSetParts[] = 'deletion_reason = :deletion_reason';
+                $deleteParams['deletion_reason'] = $deleteReason;
+            }
+            $deleteStmt = $pdo->prepare(
+                'UPDATE purchases
+                 SET ' . implode(', ', $deleteSetParts) . '
+                 WHERE id = :id
+                   AND company_id = :company_id
+                   AND garage_id = :garage_id'
+            );
+            $deleteStmt->execute($deleteParams);
 
             $pdo->commit();
+            safe_delete_log_cascade('purchase', 'delete', $purchaseId, (array) $safeDeleteValidation, [
+                'reversal_references' => array_slice($stockReversalMovementUids, 0, 20),
+                'metadata' => [
+                    'purchase_invoice_number' => (string) ($purchase['invoice_number'] ?? ''),
+                    'stock_reverse_lines' => count($stockAdjustments),
+                ],
+            ]);
             log_audit('purchases', 'soft_delete', $purchaseId, 'Soft deleted purchase #' . $purchaseId, [
                 'entity' => 'purchase',
                 'source' => 'UI',
@@ -1474,7 +1498,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         $pdo = db();
         $pdo->beginTransaction();
+        $safeDeleteValidation = null;
         try {
+          $safeDeleteValidation = safe_delete_validate_post_confirmation('purchase_payment', $paymentId, [
+            'operation' => 'reverse',
+            'reason_field' => 'reverse_reason',
+          ]);
           $paymentStmt = $pdo->prepare(
             'SELECT pp.*, p.grand_total, p.id AS purchase_id,
                 COALESCE(pay.total_paid, 0) AS total_paid
@@ -1573,6 +1602,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
           );
 
           $pdo->commit();
+          safe_delete_log_cascade('purchase_payment', 'reverse', $paymentId, (array) $safeDeleteValidation, [
+            'reversal_references' => ['REV-' . $paymentId, (string) $reversalId],
+            'metadata' => [
+              'purchase_id' => $purchaseId,
+              'reversal_id' => $reversalId,
+            ],
+          ]);
           log_audit('purchases', 'payment_reverse', $purchaseId, 'Reversed purchase payment #' . $paymentId, [
             'entity' => 'purchase_payment',
             'source' => 'UI',
@@ -2812,7 +2848,12 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                           <td><?= e((string) ($payment['created_by_name'] ?? '-')); ?></td>
                           <td>
                             <?php if ($canReverse): ?>
-                              <form method="post" class="d-flex gap-2 align-items-center">
+                              <form method="post" class="d-flex gap-2 align-items-center"
+                                    data-safe-delete
+                                    data-safe-delete-entity="purchase_payment"
+                                    data-safe-delete-record-field="payment_id"
+                                    data-safe-delete-operation="reverse"
+                                    data-safe-delete-reason-field="reverse_reason">
                                 <?= csrf_field(); ?>
                                 <input type="hidden" name="_action" value="reverse_payment">
                                 <input type="hidden" name="payment_id" value="<?= (int) ($payment['id'] ?? 0); ?>">
@@ -3268,7 +3309,12 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 <div class="modal fade" id="deletePurchaseModal" tabindex="-1" aria-hidden="true">
   <div class="modal-dialog">
     <div class="modal-content">
-      <form method="post">
+      <form method="post"
+            data-safe-delete
+            data-safe-delete-entity="purchase"
+            data-safe-delete-record-field="purchase_id"
+            data-safe-delete-operation="delete"
+            data-safe-delete-reason-field="delete_reason">
         <div class="modal-header bg-danger-subtle">
           <h5 class="modal-title">Delete Purchase</h5>
           <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
