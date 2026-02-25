@@ -38,6 +38,11 @@ function pur_decimal(mixed $raw, float $default = 0.0): float
     return (float) $normalized;
 }
 
+function pur_value_has_fraction(float $value): bool
+{
+    return abs($value - round($value)) > 0.00001;
+}
+
 function pur_is_valid_date(?string $value): bool
 {
     if ($value === null || $value === '' || !preg_match('/^\d{4}-\d{2}-\d{2}$/', $value)) {
@@ -397,7 +402,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $partMap = [];
         $partPlaceholder = implode(',', array_fill(0, count($partIds), '?'));
         $partCheckStmt = db()->prepare(
-            "SELECT id, part_name, part_sku
+            "SELECT id, part_name, part_sku, unit
              FROM parts
              WHERE company_id = ?
                AND status_code <> 'DELETED'
@@ -411,6 +416,24 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         foreach ($partIds as $partId) {
             if (!isset($partMap[$partId])) {
                 flash_set('purchase_error', 'One or more selected parts are invalid for this company.', 'danger');
+                redirect('modules/purchases/index.php');
+            }
+        }
+
+        foreach ($lineItems as $item) {
+            $partId = (int) ($item['part_id'] ?? 0);
+            $partRow = $partMap[$partId] ?? null;
+            if (!is_array($partRow)) {
+                continue;
+            }
+
+            $partName = trim((string) ($partRow['part_name'] ?? 'Part #' . $partId));
+            $partUnitCode = part_unit_normalize_code((string) ($partRow['unit'] ?? ''));
+            if ($partUnitCode === '') {
+                $partUnitCode = 'PCS';
+            }
+            if (!part_unit_allows_decimal($companyId, $partUnitCode) && pur_value_has_fraction((float) ($item['quantity'] ?? 0))) {
+                flash_set('purchase_error', 'Part "' . $partName . '" uses unit ' . $partUnitCode . ' and allows only whole quantity.', 'danger');
                 redirect('modules/purchases/index.php');
             }
         }
@@ -895,6 +918,44 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         if (empty($lineItems)) {
             flash_set('purchase_error', 'At least one valid item row is required for edit.', 'danger');
             redirect('modules/purchases/index.php?edit_purchase_id=' . $purchaseId);
+        }
+
+        $partIds = array_values(array_unique(array_map(static fn (array $item): int => (int) $item['part_id'], $lineItems)));
+        $partMap = [];
+        $partPlaceholder = implode(',', array_fill(0, count($partIds), '?'));
+        $partCheckStmt = db()->prepare(
+            "SELECT id, part_name, part_sku, unit
+             FROM parts
+             WHERE company_id = ?
+               AND status_code <> 'DELETED'
+               AND id IN ({$partPlaceholder})"
+        );
+        $partCheckStmt->execute(array_merge([$companyId], $partIds));
+        foreach ($partCheckStmt->fetchAll() as $partRow) {
+            $partMap[(int) $partRow['id']] = $partRow;
+        }
+        foreach ($partIds as $partId) {
+            if (!isset($partMap[$partId])) {
+                flash_set('purchase_error', 'One or more selected parts are invalid for this company.', 'danger');
+                redirect('modules/purchases/index.php?edit_purchase_id=' . $purchaseId);
+            }
+        }
+        foreach ($lineItems as $item) {
+            $partId = (int) ($item['part_id'] ?? 0);
+            $partRow = $partMap[$partId] ?? null;
+            if (!is_array($partRow)) {
+                continue;
+            }
+
+            $partName = trim((string) ($partRow['part_name'] ?? 'Part #' . $partId));
+            $partUnitCode = part_unit_normalize_code((string) ($partRow['unit'] ?? ''));
+            if ($partUnitCode === '') {
+                $partUnitCode = 'PCS';
+            }
+            if (!part_unit_allows_decimal($companyId, $partUnitCode) && pur_value_has_fraction((float) ($item['quantity'] ?? 0))) {
+                flash_set('purchase_error', 'Part "' . $partName . '" uses unit ' . $partUnitCode . ' and allows only whole quantity.', 'danger');
+                redirect('modules/purchases/index.php?edit_purchase_id=' . $purchaseId);
+            }
         }
 
         $totals = ['taxable' => 0.0, 'gst' => 0.0, 'grand' => 0.0];
@@ -2170,7 +2231,7 @@ if ($purchasesReady && $canManage && $editPurchaseId > 0) {
     if ($editPurchase) {
         $editPurchasePaymentSummary = reversal_purchase_payment_summary(db(), (int) ($editPurchase['id'] ?? 0));
         $editItemsStmt = db()->prepare(
-            'SELECT pi.*, p.part_name, p.part_sku, COALESCE(gi.quantity, 0) AS stock_qty
+            'SELECT pi.*, p.part_name, p.part_sku, p.unit, COALESCE(gi.quantity, 0) AS stock_qty
              FROM purchase_items pi
              INNER JOIN parts p ON p.id = pi.part_id
              LEFT JOIN garage_inventory gi ON gi.part_id = p.id AND gi.garage_id = :garage_id
@@ -2287,18 +2348,30 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                                 <select name="item_part_id[]" class="form-select form-select-sm js-item-part">
                                   <option value="">Select Part</option>
                                   <?php foreach ($parts as $part): ?>
+                                    <?php
+                                      $partUnitCode = part_unit_normalize_code((string) ($part['unit'] ?? ''));
+                                      if ($partUnitCode === '') {
+                                          $partUnitCode = 'PCS';
+                                      }
+                                      $partAllowsDecimal = part_unit_allows_decimal($companyId, $partUnitCode);
+                                      $partUnitLabel = part_unit_label($companyId, $partUnitCode);
+                                    ?>
                                     <option
                                       value="<?= (int) $part['id']; ?>"
                                       data-default-cost="<?= e(number_format((float) ($part['purchase_price'] ?? 0), 2, '.', '')); ?>"
                                       data-default-gst="<?= e(number_format((float) ($part['gst_rate'] ?? 0), 2, '.', '')); ?>"
                                       data-stock="<?= e(number_format((float) ($part['stock_qty'] ?? 0), 2, '.', '')); ?>"
+                                      data-stock-unit="<?= e($partUnitCode); ?>"
+                                      data-unit="<?= e($partUnitCode); ?>"
+                                      data-unit-label="<?= e($partUnitLabel); ?>"
+                                      data-allow-decimal="<?= $partAllowsDecimal ? '1' : '0'; ?>"
                                     >
-                                      <?= e((string) $part['part_name']); ?> (<?= e((string) $part['part_sku']); ?>)
+                                      <?= e((string) $part['part_name']); ?> (<?= e((string) $part['part_sku']); ?>) | <?= e($partUnitCode); ?><?= $partAllowsDecimal ? ' Decimal' : ' Whole'; ?>
                                     </option>
                                   <?php endforeach; ?>
                                 </select>
                               </td>
-                              <td><input type="number" name="item_quantity[]" class="form-control form-control-sm" step="0.01" min="0"></td>
+                              <td><input type="number" name="item_quantity[]" class="form-control form-control-sm" step="1" min="0"></td>
                               <td><input type="number" name="item_unit_cost[]" class="form-control form-control-sm js-item-cost" step="0.01" min="0"></td>
                               <td><input type="number" name="item_gst_rate[]" class="form-control form-control-sm js-item-gst" step="0.01" min="0"></td>
                               <td class="text-muted small js-item-stock">-</td>
@@ -2499,22 +2572,41 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                             <select name="item_part_id[]" class="form-select form-select-sm js-item-part">
                               <option value="">Select Part</option>
                               <?php foreach ($parts as $part): ?>
+                                <?php
+                                  $partUnitCode = part_unit_normalize_code((string) ($part['unit'] ?? ''));
+                                  if ($partUnitCode === '') {
+                                      $partUnitCode = 'PCS';
+                                  }
+                                  $partAllowsDecimal = part_unit_allows_decimal($companyId, $partUnitCode);
+                                  $partUnitLabel = part_unit_label($companyId, $partUnitCode);
+                                ?>
                                 <option
                                   value="<?= (int) $part['id']; ?>"
                                   data-default-cost="<?= e(number_format((float) ($part['purchase_price'] ?? 0), 2, '.', '')); ?>"
                                   data-default-gst="<?= e(number_format((float) ($part['gst_rate'] ?? 0), 2, '.', '')); ?>"
                                   data-stock="<?= e(number_format((float) ($part['stock_qty'] ?? 0), 2, '.', '')); ?>"
+                                  data-stock-unit="<?= e($partUnitCode); ?>"
+                                  data-unit="<?= e($partUnitCode); ?>"
+                                  data-unit-label="<?= e($partUnitLabel); ?>"
+                                  data-allow-decimal="<?= $partAllowsDecimal ? '1' : '0'; ?>"
                                   <?= (int) ($line['part_id'] ?? 0) === (int) $part['id'] ? 'selected' : ''; ?>
                                 >
-                                  <?= e((string) $part['part_name']); ?> (<?= e((string) $part['part_sku']); ?>)
+                                  <?= e((string) $part['part_name']); ?> (<?= e((string) $part['part_sku']); ?>) | <?= e($partUnitCode); ?><?= $partAllowsDecimal ? ' Decimal' : ' Whole'; ?>
                                 </option>
                               <?php endforeach; ?>
                             </select>
                           </td>
-                          <td><input type="number" name="item_quantity[]" class="form-control form-control-sm" step="0.01" min="0" value="<?= e(number_format((float) ($line['quantity'] ?? 0), 2, '.', '')); ?>"></td>
+                          <?php
+                            $lineUnitCode = part_unit_normalize_code((string) ($line['unit'] ?? ''));
+                            if ($lineUnitCode === '') {
+                                $lineUnitCode = 'PCS';
+                            }
+                            $lineAllowsDecimal = part_unit_allows_decimal($companyId, $lineUnitCode);
+                          ?>
+                          <td><input type="number" name="item_quantity[]" class="form-control form-control-sm" step="<?= $lineAllowsDecimal ? '0.01' : '1'; ?>" min="0" value="<?= e(number_format((float) ($line['quantity'] ?? 0), 2, '.', '')); ?>"></td>
                           <td><input type="number" name="item_unit_cost[]" class="form-control form-control-sm js-item-cost" step="0.01" min="0" value="<?= e(number_format((float) ($line['unit_cost'] ?? 0), 2, '.', '')); ?>"></td>
                           <td><input type="number" name="item_gst_rate[]" class="form-control form-control-sm js-item-gst" step="0.01" min="0" value="<?= e(number_format((float) ($line['gst_rate'] ?? 0), 2, '.', '')); ?>"></td>
-                          <td class="text-muted small js-item-stock"><?= e(number_format((float) ($line['stock_qty'] ?? 0), 2, '.', '')); ?></td>
+                          <td class="text-muted small js-item-stock"><?= e(number_format((float) ($line['stock_qty'] ?? 0), 2, '.', '')); ?> <?= e($lineUnitCode); ?></td>
                         </tr>
                       <?php endforeach; ?>
                       <?php for ($blank = 0; $blank < 2; $blank++): ?>
@@ -2523,18 +2615,30 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                             <select name="item_part_id[]" class="form-select form-select-sm js-item-part">
                               <option value="">Select Part</option>
                               <?php foreach ($parts as $part): ?>
+                                <?php
+                                  $partUnitCode = part_unit_normalize_code((string) ($part['unit'] ?? ''));
+                                  if ($partUnitCode === '') {
+                                      $partUnitCode = 'PCS';
+                                  }
+                                  $partAllowsDecimal = part_unit_allows_decimal($companyId, $partUnitCode);
+                                  $partUnitLabel = part_unit_label($companyId, $partUnitCode);
+                                ?>
                                 <option
                                   value="<?= (int) $part['id']; ?>"
                                   data-default-cost="<?= e(number_format((float) ($part['purchase_price'] ?? 0), 2, '.', '')); ?>"
                                   data-default-gst="<?= e(number_format((float) ($part['gst_rate'] ?? 0), 2, '.', '')); ?>"
                                   data-stock="<?= e(number_format((float) ($part['stock_qty'] ?? 0), 2, '.', '')); ?>"
+                                  data-stock-unit="<?= e($partUnitCode); ?>"
+                                  data-unit="<?= e($partUnitCode); ?>"
+                                  data-unit-label="<?= e($partUnitLabel); ?>"
+                                  data-allow-decimal="<?= $partAllowsDecimal ? '1' : '0'; ?>"
                                 >
-                                  <?= e((string) $part['part_name']); ?> (<?= e((string) $part['part_sku']); ?>)
+                                  <?= e((string) $part['part_name']); ?> (<?= e((string) $part['part_sku']); ?>) | <?= e($partUnitCode); ?><?= $partAllowsDecimal ? ' Decimal' : ' Whole'; ?>
                                 </option>
                               <?php endforeach; ?>
                             </select>
                           </td>
-                          <td><input type="number" name="item_quantity[]" class="form-control form-control-sm" step="0.01" min="0"></td>
+                          <td><input type="number" name="item_quantity[]" class="form-control form-control-sm" step="1" min="0"></td>
                           <td><input type="number" name="item_unit_cost[]" class="form-control form-control-sm js-item-cost" step="0.01" min="0"></td>
                           <td><input type="number" name="item_gst_rate[]" class="form-control form-control-sm js-item-gst" step="0.01" min="0"></td>
                           <td class="text-muted small js-item-stock">-</td>
@@ -2983,7 +3087,48 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         <?php endif; ?>
 
         <div class="card mb-3">
-          <div class="card-header"><h3 class="card-title">Purchase List</h3></div>
+          <div class="card-header"><h3 class="card-title mb-0">Purchase List</h3></div>
+          <div class="card-body border-bottom">
+            <form method="get" class="row g-2 align-items-end">
+              <input type="hidden" name="date_mode" value="custom">
+              <input type="hidden" name="invoice" value="<?= e($invoiceFilter); ?>">
+              <input type="hidden" name="purchase_status" value="<?= e($statusFilter); ?>">
+              <input type="hidden" name="assignment_status" value="<?= e($assignmentFilter); ?>">
+              <input type="hidden" name="purchase_source" value="<?= e($sourceFilter); ?>">
+              <div class="col-md-3">
+                <label class="form-label">Vendor</label>
+                <select name="vendor_id" class="form-select">
+                  <option value="0">All Vendors</option>
+                  <?php foreach ($vendors as $vendor): ?>
+                    <option value="<?= (int) $vendor['id']; ?>" <?= $vendorFilter === (int) $vendor['id'] ? 'selected' : ''; ?>>
+                      <?= e((string) $vendor['vendor_name']); ?>
+                    </option>
+                  <?php endforeach; ?>
+                </select>
+              </div>
+              <div class="col-md-2">
+                <label class="form-label">Payment Status</label>
+                <select name="payment_status" class="form-select">
+                  <option value="">All</option>
+                  <?php foreach ($allowedPaymentStatuses as $status): ?>
+                    <option value="<?= e($status); ?>" <?= $paymentFilter === $status ? 'selected' : ''; ?>><?= e($status); ?></option>
+                  <?php endforeach; ?>
+                </select>
+              </div>
+              <div class="col-md-2">
+                <label class="form-label">From Date</label>
+                <input type="date" name="from" class="form-control" value="<?= e($fromDate); ?>" required>
+              </div>
+              <div class="col-md-2">
+                <label class="form-label">To Date</label>
+                <input type="date" name="to" class="form-control" value="<?= e($toDate); ?>" required>
+              </div>
+              <div class="col-md-3 d-flex gap-2">
+                <button type="submit" class="btn btn-outline-primary">Apply</button>
+                <a href="<?= e(url('modules/purchases/index.php')); ?>" class="btn btn-outline-secondary">Reset</a>
+              </div>
+            </form>
+          </div>
           <div class="card-body table-responsive p-0">
             <table class="table table-sm table-striped mb-0">
               <thead>
@@ -3236,6 +3381,52 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       return totals;
     }
 
+    function applyPartSelectionToRow(row, selectedOption) {
+      if (!row) {
+        return;
+      }
+
+      var qtyInput = row.querySelector('input[name="item_quantity[]"]');
+      var costInput = row.querySelector('.js-item-cost');
+      var gstInput = row.querySelector('.js-item-gst');
+      var stockCell = row.querySelector('.js-item-stock');
+      var hasSelection = !!(selectedOption && selectedOption.value !== '');
+
+      if (!hasSelection) {
+        if (stockCell) {
+          stockCell.textContent = '-';
+        }
+        if (qtyInput) {
+          qtyInput.step = '0.01';
+        }
+        return;
+      }
+
+      var stockValue = selectedOption.getAttribute('data-stock') || '0';
+      var stockUnit = selectedOption.getAttribute('data-stock-unit') || selectedOption.getAttribute('data-unit') || 'PCS';
+      var allowDecimal = (selectedOption.getAttribute('data-allow-decimal') || '1') === '1';
+
+      if (stockCell) {
+        var unitRule = allowDecimal ? 'decimal' : 'whole only';
+        stockCell.textContent = stockValue + ' ' + stockUnit + ' (' + unitRule + ')';
+      }
+      if (qtyInput) {
+        qtyInput.step = allowDecimal ? '0.01' : '1';
+        if (!allowDecimal && qtyInput.value !== '') {
+          qtyInput.value = String(Math.max(0, Math.round(readNumber(qtyInput.value))));
+        }
+      }
+
+      var defaultCost = selectedOption.getAttribute('data-default-cost');
+      var defaultGst = selectedOption.getAttribute('data-default-gst');
+      if (costInput && (!costInput.value || parseFloat(costInput.value) === 0)) {
+        costInput.value = defaultCost || '';
+      }
+      if (gstInput && (!gstInput.value || parseFloat(gstInput.value) === 0)) {
+        gstInput.value = defaultGst || '';
+      }
+    }
+
     function wirePartSelect(select, onChanged) {
       if (!select) {
         return;
@@ -3248,28 +3439,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         }
 
         var selectedOption = select.options[select.selectedIndex];
-        var costInput = row.querySelector('.js-item-cost');
-        var gstInput = row.querySelector('.js-item-gst');
-        var stockCell = row.querySelector('.js-item-stock');
-
-        if (stockCell) {
-          var stockValue = selectedOption ? selectedOption.getAttribute('data-stock') : '';
-          stockCell.textContent = stockValue && stockValue !== '' ? stockValue : '-';
-        }
-
-        if (!selectedOption) {
-          return;
-        }
-
-        var defaultCost = selectedOption.getAttribute('data-default-cost');
-        var defaultGst = selectedOption.getAttribute('data-default-gst');
-
-        if (costInput && (!costInput.value || parseFloat(costInput.value) === 0)) {
-          costInput.value = defaultCost || '';
-        }
-        if (gstInput && (!gstInput.value || parseFloat(gstInput.value) === 0)) {
-          gstInput.value = defaultGst || '';
-        }
+        applyPartSelectionToRow(row, selectedOption || null);
 
         if (typeof onChanged === 'function') {
           onChanged();
@@ -3282,7 +3452,11 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         return;
       }
 
-      wirePartSelect(row.querySelector('.js-item-part'), onChanged);
+      var partSelect = row.querySelector('.js-item-part');
+      wirePartSelect(partSelect, onChanged);
+      if (partSelect) {
+        applyPartSelectionToRow(row, partSelect.options[partSelect.selectedIndex] || null);
+      }
 
       row.querySelectorAll('input[name="item_quantity[]"], .js-item-cost, .js-item-gst').forEach(function (input) {
         input.addEventListener('input', onChanged);

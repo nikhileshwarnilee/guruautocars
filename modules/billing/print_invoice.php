@@ -37,6 +37,28 @@ function snapshot_get(array $snapshot, string $section, string $key, ?string $fa
     return $fallback;
 }
 
+function billing_invoice_parse_item_description(string $rawDescription): array
+{
+    $description = trim($rawDescription);
+    $unitCode = '';
+
+    if (preg_match('/^(.*)\[([A-Z0-9_-]{1,20})\]\s*$/', $description, $matches)) {
+        $description = trim((string) ($matches[1] ?? ''));
+        $unitCode = strtoupper(trim((string) ($matches[2] ?? '')));
+    }
+
+    return [
+        'description' => $description !== '' ? $description : $rawDescription,
+        'unit_code' => $unitCode,
+    ];
+}
+
+function billing_invoice_format_quantity(float $quantity): string
+{
+    $formatted = rtrim(rtrim(number_format($quantity, 2, '.', ''), '0'), '.');
+    return $formatted !== '' ? $formatted : '0';
+}
+
 $invoiceStmt = db()->prepare(
     'SELECT i.*,
             c.name AS live_company_name, c.gstin AS live_company_gstin, c.address_line1 AS live_company_address, c.city AS live_company_city, c.state AS live_company_state,
@@ -72,6 +94,13 @@ $snapshot = json_decode((string) ($invoice['snapshot_json'] ?? ''), true);
 if (!is_array($snapshot)) {
     $snapshot = [];
 }
+$invoicePrintSettings = billing_invoice_print_settings((int) ($invoice['company_id'] ?? $companyId), $garageId);
+$showCompanyLogo = !empty($invoicePrintSettings['show_company_logo']);
+$showCompanyGstinBySetting = !empty($invoicePrintSettings['show_company_gstin']);
+$showCustomerGstinBySetting = !empty($invoicePrintSettings['show_customer_gstin']);
+$showRecommendationNote = !empty($invoicePrintSettings['show_recommendation_note']);
+$showNextServiceReminders = !empty($invoicePrintSettings['show_next_service_reminders']);
+$showPaidOutstandingRows = !empty($invoicePrintSettings['show_paid_outstanding']);
 $discountMeta = billing_discount_meta_from_snapshot($snapshot);
 $discountType = (string) ($discountMeta['type'] ?? 'AMOUNT');
 $discountValue = (float) ($discountMeta['value'] ?? 0);
@@ -153,8 +182,8 @@ if (!$invoiceHasGst) {
         }
     }
 }
-$showCompanyGstin = $invoiceHasGst && trim((string) ($companyGstin ?? '')) !== '';
-$showCustomerGstin = $invoiceHasGst && trim((string) ($customerGstin ?? '')) !== '';
+$showCompanyGstin = $showCompanyGstinBySetting && $invoiceHasGst && trim((string) ($companyGstin ?? '')) !== '';
+$showCustomerGstin = $showCustomerGstinBySetting && $invoiceHasGst && trim((string) ($customerGstin ?? '')) !== '';
 
 $paidAmount = 0.0;
 foreach ($payments as $payment) {
@@ -173,10 +202,13 @@ $serviceTotalWithTax = billing_round($serviceSubtotal + $serviceTaxAmount);
 $partsTotalWithTax = billing_round($partsSubtotal + $partsTaxAmount);
 $outstanding = max(0.0, (float) $invoice['grand_total'] - $paidAmount);
 $invoiceStatus = (string) ($invoice['invoice_status'] ?? 'FINALIZED');
-$nextServiceReminders = service_reminder_feature_ready()
+$nextServiceReminders = $showNextServiceReminders && service_reminder_feature_ready()
     ? service_reminder_fetch_active_by_vehicle($companyId, (int) ($invoice['vehicle_id'] ?? 0), $garageId, 6)
     : [];
-$companyLogoUrl = company_logo_url((int) ($invoice['company_id'] ?? $companyId), $garageId);
+$companyLogoUrl = billing_invoice_logo_url((int) ($invoice['company_id'] ?? $companyId), $garageId);
+if ($companyLogoUrl === null) {
+    $companyLogoUrl = company_logo_url((int) ($invoice['company_id'] ?? $companyId), $garageId);
+}
 ?>
 <!doctype html>
 <html lang="en">
@@ -479,7 +511,7 @@ $companyLogoUrl = company_logo_url((int) ($invoice['company_id'] ?? $companyId),
       <div class="invoice-sheet">
         <div class="header-block">
           <div class="company-block">
-            <?php if ($companyLogoUrl !== null): ?>
+            <?php if ($showCompanyLogo && $companyLogoUrl !== null): ?>
               <img src="<?= e($companyLogoUrl); ?>" alt="Company Logo" class="brand-logo" />
             <?php endif; ?>
             <div class="invoice-title"><?= e((string) $companyName); ?></div>
@@ -528,7 +560,7 @@ $companyLogoUrl = company_logo_url((int) ($invoice['company_id'] ?? $companyId),
           </div>
         </div>
 
-        <?php if ($jobRecommendationNote !== ''): ?>
+        <?php if ($showRecommendationNote && $jobRecommendationNote !== ''): ?>
           <div class="panel" style="margin-bottom: 10px;">
             <div class="panel-heading">Recommendation Note</div>
             <div class="panel-line"><?= nl2br(e($jobRecommendationNote)); ?></div>
@@ -566,11 +598,24 @@ $companyLogoUrl = company_logo_url((int) ($invoice['company_id'] ?? $companyId),
             <?php else: ?>
               <?php $lineNo = 1; ?>
               <?php foreach ($items as $item): ?>
+                <?php
+                  $rawItemDescription = (string) ($item['description'] ?? '');
+                  $itemType = strtoupper((string) ($item['item_type'] ?? ''));
+                  $itemDescription = $rawItemDescription;
+                  $itemUnitCode = '';
+                  if ($itemType === 'PART') {
+                      $parsedItem = billing_invoice_parse_item_description($rawItemDescription);
+                      $itemDescription = (string) ($parsedItem['description'] ?? $rawItemDescription);
+                      $itemUnitCode = (string) ($parsedItem['unit_code'] ?? '');
+                  }
+                ?>
                 <tr>
                   <td><?= $lineNo++; ?></td>
                   <td><?= e((string) $item['item_type']); ?></td>
-                  <td><?= e((string) $item['description']); ?></td>
-                  <td class="text-end"><?= e((string) $item['quantity']); ?></td>
+                  <td><?= e($itemDescription); ?></td>
+                  <td class="text-end">
+                    <?= e(billing_invoice_format_quantity((float) ($item['quantity'] ?? 0))); ?><?= $itemUnitCode !== '' ? ' ' . e($itemUnitCode) : ''; ?>
+                  </td>
                   <td class="text-end"><?= e(number_format((float) $item['unit_price'], 2)); ?></td>
                   <?php if ($invoiceHasGst): ?>
                     <td class="text-end"><?= e(number_format((float) $item['gst_rate'], 2)); ?></td>
@@ -685,46 +730,50 @@ $companyLogoUrl = company_logo_url((int) ($invoice['company_id'] ?? $companyId),
                   <th>Grand Total</th>
                   <td class="text-end"><?= e(number_format((float) $invoice['grand_total'], 2)); ?></td>
                 </tr>
-                <tr>
-                  <th>Paid</th>
-                  <td class="text-end"><?= e(number_format($paidAmount, 2)); ?></td>
-                </tr>
-                <tr>
-                  <th>Outstanding</th>
-                  <td class="text-end"><?= e(number_format($outstanding, 2)); ?></td>
-                </tr>
+                <?php if ($showPaidOutstandingRows): ?>
+                  <tr>
+                    <th>Paid</th>
+                    <td class="text-end"><?= e(number_format($paidAmount, 2)); ?></td>
+                  </tr>
+                  <tr>
+                    <th>Outstanding</th>
+                    <td class="text-end"><?= e(number_format($outstanding, 2)); ?></td>
+                  </tr>
+                <?php endif; ?>
               </tbody>
             </table>
           </div>
         </div>
 
-        <div class="section-title">Next Recommended Service</div>
-        <table class="line-table">
-          <thead>
-            <tr>
-              <th style="width:30%;">Service</th>
-              <th style="width:18%;" class="text-end">Due KM</th>
-              <th style="width:18%;">Due Date</th>
-              <th style="width:20%;">Predicted Visit</th>
-              <th style="width:14%;">Status</th>
-            </tr>
-          </thead>
-          <tbody>
-            <?php if (empty($nextServiceReminders)): ?>
-              <tr><td colspan="5" class="text-center">No active service reminders.</td></tr>
-            <?php else: ?>
-              <?php foreach ($nextServiceReminders as $reminder): ?>
-                <tr>
-                  <td><?= e((string) ($reminder['service_label'] ?? service_reminder_type_label((string) ($reminder['service_type'] ?? '')))); ?></td>
-                  <td class="text-end"><?= isset($reminder['next_due_km']) && $reminder['next_due_km'] !== null ? e(number_format((float) $reminder['next_due_km'], 0)) : '-'; ?></td>
-                  <td><?= e((string) (($reminder['next_due_date'] ?? '') !== '' ? $reminder['next_due_date'] : '-')); ?></td>
-                  <td><?= e((string) (($reminder['predicted_next_visit_date'] ?? '') !== '' ? $reminder['predicted_next_visit_date'] : '-')); ?></td>
-                  <td><?= e((string) ($reminder['due_state'] ?? 'UNSCHEDULED')); ?></td>
-                </tr>
-              <?php endforeach; ?>
-            <?php endif; ?>
-          </tbody>
-        </table>
+        <?php if ($showNextServiceReminders): ?>
+          <div class="section-title">Next Recommended Service</div>
+          <table class="line-table">
+            <thead>
+              <tr>
+                <th style="width:30%;">Service</th>
+                <th style="width:18%;" class="text-end">Due KM</th>
+                <th style="width:18%;">Due Date</th>
+                <th style="width:20%;">Predicted Visit</th>
+                <th style="width:14%;">Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              <?php if (empty($nextServiceReminders)): ?>
+                <tr><td colspan="5" class="text-center">No active service reminders.</td></tr>
+              <?php else: ?>
+                <?php foreach ($nextServiceReminders as $reminder): ?>
+                  <tr>
+                    <td><?= e((string) ($reminder['service_label'] ?? service_reminder_type_label((string) ($reminder['service_type'] ?? '')))); ?></td>
+                    <td class="text-end"><?= isset($reminder['next_due_km']) && $reminder['next_due_km'] !== null ? e(number_format((float) $reminder['next_due_km'], 0)) : '-'; ?></td>
+                    <td><?= e((string) (($reminder['next_due_date'] ?? '') !== '' ? $reminder['next_due_date'] : '-')); ?></td>
+                    <td><?= e((string) (($reminder['predicted_next_visit_date'] ?? '') !== '' ? $reminder['predicted_next_visit_date'] : '-')); ?></td>
+                    <td><?= e((string) ($reminder['due_state'] ?? 'UNSCHEDULED')); ?></td>
+                  </tr>
+                <?php endforeach; ?>
+              <?php endif; ?>
+            </tbody>
+          </table>
+        <?php endif; ?>
 
         <?php if ($invoiceStatus === 'CANCELLED'): ?>
           <div class="cancel-note">

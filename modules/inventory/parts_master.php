@@ -11,6 +11,18 @@ $canManage = has_permission('part_master.manage');
 $canViewPartCategories = has_permission('part_category.view');
 $companyId = active_company_id();
 $garageId = active_garage_id();
+$unitOptions = part_unit_active_options($companyId);
+$unitOptionsList = array_values($unitOptions);
+usort(
+    $unitOptionsList,
+    static fn (array $left, array $right): int => strcmp((string) ($left['code'] ?? ''), (string) ($right['code'] ?? ''))
+);
+
+function part_quantity_has_fraction(float $quantity): bool
+{
+    return abs($quantity - round($quantity)) > 0.00001;
+}
+
 $partColumns = table_columns('parts');
 $hasEnableReminder = in_array('enable_reminder', $partColumns, true);
 if (!$hasEnableReminder) {
@@ -85,7 +97,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $categoryId = post_int('category_id');
         $vendorId = post_int('vendor_id');
         $hsnCode = post_string('hsn_code', 20);
-        $unit = strtoupper(post_string('unit', 20));
+        $unit = part_unit_normalize_code(post_string('unit', 20));
         $purchasePrice = (float) ($_POST['purchase_price'] ?? 0);
         $sellingPrice = (float) ($_POST['selling_price'] ?? 0);
         $gstRate = (float) ($_POST['gst_rate'] ?? 18);
@@ -113,6 +125,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             flash_set('parts_error', 'Part SKU and part name are required.', 'danger');
             redirect('modules/inventory/parts_master.php');
         }
+        if ($unit === '') {
+            $unit = 'PCS';
+        }
+        if (!isset($unitOptions[$unit])) {
+            flash_set('parts_error', 'Select a valid unit from managed units.', 'danger');
+            redirect('modules/inventory/parts_master.php');
+        }
+        $unitAllowsDecimal = part_unit_allows_decimal($companyId, $unit);
+        if (!$unitAllowsDecimal && (part_quantity_has_fraction($minStock) || part_quantity_has_fraction($openingStock))) {
+            flash_set('parts_error', 'Selected unit allows only whole-number stock/min values.', 'danger');
+            redirect('modules/inventory/parts_master.php');
+        }
 
         $pdo = db();
         $pdo->beginTransaction();
@@ -127,7 +151,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'part_name' => $partName,
                 'part_sku' => $partSku,
                 'hsn_code' => $hsnCode !== '' ? $hsnCode : null,
-                'unit' => $unit !== '' ? $unit : 'PCS',
+                'unit' => $unit,
                 'purchase_price' => $purchasePrice,
                 'selling_price' => $sellingPrice,
                 'gst_rate' => $gstRate,
@@ -253,13 +277,24 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $categoryId = post_int('category_id');
         $vendorId = post_int('vendor_id');
         $hsnCode = post_string('hsn_code', 20);
-        $unit = strtoupper(post_string('unit', 20));
+        $unit = part_unit_normalize_code(post_string('unit', 20));
         $purchasePrice = (float) ($_POST['purchase_price'] ?? 0);
         $sellingPrice = (float) ($_POST['selling_price'] ?? 0);
         $gstRate = (float) ($_POST['gst_rate'] ?? 18);
         $minStock = (float) ($_POST['min_stock'] ?? 0);
         $statusCode = normalize_status_code((string) ($_POST['status_code'] ?? 'ACTIVE'));
         $enableReminder = (int) ($_POST['enable_reminder'] ?? 0) === 1 ? 1 : 0;
+        if ($unit === '') {
+            $unit = 'PCS';
+        }
+        if (!isset($unitOptions[$unit])) {
+            flash_set('parts_error', 'Select a valid unit from managed units.', 'danger');
+            redirect('modules/inventory/parts_master.php');
+        }
+        if (!part_unit_allows_decimal($companyId, $unit) && part_quantity_has_fraction($minStock)) {
+            flash_set('parts_error', 'Selected unit allows only whole-number min stock.', 'danger');
+            redirect('modules/inventory/parts_master.php');
+        }
         $beforeStmt = db()->prepare(
             'SELECT part_name, part_sku, status_code, selling_price, gst_rate, min_stock,
                     ' . ($hasEnableReminder ? 'enable_reminder' : '0') . ' AS enable_reminder
@@ -300,7 +335,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'category_id' => $categoryId > 0 ? $categoryId : null,
             'vendor_id' => $vendorId > 0 ? $vendorId : null,
             'hsn_code' => $hsnCode !== '' ? $hsnCode : null,
-            'unit' => $unit !== '' ? $unit : 'PCS',
+            'unit' => $unit,
             'purchase_price' => $purchasePrice,
             'selling_price' => $sellingPrice,
             'gst_rate' => $gstRate,
@@ -465,6 +500,9 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                 <i class="bi bi-tags me-1"></i>Manage Categories
               </a>
             <?php endif; ?>
+            <a href="<?= e(url('modules/inventory/units.php')); ?>" class="btn btn-sm btn-outline-secondary">
+              <i class="bi bi-rulers me-1"></i>Manage Units
+            </a>
             <ol class="breadcrumb mb-0">
               <li class="breadcrumb-item"><a href="<?= e(url('dashboard.php')); ?>">Home</a></li>
               <li class="breadcrumb-item active">Parts Master</li>
@@ -523,7 +561,24 @@ require_once __DIR__ . '/../../includes/sidebar.php';
               </div>
               <div class="col-md-2">
                 <label class="form-label">Unit</label>
-                <input type="text" name="unit" class="form-control" value="<?= e((string) ($editPart['unit'] ?? 'PCS')); ?>" />
+                <?php $selectedUnitCode = part_unit_normalize_code((string) ($editPart['unit'] ?? 'PCS')); ?>
+                <select name="unit" class="form-select" required>
+                  <?php foreach ($unitOptionsList as $unitOption): ?>
+                    <?php
+                      $unitCode = (string) ($unitOption['code'] ?? '');
+                      $unitName = (string) ($unitOption['name'] ?? $unitCode);
+                      $allowDecimal = (int) ($unitOption['allow_decimal'] ?? 0) === 1;
+                    ?>
+                    <option value="<?= e($unitCode); ?>" <?= $selectedUnitCode === $unitCode ? 'selected' : ''; ?>>
+                      <?= e($unitCode); ?> - <?= e($unitName); ?><?= $allowDecimal ? ' (Decimal)' : ' (Whole)'; ?>
+                    </option>
+                  <?php endforeach; ?>
+                  <?php if ($selectedUnitCode !== '' && !isset($unitOptions[$selectedUnitCode])): ?>
+                    <option value="<?= e($selectedUnitCode); ?>" selected>
+                      <?= e($selectedUnitCode); ?> - Inactive/Legacy Unit
+                    </option>
+                  <?php endif; ?>
+                </select>
               </div>
               <div class="col-md-2">
                 <label class="form-label">Purchase Price</label>

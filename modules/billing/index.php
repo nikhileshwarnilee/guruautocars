@@ -19,6 +19,8 @@ $canCreate = billing_can_create();
 $canFinalize = billing_can_finalize();
 $canCancel = billing_can_cancel();
 $canPay = billing_can_pay();
+$canManageInvoiceSettings = billing_has_permission(['invoice.manage', 'settings.manage']);
+$canViewJobs = has_permission('job.view');
 $paymentColumns = table_columns('payments');
 $paymentHasEntryType = in_array('entry_type', $paymentColumns, true);
 $paymentHasReversedPaymentId = in_array('reversed_payment_id', $paymentColumns, true);
@@ -135,7 +137,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
             $partsStmt = $pdo->prepare(
                 'SELECT jp.id, jp.part_id, jp.quantity, jp.unit_price, jp.gst_rate,
-                        p.part_name, p.hsn_code
+                        p.part_name, p.hsn_code, p.unit AS part_unit
                  FROM job_parts jp
                  INNER JOIN parts p ON p.id = jp.part_id
                  WHERE jp.job_card_id = :job_id
@@ -170,9 +172,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
 
             foreach ($partLines as $line) {
+                $partUnitCode = part_unit_normalize_code((string) ($line['part_unit'] ?? ''));
+                $partDescription = (string) ($line['part_name'] ?? '');
+                if ($partDescription === '') {
+                    $partDescription = 'Part Line #' . (int) ($line['id'] ?? 0);
+                }
+                if ($partUnitCode !== '') {
+                    $partDescription .= ' [' . $partUnitCode . ']';
+                }
                 $invoiceLines[] = billing_calculate_line(
                     'PART',
-                    (string) $line['part_name'],
+                    $partDescription,
                     (int) $line['part_id'],
                     null,
                     isset($line['hsn_code']) ? (string) $line['hsn_code'] : null,
@@ -1022,14 +1032,15 @@ $eligibleJobsStmt->execute([
 $eligibleJobs = $eligibleJobsStmt->fetchAll();
 
 $invoicesStmt = db()->prepare(
-    'SELECT i.id, i.invoice_number, i.invoice_date, i.financial_year_label, i.invoice_status, i.tax_regime,
+    'SELECT i.id, i.job_card_id, i.invoice_number, i.invoice_date, i.financial_year_label, i.invoice_status, i.tax_regime,
             i.taxable_amount, i.total_tax_amount, i.grand_total, i.payment_status, i.payment_mode, i.cancel_reason,
             i.snapshot_json,
-            c.full_name AS live_customer_name, v.registration_no AS live_registration_no,
+            c.full_name AS live_customer_name, v.registration_no AS live_registration_no, jc.job_number AS live_job_number,
             COALESCE((SELECT SUM(p.amount) FROM payments p WHERE p.invoice_id = i.id), 0) AS paid_amount
      FROM invoices i
      LEFT JOIN customers c ON c.id = i.customer_id
      LEFT JOIN vehicles v ON v.id = i.vehicle_id
+     LEFT JOIN job_cards jc ON jc.id = i.job_card_id
      WHERE i.company_id = :company_id
        AND i.garage_id = :garage_id
      ORDER BY i.id DESC'
@@ -1048,12 +1059,17 @@ foreach ($invoices as &$invoice) {
     $invoice['snapshot'] = $snapshot;
     $snapCustomer = billing_snapshot_value($snapshot, 'customer', 'full_name');
     $snapVehicle = billing_snapshot_value($snapshot, 'vehicle', 'registration_no');
+    $snapJobNumber = billing_snapshot_value($snapshot, 'job', 'job_number');
+    $snapJobId = isset($snapshot['job']['id']) ? (int) $snapshot['job']['id'] : 0;
+    $liveJobId = isset($invoice['job_card_id']) ? (int) $invoice['job_card_id'] : 0;
     $discountMeta = billing_discount_meta_from_snapshot($snapshot);
     $discountAmount = (float) ($discountMeta['amount'] ?? 0);
     $discountType = (string) ($discountMeta['type'] ?? 'AMOUNT');
     $discountValue = (float) ($discountMeta['value'] ?? 0);
     $invoice['display_customer_name'] = $snapCustomer !== '' ? $snapCustomer : (string) ($invoice['live_customer_name'] ?? '-');
     $invoice['display_registration_no'] = $snapVehicle !== '' ? $snapVehicle : (string) ($invoice['live_registration_no'] ?? '-');
+    $invoice['display_job_number'] = $snapJobNumber !== '' ? $snapJobNumber : (string) ($invoice['live_job_number'] ?? '-');
+    $invoice['display_job_card_id'] = $snapJobId > 0 ? $snapJobId : $liveJobId;
     $invoice['discount_amount'] = $discountAmount;
     if ($discountAmount > 0.009 && $discountType === 'PERCENT' && $discountValue > 0.009) {
         $invoice['discount_label'] = rtrim(rtrim(number_format($discountValue, 2), '0'), '.') . '%';
@@ -1145,6 +1161,13 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 
   <div class="app-content">
     <div class="container-fluid">
+      <?php if ($canManageInvoiceSettings): ?>
+        <div class="d-flex justify-content-end mb-2">
+          <a href="<?= e(url('modules/billing/invoice_settings.php')); ?>" class="btn btn-outline-secondary btn-sm">
+            <i class="bi bi-sliders me-1"></i>Invoice Settings
+          </a>
+        </div>
+      <?php endif; ?>
       <?php if ($canCreate): ?>
         <div class="card card-primary">
           <div class="card-header"><h3 class="card-title">Generate Draft Invoice from Closed Job Card</h3></div>
@@ -1260,11 +1283,11 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             <thead>
               <tr>
                 <th>Invoice No</th>
+                <th>Job Card</th>
                 <th>Date</th>
                 <th>FY</th>
                 <th>Customer</th>
                 <th>Vehicle</th>
-                <th>Regime</th>
                 <th>Taxable</th>
                 <th>Tax</th>
                 <th>Discount</th>
@@ -1288,16 +1311,25 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                     $invoiceStatus = (string) ($invoice['invoice_status'] ?? 'DRAFT');
                   ?>
                   <tr>
+                    <?php $rowJobCardId = (int) ($invoice['display_job_card_id'] ?? 0); ?>
                     <td>
                       <a href="<?= e(url('modules/billing/print_invoice.php?id=' . (int) $invoice['id'])); ?>" target="_blank">
                         <?= e((string) $invoice['invoice_number']); ?>
                       </a>
                     </td>
+                    <td>
+                      <?php if ($canViewJobs && $rowJobCardId > 0): ?>
+                        <a href="<?= e(url('modules/jobs/view.php?id=' . $rowJobCardId)); ?>">
+                          <?= e((string) ($invoice['display_job_number'] ?? '-')); ?>
+                        </a>
+                      <?php else: ?>
+                        <?= e((string) ($invoice['display_job_number'] ?? '-')); ?>
+                      <?php endif; ?>
+                    </td>
                     <td><?= e((string) $invoice['invoice_date']); ?></td>
                     <td><?= e((string) ($invoice['financial_year_label'] ?? '-')); ?></td>
                     <td><?= e((string) $invoice['display_customer_name']); ?></td>
                     <td><?= e((string) $invoice['display_registration_no']); ?></td>
-                    <td><?= e((string) ($invoice['tax_regime'] ?? '-')); ?></td>
                     <td><?= e(format_currency((float) $invoice['taxable_amount'])); ?></td>
                     <td><?= e(format_currency((float) $invoice['total_tax_amount'])); ?></td>
                     <td>

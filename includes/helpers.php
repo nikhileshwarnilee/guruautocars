@@ -394,6 +394,216 @@ function system_setting_upsert_value(
     }
 }
 
+function part_unit_normalize_code(string $code): string
+{
+    $normalized = strtoupper(trim($code));
+    $normalized = preg_replace('/[^A-Z0-9_-]+/', '', $normalized) ?? '';
+    return mb_substr($normalized, 0, 20);
+}
+
+function part_unit_default_catalog(): array
+{
+    return [
+        ['code' => 'PCS', 'name' => 'Pieces', 'allow_decimal' => 0, 'status_code' => 'ACTIVE'],
+        ['code' => 'LTR', 'name' => 'Litre', 'allow_decimal' => 1, 'status_code' => 'ACTIVE'],
+        ['code' => 'ML', 'name' => 'Millilitre', 'allow_decimal' => 1, 'status_code' => 'ACTIVE'],
+        ['code' => 'KG', 'name' => 'Kilogram', 'allow_decimal' => 1, 'status_code' => 'ACTIVE'],
+        ['code' => 'GM', 'name' => 'Gram', 'allow_decimal' => 1, 'status_code' => 'ACTIVE'],
+        ['code' => 'MTR', 'name' => 'Meter', 'allow_decimal' => 1, 'status_code' => 'ACTIVE'],
+        ['code' => 'SET', 'name' => 'Set', 'allow_decimal' => 0, 'status_code' => 'ACTIVE'],
+        ['code' => 'BOX', 'name' => 'Box', 'allow_decimal' => 0, 'status_code' => 'ACTIVE'],
+    ];
+}
+
+function part_unit_sanitize_row(array $row): ?array
+{
+    $code = part_unit_normalize_code((string) ($row['code'] ?? ''));
+    if ($code === '') {
+        return null;
+    }
+
+    $name = trim((string) ($row['name'] ?? ''));
+    if ($name === '') {
+        $name = $code;
+    }
+
+    $allowDecimal = 0;
+    $rawAllowDecimal = $row['allow_decimal'] ?? 0;
+    if (is_bool($rawAllowDecimal)) {
+        $allowDecimal = $rawAllowDecimal ? 1 : 0;
+    } elseif (is_numeric($rawAllowDecimal)) {
+        $allowDecimal = ((float) $rawAllowDecimal) > 0 ? 1 : 0;
+    } elseif (is_string($rawAllowDecimal)) {
+        $allowDecimal = in_array(strtolower(trim($rawAllowDecimal)), ['1', 'true', 'yes', 'on', 'enabled'], true) ? 1 : 0;
+    }
+
+    $statusCode = normalize_status_code((string) ($row['status_code'] ?? 'ACTIVE'));
+    return [
+        'code' => $code,
+        'name' => mb_substr($name, 0, 60),
+        'allow_decimal' => $allowDecimal,
+        'status_code' => $statusCode,
+    ];
+}
+
+function part_unit_catalog(int $companyId): array
+{
+    static $cache = [];
+    if ($companyId <= 0) {
+        return part_unit_default_catalog();
+    }
+    if (isset($cache[$companyId])) {
+        return $cache[$companyId];
+    }
+
+    $rows = [];
+    $rawJson = system_setting_get_value($companyId, 0, 'part_units_catalog_json', null);
+    if ($rawJson !== null && trim($rawJson) !== '') {
+        $decoded = json_decode($rawJson, true);
+        if (is_array($decoded)) {
+            foreach ($decoded as $row) {
+                if (!is_array($row)) {
+                    continue;
+                }
+                $sanitized = part_unit_sanitize_row($row);
+                if ($sanitized === null) {
+                    continue;
+                }
+                $rows[$sanitized['code']] = $sanitized;
+            }
+        }
+    }
+
+    if ($rows === []) {
+        foreach (part_unit_default_catalog() as $defaultRow) {
+            $sanitized = part_unit_sanitize_row($defaultRow);
+            if ($sanitized !== null) {
+                $rows[$sanitized['code']] = $sanitized;
+            }
+        }
+    }
+
+    $cache[$companyId] = array_values($rows);
+    return $cache[$companyId];
+}
+
+function part_unit_save_catalog(int $companyId, array $rows, ?int $actorUserId = null): int
+{
+    if ($companyId <= 0) {
+        return 0;
+    }
+
+    $normalized = [];
+    foreach ($rows as $row) {
+        if (!is_array($row)) {
+            continue;
+        }
+        $sanitized = part_unit_sanitize_row($row);
+        if ($sanitized === null) {
+            continue;
+        }
+        $normalized[$sanitized['code']] = $sanitized;
+    }
+
+    if ($normalized === []) {
+        foreach (part_unit_default_catalog() as $defaultRow) {
+            $sanitized = part_unit_sanitize_row($defaultRow);
+            if ($sanitized !== null) {
+                $normalized[$sanitized['code']] = $sanitized;
+            }
+        }
+    }
+
+    $payload = json_encode(array_values($normalized), JSON_UNESCAPED_UNICODE);
+    if (!is_string($payload)) {
+        return 0;
+    }
+
+    return system_setting_upsert_value(
+        $companyId,
+        0,
+        'INVENTORY',
+        'part_units_catalog_json',
+        $payload,
+        'JSON',
+        'ACTIVE',
+        $actorUserId
+    );
+}
+
+function part_unit_active_options(int $companyId): array
+{
+    $options = [];
+    foreach (part_unit_catalog($companyId) as $row) {
+        if (normalize_status_code((string) ($row['status_code'] ?? 'ACTIVE')) !== 'ACTIVE') {
+            continue;
+        }
+        $code = part_unit_normalize_code((string) ($row['code'] ?? ''));
+        if ($code === '') {
+            continue;
+        }
+        $options[$code] = [
+            'code' => $code,
+            'name' => (string) ($row['name'] ?? $code),
+            'allow_decimal' => (int) (($row['allow_decimal'] ?? 0) ? 1 : 0),
+            'status_code' => 'ACTIVE',
+        ];
+    }
+
+    if ($options === []) {
+        $fallback = part_unit_sanitize_row(['code' => 'PCS', 'name' => 'Pieces', 'allow_decimal' => 0, 'status_code' => 'ACTIVE']);
+        if ($fallback !== null) {
+            $options[$fallback['code']] = $fallback;
+        }
+    }
+
+    return $options;
+}
+
+function part_unit_allows_decimal(int $companyId, ?string $unitCode): bool
+{
+    $code = part_unit_normalize_code((string) $unitCode);
+    if ($code === '') {
+        return true;
+    }
+
+    $options = part_unit_active_options($companyId);
+    if (isset($options[$code])) {
+        return (int) ($options[$code]['allow_decimal'] ?? 0) === 1;
+    }
+
+    foreach (part_unit_catalog($companyId) as $row) {
+        if (part_unit_normalize_code((string) ($row['code'] ?? '')) !== $code) {
+            continue;
+        }
+        return (int) (($row['allow_decimal'] ?? 0) ? 1 : 0) === 1;
+    }
+
+    return true;
+}
+
+function part_unit_label(int $companyId, ?string $unitCode): string
+{
+    $code = part_unit_normalize_code((string) $unitCode);
+    if ($code === '') {
+        return '';
+    }
+
+    $options = part_unit_active_options($companyId);
+    if (isset($options[$code])) {
+        return (string) ($options[$code]['name'] ?? $code);
+    }
+
+    foreach (part_unit_catalog($companyId) as $row) {
+        if (part_unit_normalize_code((string) ($row['code'] ?? '')) !== $code) {
+            continue;
+        }
+        return (string) (($row['name'] ?? '') !== '' ? $row['name'] : $code);
+    }
+
+    return $code;
+}
+
 function date_filter_modes(): array
 {
     return [

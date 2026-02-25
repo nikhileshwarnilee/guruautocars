@@ -16,14 +16,16 @@ $isFinanceOpen = is_menu_group_open('finance.', $activeMenu);
 $isVehicleIntelligenceOpen = $activeMenu === 'jobs.maintenance_setup'
     || $activeMenu === 'inventory.parts_master'
     || $activeMenu === 'inventory.categories'
+    || $activeMenu === 'inventory.units'
     || is_menu_group_open('services.', $activeMenu)
     || is_menu_group_open('vis.', $activeMenu);
 $isReportsOpen = is_menu_group_open('reports', $activeMenu);
 $isUsersPermissionsOpen = is_menu_group_open('people.', $activeMenu);
 $isAdministrationOpen = is_menu_group_open('organization.', $activeMenu)
-    || is_menu_group_open('system.', $activeMenu);
+    || is_menu_group_open('system.', $activeMenu)
+    || is_menu_group_open('billing.', $activeMenu);
 $servicesMenuActive = ($activeMenu === 'services.master' || $activeMenu === 'services.categories') ? 'active' : '';
-$partsMenuActive = ($activeMenu === 'inventory.parts_master' || $activeMenu === 'inventory.categories') ? 'active' : '';
+$partsMenuActive = ($activeMenu === 'inventory.parts_master' || $activeMenu === 'inventory.categories' || $activeMenu === 'inventory.units') ? 'active' : '';
 $canViewReports = has_permission('reports.view') || has_permission('report.view');
 $canViewUsersPermissions = has_permission('staff.view')
     || has_permission('staff.manage')
@@ -33,6 +35,8 @@ $canViewAdministration = has_permission('company.manage')
     || has_permission('garage.manage')
     || has_permission('financial_year.view')
     || has_permission('settings.view')
+    || has_permission('settings.manage')
+    || has_permission('invoice.manage')
     || has_permission('audit.view')
     || has_permission('export.data')
     || has_permission('backup.manage');
@@ -450,6 +454,14 @@ if ($sidebarBrandName === '') {
                   <a href="<?= e(url('modules/system/settings.php')); ?>" class="nav-link <?= e(is_active_menu('system.settings', $activeMenu)); ?>">
                     <i class="nav-icon bi bi-sliders"></i>
                     <p>Settings</p>
+                  </a>
+                </li>
+              <?php endif; ?>
+              <?php if ((has_permission('billing.view') || has_permission('invoice.view')) && (has_permission('invoice.manage') || has_permission('settings.manage'))): ?>
+                <li class="nav-item">
+                  <a href="<?= e(url('modules/billing/invoice_settings.php')); ?>" class="nav-link <?= e(is_active_menu('billing.settings', $activeMenu)); ?>">
+                    <i class="nav-icon bi bi-receipt"></i>
+                    <p>Invoice Settings</p>
                   </a>
                 </li>
               <?php endif; ?>

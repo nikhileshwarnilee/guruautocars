@@ -40,6 +40,11 @@ function post_decimal(string $key, float $default = 0.0): float
     return (float) $normalized;
 }
 
+function job_value_has_fraction(float $value): bool
+{
+    return abs($value - round($value)) > 0.00001;
+}
+
 function parse_user_ids(mixed $value): array
 {
     if (!is_array($value)) {
@@ -452,7 +457,7 @@ function fetch_job_labor(int $jobId): array
 function fetch_job_parts(int $jobId, int $garageId): array
 {
     $stmt = db()->prepare(
-        'SELECT jp.*, p.part_name, p.part_sku, COALESCE(gi.quantity, 0) AS stock_qty
+        'SELECT jp.*, p.part_name, p.part_sku, p.unit AS part_unit, COALESCE(gi.quantity, 0) AS stock_qty
          FROM job_parts jp
          INNER JOIN parts p ON p.id = jp.part_id
          LEFT JOIN garage_inventory gi ON gi.part_id = jp.part_id AND gi.garage_id = :garage_id
@@ -505,7 +510,7 @@ function fetch_service_categories_for_labor(int $companyId): array
 function fetch_parts_master(int $companyId, int $garageId): array
 {
     $stmt = db()->prepare(
-        'SELECT p.id, p.part_name, p.part_sku, p.selling_price, p.gst_rate,
+        'SELECT p.id, p.part_name, p.part_sku, p.unit, p.selling_price, p.gst_rate,
                 COALESCE(gi.quantity, 0) AS stock_qty
          FROM parts p
          LEFT JOIN garage_inventory gi ON gi.part_id = p.id AND gi.garage_id = :garage_id
@@ -1882,7 +1887,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
 
         $partStmt = db()->prepare(
-            'SELECT p.id, p.part_name, p.part_sku, p.selling_price, p.gst_rate,
+            'SELECT p.id, p.part_name, p.part_sku, p.unit, p.selling_price, p.gst_rate,
                     COALESCE(gi.quantity, 0) AS stock_qty
              FROM parts p
              LEFT JOIN garage_inventory gi ON gi.part_id = p.id AND gi.garage_id = :garage_id
@@ -1908,6 +1913,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
         if ($gstRate < 0) {
             $gstRate = (float) $part['gst_rate'];
+        }
+
+        $partUnit = part_unit_normalize_code((string) ($part['unit'] ?? ''));
+        if ($partUnit === '') {
+            $partUnit = 'PCS';
+        }
+        $allowsDecimalQty = part_unit_allows_decimal($companyId, $partUnit);
+        if (!$allowsDecimalQty && job_value_has_fraction($quantity)) {
+            flash_set('job_error', 'Quantity for ' . (string) $part['part_name'] . ' must be a whole number (' . $partUnit . ').', 'danger');
+            redirect('modules/jobs/view.php?id=' . $jobId);
         }
 
         $gstRate = max(0, min(100, $gstRate));
@@ -1939,6 +1954,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             [
                 'part_id' => $partId,
                 'part_name' => (string) $part['part_name'],
+                'part_unit' => $partUnit,
                 'quantity' => round($quantity, 2),
                 'unit_price' => round($unitPrice, 2),
                 'available_qty' => round($availableQty, 2),
@@ -1950,7 +1966,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         if ($availableQty < $quantity) {
             flash_set(
                 'job_warning',
-                'Stock warning: ' . (string) $part['part_name'] . ' requires ' . number_format($quantity, 2) . ', available ' . number_format($availableQty, 2) . '. Closing will still post stock.',
+                'Stock warning: ' . (string) $part['part_name'] . ' requires ' . number_format($quantity, 2) . ' ' . $partUnit . ', available ' . number_format($availableQty, 2) . ' ' . $partUnit . '. Closing will still post stock.',
                 'warning'
             );
         }
@@ -1970,7 +1986,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
 
         $lineStmt = db()->prepare(
-            'SELECT jp.id, jp.part_id, p.part_name, COALESCE(gi.quantity, 0) AS stock_qty
+            'SELECT jp.id, jp.part_id, p.part_name, p.unit AS part_unit, COALESCE(gi.quantity, 0) AS stock_qty
              FROM job_parts jp
              INNER JOIN job_cards jc ON jc.id = jp.job_card_id
              INNER JOIN parts p ON p.id = jp.part_id
@@ -1991,6 +2007,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         if (!$line) {
             flash_set('job_error', 'Part line not found for this job.', 'danger');
+            redirect('modules/jobs/view.php?id=' . $jobId);
+        }
+
+        $partUnit = part_unit_normalize_code((string) ($line['part_unit'] ?? ''));
+        if ($partUnit === '') {
+            $partUnit = 'PCS';
+        }
+        if (!part_unit_allows_decimal($companyId, $partUnit) && job_value_has_fraction($quantity)) {
+            flash_set('job_error', 'Quantity for ' . (string) $line['part_name'] . ' must be a whole number (' . $partUnit . ').', 'danger');
             redirect('modules/jobs/view.php?id=' . $jobId);
         }
 
@@ -2026,6 +2051,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             [
                 'job_part_id' => $jobPartId,
                 'part_id' => (int) $line['part_id'],
+                'part_unit' => $partUnit,
                 'quantity' => round($quantity, 2),
                 'unit_price' => round($unitPrice, 2),
                 'available_qty' => round($availableQty, 2),
@@ -2037,7 +2063,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         if ($availableQty < $quantity) {
             flash_set(
                 'job_warning',
-                'Stock warning: ' . (string) $line['part_name'] . ' requires ' . number_format($quantity, 2) . ', available ' . number_format($availableQty, 2) . '. Closing will still post stock.',
+                'Stock warning: ' . (string) $line['part_name'] . ' requires ' . number_format($quantity, 2) . ' ' . $partUnit . ', available ' . number_format($availableQty, 2) . ' ' . $partUnit . '. Closing will still post stock.',
                 'warning'
             );
         }
@@ -2942,6 +2968,12 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                           $partStockQty = (float) ($part['stock_qty'] ?? 0);
                           $partNameText = (string) ($part['part_name'] ?? '');
                           $partSkuText = (string) ($part['part_sku'] ?? '');
+                          $partUnitCode = part_unit_normalize_code((string) ($part['unit'] ?? ''));
+                          if ($partUnitCode === '') {
+                              $partUnitCode = 'PCS';
+                          }
+                          $partUnitLabel = part_unit_label($companyId, $partUnitCode);
+                          $partAllowsDecimal = part_unit_allows_decimal($companyId, $partUnitCode);
                           $partVisCompatible = isset($visPartCompatibilityLookup[$partId]);
                         ?>
                         <option
@@ -2949,12 +2981,15 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                           data-price="<?= e((string) $part['selling_price']); ?>"
                           data-gst="<?= e((string) $part['gst_rate']); ?>"
                           data-stock="<?= e((string) $partStockQty); ?>"
+                          data-unit="<?= e($partUnitCode); ?>"
+                          data-unit-label="<?= e($partUnitLabel); ?>"
+                          data-allow-decimal="<?= $partAllowsDecimal ? '1' : '0'; ?>"
                           data-name="<?= e($partNameText); ?>"
                           data-sku="<?= e($partSkuText); ?>"
                           data-vis-compatible="<?= $partVisCompatible ? '1' : '0'; ?>"
                           data-in-stock="<?= $partStockQty > 0 ? '1' : '0'; ?>"
                         >
-                          <?= e($partNameText); ?> (<?= e($partSkuText); ?>) | Stock <?= e(number_format($partStockQty, 2)); ?><?= $partVisCompatible ? ' | VIS' : ''; ?>
+                          <?= e($partNameText); ?> (<?= e($partSkuText); ?>) | Stock <?= e(number_format($partStockQty, 2)); ?> <?= e($partUnitCode); ?><?= $partVisCompatible ? ' | VIS' : ''; ?>
                         </option>
                       <?php endforeach; ?>
                     </select>
@@ -3001,16 +3036,21 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                       <?php
                         $lineQty = (float) $line['quantity'];
                         $lineStock = (float) $line['stock_qty'];
+                        $lineUnitCode = part_unit_normalize_code((string) ($line['part_unit'] ?? ''));
+                        if ($lineUnitCode === '') {
+                            $lineUnitCode = 'PCS';
+                        }
+                        $lineAllowsDecimal = part_unit_allows_decimal($companyId, $lineUnitCode);
                         $stockClass = $lineStock >= $lineQty ? 'text-success' : 'text-danger';
                       ?>
                       <tr>
                         <td><?= e((string) $line['part_name']); ?> (<?= e((string) $line['part_sku']); ?>)</td>
-                        <td><?= e(number_format($lineQty, 2)); ?></td>
+                        <td><?= e(number_format($lineQty, 2)); ?> <?= e($lineUnitCode); ?></td>
                         <td><?= e(format_currency((float) $line['unit_price'])); ?></td>
                         <td><?= e(number_format((float) $line['gst_rate'], 2)); ?></td>
                         <td><?= e(format_currency((float) $line['total_amount'])); ?></td>
                         <td>
-                          <span class="<?= e($stockClass); ?>"><?= e(number_format($lineStock, 2)); ?></span>
+                          <span class="<?= e($stockClass); ?>"><?= e(number_format($lineStock, 2)); ?> <?= e($lineUnitCode); ?></span>
                         </td>
                         <td>
                           <?php if ($canEdit && !$jobLocked): ?>
@@ -3042,7 +3082,8 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                               <input type="hidden" name="_action" value="update_part">
                               <input type="hidden" name="job_part_id" value="<?= (int) $line['id']; ?>">
                               <div class="col-md-3">
-                                <input type="number" step="0.01" min="0.01" name="quantity" class="form-control form-control-sm" value="<?= e((string) $line['quantity']); ?>" required>
+                                <input type="number" step="<?= $lineAllowsDecimal ? '0.01' : '1'; ?>" min="0.01" name="quantity" class="form-control form-control-sm" value="<?= e((string) $line['quantity']); ?>" required>
+                                <small class="text-muted"><?= e($lineUnitCode); ?><?= $lineAllowsDecimal ? ' (decimal allowed)' : ' (whole only)'; ?></small>
                               </div>
                               <div class="col-md-3">
                                 <input type="number" step="0.01" min="0" name="unit_price" class="form-control form-control-sm" value="<?= e((string) $line['unit_price']); ?>" required>
@@ -3449,6 +3490,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
     }
 
     var partSelect = document.getElementById('add-part-select');
+    var partQty = document.getElementById('add-part-qty');
     var partPrice = document.getElementById('add-part-price');
     var partGst = document.getElementById('add-part-gst');
     var partStockHint = document.getElementById('add-part-stock-hint');
@@ -3612,7 +3654,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
     }
 
     function applyPartDefaults() {
-      if (!partSelect || !partPrice || !partGst || !partStockHint) {
+      if (!partSelect || !partPrice || !partGst || !partStockHint || !partQty) {
         return;
       }
       var selected = partSelect.options[partSelect.selectedIndex];
@@ -3624,8 +3666,18 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       partPrice.value = selected.getAttribute('data-price') || partPrice.value;
       partGst.value = selected.getAttribute('data-gst') || partGst.value;
       var stock = selected.getAttribute('data-stock') || '0';
+      var unitCode = selected.getAttribute('data-unit') || 'PCS';
+      var unitLabel = selected.getAttribute('data-unit-label') || unitCode;
+      var allowDecimal = (selected.getAttribute('data-allow-decimal') || '1') === '1';
+      partQty.step = allowDecimal ? '0.01' : '1';
+      if (!allowDecimal) {
+        var currentQty = readNumber(partQty.value || 0);
+        var wholeQty = Math.max(1, Math.round(currentQty));
+        partQty.value = String(wholeQty);
+      }
       var visCompatible = (selected.getAttribute('data-vis-compatible') || '0') === '1';
-      partStockHint.textContent = 'Garage stock: ' + stock + ' | ' + (visCompatible ? 'VIS compatible' : 'Manual override part');
+      var unitRule = allowDecimal ? 'decimal quantity allowed' : 'whole quantity only';
+      partStockHint.textContent = 'Garage stock: ' + stock + ' ' + unitCode + ' (' + unitLabel + ') | ' + unitRule + ' | ' + (visCompatible ? 'VIS compatible' : 'Manual override part');
     }
 
     function setPartMode(mode, focusSearch) {
@@ -3650,7 +3702,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       }
     }
 
-    if (partSelect && partPrice && partGst && partStockHint) {
+    if (partSelect && partQty && partPrice && partGst && partStockHint) {
       partSelect.addEventListener('change', function () {
         applyPartDefaults();
         syncPartOptionVisibility();

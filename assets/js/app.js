@@ -739,6 +739,7 @@ function buildBreadcrumbMap(dashboardUrl) {
     'services.categories': [home, { label: 'Vehicle Intelligence' }, { label: 'Services' }],
     'inventory.parts_master': [home, { label: 'Vehicle Intelligence' }, { label: 'Parts' }],
     'inventory.categories': [home, { label: 'Vehicle Intelligence' }, { label: 'Parts' }],
+    'inventory.units': [home, { label: 'Vehicle Intelligence' }, { label: 'Parts' }, { label: 'Units' }],
     'reports': [home, { label: 'Reports' }, { label: 'Overview' }],
     'reports.jobs': [home, { label: 'Reports' }, { label: 'Job Reports' }],
     'reports.inventory': [home, { label: 'Reports' }, { label: 'Inventory Reports' }],

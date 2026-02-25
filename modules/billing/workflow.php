@@ -286,6 +286,118 @@ function billing_get_setting_value(PDO $pdo, int $companyId, int $garageId, stri
     return trim((string) $value);
 }
 
+function billing_invoice_print_default_settings(): array
+{
+    return [
+        'show_company_logo' => true,
+        'show_company_gstin' => true,
+        'show_customer_gstin' => true,
+        'show_recommendation_note' => true,
+        'show_next_service_reminders' => true,
+        'show_paid_outstanding' => true,
+    ];
+}
+
+function billing_invoice_setting_to_bool(mixed $value, bool $default = false): bool
+{
+    if (is_bool($value)) {
+        return $value;
+    }
+    if (is_int($value) || is_float($value)) {
+        return ((float) $value) > 0;
+    }
+    if (!is_string($value)) {
+        return $default;
+    }
+
+    $normalized = strtolower(trim($value));
+    if ($normalized === '') {
+        return $default;
+    }
+
+    if (in_array($normalized, ['1', 'true', 'yes', 'on', 'enabled'], true)) {
+        return true;
+    }
+    if (in_array($normalized, ['0', 'false', 'no', 'off', 'disabled'], true)) {
+        return false;
+    }
+
+    return $default;
+}
+
+function billing_invoice_print_settings(int $companyId, int $garageId): array
+{
+    $defaults = billing_invoice_print_default_settings();
+    $rawValue = system_setting_get_value($companyId, $garageId, 'invoice_print_settings_json', null);
+    if ($rawValue === null || trim($rawValue) === '') {
+        return $defaults;
+    }
+
+    $decoded = json_decode($rawValue, true);
+    if (!is_array($decoded)) {
+        return $defaults;
+    }
+
+    $resolved = $defaults;
+    foreach ($defaults as $settingKey => $defaultValue) {
+        $resolved[$settingKey] = billing_invoice_setting_to_bool($decoded[$settingKey] ?? null, (bool) $defaultValue);
+    }
+
+    return $resolved;
+}
+
+function billing_invoice_logo_relative_path(int $companyId, int $garageId = 0): ?string
+{
+    $rawPath = system_setting_get_value($companyId, $garageId, 'invoice_logo_path', null);
+    if ($rawPath === null) {
+        return null;
+    }
+
+    $normalized = str_replace('\\', '/', trim($rawPath));
+    $normalized = ltrim($normalized, '/');
+    if ($normalized === '' || str_contains($normalized, '..')) {
+        return null;
+    }
+
+    $allowedPrefixes = [
+        'assets/uploads/invoice_logos/',
+        'assets/uploads/company_logos/',
+    ];
+    $isAllowed = false;
+    foreach ($allowedPrefixes as $prefix) {
+        if (str_starts_with($normalized, $prefix)) {
+            $isAllowed = true;
+            break;
+        }
+    }
+    if (!$isAllowed) {
+        return null;
+    }
+
+    return $normalized;
+}
+
+function billing_invoice_logo_fs_path(int $companyId, int $garageId = 0): ?string
+{
+    $relative = billing_invoice_logo_relative_path($companyId, $garageId);
+    if ($relative === null) {
+        return null;
+    }
+
+    $fullPath = APP_ROOT . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $relative);
+    return is_file($fullPath) ? $fullPath : null;
+}
+
+function billing_invoice_logo_url(int $companyId, int $garageId = 0): ?string
+{
+    $relative = billing_invoice_logo_relative_path($companyId, $garageId);
+    if ($relative === null) {
+        return null;
+    }
+
+    return billing_invoice_logo_fs_path($companyId, $garageId) !== null ? url($relative) : null;
+}
+
 function billing_invoice_prefix(PDO $pdo, int $companyId, int $garageId): string
 {
     $prefix = billing_get_setting_value($pdo, $companyId, $garageId, 'invoice_prefix', null);

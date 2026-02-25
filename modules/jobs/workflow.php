@@ -2413,7 +2413,7 @@ function service_reminder_due_recommendations_for_vehicle(int $companyId, int $g
             $partIdList = array_keys($partIds);
             $placeholders = implode(',', array_fill(0, count($partIdList), '?'));
             $stmt = db()->prepare(
-                'SELECT p.id, p.part_name, p.selling_price, p.gst_rate, COALESCE(gi.quantity, 0) AS stock_qty
+                'SELECT p.id, p.part_name, p.unit AS part_unit, p.selling_price, p.gst_rate, COALESCE(gi.quantity, 0) AS stock_qty
                  FROM parts p
                  LEFT JOIN garage_inventory gi ON gi.part_id = p.id AND gi.garage_id = ?
                  WHERE p.company_id = ?
@@ -2445,6 +2445,7 @@ function service_reminder_due_recommendations_for_vehicle(int $companyId, int $g
         $unitPrice = 0.0;
         $gstRate = 0.0;
         $stockQty = null;
+        $partUnit = null;
         if ($itemType === 'SERVICE' && isset($serviceMeta[$itemId])) {
             $unitPrice = (float) ($serviceMeta[$itemId]['default_rate'] ?? 0);
             $gstRate = (float) ($serviceMeta[$itemId]['gst_rate'] ?? 0);
@@ -2452,6 +2453,7 @@ function service_reminder_due_recommendations_for_vehicle(int $companyId, int $g
             $unitPrice = (float) ($partMeta[$itemId]['selling_price'] ?? 0);
             $gstRate = (float) ($partMeta[$itemId]['gst_rate'] ?? 0);
             $stockQty = (float) ($partMeta[$itemId]['stock_qty'] ?? 0);
+            $partUnit = part_unit_normalize_code((string) ($partMeta[$itemId]['part_unit'] ?? ''));
         }
 
         $recommended[] = [
@@ -2470,6 +2472,7 @@ function service_reminder_due_recommendations_for_vehicle(int $companyId, int $g
             'unit_price' => round($unitPrice, 2),
             'gst_rate' => round($gstRate, 2),
             'stock_qty' => $stockQty,
+            'part_unit' => $partUnit,
             'action_default' => in_array($dueState, ['OVERDUE', 'DUE'], true) ? 'add' : 'postpone',
         ];
     }
@@ -2572,7 +2575,7 @@ function service_reminder_apply_job_creation_actions(
          LIMIT 1'
     );
     $partFetchStmt = $pdo->prepare(
-        'SELECT p.id, p.part_name, p.selling_price, p.gst_rate, COALESCE(gi.quantity, 0) AS stock_qty
+        'SELECT p.id, p.part_name, p.unit AS part_unit, p.selling_price, p.gst_rate, COALESCE(gi.quantity, 0) AS stock_qty
          FROM parts p
          LEFT JOIN garage_inventory gi ON gi.part_id = p.id AND gi.garage_id = :garage_id
          WHERE p.id = :id
