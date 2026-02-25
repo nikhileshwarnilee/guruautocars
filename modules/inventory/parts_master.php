@@ -8,6 +8,7 @@ require_permission('part_master.view');
 $page_title = 'Parts / Item Master';
 $active_menu = 'inventory.parts_master';
 $canManage = has_permission('part_master.manage');
+$canViewPartCategories = has_permission('part_category.view');
 $companyId = active_company_id();
 $garageId = active_garage_id();
 $partColumns = table_columns('parts');
@@ -458,10 +459,17 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       <div class="row">
         <div class="col-sm-6"><h3 class="mb-0">Parts / Item Master</h3></div>
         <div class="col-sm-6">
-          <ol class="breadcrumb float-sm-end">
-            <li class="breadcrumb-item"><a href="<?= e(url('dashboard.php')); ?>">Home</a></li>
-            <li class="breadcrumb-item active">Parts Master</li>
-          </ol>
+          <div class="d-flex justify-content-sm-end align-items-center gap-2 flex-wrap">
+            <?php if ($canViewPartCategories): ?>
+              <a href="<?= e(url('modules/inventory/categories.php')); ?>" class="btn btn-sm btn-outline-primary">
+                <i class="bi bi-tags me-1"></i>Manage Categories
+              </a>
+            <?php endif; ?>
+            <ol class="breadcrumb mb-0">
+              <li class="breadcrumb-item"><a href="<?= e(url('dashboard.php')); ?>">Home</a></li>
+              <li class="breadcrumb-item active">Parts Master</li>
+            </ol>
+          </div>
         </div>
       </div>
     </div>

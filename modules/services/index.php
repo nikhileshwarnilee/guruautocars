@@ -401,10 +401,15 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       <div class="row">
         <div class="col-sm-6"><h3 class="mb-0">Service / Labour Master</h3></div>
         <div class="col-sm-6">
-          <ol class="breadcrumb float-sm-end">
-            <li class="breadcrumb-item"><a href="<?= e(url('dashboard.php')); ?>">Home</a></li>
-            <li class="breadcrumb-item active">Service Master</li>
-          </ol>
+          <div class="d-flex justify-content-sm-end align-items-center gap-2 flex-wrap">
+            <a href="<?= e(url('modules/services/categories.php')); ?>" class="btn btn-sm btn-outline-primary">
+              <i class="bi bi-diagram-2 me-1"></i>Manage Categories
+            </a>
+            <ol class="breadcrumb mb-0">
+              <li class="breadcrumb-item"><a href="<?= e(url('dashboard.php')); ?>">Home</a></li>
+              <li class="breadcrumb-item active">Service Master</li>
+            </ol>
+          </div>
         </div>
       </div>
     </div>
@@ -438,7 +443,6 @@ require_once __DIR__ . '/../../includes/sidebar.php';
               <a href="<?= e(url('modules/services/index.php')); ?>" class="btn btn-outline-secondary">Reset</a>
             </div>
           </form>
-          <a href="<?= e(url('modules/services/categories.php')); ?>" class="btn btn-outline-dark">Manage Service Categories</a>
         </div>
       </div>
 
