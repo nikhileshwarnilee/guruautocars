@@ -135,7 +135,6 @@ $logoUrl = company_logo_url((int) ($returnRow['company_id'] ?? $companyId), $gar
           <strong>Phone:</strong> <?= e((string) (($returnRow['customer_phone'] ?? '') !== '' ? $returnRow['customer_phone'] : '-')); ?><br />
         <?php else: ?>
           <strong>Vendor:</strong> <?= e((string) (($returnRow['vendor_name'] ?? '') !== '' ? $returnRow['vendor_name'] : '-')); ?><br />
-          <strong>Vendor CN:</strong> <?= e((string) (($returnRow['vendor_credit_note_number'] ?? '') !== '' ? $returnRow['vendor_credit_note_number'] : '-')); ?><br />
         <?php endif; ?>
         <strong>Notes:</strong> <?= e((string) (($returnRow['notes'] ?? '') !== '' ? $returnRow['notes'] : '-')); ?>
       </div>

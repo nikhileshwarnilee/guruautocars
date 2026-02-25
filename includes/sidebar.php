@@ -12,7 +12,6 @@ $isPurchaseOpen = is_menu_group_open('purchases.', $activeMenu)
 $isInventoryOpen = $activeMenu === 'inventory'
     || $activeMenu === 'inventory.returns';
 $isSalesOpen = $activeMenu === 'billing'
-    || $activeMenu === 'billing.credit_notes'
     || $activeMenu === 'customers'
     || $activeMenu === 'vehicles';
 $isFinanceOpen = is_menu_group_open('finance.', $activeMenu);
@@ -197,12 +196,6 @@ if ($sidebarBrandName === '') {
                   <a href="<?= e(url('modules/billing/index.php')); ?>" class="nav-link <?= e(is_active_menu('billing', $activeMenu)); ?>">
                     <i class="nav-icon bi bi-receipt-cutoff"></i>
                     <p>Billing</p>
-                  </a>
-                </li>
-                <li class="nav-item">
-                  <a href="<?= e(url('modules/billing/credit_notes.php')); ?>" class="nav-link <?= e(is_active_menu('billing.credit_notes', $activeMenu)); ?>">
-                    <i class="nav-icon bi bi-receipt"></i>
-                    <p>Credit Notes</p>
                   </a>
                 </li>
               <?php endif; ?>

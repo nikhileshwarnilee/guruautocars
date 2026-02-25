@@ -96,7 +96,7 @@ $summary = $summaryStmt->fetch() ?: [
 
 $rowsStmt = db()->prepare(
     'SELECT r.id, r.return_number, r.return_date, r.return_type, r.approval_status,
-            r.total_amount, r.vendor_credit_note_number,
+            r.total_amount,
             i.invoice_number,
             p.invoice_number AS purchase_invoice_number,
             c.full_name AS customer_name,
@@ -133,12 +133,11 @@ if ($exportKey !== '') {
             (string) (($row['invoice_number'] ?? '') !== '' ? $row['invoice_number'] : ((($row['purchase_invoice_number'] ?? '') !== '') ? $row['purchase_invoice_number'] : '')),
             (string) (($row['customer_name'] ?? '') !== '' ? $row['customer_name'] : ($row['vendor_name'] ?? '')),
             (float) ($row['total_amount'] ?? 0),
-            (string) (($row['vendor_credit_note_number'] ?? '') !== '' ? $row['vendor_credit_note_number'] : ''),
             (string) ($row['garage_name'] ?? ''),
         ], $rows);
         reports_csv_download(
             'returns_report_' . $timestamp . '.csv',
-            ['Return No', 'Date', 'Type', 'Approval', 'Source Doc', 'Customer/Vendor', 'Amount', 'Vendor Credit Note', 'Garage'],
+            ['Return No', 'Date', 'Type', 'Approval', 'Source Doc', 'Customer/Vendor', 'Amount', 'Garage'],
             $csvRows
         );
     }
@@ -253,13 +252,12 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                 <th>Source</th>
                 <th>Counterparty</th>
                 <th>Garage</th>
-                <th>Vendor Credit Note</th>
                 <th>Amount</th>
               </tr>
             </thead>
             <tbody>
               <?php if ($rows === []): ?>
-                <tr><td colspan="9" class="text-center text-muted py-4">No returns found in selected scope.</td></tr>
+                <tr><td colspan="8" class="text-center text-muted py-4">No returns found in selected scope.</td></tr>
               <?php else: ?>
                 <?php foreach ($rows as $row): ?>
                   <?php $returnId = (int) ($row['id'] ?? 0); ?>
@@ -271,7 +269,6 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                     <td><?= e((string) (($row['invoice_number'] ?? '') !== '' ? $row['invoice_number'] : ((($row['purchase_invoice_number'] ?? '') !== '') ? $row['purchase_invoice_number'] : '-'))); ?></td>
                     <td><?= e((string) (($row['customer_name'] ?? '') !== '' ? $row['customer_name'] : ($row['vendor_name'] ?? '-'))); ?></td>
                     <td><?= e((string) ($row['garage_name'] ?? '-')); ?></td>
-                    <td><?= e((string) (($row['vendor_credit_note_number'] ?? '') !== '' ? $row['vendor_credit_note_number'] : '-')); ?></td>
                     <td><?= e(format_currency((float) ($row['total_amount'] ?? 0))); ?></td>
                   </tr>
                 <?php endforeach; ?>

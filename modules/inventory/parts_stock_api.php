@@ -182,7 +182,15 @@ $params = [
 ];
 
 if ($partName !== '') {
-    $whereParts[] = '(p.part_name LIKE :part_query OR p.part_sku LIKE :part_query)';
+    $whereParts[] = '(
+        CAST(p.id AS CHAR) LIKE :part_query
+        OR p.part_name LIKE :part_query
+        OR p.part_sku LIKE :part_query
+        OR p.hsn_code LIKE :part_query
+        OR p.unit LIKE :part_query
+        OR pc.category_name LIKE :part_query
+        OR v.vendor_name LIKE :part_query
+    )';
     $params['part_query'] = '%' . $partName . '%';
 }
 

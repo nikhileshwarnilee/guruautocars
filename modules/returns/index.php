@@ -80,7 +80,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $reasonText = post_string('reason_text', 255);
         $reasonDetail = post_string('reason_detail', 5000);
         $notes = post_string('notes', 255);
-        $vendorCreditNoteNumber = post_string('vendor_credit_note_number', 80);
         $lines = returns_post_line_inputs();
 
         try {
@@ -95,7 +94,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $reasonText,
                 $reasonDetail,
                 $notes,
-                $vendorCreditNoteNumber,
                 $lines
             );
 
@@ -152,13 +150,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'source' => 'UI',
                 'after' => [
                     'stock_posted_count' => count((array) (($result['stock_posting'] ?? [])['posted'] ?? [])),
-                    'credit_note_number' => (string) (($result['credit_note'] ?? [])['credit_note_number'] ?? ''),
                 ],
             ]);
             flash_set('return_success', 'Return approved successfully.', 'success');
-            if (!empty(($result['credit_note'] ?? [])['credit_note_number'])) {
-                flash_set('return_success', 'Credit note generated: ' . (string) ($result['credit_note']['credit_note_number'] ?? ''), 'success');
-            }
         } catch (Throwable $exception) {
             flash_set('return_error', $exception->getMessage(), 'danger');
         }
@@ -447,11 +441,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                   <label class="form-label">Reason Detail</label>
                   <textarea name="reason_detail" class="form-control" rows="2" maxlength="5000"></textarea>
                 </div>
-                <div class="col-md-3">
-                  <label class="form-label">Vendor Credit Note No (Vendor Return)</label>
-                  <input type="text" name="vendor_credit_note_number" class="form-control" maxlength="80" />
-                </div>
-                <div class="col-md-3">
+                <div class="col-md-6">
                   <label class="form-label">Attachment (Optional)</label>
                   <input type="file" name="return_attachment" class="form-control" accept=".jpg,.jpeg,.png,.webp,.pdf,image/jpeg,image/png,image/webp,application/pdf" />
                 </div>
@@ -679,7 +669,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                 <p class="mb-2"><strong>Reason:</strong> <?= e((string) (($selectedReturn['reason_text'] ?? '') !== '' ? $selectedReturn['reason_text'] : '-')); ?></p>
                 <p class="mb-2"><strong>Detail:</strong><br><?= nl2br(e((string) (($selectedReturn['reason_detail'] ?? '') !== '' ? $selectedReturn['reason_detail'] : '-'))); ?></p>
                 <p class="mb-2"><strong>Rejected Reason:</strong> <?= e((string) (($selectedReturn['rejected_reason'] ?? '') !== '' ? $selectedReturn['rejected_reason'] : '-')); ?></p>
-                <p class="mb-0"><strong>Vendor Credit Note:</strong> <?= e((string) (($selectedReturn['vendor_credit_note_number'] ?? '') !== '' ? $selectedReturn['vendor_credit_note_number'] : '-')); ?></p>
+                <p class="mb-0"><strong>Notes:</strong> <?= e((string) (($selectedReturn['notes'] ?? '') !== '' ? $selectedReturn['notes'] : '-')); ?></p>
               </div>
             </div>
           </div>

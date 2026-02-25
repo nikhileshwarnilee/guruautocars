@@ -154,7 +154,15 @@ $params = [
 ];
 
 if ($search !== '') {
-    $whereParts[] = '(c.full_name LIKE :query OR c.phone LIKE :query OR c.email LIKE :query OR c.gstin LIKE :query)';
+    $whereParts[] = '(
+        CAST(c.id AS CHAR) LIKE :query
+        OR c.full_name LIKE :query
+        OR c.phone LIKE :query
+        OR c.email LIKE :query
+        OR c.gstin LIKE :query
+        OR c.city LIKE :query
+        OR c.state LIKE :query
+    )';
     $params['query'] = '%' . $search . '%';
 }
 

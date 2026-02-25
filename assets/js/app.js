@@ -729,7 +729,6 @@ function buildBreadcrumbMap(dashboardUrl) {
     'inventory': [home, { label: 'Inventory' }, { label: 'Stock Movements' }],
     'inventory.returns': [home, { label: 'Inventory' }, { label: 'Returns & RMA' }],
     'billing': [home, { label: 'Sales' }, { label: 'Billing' }],
-    'billing.credit_notes': [home, { label: 'Sales' }, { label: 'Credit Notes' }],
     'customers': [home, { label: 'Sales' }, { label: 'Customers' }],
     'vehicles': [home, { label: 'Sales' }, { label: 'Vehicles' }],
     'purchases.index': [home, { label: 'Purchase' }, { label: 'Purchases' }],

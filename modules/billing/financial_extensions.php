@@ -145,79 +145,13 @@ function billing_financial_extensions_ready(bool $refresh = false): bool
         );
 
         $pdo->exec(
-            'CREATE TABLE IF NOT EXISTS credit_note_number_sequences (
-                id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
-                company_id INT UNSIGNED NOT NULL,
-                garage_id INT UNSIGNED NOT NULL,
-                financial_year_id INT UNSIGNED NULL,
-                financial_year_label VARCHAR(20) NOT NULL,
-                prefix VARCHAR(20) NOT NULL DEFAULT "CN",
-                current_number INT UNSIGNED NOT NULL DEFAULT 0,
-                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                UNIQUE KEY uniq_credit_note_seq_scope (company_id, garage_id, financial_year_label),
-                KEY idx_credit_note_seq_company_garage (company_id, garage_id)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4'
-        );
-
-        $pdo->exec(
-            'CREATE TABLE IF NOT EXISTS credit_notes (
-                id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
-                company_id INT UNSIGNED NOT NULL,
-                garage_id INT UNSIGNED NOT NULL,
-                credit_note_number VARCHAR(40) NOT NULL,
-                credit_sequence_number INT UNSIGNED NOT NULL,
-                financial_year_id INT UNSIGNED NULL,
-                financial_year_label VARCHAR(20) NULL,
-                invoice_id INT UNSIGNED NULL,
-                job_card_id INT UNSIGNED NULL,
-                customer_id INT UNSIGNED NULL,
-                return_id BIGINT UNSIGNED NULL,
-                credit_note_date DATE NOT NULL,
-                taxable_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00,
-                cgst_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00,
-                sgst_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00,
-                igst_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00,
-                total_tax_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00,
-                total_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00,
-                status_code ENUM("ACTIVE","CANCELLED") NOT NULL DEFAULT "ACTIVE",
-                notes VARCHAR(255) NULL,
-                created_by INT UNSIGNED NULL,
-                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE KEY uniq_credit_note_scope (company_id, garage_id, credit_note_number),
-                KEY idx_credit_note_invoice (invoice_id),
-                KEY idx_credit_note_customer (company_id, customer_id, status_code),
-                KEY idx_credit_note_return (return_id)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4'
-        );
-
-        $pdo->exec(
-            'CREATE TABLE IF NOT EXISTS credit_note_items (
-                id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
-                credit_note_id BIGINT UNSIGNED NOT NULL,
-                invoice_item_id INT UNSIGNED NULL,
-                part_id INT UNSIGNED NULL,
-                description VARCHAR(255) NOT NULL,
-                quantity DECIMAL(12,2) NOT NULL,
-                unit_price DECIMAL(12,2) NOT NULL,
-                gst_rate DECIMAL(5,2) NOT NULL DEFAULT 0.00,
-                taxable_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00,
-                tax_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00,
-                total_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00,
-                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                KEY idx_credit_note_item_note (credit_note_id),
-                KEY idx_credit_note_item_invoice_item (invoice_item_id)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4'
-        );
-
-        $pdo->exec(
             'CREATE TABLE IF NOT EXISTS customer_ledger_entries (
                 id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
                 company_id INT UNSIGNED NOT NULL,
                 garage_id INT UNSIGNED NOT NULL,
                 customer_id INT UNSIGNED NOT NULL,
                 entry_date DATE NOT NULL,
-                entry_type ENUM("INVOICE","PAYMENT","CREDIT_NOTE","ADJUSTMENT") NOT NULL,
+                entry_type ENUM("INVOICE","PAYMENT","ADJUSTMENT") NOT NULL,
                 reference_type VARCHAR(40) NOT NULL,
                 reference_id BIGINT UNSIGNED NOT NULL,
                 debit_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00,
@@ -230,6 +164,33 @@ function billing_financial_extensions_ready(bool $refresh = false): bool
                 KEY idx_customer_ledger_scope (company_id, garage_id, customer_id, entry_date)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4'
         );
+
+        foreach ([
+            'DROP TABLE IF EXISTS credit_note_items',
+            'DROP TABLE IF EXISTS credit_notes',
+            'DROP TABLE IF EXISTS credit_note_number_sequences',
+        ] as $dropSql) {
+            try {
+                $pdo->exec($dropSql);
+            } catch (Throwable $exception) {
+                // Ignore cleanup races and permission edge-cases.
+            }
+        }
+        try {
+            $pdo->exec("DELETE FROM system_settings WHERE setting_key = 'credit_note_prefix'");
+        } catch (Throwable $exception) {
+            // Ignore missing settings table / scope edge-cases.
+        }
+        try {
+            $pdo->exec('UPDATE customer_ledger_entries SET entry_type = "ADJUSTMENT" WHERE entry_type = "CREDIT_NOTE"');
+        } catch (Throwable $exception) {
+            // Ignore legacy row migration errors.
+        }
+        try {
+            $pdo->exec('ALTER TABLE customer_ledger_entries MODIFY COLUMN entry_type ENUM("INVOICE","PAYMENT","ADJUSTMENT") NOT NULL');
+        } catch (Throwable $exception) {
+            // Ignore incompatible existing values / concurrent DDL.
+        }
 
         billing_add_column_if_missing(
             $pdo,
@@ -415,19 +376,6 @@ function billing_generate_payment_receipt_number(PDO $pdo, int $companyId, int $
         $receiptDate,
         'payment_receipt_prefix',
         'RCP'
-    );
-}
-
-function billing_generate_credit_note_number(PDO $pdo, int $companyId, int $garageId, string $creditDate): array
-{
-    return billing_generate_scoped_sequence_number(
-        $pdo,
-        'credit_note_number_sequences',
-        $companyId,
-        $garageId,
-        $creditDate,
-        'credit_note_prefix',
-        'CN'
     );
 }
 
@@ -765,7 +713,7 @@ function billing_record_customer_ledger_entry(
     }
 
     $entryType = strtoupper(trim($entryType));
-    if (!in_array($entryType, ['INVOICE', 'PAYMENT', 'CREDIT_NOTE', 'ADJUSTMENT'], true)) {
+    if (!in_array($entryType, ['INVOICE', 'PAYMENT', 'ADJUSTMENT'], true)) {
         $entryType = 'ADJUSTMENT';
     }
 
@@ -799,233 +747,6 @@ function billing_record_customer_ledger_entry(
         'notes' => $notes !== null && trim($notes) !== '' ? mb_substr(trim($notes), 0, 255) : null,
         'created_by' => $createdBy,
     ]);
-}
-
-function billing_create_credit_note_from_return(
-    PDO $pdo,
-    int $companyId,
-    int $garageId,
-    int $invoiceId,
-    int $returnId,
-    array $returnItems,
-    ?int $createdBy = null,
-    ?string $note = null,
-    ?string $creditDate = null
-): array {
-    if (!billing_financial_extensions_ready()) {
-        throw new RuntimeException('Credit note feature is not ready.');
-    }
-    if ($invoiceId <= 0 || $returnId <= 0) {
-        throw new RuntimeException('Invoice and return linkage is required for credit note.');
-    }
-
-    $invoiceStmt = $pdo->prepare(
-        'SELECT id, job_card_id, customer_id, invoice_number, invoice_status
-         FROM invoices
-         WHERE id = :invoice_id
-           AND company_id = :company_id
-           AND garage_id = :garage_id
-         LIMIT 1
-         FOR UPDATE'
-    );
-    $invoiceStmt->execute([
-        'invoice_id' => $invoiceId,
-        'company_id' => $companyId,
-        'garage_id' => $garageId,
-    ]);
-    $invoice = $invoiceStmt->fetch();
-    if (!$invoice) {
-        throw new RuntimeException('Invoice not found for credit note.');
-    }
-
-    $existingStmt = $pdo->prepare(
-        'SELECT id, credit_note_number
-         FROM credit_notes
-         WHERE company_id = :company_id
-           AND garage_id = :garage_id
-           AND return_id = :return_id
-         LIMIT 1'
-    );
-    $existingStmt->execute([
-        'company_id' => $companyId,
-        'garage_id' => $garageId,
-        'return_id' => $returnId,
-    ]);
-    $existing = $existingStmt->fetch();
-    if ($existing) {
-        return [
-            'credit_note_id' => (int) ($existing['id'] ?? 0),
-            'credit_note_number' => (string) ($existing['credit_note_number'] ?? ''),
-            'reused' => true,
-        ];
-    }
-
-    $itemIds = [];
-    foreach ($returnItems as $item) {
-        $invoiceItemId = (int) ($item['invoice_item_id'] ?? 0);
-        if ($invoiceItemId > 0) {
-            $itemIds[] = $invoiceItemId;
-        }
-    }
-    $itemIds = array_values(array_unique($itemIds));
-    if ($itemIds === []) {
-        throw new RuntimeException('No invoice items provided for credit note generation.');
-    }
-
-    $placeholders = implode(',', array_fill(0, count($itemIds), '?'));
-    $invoiceItemsStmt = $pdo->prepare(
-        "SELECT id, description, part_id, quantity, unit_price, gst_rate, taxable_value, cgst_amount, sgst_amount, igst_amount, tax_amount, total_value
-         FROM invoice_items
-         WHERE invoice_id = ?
-           AND id IN ($placeholders)"
-    );
-    $invoiceItemsStmt->execute(array_merge([$invoiceId], $itemIds));
-    $invoiceItemRows = $invoiceItemsStmt->fetchAll();
-    $invoiceItemMap = [];
-    foreach ($invoiceItemRows as $row) {
-        $invoiceItemMap[(int) ($row['id'] ?? 0)] = $row;
-    }
-
-    $creditLines = [];
-    $totals = [
-        'taxable' => 0.0,
-        'cgst' => 0.0,
-        'sgst' => 0.0,
-        'igst' => 0.0,
-        'tax' => 0.0,
-        'total' => 0.0,
-    ];
-    foreach ($returnItems as $item) {
-        $invoiceItemId = (int) ($item['invoice_item_id'] ?? 0);
-        $returnQty = billing_round((float) ($item['quantity'] ?? 0));
-        if ($invoiceItemId <= 0 || $returnQty <= 0) {
-            continue;
-        }
-        $source = $invoiceItemMap[$invoiceItemId] ?? null;
-        if (!is_array($source)) {
-            continue;
-        }
-
-        $sourceQty = max(0.01, billing_round((float) ($source['quantity'] ?? 0)));
-        $appliedQty = min($returnQty, $sourceQty);
-        $ratio = $appliedQty / $sourceQty;
-
-        $taxable = billing_round((float) ($source['taxable_value'] ?? 0) * $ratio);
-        $cgst = billing_round((float) ($source['cgst_amount'] ?? 0) * $ratio);
-        $sgst = billing_round((float) ($source['sgst_amount'] ?? 0) * $ratio);
-        $igst = billing_round((float) ($source['igst_amount'] ?? 0) * $ratio);
-        $tax = billing_round($cgst + $sgst + $igst);
-        $total = billing_round($taxable + $tax);
-
-        $creditLines[] = [
-            'invoice_item_id' => $invoiceItemId,
-            'part_id' => (int) ($source['part_id'] ?? 0) > 0 ? (int) $source['part_id'] : null,
-            'description' => (string) ($source['description'] ?? ('Invoice Item #' . $invoiceItemId)),
-            'quantity' => $appliedQty,
-            'unit_price' => billing_round((float) ($source['unit_price'] ?? 0)),
-            'gst_rate' => billing_round((float) ($source['gst_rate'] ?? 0)),
-            'taxable_amount' => $taxable,
-            'cgst_amount' => $cgst,
-            'sgst_amount' => $sgst,
-            'igst_amount' => $igst,
-            'tax_amount' => $tax,
-            'total_amount' => $total,
-        ];
-
-        $totals['taxable'] += $taxable;
-        $totals['cgst'] += $cgst;
-        $totals['sgst'] += $sgst;
-        $totals['igst'] += $igst;
-        $totals['tax'] += $tax;
-        $totals['total'] += $total;
-    }
-
-    if ($creditLines === []) {
-        throw new RuntimeException('No valid return quantities available for credit note.');
-    }
-
-    $creditDate = ($creditDate !== null && preg_match('/^\d{4}-\d{2}-\d{2}$/', $creditDate))
-        ? $creditDate
-        : date('Y-m-d');
-    $numberMeta = billing_generate_credit_note_number($pdo, $companyId, $garageId, $creditDate);
-
-    $creditInsert = $pdo->prepare(
-        'INSERT INTO credit_notes
-          (company_id, garage_id, credit_note_number, credit_sequence_number, financial_year_id, financial_year_label,
-           invoice_id, job_card_id, customer_id, return_id, credit_note_date, taxable_amount, cgst_amount, sgst_amount, igst_amount,
-           total_tax_amount, total_amount, status_code, notes, created_by)
-         VALUES
-          (:company_id, :garage_id, :credit_note_number, :credit_sequence_number, :financial_year_id, :financial_year_label,
-           :invoice_id, :job_card_id, :customer_id, :return_id, :credit_note_date, :taxable_amount, :cgst_amount, :sgst_amount, :igst_amount,
-           :total_tax_amount, :total_amount, "ACTIVE", :notes, :created_by)'
-    );
-    $creditInsert->execute([
-        'company_id' => $companyId,
-        'garage_id' => $garageId,
-        'credit_note_number' => (string) $numberMeta['number'],
-        'credit_sequence_number' => (int) $numberMeta['sequence_number'],
-        'financial_year_id' => $numberMeta['financial_year_id'],
-        'financial_year_label' => (string) $numberMeta['financial_year_label'],
-        'invoice_id' => $invoiceId,
-        'job_card_id' => (int) ($invoice['job_card_id'] ?? 0) > 0 ? (int) $invoice['job_card_id'] : null,
-        'customer_id' => (int) ($invoice['customer_id'] ?? 0) > 0 ? (int) $invoice['customer_id'] : null,
-        'return_id' => $returnId,
-        'credit_note_date' => $creditDate,
-        'taxable_amount' => billing_round($totals['taxable']),
-        'cgst_amount' => billing_round($totals['cgst']),
-        'sgst_amount' => billing_round($totals['sgst']),
-        'igst_amount' => billing_round($totals['igst']),
-        'total_tax_amount' => billing_round($totals['tax']),
-        'total_amount' => billing_round($totals['total']),
-        'notes' => $note !== null && trim($note) !== '' ? mb_substr(trim($note), 0, 255) : null,
-        'created_by' => $createdBy,
-    ]);
-    $creditNoteId = (int) $pdo->lastInsertId();
-
-    $lineInsert = $pdo->prepare(
-        'INSERT INTO credit_note_items
-          (credit_note_id, invoice_item_id, part_id, description, quantity, unit_price, gst_rate, taxable_amount, tax_amount, total_amount)
-         VALUES
-          (:credit_note_id, :invoice_item_id, :part_id, :description, :quantity, :unit_price, :gst_rate, :taxable_amount, :tax_amount, :total_amount)'
-    );
-    foreach ($creditLines as $line) {
-        $lineInsert->execute([
-            'credit_note_id' => $creditNoteId,
-            'invoice_item_id' => $line['invoice_item_id'],
-            'part_id' => $line['part_id'],
-            'description' => mb_substr((string) $line['description'], 0, 255),
-            'quantity' => $line['quantity'],
-            'unit_price' => $line['unit_price'],
-            'gst_rate' => $line['gst_rate'],
-            'taxable_amount' => $line['taxable_amount'],
-            'tax_amount' => $line['tax_amount'],
-            'total_amount' => $line['total_amount'],
-        ]);
-    }
-
-    $customerId = (int) ($invoice['customer_id'] ?? 0);
-    if ($customerId > 0) {
-        billing_record_customer_ledger_entry(
-            $pdo,
-            $companyId,
-            $garageId,
-            $customerId,
-            $creditDate,
-            'CREDIT_NOTE',
-            'CREDIT_NOTE',
-            $creditNoteId,
-            0.0,
-            billing_round($totals['total']),
-            $createdBy,
-            'Credit note issued against invoice ' . (string) ($invoice['invoice_number'] ?? '')
-        );
-    }
-
-    return [
-        'credit_note_id' => $creditNoteId,
-        'credit_note_number' => (string) $numberMeta['number'],
-        'reused' => false,
-    ];
 }
 
 function billing_fetch_payment_receipt_row(PDO $pdo, int $paymentId, int $companyId, int $garageId): ?array

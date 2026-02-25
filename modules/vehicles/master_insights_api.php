@@ -158,7 +158,19 @@ $params = [
 ];
 
 if ($search !== '') {
-    $whereParts[] = '(v.registration_no LIKE :query OR v.brand LIKE :query OR v.model LIKE :query OR v.variant LIKE :query OR c.full_name LIKE :query)';
+    $whereParts[] = '(
+        CAST(v.id AS CHAR) LIKE :query
+        OR v.registration_no LIKE :query
+        OR v.brand LIKE :query
+        OR v.model LIKE :query
+        OR v.variant LIKE :query
+        OR v.vehicle_type LIKE :query
+        OR v.fuel_type LIKE :query
+        OR v.chassis_no LIKE :query
+        OR v.engine_no LIKE :query
+        OR c.full_name LIKE :query
+        OR c.phone LIKE :query
+    )';
     $params['query'] = '%' . $search . '%';
 }
 

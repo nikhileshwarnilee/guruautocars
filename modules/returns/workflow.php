@@ -56,6 +56,20 @@ function returns_add_column_if_missing(PDO $pdo, string $tableName, string $colu
     return in_array($columnName, returns_table_columns_uncached($pdo, $tableName), true);
 }
 
+function returns_drop_column_if_exists(PDO $pdo, string $tableName, string $columnName): void
+{
+    $columns = returns_table_columns_uncached($pdo, $tableName);
+    if (!in_array($columnName, $columns, true)) {
+        return;
+    }
+
+    try {
+        $pdo->exec('ALTER TABLE `' . $tableName . '` DROP COLUMN `' . $columnName . '`');
+    } catch (Throwable $exception) {
+        // Ignore incompatible ALTER / race conditions.
+    }
+}
+
 function returns_module_ready(bool $refresh = false): bool
 {
     static $cached = null;
@@ -66,7 +80,7 @@ function returns_module_ready(bool $refresh = false): bool
 
     $pdo = db();
     try {
-        // Ensure billing extensions are available for credit-note linkage.
+        // Shared billing helpers are used for scoped sequence generation.
         billing_financial_extensions_ready();
 
         $pdo->exec(
@@ -105,8 +119,6 @@ function returns_module_ready(bool $refresh = false): bool
                 approved_by INT UNSIGNED NULL,
                 approved_at DATETIME NULL,
                 rejected_reason VARCHAR(255) NULL,
-                vendor_credit_note_number VARCHAR(80) NULL,
-                credit_note_id BIGINT UNSIGNED NULL,
                 taxable_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00,
                 tax_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00,
                 total_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00,
@@ -183,19 +195,9 @@ function returns_module_ready(bool $refresh = false): bool
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4'
         );
 
-        // Backward-safe columns if table existed from earlier experiments.
-        returns_add_column_if_missing(
-            $pdo,
-            'returns_rma',
-            'vendor_credit_note_number',
-            'ALTER TABLE returns_rma ADD COLUMN vendor_credit_note_number VARCHAR(80) NULL AFTER rejected_reason'
-        );
-        returns_add_column_if_missing(
-            $pdo,
-            'returns_rma',
-            'credit_note_id',
-            'ALTER TABLE returns_rma ADD COLUMN credit_note_id BIGINT UNSIGNED NULL AFTER vendor_credit_note_number'
-        );
+        // Cleanup legacy credit-note columns from older versions.
+        returns_drop_column_if_exists($pdo, 'returns_rma', 'vendor_credit_note_number');
+        returns_drop_column_if_exists($pdo, 'returns_rma', 'credit_note_id');
 
         if (!returns_table_has_index($pdo, 'returns_rma', 'idx_returns_customer')) {
             try {
@@ -510,7 +512,6 @@ function returns_create_rma(
     string $reasonText,
     string $reasonDetail,
     string $notes,
-    string $vendorCreditNoteNumber,
     array $lineInputs
 ): array {
     if (!returns_module_ready()) {
@@ -609,12 +610,12 @@ function returns_create_rma(
             'INSERT INTO returns_rma
               (company_id, garage_id, return_number, return_sequence_number, financial_year_label, return_type,
                return_date, job_card_id, invoice_id, purchase_id, customer_id, vendor_id,
-               reason_text, reason_detail, approval_status, vendor_credit_note_number,
+               reason_text, reason_detail, approval_status,
                taxable_amount, tax_amount, total_amount, notes, status_code, created_by, updated_by)
              VALUES
               (:company_id, :garage_id, :return_number, :return_sequence_number, :financial_year_label, :return_type,
                :return_date, :job_card_id, :invoice_id, :purchase_id, :customer_id, :vendor_id,
-               :reason_text, :reason_detail, "PENDING", :vendor_credit_note_number,
+               :reason_text, :reason_detail, "PENDING",
                :taxable_amount, :tax_amount, :total_amount, :notes, "ACTIVE", :created_by, :updated_by)'
         );
         $insertReturnStmt->execute([
@@ -632,7 +633,6 @@ function returns_create_rma(
             'vendor_id' => (int) ($sourceDoc['vendor_id'] ?? 0) > 0 ? (int) $sourceDoc['vendor_id'] : null,
             'reason_text' => $reasonText !== '' ? mb_substr($reasonText, 0, 255) : null,
             'reason_detail' => $reasonDetail !== '' ? $reasonDetail : null,
-            'vendor_credit_note_number' => $vendorCreditNoteNumber !== '' ? mb_substr($vendorCreditNoteNumber, 0, 80) : null,
             'taxable_amount' => returns_round($taxableTotal),
             'tax_amount' => returns_round($taxTotal),
             'total_amount' => returns_round($grandTotal),
@@ -1110,45 +1110,12 @@ function returns_approve_rma(PDO $pdo, int $returnId, int $companyId, int $garag
 
         $stockPosting = returns_post_stock_reversal_for_approved_return($pdo, $returnRow, $returnItems, $actorUserId);
 
-        $creditNoteMeta = null;
-        if (returns_normalize_type((string) ($returnRow['return_type'] ?? '')) === 'CUSTOMER_RETURN') {
-            $invoiceId = (int) ($returnRow['invoice_id'] ?? 0);
-            if ($invoiceId > 0) {
-                $creditItems = [];
-                foreach ($returnItems as $item) {
-                    $sourceItemId = (int) ($item['source_item_id'] ?? 0);
-                    $qty = returns_round((float) ($item['quantity'] ?? 0));
-                    if ($sourceItemId <= 0 || $qty <= 0.009) {
-                        continue;
-                    }
-                    $creditItems[] = [
-                        'invoice_item_id' => $sourceItemId,
-                        'quantity' => $qty,
-                    ];
-                }
-
-                if ($creditItems !== []) {
-                    $creditNoteMeta = billing_create_credit_note_from_return(
-                        $pdo,
-                        $companyId,
-                        $garageId,
-                        $invoiceId,
-                        (int) ($returnRow['id'] ?? 0),
-                        $creditItems,
-                        $actorUserId > 0 ? $actorUserId : null,
-                        (string) ($returnRow['return_date'] ?? date('Y-m-d'))
-                    );
-                }
-            }
-        }
-
         $updateStmt = $pdo->prepare(
             'UPDATE returns_rma
              SET approval_status = "APPROVED",
                  approved_by = :approved_by,
                  approved_at = NOW(),
                  rejected_reason = NULL,
-                 credit_note_id = :credit_note_id,
                  updated_by = :updated_by
              WHERE id = :id
                AND company_id = :company_id
@@ -1156,7 +1123,6 @@ function returns_approve_rma(PDO $pdo, int $returnId, int $companyId, int $garag
         );
         $updateStmt->execute([
             'approved_by' => $actorUserId > 0 ? $actorUserId : null,
-            'credit_note_id' => $creditNoteMeta !== null ? (int) ($creditNoteMeta['credit_note_id'] ?? 0) : null,
             'updated_by' => $actorUserId > 0 ? $actorUserId : null,
             'id' => $returnId,
             'company_id' => $companyId,
@@ -1170,7 +1136,6 @@ function returns_approve_rma(PDO $pdo, int $returnId, int $companyId, int $garag
             'return_number' => (string) ($returnRow['return_number'] ?? ''),
             'return_type' => (string) ($returnRow['return_type'] ?? ''),
             'stock_posting' => $stockPosting,
-            'credit_note' => $creditNoteMeta,
         ];
     } catch (Throwable $exception) {
         $pdo->rollBack();
