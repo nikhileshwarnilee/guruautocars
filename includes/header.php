@@ -22,6 +22,39 @@ $globalVehicleSearchEnabled = $user !== null && has_permission('vehicle.view');
 $globalVehicleSearchApiUrl = $globalVehicleSearchEnabled ? url('modules/vehicles/search_api.php') : '';
 $headerCompanyId = (int) ($user['company_id'] ?? active_company_id());
 $headerCompanyLogoUrl = $headerCompanyId > 0 ? company_logo_url($headerCompanyId, active_garage_id()) : null;
+$quickAccessLinks = [];
+if (has_permission('job.view')) {
+    $quickAccessLinks[] = [
+        'label' => 'Job Card',
+        'icon' => 'bi bi-card-checklist',
+        'url' => url('modules/jobs/index.php'),
+        'active_keys' => ['jobs'],
+    ];
+}
+if (has_permission('billing.view') || has_permission('invoice.view')) {
+    $quickAccessLinks[] = [
+        'label' => 'Billing',
+        'icon' => 'bi bi-receipt-cutoff',
+        'url' => url('modules/billing/index.php'),
+        'active_keys' => ['billing'],
+    ];
+}
+if (has_permission('estimate.view')) {
+    $quickAccessLinks[] = [
+        'label' => 'Estimate',
+        'icon' => 'bi bi-file-earmark-text',
+        'url' => url('modules/estimates/index.php'),
+        'active_keys' => ['estimates'],
+    ];
+}
+if (has_permission('inventory.view')) {
+    $quickAccessLinks[] = [
+        'label' => 'Stock',
+        'icon' => 'bi bi-arrow-left-right',
+        'url' => url('modules/inventory/index.php'),
+        'active_keys' => ['inventory'],
+    ];
+}
 $appCssPath = __DIR__ . '/../assets/css/app.css';
 $appCssVersion = (string) @md5_file($appCssPath);
 if ($appCssVersion === '') {
@@ -53,6 +86,20 @@ if ($appCssVersion === '') {
     <script>
       (function () {
         try {
+          if (window.localStorage) {
+            var storedSidebarWidth = parseInt(window.localStorage.getItem('gac.sidebar.width') || '', 10);
+            if (!isNaN(storedSidebarWidth)) {
+              var minSidebarWidth = 260;
+              var maxSidebarWidth = 360;
+              if (storedSidebarWidth < minSidebarWidth) {
+                storedSidebarWidth = minSidebarWidth;
+              } else if (storedSidebarWidth > maxSidebarWidth) {
+                storedSidebarWidth = maxSidebarWidth;
+              }
+              document.documentElement.style.setProperty('--lte-sidebar-width', String(storedSidebarWidth) + 'px');
+            }
+          }
+
           if (window.localStorage && window.localStorage.getItem('gac.sidebar.collapsed') === '1') {
             document.body.classList.add('sidebar-collapse');
             document.body.classList.remove('sidebar-open');
@@ -159,6 +206,25 @@ if ($appCssVersion === '') {
               </li>
             <?php endif; ?>
           </ul>
+          <?php if ($quickAccessLinks !== []): ?>
+            <div class="gac-quick-access-wrap">
+              <nav class="gac-quick-access-nav" aria-label="Quick access">
+                <?php foreach ($quickAccessLinks as $quickLink): ?>
+                  <?php
+                  $activeKeys = $quickLink['active_keys'] ?? [];
+                  $isQuickLinkActive = in_array($activeMenu, $activeKeys, true);
+                  ?>
+                  <a
+                    href="<?= e((string) ($quickLink['url'] ?? '#')); ?>"
+                    class="gac-quick-access-link <?= $isQuickLinkActive ? 'active' : ''; ?>"
+                  >
+                    <i class="<?= e((string) ($quickLink['icon'] ?? 'bi bi-lightning')); ?>" aria-hidden="true"></i>
+                    <span><?= e((string) ($quickLink['label'] ?? 'Quick')); ?></span>
+                  </a>
+                <?php endforeach; ?>
+              </nav>
+            </div>
+          <?php endif; ?>
         </div>
       </nav>
       <?php $normalizedFlashMessages = flash_messages_normalize($flashMessages); ?>

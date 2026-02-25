@@ -4,6 +4,8 @@ document.addEventListener('DOMContentLoaded', function () {
 
 function gacBoot() {
   runInitTask(initSidebarStatePersistence, 'initSidebarStatePersistence');
+  runInitTask(initSidebarWidthResizer, 'initSidebarWidthResizer');
+  runInitTask(initSidebarUiEnhancements, 'initSidebarUiEnhancements');
   runInitTask(ensurePageBreadcrumbs, 'ensurePageBreadcrumbs');
   runInitTask(initFlashNotifications, 'initFlashNotifications');
   runInitTask(bindConfirmForms, 'bindConfirmForms');
@@ -104,6 +106,356 @@ function persistSidebarState(storageKey) {
   } catch (error) {
     // Ignore storage permission errors.
   }
+}
+
+function initSidebarWidthResizer() {
+  if (!document.body || document.body.getAttribute('data-gac-sidebar-width-init') === '1') {
+    return;
+  }
+  document.body.setAttribute('data-gac-sidebar-width-init', '1');
+
+  var sidebar = document.querySelector('.app-sidebar.gac-sidebar-theme');
+  if (!sidebar) {
+    return;
+  }
+
+  var storageKey = 'gac.sidebar.width';
+  var defaultWidth = 272;
+  var minWidth = 260;
+  var maxWidth = 360;
+
+  applySidebarWidthValue(resolveStoredSidebarWidth(storageKey, defaultWidth, minWidth, maxWidth));
+
+  var resizer = sidebar.querySelector('.gac-sidebar-resizer');
+  if (!resizer) {
+    resizer = document.createElement('button');
+    resizer.type = 'button';
+    resizer.className = 'gac-sidebar-resizer';
+    resizer.setAttribute('aria-label', 'Resize sidebar width');
+    resizer.setAttribute('title', 'Drag to resize sidebar');
+    sidebar.appendChild(resizer);
+  }
+
+  function syncResizerVisibility() {
+    var isDesktop = window.matchMedia ? window.matchMedia('(min-width: 992px)').matches : window.innerWidth >= 992;
+    var isCollapsed = !!document.body && document.body.classList.contains('sidebar-collapse');
+    resizer.style.display = isDesktop && !isCollapsed ? '' : 'none';
+  }
+
+  function startResize(event) {
+    if (!event || event.button !== 0) {
+      return;
+    }
+    if (!document.body || document.body.classList.contains('sidebar-collapse')) {
+      return;
+    }
+
+    event.preventDefault();
+
+    var startX = event.clientX;
+    var startWidth = resolveCurrentSidebarWidth(sidebar, minWidth, maxWidth);
+    document.body.classList.add('gac-sidebar-resizing');
+    document.body.style.userSelect = 'none';
+
+    function onMouseMove(moveEvent) {
+      var deltaX = moveEvent.clientX - startX;
+      var nextWidth = clampSidebarWidth(startWidth + deltaX, minWidth, maxWidth);
+      applySidebarWidthValue(nextWidth);
+    }
+
+    function onMouseUp() {
+      document.removeEventListener('mousemove', onMouseMove);
+      document.removeEventListener('mouseup', onMouseUp);
+      if (document.body) {
+        document.body.classList.remove('gac-sidebar-resizing');
+        document.body.style.removeProperty('user-select');
+      }
+      persistSidebarWidth(storageKey, resolveCurrentSidebarWidth(sidebar, minWidth, maxWidth));
+    }
+
+    document.addEventListener('mousemove', onMouseMove);
+    document.addEventListener('mouseup', onMouseUp);
+  }
+
+  function resetResize(event) {
+    if (event) {
+      event.preventDefault();
+    }
+    applySidebarWidthValue(defaultWidth);
+    persistSidebarWidth(storageKey, defaultWidth);
+  }
+
+  resizer.addEventListener('mousedown', startResize);
+  resizer.addEventListener('dblclick', resetResize);
+  resizer.addEventListener('keydown', function (event) {
+    if (!event) {
+      return;
+    }
+    var key = String(event.key || '');
+    if (key !== 'ArrowLeft' && key !== 'ArrowRight') {
+      return;
+    }
+    event.preventDefault();
+    var step = event.shiftKey ? 20 : 10;
+    var delta = key === 'ArrowRight' ? step : -step;
+    var nextWidth = clampSidebarWidth(resolveCurrentSidebarWidth(sidebar, minWidth, maxWidth) + delta, minWidth, maxWidth);
+    applySidebarWidthValue(nextWidth);
+    persistSidebarWidth(storageKey, nextWidth);
+  });
+
+  window.addEventListener('resize', syncResizerVisibility);
+  document.addEventListener('click', function (event) {
+    var target = event.target;
+    if (!target || typeof target.closest !== 'function') {
+      return;
+    }
+    if (!target.closest('[data-lte-toggle=\"sidebar\"]')) {
+      return;
+    }
+    window.setTimeout(syncResizerVisibility, 180);
+  });
+
+  syncResizerVisibility();
+}
+
+function applySidebarWidthValue(width) {
+  if (!document.documentElement) {
+    return;
+  }
+  document.documentElement.style.setProperty('--lte-sidebar-width', String(Math.round(width)) + 'px');
+}
+
+function resolveStoredSidebarWidth(storageKey, fallbackWidth, minWidth, maxWidth) {
+  var width = fallbackWidth;
+  try {
+    if (window.localStorage) {
+      var stored = parseInt(window.localStorage.getItem(storageKey) || '', 10);
+      if (!isNaN(stored)) {
+        width = stored;
+      }
+    }
+  } catch (error) {
+    // Ignore storage permission errors.
+  }
+
+  return clampSidebarWidth(width, minWidth, maxWidth);
+}
+
+function persistSidebarWidth(storageKey, width) {
+  try {
+    if (!window.localStorage) {
+      return;
+    }
+    window.localStorage.setItem(storageKey, String(Math.round(width)));
+  } catch (error) {
+    // Ignore storage permission errors.
+  }
+}
+
+function resolveCurrentSidebarWidth(sidebar, minWidth, maxWidth) {
+  var current = NaN;
+
+  if (document.documentElement && window.getComputedStyle) {
+    var computed = window.getComputedStyle(document.documentElement).getPropertyValue('--lte-sidebar-width');
+    current = parseInt(String(computed || '').trim(), 10);
+  }
+
+  if (isNaN(current) && sidebar && sidebar.getBoundingClientRect) {
+    current = Math.round(sidebar.getBoundingClientRect().width);
+  }
+
+  if (isNaN(current)) {
+    current = minWidth;
+  }
+
+  return clampSidebarWidth(current, minWidth, maxWidth);
+}
+
+function clampSidebarWidth(value, minWidth, maxWidth) {
+  var numeric = Number(value);
+  if (!isFinite(numeric)) {
+    return minWidth;
+  }
+  if (numeric < minWidth) {
+    return minWidth;
+  }
+  if (numeric > maxWidth) {
+    return maxWidth;
+  }
+  return numeric;
+}
+
+function initSidebarUiEnhancements() {
+  var sidebarMenu = document.querySelector('.app-sidebar .sidebar-menu');
+  if (!sidebarMenu || sidebarMenu.getAttribute('data-gac-sidebar-ui-init') === '1') {
+    return;
+  }
+  sidebarMenu.setAttribute('data-gac-sidebar-ui-init', '1');
+
+  assignSidebarCollapsedTooltips(sidebarMenu);
+  enforceSingleExpandedSidebarGroup(sidebarMenu);
+
+  sidebarMenu.addEventListener('click', function (event) {
+    var target = event.target;
+    if (!target || typeof target.closest !== 'function') {
+      return;
+    }
+
+    var clickedLink = target.closest('.nav-link');
+    if (!clickedLink) {
+      return;
+    }
+
+    var navItem = clickedLink.parentElement;
+    if (!navItem || navItem.parentElement !== sidebarMenu) {
+      return;
+    }
+
+    if (!sidebarDirectTreeview(navItem)) {
+      return;
+    }
+
+    window.setTimeout(function () {
+      if (!navItem.classList.contains('menu-open')) {
+        return;
+      }
+      collapseSidebarSiblingGroups(sidebarMenu, navItem);
+    }, 180);
+  });
+}
+
+function assignSidebarCollapsedTooltips(sidebarMenu) {
+  if (!sidebarMenu || !sidebarMenu.children) {
+    return;
+  }
+
+  for (var index = 0; index < sidebarMenu.children.length; index++) {
+    var navItem = sidebarMenu.children[index];
+    if (!navItem || !navItem.classList || !navItem.classList.contains('nav-item')) {
+      continue;
+    }
+
+    var navLink = sidebarDirectNavLink(navItem);
+    if (!navLink) {
+      continue;
+    }
+
+    var label = sidebarLinkLabel(navLink);
+    if (label === '') {
+      continue;
+    }
+
+    navLink.setAttribute('data-gac-tooltip', label);
+    navLink.setAttribute('title', label);
+  }
+}
+
+function enforceSingleExpandedSidebarGroup(sidebarMenu) {
+  if (!sidebarMenu || !sidebarMenu.children) {
+    return;
+  }
+
+  var keepOpen = null;
+  for (var index = 0; index < sidebarMenu.children.length; index++) {
+    var navItem = sidebarMenu.children[index];
+    if (!navItem || !navItem.classList || !navItem.classList.contains('menu-open')) {
+      continue;
+    }
+    if (!keepOpen) {
+      keepOpen = navItem;
+    }
+    if (sidebarHasActiveChild(navItem)) {
+      keepOpen = navItem;
+      break;
+    }
+  }
+
+  if (!keepOpen) {
+    return;
+  }
+  collapseSidebarSiblingGroups(sidebarMenu, keepOpen);
+}
+
+function collapseSidebarSiblingGroups(sidebarMenu, openItem) {
+  if (!sidebarMenu || !sidebarMenu.children) {
+    return;
+  }
+
+  for (var index = 0; index < sidebarMenu.children.length; index++) {
+    var sibling = sidebarMenu.children[index];
+    if (!sibling || sibling === openItem || !sibling.classList || !sibling.classList.contains('nav-item')) {
+      continue;
+    }
+    if (!sibling.classList.contains('menu-open')) {
+      continue;
+    }
+
+    sibling.classList.remove('menu-open');
+
+    var siblingTreeview = sidebarDirectTreeview(sibling);
+    if (siblingTreeview) {
+      siblingTreeview.style.display = 'none';
+    }
+
+    var siblingLink = sidebarDirectNavLink(sibling);
+    if (siblingLink && !sidebarHasActiveChild(sibling)) {
+      siblingLink.classList.remove('active');
+    }
+  }
+}
+
+function sidebarDirectNavLink(navItem) {
+  if (!navItem || !navItem.children) {
+    return null;
+  }
+
+  for (var index = 0; index < navItem.children.length; index++) {
+    var child = navItem.children[index];
+    if (child && child.classList && child.classList.contains('nav-link')) {
+      return child;
+    }
+  }
+
+  return null;
+}
+
+function sidebarDirectTreeview(navItem) {
+  if (!navItem || !navItem.children) {
+    return null;
+  }
+
+  for (var index = 0; index < navItem.children.length; index++) {
+    var child = navItem.children[index];
+    if (child && child.classList && child.classList.contains('nav-treeview')) {
+      return child;
+    }
+  }
+
+  return null;
+}
+
+function sidebarHasActiveChild(navItem) {
+  var navTreeview = sidebarDirectTreeview(navItem);
+  if (!navTreeview) {
+    return false;
+  }
+  return !!navTreeview.querySelector('.nav-link.active');
+}
+
+function sidebarLinkLabel(navLink) {
+  if (!navLink || !navLink.children) {
+    return '';
+  }
+
+  for (var index = 0; index < navLink.children.length; index++) {
+    var child = navLink.children[index];
+    if (!child || String(child.tagName || '').toUpperCase() !== 'P') {
+      continue;
+    }
+    return collapseWhitespace(String(child.textContent || '')).trim();
+  }
+
+  return collapseWhitespace(String(navLink.textContent || '')).trim();
 }
 
 function ensurePageBreadcrumbs() {
@@ -236,43 +588,47 @@ function buildBreadcrumbMap(dashboardUrl) {
 
   return {
     'dashboard': [home, { label: 'Dashboard' }],
-    'jobs': [home, { label: 'Operations' }, { label: 'Job Cards' }],
+    'jobs': [home, { label: 'Operations' }, { label: 'Job Card' }],
+    'jobs.maintenance_reminders': [home, { label: 'Operations' }, { label: 'Service Reminders' }],
+    'jobs.maintenance_setup': [home, { label: 'Vehicle Intelligence' }, { label: 'Vehicle Maintenance Setup' }],
     'estimates': [home, { label: 'Operations' }, { label: 'Estimates' }],
     'outsourced.index': [home, { label: 'Operations' }, { label: 'Outsourced Works' }],
-    'inventory': [home, { label: 'Operations' }, { label: 'Stock Movements' }],
-    'billing': [home, { label: 'Sales' }, { label: 'Billing / Invoices' }],
-    'customers': [home, { label: 'Sales' }, { label: 'Customer Master' }],
-    'vehicles': [home, { label: 'Sales' }, { label: 'Vehicle Master' }],
-    'inventory.parts_master': [home, { label: 'Inventory' }, { label: 'Parts / Item Master' }],
-    'inventory.categories': [home, { label: 'Inventory' }, { label: 'Part Category Master' }],
-    'purchases.index': [home, { label: 'Inventory' }, { label: 'Purchases' }],
-    'vendors.master': [home, { label: 'Inventory' }, { label: 'Vendor / Supplier Master' }],
-    'finance.payroll': [home, { label: 'Finance' }, { label: 'Payroll & Salary' }],
+    'inventory': [home, { label: 'Inventory' }, { label: 'Stock Movements' }],
+    'billing': [home, { label: 'Sales' }, { label: 'Billing' }],
+    'customers': [home, { label: 'Sales' }, { label: 'Customers' }],
+    'vehicles': [home, { label: 'Sales' }, { label: 'Vehicles' }],
+    'purchases.index': [home, { label: 'Purchase' }, { label: 'Purchases' }],
+    'vendors.master': [home, { label: 'Purchase' }, { label: 'Vendors' }],
+    'finance.payroll': [home, { label: 'Finance' }, { label: 'Payroll' }],
     'finance.expenses': [home, { label: 'Finance' }, { label: 'Expenses' }],
-    'reports.gst_compliance': [home, { label: 'Finance' }, { label: 'GST Compliance' }],
+    'vis.catalog': [home, { label: 'Vehicle Intelligence' }, { label: 'Catalog' }],
+    'vis.compatibility': [home, { label: 'Vehicle Intelligence' }, { label: 'Compatibility' }],
+    'services.master': [home, { label: 'Vehicle Intelligence' }, { label: 'Services' }],
+    'services.categories': [home, { label: 'Vehicle Intelligence' }, { label: 'Services' }],
+    'inventory.parts_master': [home, { label: 'Vehicle Intelligence' }, { label: 'Parts' }],
+    'inventory.categories': [home, { label: 'Vehicle Intelligence' }, { label: 'Parts' }],
     'reports': [home, { label: 'Reports' }, { label: 'Overview' }],
     'reports.jobs': [home, { label: 'Reports' }, { label: 'Job Reports' }],
     'reports.inventory': [home, { label: 'Reports' }, { label: 'Inventory Reports' }],
     'reports.billing': [home, { label: 'Reports' }, { label: 'Billing & GST' }],
+    'reports.gst_compliance': [home, { label: 'Reports' }, { label: 'GST Compliance' }],
+    'reports.purchases': [home, { label: 'Reports' }, { label: 'Purchase Report' }],
+    'reports.service_reminders': [home, { label: 'Reports' }, { label: 'Service Reminders' }],
     'reports.payroll': [home, { label: 'Reports' }, { label: 'Payroll Reports' }],
     'reports.expenses': [home, { label: 'Reports' }, { label: 'Expense Reports' }],
-    'reports.outsourced': [home, { label: 'Reports' }, { label: 'Outsourced Labour' }],
+    'reports.outsourced': [home, { label: 'Reports' }, { label: 'Outsourced Reports' }],
     'reports.customers': [home, { label: 'Reports' }, { label: 'Customer Reports' }],
     'reports.vehicles': [home, { label: 'Reports' }, { label: 'Vehicle Reports' }],
-    'organization.companies': [home, { label: 'Administration' }, { label: 'Organization & System' }, { label: 'Company Master' }],
-    'organization.garages': [home, { label: 'Administration' }, { label: 'Organization & System' }, { label: 'Garage / Branch Master' }],
-    'system.financial_years': [home, { label: 'Administration' }, { label: 'Organization & System' }, { label: 'Financial Year' }],
-    'system.settings': [home, { label: 'Administration' }, { label: 'Organization & System' }, { label: 'System Settings' }],
-    'system.audit': [home, { label: 'Administration' }, { label: 'Organization & System' }, { label: 'Audit Logs' }],
-    'system.exports': [home, { label: 'Administration' }, { label: 'Organization & System' }, { label: 'Data Exports' }],
-    'system.backup': [home, { label: 'Administration' }, { label: 'Organization & System' }, { label: 'Backup & Recovery' }],
-    'people.roles': [home, { label: 'Administration' }, { label: 'Role Master' }],
-    'people.permissions': [home, { label: 'Administration' }, { label: 'Permission Management' }],
-    'people.staff': [home, { label: 'Administration' }, { label: 'Staff Master' }],
-    'services.categories': [home, { label: 'Administration' }, { label: 'Service Category Master' }],
-    'services.master': [home, { label: 'Administration' }, { label: 'Service / Labour Master' }],
-    'vis.catalog': [home, { label: 'Administration' }, { label: 'VIS Vehicle Catalog' }],
-    'vis.compatibility': [home, { label: 'Administration' }, { label: 'VIS Compatibility Mapping' }]
+    'people.staff': [home, { label: 'Users & Permissions' }, { label: 'Users / Staff' }],
+    'people.roles': [home, { label: 'Users & Permissions' }, { label: 'Roles' }],
+    'people.permissions': [home, { label: 'Users & Permissions' }, { label: 'Permissions' }],
+    'organization.companies': [home, { label: 'Administration' }, { label: 'Company' }],
+    'organization.garages': [home, { label: 'Administration' }, { label: 'Garage' }],
+    'system.financial_years': [home, { label: 'Administration' }, { label: 'Financial Year' }],
+    'system.settings': [home, { label: 'Administration' }, { label: 'Settings' }],
+    'system.audit': [home, { label: 'Administration' }, { label: 'Audit' }],
+    'system.exports': [home, { label: 'Administration' }, { label: 'Export' }],
+    'system.backup': [home, { label: 'Administration' }, { label: 'Backup' }]
   };
 }
 

@@ -245,16 +245,27 @@ if (has_permission('expense.view') || has_permission('expense.manage')) {
     ];
 }
 
-  if (has_permission('gst.reports') || has_permission('financial.reports')) {
+if (has_permission('purchase.view') || has_permission('purchase.manage')) {
     $moduleCards[] = [
-      'title' => 'GST Compliance Reports',
-      'description' => 'CA-ready sales and purchase GST registers with monthly exports.',
-      'path' => 'modules/reports/gst_compliance.php',
-      'icon' => 'bi bi-journal-text',
-      'badge' => 'GST Compliance',
-      'metric' => 'Ready',
+        'title' => 'Purchase Report',
+        'description' => 'Purchase register, vendor-wise spend, monthly trend, and outstanding payable summary.',
+        'path' => 'modules/reports/purchases.php',
+        'icon' => 'bi bi-bag-check',
+        'badge' => 'Purchase Analytics',
+        'metric' => 'Open',
     ];
-  }
+}
+
+if (has_permission('gst.reports') || has_permission('financial.reports')) {
+    $moduleCards[] = [
+        'title' => 'GST Compliance Reports',
+        'description' => 'CA-ready sales and purchase GST registers with monthly exports.',
+        'path' => 'modules/reports/gst_compliance.php',
+        'icon' => 'bi bi-journal-text',
+        'badge' => 'GST Compliance',
+        'metric' => 'Ready',
+    ];
+}
 
 require_once __DIR__ . '/../../includes/header.php';
 require_once __DIR__ . '/../../includes/sidebar.php';

@@ -263,6 +263,15 @@ function reports_module_links(): array
         ]]);
     }
 
+    if (has_permission('purchase.view') || has_permission('purchase.manage')) {
+        $links[] = [
+            'menu_key' => 'reports.purchases',
+            'label' => 'Purchase Report',
+            'icon' => 'bi bi-bag-check',
+            'path' => 'modules/reports/purchases.php',
+        ];
+    }
+
     if (has_permission('payroll.view') || has_permission('payroll.manage')) {
         $links[] = [
             'menu_key' => 'reports.payroll',
