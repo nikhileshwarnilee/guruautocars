@@ -27,6 +27,17 @@ $toDate = (string) $scope['to_date'];
 $canViewFinancial = (bool) $scope['can_view_financial'];
 $canExportData = (bool) $scope['can_export_data'];
 $baseParams = $scope['base_params'];
+$advanceAdjustmentsReady = table_columns('advance_adjustments') !== [];
+$salesAdvanceJoinSql = $advanceAdjustmentsReady
+    ? 'LEFT JOIN (
+            SELECT invoice_id, COALESCE(SUM(adjusted_amount), 0) AS total_adjusted
+            FROM advance_adjustments
+            GROUP BY invoice_id
+         ) adv ON adv.invoice_id = i.id'
+    : '';
+$salesSettledAmountExpr = 'COALESCE(paid.total_paid, 0)' . ($advanceAdjustmentsReady ? ' + COALESCE(adv.total_adjusted, 0)' : '');
+$salesCollectedAmountExpr = 'LEAST((' . $salesSettledAmountExpr . '), i.grand_total)';
+$salesOutstandingAmountExpr = 'GREATEST(i.grand_total - (' . $salesSettledAmountExpr . '), 0)';
 
 $revenueDaily = [];
 $revenueMonthly = [];
@@ -133,9 +144,9 @@ if ($canViewFinancial) {
     $salesSummaryStmt = db()->prepare(
         'SELECT COUNT(*) AS invoice_count,
                 COALESCE(SUM(i.grand_total), 0) AS revenue_total,
-                COALESCE(SUM(LEAST(COALESCE(paid.total_paid, 0), i.grand_total)), 0) AS collected_total,
-                COALESCE(SUM(GREATEST(i.grand_total - COALESCE(paid.total_paid, 0), 0)), 0) AS outstanding_total,
-                COALESCE(SUM(CASE WHEN (i.grand_total - COALESCE(paid.total_paid, 0)) > 0.01 THEN 1 ELSE 0 END), 0) AS outstanding_invoices
+                COALESCE(SUM(' . $salesCollectedAmountExpr . '), 0) AS collected_total,
+                COALESCE(SUM(' . $salesOutstandingAmountExpr . '), 0) AS outstanding_total,
+                COALESCE(SUM(CASE WHEN ' . $salesOutstandingAmountExpr . ' > 0.01 THEN 1 ELSE 0 END), 0) AS outstanding_invoices
          FROM invoices i
          INNER JOIN job_cards jc ON jc.id = i.job_card_id
          LEFT JOIN (
@@ -143,6 +154,7 @@ if ($canViewFinancial) {
             FROM payments
             GROUP BY invoice_id
          ) paid ON paid.invoice_id = i.id
+         ' . $salesAdvanceJoinSql . '
          WHERE i.company_id = :company_id
            AND i.invoice_status = "FINALIZED"
            AND jc.status = "CLOSED"
@@ -230,8 +242,8 @@ if ($canViewFinancial) {
                 c.phone AS customer_phone,
                 COUNT(*) AS invoice_count,
                 COALESCE(SUM(i.grand_total), 0) AS billed_total,
-                COALESCE(SUM(LEAST(COALESCE(paid.total_paid, 0), i.grand_total)), 0) AS collected_total,
-                COALESCE(SUM(GREATEST(i.grand_total - COALESCE(paid.total_paid, 0), 0)), 0) AS outstanding_total
+                COALESCE(SUM(' . $salesCollectedAmountExpr . '), 0) AS collected_total,
+                COALESCE(SUM(' . $salesOutstandingAmountExpr . '), 0) AS outstanding_total
          FROM invoices i
          INNER JOIN job_cards jc ON jc.id = i.job_card_id
          INNER JOIN customers c ON c.id = i.customer_id
@@ -240,6 +252,7 @@ if ($canViewFinancial) {
             FROM payments
             GROUP BY invoice_id
          ) paid ON paid.invoice_id = i.id
+         ' . $salesAdvanceJoinSql . '
          WHERE i.company_id = :company_id
            AND i.invoice_status = "FINALIZED"
            AND jc.status = "CLOSED"
@@ -270,7 +283,7 @@ if ($canViewFinancial) {
          FROM (
             SELECT
                 CASE WHEN i.due_date IS NOT NULL AND i.due_date < CURDATE() THEN DATEDIFF(CURDATE(), i.due_date) ELSE 0 END AS overdue_days,
-                GREATEST(i.grand_total - COALESCE(paid.total_paid, 0), 0) AS outstanding_amount
+                ' . $salesOutstandingAmountExpr . ' AS outstanding_amount
             FROM invoices i
             INNER JOIN job_cards jc ON jc.id = i.job_card_id
             LEFT JOIN (
@@ -278,13 +291,14 @@ if ($canViewFinancial) {
                 FROM payments
                 GROUP BY invoice_id
             ) paid ON paid.invoice_id = i.id
+            ' . $salesAdvanceJoinSql . '
             WHERE i.company_id = :company_id
               AND i.invoice_status = "FINALIZED"
               AND jc.status = "CLOSED"
               AND jc.status_code = "ACTIVE"
               ' . $receivableAgingScopeSql . '
               AND i.invoice_date BETWEEN :from_date AND :to_date
-              AND (i.grand_total - COALESCE(paid.total_paid, 0)) > 0.01
+              AND ' . $salesOutstandingAmountExpr . ' > 0.01
          ) recv'
     );
     $receivableAgingStmt->execute($receivableAgingParams);
@@ -301,7 +315,7 @@ if ($canViewFinancial) {
     $receivableStmt = db()->prepare(
         'SELECT i.invoice_number, i.invoice_date, i.due_date, c.full_name AS customer_name,
                 i.snapshot_json,
-                GREATEST(i.grand_total - COALESCE(paid.total_paid, 0), 0) AS outstanding_amount,
+                ' . $salesOutstandingAmountExpr . ' AS outstanding_amount,
                 CASE WHEN i.due_date IS NOT NULL AND i.due_date < CURDATE() THEN DATEDIFF(CURDATE(), i.due_date) ELSE 0 END AS overdue_days
          FROM invoices i
          INNER JOIN job_cards jc ON jc.id = i.job_card_id
@@ -311,13 +325,14 @@ if ($canViewFinancial) {
             FROM payments
             GROUP BY invoice_id
          ) paid ON paid.invoice_id = i.id
+         ' . $salesAdvanceJoinSql . '
          WHERE i.company_id = :company_id
            AND i.invoice_status = "FINALIZED"
            AND jc.status = "CLOSED"
            AND jc.status_code = "ACTIVE"
            ' . $receivableScopeSql . '
            AND i.invoice_date BETWEEN :from_date AND :to_date
-           AND (i.grand_total - COALESCE(paid.total_paid, 0)) > 0.01
+           AND ' . $salesOutstandingAmountExpr . ' > 0.01
          ORDER BY overdue_days DESC, outstanding_amount DESC
          LIMIT 150'
     );
