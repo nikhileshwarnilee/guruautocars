@@ -8,6 +8,7 @@ if (!defined('SAFE_DELETE_GROUP_ITEM_LIMIT')) {
     define('SAFE_DELETE_GROUP_ITEM_LIMIT', 25);
 }
 require_once __DIR__ . '/safe_delete_generic_entities.php';
+require_once __DIR__ . '/safe_delete_dependency_actions.php';
 
 function safe_delete_normalize_entity(string $entity): string
 {
@@ -140,12 +141,21 @@ function safe_delete_require_global_permissions(string $entity): void
     }
 }
 
+function safe_delete_require_dependency_resolution_permission(): void
+{
+    if (safe_delete_permission_key_exists('dependency.resolve') && !has_permission('dependency.resolve')) {
+        throw new RuntimeException('Dependency resolution permission (`dependency.resolve`) is required.');
+    }
+}
+
 function safe_delete_make_item(
     string $reference,
     ?string $date = null,
     ?float $amount = null,
     ?string $status = null,
-    ?string $note = null
+    ?string $note = null,
+    ?string $related = null,
+    array $actions = []
 ): array {
     return [
         'reference' => trim($reference),
@@ -153,6 +163,62 @@ function safe_delete_make_item(
         'amount' => $amount !== null ? round($amount, 2) : null,
         'status' => $status !== null ? trim($status) : null,
         'note' => $note !== null ? trim($note) : null,
+        'related' => $related !== null ? trim($related) : null,
+        'actions' => $actions,
+    ];
+}
+
+function safe_delete_make_dependency_action(
+    string $label,
+    string $entity,
+    int $recordId = 0,
+    string $operation = 'delete',
+    ?string $recordKey = null,
+    bool $enabled = true,
+    string $style = 'outline-danger',
+    bool $requireBeforeParent = false,
+    ?string $hint = null
+): array {
+    return [
+        'label' => trim($label),
+        'entity' => safe_delete_normalize_entity($entity),
+        'record_id' => max(0, $recordId),
+        'record_key' => $recordKey !== null ? trim($recordKey) : '',
+        'operation' => strtolower(trim($operation)) !== '' ? strtolower(trim($operation)) : 'delete',
+        'enabled' => $enabled,
+        'style' => trim($style) !== '' ? trim($style) : 'outline-secondary',
+        'require_before_parent' => $requireBeforeParent,
+        'hint' => $hint !== null ? trim($hint) : '',
+    ];
+}
+
+function safe_delete_make_dependency_action_auto(string $label = 'Auto on Final Delete', ?string $hint = null): array
+{
+    return [
+        'label' => trim($label) !== '' ? trim($label) : 'Auto on Final Delete',
+        'entity' => '',
+        'record_id' => 0,
+        'record_key' => '',
+        'operation' => 'auto',
+        'enabled' => false,
+        'style' => 'outline-secondary',
+        'require_before_parent' => false,
+        'hint' => $hint !== null ? trim($hint) : '',
+    ];
+}
+
+function safe_delete_make_dependency_action_unavailable(string $label = 'No Direct Action', ?string $hint = null): array
+{
+    return [
+        'label' => trim($label) !== '' ? trim($label) : 'No Direct Action',
+        'entity' => '',
+        'record_id' => 0,
+        'record_key' => '',
+        'operation' => 'none',
+        'enabled' => false,
+        'style' => 'outline-secondary',
+        'require_before_parent' => false,
+        'hint' => $hint !== null ? trim($hint) : '',
     ];
 }
 
@@ -179,7 +245,25 @@ function safe_delete_make_group(
             'amount' => isset($item['amount']) && $item['amount'] !== null ? round((float) $item['amount'], 2) : null,
             'status' => ($item['status'] ?? null) !== null ? trim((string) $item['status']) : null,
             'note' => ($item['note'] ?? null) !== null ? trim((string) $item['note']) : null,
+            'related' => ($item['related'] ?? null) !== null ? trim((string) $item['related']) : null,
+            'actions' => safe_delete_normalize_dependency_actions((array) ($item['actions'] ?? [])),
         ];
+    }
+
+    $manualActionCount = 0;
+    $pendingResolutionCount = 0;
+    foreach ($cleanItems as $cleanItem) {
+        foreach ((array) ($cleanItem['actions'] ?? []) as $action) {
+            if (!is_array($action)) {
+                continue;
+            }
+            if ((bool) ($action['enabled'] ?? false) && safe_delete_normalize_entity((string) ($action['entity'] ?? '')) !== '') {
+                $manualActionCount++;
+                if ((bool) ($action['require_before_parent'] ?? false)) {
+                    $pendingResolutionCount++;
+                }
+            }
+        }
     }
 
     $remainingCount = max(0, count($cleanItems) - SAFE_DELETE_GROUP_ITEM_LIMIT);
@@ -195,7 +279,60 @@ function safe_delete_make_group(
         'warning' => $warning !== null ? trim($warning) : '',
         'items' => $cleanItems,
         'remaining_count' => $remainingCount,
+        'manual_action_count' => $manualActionCount,
+        'pending_resolution_count' => $pendingResolutionCount,
     ];
+}
+
+function safe_delete_normalize_dependency_actions(array $actions): array
+{
+    $normalized = [];
+    foreach ($actions as $action) {
+        if (!is_array($action)) {
+            continue;
+        }
+        $label = trim((string) ($action['label'] ?? ''));
+        $entity = safe_delete_normalize_entity((string) ($action['entity'] ?? ''));
+        $operation = strtolower(trim((string) ($action['operation'] ?? 'delete')));
+        $recordId = max(0, (int) ($action['record_id'] ?? 0));
+        $recordKey = trim((string) ($action['record_key'] ?? ''));
+        $enabled = (bool) ($action['enabled'] ?? false);
+        $style = trim((string) ($action['style'] ?? 'outline-secondary'));
+        $requireBeforeParent = (bool) ($action['require_before_parent'] ?? false);
+        $hint = trim((string) ($action['hint'] ?? ''));
+
+        if ($label === '') {
+            if ($operation === 'reverse') {
+                $label = 'Reverse';
+            } elseif ($operation === 'delete') {
+                $label = 'Delete';
+            } elseif ($operation === 'auto') {
+                $label = 'Auto on Final Delete';
+            } else {
+                $label = 'Action';
+            }
+        }
+
+        if ($enabled && $entity === '') {
+            $enabled = false;
+        }
+        if ($enabled && $recordId <= 0 && $recordKey === '') {
+            $enabled = false;
+        }
+
+        $normalized[] = [
+            'label' => $label,
+            'entity' => $entity,
+            'record_id' => $recordId,
+            'record_key' => $recordKey,
+            'operation' => $operation !== '' ? $operation : 'delete',
+            'enabled' => $enabled,
+            'style' => $style !== '' ? $style : 'outline-secondary',
+            'require_before_parent' => $requireBeforeParent && $enabled,
+            'hint' => $hint,
+        ];
+    }
+    return $normalized;
 }
 
 function safe_delete_summary_base(string $entity, int $recordId, string $operation = 'delete'): array
@@ -225,6 +362,8 @@ function safe_delete_summary_base(string $entity, int $recordId, string $operati
         'execution_mode' => 'block',
         'requires_strong_confirmation' => true,
         'requires_reason' => true,
+        'requires_dependency_clearance' => false,
+        'pending_dependency_resolutions' => 0,
     ];
 }
 
@@ -240,6 +379,8 @@ function safe_delete_summary_finalize(array $summary): array
     $groups = [];
     $totalDependencies = 0;
     $totalFinancialImpact = 0.0;
+    $pendingDependencyResolutions = 0;
+    $hasManualDependencyActions = false;
 
     foreach ((array) ($summary['groups'] ?? []) as $group) {
         if (!is_array($group)) {
@@ -251,12 +392,20 @@ function safe_delete_summary_finalize(array $summary): array
         }
         $totalDependencies += $count;
         $totalFinancialImpact += (float) ($group['financial_impact'] ?? 0);
+        $pendingDependencyResolutions += max(0, (int) ($group['pending_resolution_count'] ?? 0));
+        if ((int) ($group['manual_action_count'] ?? 0) > 0) {
+            $hasManualDependencyActions = true;
+        }
         $groups[] = $group;
     }
 
     $summary['groups'] = $groups;
     $summary['total_dependencies'] = $totalDependencies;
     $summary['total_financial_impact'] = round($totalFinancialImpact, 2);
+    $summary['pending_dependency_resolutions'] = max(0, $pendingDependencyResolutions);
+    $summary['has_manual_dependency_actions'] = $hasManualDependencyActions;
+    $summary['requires_dependency_clearance'] = ((bool) ($summary['requires_dependency_clearance'] ?? false))
+        || $pendingDependencyResolutions > 0;
 
     $summary['blockers'] = array_values(array_unique(array_filter(array_map(
         static fn (mixed $v): string => trim((string) $v),
@@ -315,6 +464,8 @@ function safe_delete_compact_summary_for_token(array $summary): array
         'recommended_action' => (string) ($summary['recommended_action'] ?? 'BLOCK'),
         'execution_mode' => (string) ($summary['execution_mode'] ?? 'block'),
         'severity' => (string) ($summary['severity'] ?? 'normal'),
+        'requires_dependency_clearance' => (bool) ($summary['requires_dependency_clearance'] ?? false),
+        'pending_dependency_resolutions' => (int) ($summary['pending_dependency_resolutions'] ?? 0),
     ];
 }
 
@@ -447,7 +598,7 @@ function safe_delete_validate_post_confirmation(string $entity, int $recordId, a
 
     $confirmText = trim((string) ($_POST['_safe_delete_confirm_text'] ?? ''));
     $confirmChecked = (string) ($_POST['_safe_delete_confirm_checked'] ?? '') === '1';
-    $typedConfirmed = $confirmText === 'CONFIRM';
+    $typedConfirmed = strtoupper($confirmText) === 'CONFIRM';
     if (!$typedConfirmed && !($allowCheckboxOnly && $confirmChecked)) {
         throw new RuntimeException('Strong confirmation is required. Type CONFIRM or tick the confirmation checkbox.');
     }
@@ -468,6 +619,12 @@ function safe_delete_validate_post_confirmation(string $entity, int $recordId, a
             $message .= ' ' . implode(' ', $blockers);
         }
         throw new RuntimeException($message);
+    }
+
+    $requiresDependencyClearance = (bool) ($summary['requires_dependency_clearance'] ?? false);
+    $pendingDependencyResolutions = max(0, (int) ($summary['pending_dependency_resolutions'] ?? 0));
+    if ($requiresDependencyClearance && $pendingDependencyResolutions > 0) {
+        throw new RuntimeException('Resolve required dependency actions before final deletion/reversal.');
     }
 
     if ($consumeToken) {
@@ -540,7 +697,7 @@ function safe_delete_validate_post_confirmation_key(string $entity, string $reco
 
     $confirmText = trim((string) ($_POST['_safe_delete_confirm_text'] ?? ''));
     $confirmChecked = (string) ($_POST['_safe_delete_confirm_checked'] ?? '') === '1';
-    $typedConfirmed = $confirmText === 'CONFIRM';
+    $typedConfirmed = strtoupper($confirmText) === 'CONFIRM';
     if (!$typedConfirmed && !($allowCheckboxOnly && $confirmChecked)) {
         throw new RuntimeException('Strong confirmation is required. Type CONFIRM or tick the confirmation checkbox.');
     }
@@ -561,6 +718,12 @@ function safe_delete_validate_post_confirmation_key(string $entity, string $reco
             $message .= ' ' . implode(' ', $blockers);
         }
         throw new RuntimeException($message);
+    }
+
+    $requiresDependencyClearance = (bool) ($summary['requires_dependency_clearance'] ?? false);
+    $pendingDependencyResolutions = max(0, (int) ($summary['pending_dependency_resolutions'] ?? 0));
+    if ($requiresDependencyClearance && $pendingDependencyResolutions > 0) {
+        throw new RuntimeException('Resolve required dependency actions before final deletion/reversal.');
     }
 
     if ($consumeToken) {
@@ -872,7 +1035,7 @@ function safe_delete_analyze_invoice(PDO $pdo, int $invoiceId, array $scope, arr
     }
 
     $select = ['i.id', 'i.invoice_number', 'i.invoice_status', 'i.payment_status'];
-    foreach (['invoice_date', 'created_at', 'updated_at', 'grand_total', 'job_card_id', 'cgst_amount', 'sgst_amount', 'igst_amount', 'gst_amount'] as $col) {
+    foreach (['invoice_date', 'created_at', 'updated_at', 'grand_total', 'job_card_id', 'customer_id', 'vehicle_id', 'cgst_amount', 'sgst_amount', 'igst_amount', 'gst_amount'] as $col) {
         if (in_array($col, $invoiceCols, true)) {
             $select[] = 'i.' . $col;
         }
@@ -902,13 +1065,46 @@ function safe_delete_analyze_invoice(PDO $pdo, int $invoiceId, array $scope, arr
         (int) ($scope['garage_id'] ?? 0)
     );
 
+    $invoiceCustomerName = '';
+    if ((int) ($invoice['customer_id'] ?? 0) > 0 && safe_delete_table_exists('customers')) {
+        $customerRow = safe_delete_fetch_row($pdo, 'SELECT full_name, phone FROM customers WHERE id = :id LIMIT 1', [
+            'id' => (int) $invoice['customer_id'],
+        ]);
+        if (is_array($customerRow)) {
+            $invoiceCustomerName = trim((string) ($customerRow['full_name'] ?? ''));
+            if ($invoiceCustomerName === '') {
+                $invoiceCustomerName = trim((string) ($customerRow['phone'] ?? ''));
+            }
+        }
+    }
+    $invoiceVehicleLabel = '';
+    if ((int) ($invoice['vehicle_id'] ?? 0) > 0 && safe_delete_table_exists('vehicles')) {
+        $vehicleRow = safe_delete_fetch_row($pdo, 'SELECT registration_no, brand, model FROM vehicles WHERE id = :id LIMIT 1', [
+            'id' => (int) $invoice['vehicle_id'],
+        ]);
+        if (is_array($vehicleRow)) {
+            $invoiceVehicleLabel = trim((string) ($vehicleRow['registration_no'] ?? ''));
+            if ($invoiceVehicleLabel === '') {
+                $invoiceVehicleLabel = trim((string) (($vehicleRow['brand'] ?? '') . ' ' . ($vehicleRow['model'] ?? '')));
+            }
+        }
+    }
+    $invoiceNoteParts = [];
+    if ($invoiceCustomerName !== '') {
+        $invoiceNoteParts[] = 'Customer: ' . $invoiceCustomerName;
+    }
+    if ($invoiceVehicleLabel !== '') {
+        $invoiceNoteParts[] = 'Vehicle: ' . $invoiceVehicleLabel;
+    }
+    $invoiceNoteParts[] = 'Payment status: ' . (string) ($invoice['payment_status'] ?? '');
+
     $summary['main_record'] = [
         'label' => 'Invoice ' . safe_delete_row_reference($invoice, ['invoice_number'], 'INV'),
         'reference' => safe_delete_row_reference($invoice, ['invoice_number'], 'INV'),
         'date' => safe_delete_pick_date($invoice, ['invoice_date', 'created_at', 'updated_at']),
         'amount' => safe_delete_pick_amount($invoice, ['grand_total']),
         'status' => (string) ($invoice['invoice_status'] ?? ''),
-        'note' => 'Payment status: ' . (string) ($invoice['payment_status'] ?? ''),
+        'note' => implode(' | ', array_filter($invoiceNoteParts)),
     ];
 
     $paymentRows = [];
@@ -916,7 +1112,7 @@ function safe_delete_analyze_invoice(PDO $pdo, int $invoiceId, array $scope, arr
     if (safe_delete_table_exists('payments')) {
         $payCols = table_columns('payments');
         $select = ['p.id', 'p.amount'];
-        foreach (['paid_on', 'payment_date', 'reference_no', 'entry_type'] as $col) {
+        foreach (['paid_on', 'payment_date', 'reference_no', 'entry_type', 'is_reversed'] as $col) {
             if (in_array($col, $payCols, true)) {
                 $select[] = 'p.' . $col;
             }
@@ -935,11 +1131,33 @@ function safe_delete_analyze_invoice(PDO $pdo, int $invoiceId, array $scope, arr
             if ($entryType === 'PAYMENT' && $amount > 0) {
                 $paymentImpact += $amount;
             }
+            $canReverseRow = $entryType === 'PAYMENT'
+                && $amount > 0
+                && !((int) ($row['is_reversed'] ?? 0) === 1);
+            $rowActions = $canReverseRow
+                ? [safe_delete_make_dependency_action(
+                    'Reverse',
+                    'invoice_payment',
+                    (int) ($row['id'] ?? 0),
+                    'reverse',
+                    null,
+                    true,
+                    'outline-danger',
+                    true,
+                    'Create reversal entry for this payment before deleting the invoice.'
+                )]
+                : [safe_delete_make_dependency_action_unavailable(
+                    $entryType === 'REVERSAL' ? 'Already Reversal' : 'No Direct Action',
+                    $entryType === 'REVERSAL' ? 'This row is already a reversal entry.' : ''
+                )];
             $paymentRows[] = safe_delete_make_item(
                 safe_delete_row_reference($row, ['reference_no'], 'PAY'),
                 safe_delete_pick_date($row, ['paid_on', 'payment_date']),
                 $amount,
-                $entryType
+                $entryType,
+                null,
+                $invoiceCustomerName !== '' ? ('Customer: ' . $invoiceCustomerName) : null,
+                $rowActions
             );
         }
     }
@@ -975,7 +1193,10 @@ function safe_delete_analyze_invoice(PDO $pdo, int $invoiceId, array $scope, arr
                     'Adjustment #' . (int) ($row['id'] ?? 0),
                     safe_delete_pick_date($row, ['applied_on', 'created_at']),
                     $amt,
-                    (string) ($row['status_code'] ?? '')
+                    (string) ($row['status_code'] ?? ''),
+                    null,
+                    $invoiceCustomerName !== '' ? ('Customer: ' . $invoiceCustomerName) : null,
+                    [safe_delete_make_dependency_action_auto('Auto Release on Cancel', 'Advance adjustments are released automatically during invoice cancellation.')]
                 );
             }
         }
@@ -1011,7 +1232,10 @@ function safe_delete_analyze_invoice(PDO $pdo, int $invoiceId, array $scope, arr
                 safe_delete_row_reference($row, ['movement_uid'], 'MOV'),
                 safe_delete_pick_date($row, ['created_at']),
                 null,
-                (string) ($row['movement_type'] ?? '')
+                (string) ($row['movement_type'] ?? ''),
+                'Posted stock movement linked to job card.',
+                $invoiceVehicleLabel !== '' ? ('Vehicle: ' . $invoiceVehicleLabel) : null,
+                [safe_delete_make_dependency_action_unavailable('Manage in Job/Stock', 'Stock postings are managed in the job/stock workflow, not directly from invoice summary.')]
             );
         }
     }
@@ -1035,7 +1259,15 @@ function safe_delete_analyze_invoice(PDO $pdo, int $invoiceId, array $scope, arr
             'gst_impact',
             'GST Impact',
             1,
-            [safe_delete_make_item(safe_delete_row_reference($invoice, ['invoice_number'], 'INV'), safe_delete_pick_date($invoice, ['invoice_date']), $gstImpact, 'TAX')],
+            [safe_delete_make_item(
+                safe_delete_row_reference($invoice, ['invoice_number'], 'INV'),
+                safe_delete_pick_date($invoice, ['invoice_date']),
+                $gstImpact,
+                'TAX',
+                'GST impact will be marked reversed with invoice cancellation workflow.',
+                $invoiceCustomerName !== '' ? ('Customer: ' . $invoiceCustomerName) : null,
+                [safe_delete_make_dependency_action_auto('Auto GST Reversal', 'GST impact is handled by the invoice cancellation workflow.')]
+            )],
             $gstImpact
         );
     }
@@ -1072,7 +1304,10 @@ function safe_delete_analyze_invoice(PDO $pdo, int $invoiceId, array $scope, arr
                 safe_delete_row_reference($row, ['credit_note_number', 'note_number'], 'CN'),
                 safe_delete_pick_date($row, ['credit_note_date', 'created_at']),
                 $amt,
-                (string) ($row['status_code'] ?? '')
+                (string) ($row['status_code'] ?? ''),
+                'Reverse this credit note before cancelling invoice if it blocks cancellation.',
+                $invoiceCustomerName !== '' ? ('Customer: ' . $invoiceCustomerName) : null,
+                [safe_delete_make_dependency_action_unavailable('Reverse in Credit Notes', 'Credit note reversal is not yet wired in the summary modal.')]
             );
         }
         $summary['groups'][] = safe_delete_make_group('credit_notes', 'Credit Notes', count($rows), $rows, $impact);
@@ -1302,13 +1537,33 @@ function safe_delete_analyze_purchase(PDO $pdo, int $purchaseId, array $scope, a
         (int) ($scope['garage_id'] ?? 0)
     );
 
+    $purchaseVendorName = '';
+    $purchaseVendorCode = '';
+    if ((int) ($purchase['vendor_id'] ?? 0) > 0 && safe_delete_table_exists('vendors')) {
+        $vendorRow = safe_delete_fetch_row($pdo, 'SELECT vendor_code, vendor_name FROM vendors WHERE id = :id LIMIT 1', [
+            'id' => (int) $purchase['vendor_id'],
+        ]);
+        if (is_array($vendorRow)) {
+            $purchaseVendorName = trim((string) ($vendorRow['vendor_name'] ?? ''));
+            $purchaseVendorCode = trim((string) ($vendorRow['vendor_code'] ?? ''));
+        }
+    }
+    $purchaseNoteParts = [];
+    if ($purchaseVendorName !== '') {
+        $purchaseNoteParts[] = 'Vendor: ' . $purchaseVendorName;
+    }
+    if ($purchaseVendorCode !== '') {
+        $purchaseNoteParts[] = 'Code: ' . $purchaseVendorCode;
+    }
+    $purchaseNoteParts[] = 'Payment status: ' . (string) ($purchase['payment_status'] ?? '');
+
     $summary['main_record'] = [
         'label' => 'Purchase ' . safe_delete_row_reference($purchase, ['invoice_number'], 'PUR'),
         'reference' => safe_delete_row_reference($purchase, ['invoice_number'], 'PUR'),
         'date' => safe_delete_pick_date($purchase, ['purchase_date']),
         'amount' => safe_delete_pick_amount($purchase, ['grand_total']),
         'status' => (string) ($purchase['purchase_status'] ?? ''),
-        'note' => 'Payment status: ' . (string) ($purchase['payment_status'] ?? ''),
+        'note' => implode(' | ', array_filter($purchaseNoteParts)),
     ];
 
     $paymentRows = [];
@@ -1316,7 +1571,7 @@ function safe_delete_analyze_purchase(PDO $pdo, int $purchaseId, array $scope, a
     if (safe_delete_table_exists('purchase_payments')) {
         $ppCols = table_columns('purchase_payments');
         $select = ['pp.id', 'pp.amount'];
-        foreach (['payment_date', 'entry_type', 'reference_no', 'payment_mode'] as $col) {
+        foreach (['payment_date', 'entry_type', 'reference_no', 'payment_mode', 'reversed_payment_id'] as $col) {
             if (in_array($col, $ppCols, true)) {
                 $select[] = 'pp.' . $col;
             }
@@ -1331,11 +1586,31 @@ function safe_delete_analyze_purchase(PDO $pdo, int $purchaseId, array $scope, a
             if ($entryType === 'PAYMENT' && $amount > 0) {
                 $paymentImpact += $amount;
             }
+            $canReverseRow = $entryType === 'PAYMENT' && $amount > 0;
+            $rowActions = $canReverseRow
+                ? [safe_delete_make_dependency_action(
+                    'Reverse',
+                    'purchase_payment',
+                    (int) ($row['id'] ?? 0),
+                    'reverse',
+                    null,
+                    true,
+                    'outline-danger',
+                    true,
+                    'Create reversal entry for this purchase payment before deleting the purchase.'
+                )]
+                : [safe_delete_make_dependency_action_unavailable(
+                    $entryType === 'REVERSAL' ? 'Already Reversal' : 'No Direct Action',
+                    $entryType === 'REVERSAL' ? 'This row is already a reversal entry.' : ''
+                )];
             $paymentRows[] = safe_delete_make_item(
                 safe_delete_row_reference($row, ['reference_no'], 'PPAY'),
                 safe_delete_pick_date($row, ['payment_date']),
                 $amount,
-                $entryType
+                $entryType,
+                trim((string) ($row['payment_mode'] ?? '')) !== '' ? ('Mode: ' . (string) $row['payment_mode']) : null,
+                $purchaseVendorName !== '' ? ('Vendor: ' . $purchaseVendorName) : null,
+                $rowActions
             );
         }
     }
@@ -1367,7 +1642,10 @@ function safe_delete_analyze_purchase(PDO $pdo, int $purchaseId, array $scope, a
                 trim((string) ($row['part_name'] ?? '')) !== '' ? (string) $row['part_name'] : ('Part #' . (int) ($row['part_id'] ?? 0)),
                 null,
                 safe_delete_pick_amount($row, ['total_amount']),
-                (($row['quantity'] ?? null) !== null ? ('QTY ' . number_format((float) ($row['quantity'] ?? 0), 2)) : null)
+                (($row['quantity'] ?? null) !== null ? ('QTY ' . number_format((float) ($row['quantity'] ?? 0), 2)) : null),
+                'Line item is part of the purchase and handled with parent delete.',
+                $purchaseVendorName !== '' ? ('Vendor: ' . $purchaseVendorName) : null,
+                [safe_delete_make_dependency_action_auto('Auto with Purchase Delete', 'Purchase line items are handled by the purchase delete workflow.')]
             );
         }
     }
@@ -1401,7 +1679,10 @@ function safe_delete_analyze_purchase(PDO $pdo, int $purchaseId, array $scope, a
                 safe_delete_row_reference($row, ['movement_uid'], 'MOV'),
                 safe_delete_pick_date($row, ['created_at']),
                 null,
-                (string) ($row['movement_type'] ?? '')
+                (string) ($row['movement_type'] ?? ''),
+                'Stock movement will be reversed when purchase delete executes.',
+                $purchaseVendorName !== '' ? ('Vendor: ' . $purchaseVendorName) : null,
+                [safe_delete_make_dependency_action_auto('Auto Stock Reversal', 'Purchase delete creates stock reversal movements transactionally.')]
             );
         }
     }
@@ -1416,7 +1697,9 @@ function safe_delete_analyze_purchase(PDO $pdo, int $purchaseId, array $scope, a
                     null,
                     safe_delete_pick_amount($purchase, ['grand_total']),
                     null,
-                    (string) ($vendor['vendor_name'] ?? '')
+                    (string) ($vendor['vendor_name'] ?? ''),
+                    null,
+                    [safe_delete_make_dependency_action_auto('Auto Ledger/Payable Reversal', 'Vendor payable impact is handled by the purchase delete workflow.')]
                 )
             ], safe_delete_pick_amount($purchase, ['grand_total']) ?? 0.0);
         }
@@ -1554,6 +1837,198 @@ function safe_delete_analyze_job_card(PDO $pdo, int $jobId, array $scope, array 
         'status' => (string) ($job['status'] ?? ''),
         'note' => 'Status Code: ' . (string) ($job['status_code'] ?? ''),
     ];
+    $jobStatusUpper = strtoupper(trim((string) ($job['status'] ?? '')));
+    $jobStatusCodeUpper = strtoupper(trim((string) ($job['status_code'] ?? 'ACTIVE')));
+    $jobLockedForLineDelete = ($jobStatusUpper === 'CLOSED' || $jobStatusCodeUpper !== 'ACTIVE');
+
+    $advanceRows = [];
+    $advanceImpact = 0.0;
+    if (safe_delete_table_exists('job_advances')) {
+        $jaCols = table_columns('job_advances');
+        $select = ['ja.id', 'ja.job_card_id'];
+        foreach (['receipt_number', 'advance_amount', 'adjusted_amount', 'balance_amount', 'received_on', 'status_code'] as $col) {
+            if (in_array($col, $jaCols, true)) {
+                $select[] = 'ja.' . $col;
+            }
+        }
+        $sql = 'SELECT ' . implode(', ', $select) . ' FROM job_advances ja WHERE ja.job_card_id = :job_id';
+        $params = ['job_id' => $jobId];
+        if (($scope['company_id'] ?? 0) > 0 && in_array('company_id', $jaCols, true)) {
+            $sql .= ' AND ja.company_id = :company_id';
+            $params['company_id'] = (int) $scope['company_id'];
+        }
+        if (($scope['garage_id'] ?? 0) > 0 && in_array('garage_id', $jaCols, true)) {
+            $sql .= ' AND ja.garage_id = :garage_id';
+            $params['garage_id'] = (int) $scope['garage_id'];
+        }
+        if (in_array('status_code', $jaCols, true)) {
+            $sql .= ' AND ja.status_code <> "DELETED"';
+        }
+        $sql .= ' ORDER BY ja.id DESC';
+        foreach (safe_delete_fetch_rows($pdo, $sql, $params) as $row) {
+            $amt = round((float) ($row['advance_amount'] ?? 0), 2);
+            $advanceImpact += $amt;
+            $adjustedAmount = round((float) ($row['adjusted_amount'] ?? 0), 2);
+            $canDeleteAdvanceRow = strtoupper(trim((string) ($row['status_code'] ?? 'ACTIVE'))) === 'ACTIVE';
+            $advanceActions = $canDeleteAdvanceRow
+                ? [safe_delete_make_dependency_action(
+                    'Delete',
+                    'billing_advance',
+                    (int) ($row['id'] ?? 0),
+                    'delete',
+                    null,
+                    true,
+                    'outline-danger',
+                    true,
+                    'Delete the advance receipt (unadjusted only) before deleting the job card.'
+                )]
+                : [safe_delete_make_dependency_action_unavailable('Already Deleted', 'Advance receipt is not active.')];
+            $advanceRows[] = safe_delete_make_item(
+                safe_delete_row_reference($row, ['receipt_number'], 'ADV'),
+                safe_delete_pick_date($row, ['received_on']),
+                $amt,
+                (string) ($row['status_code'] ?? ''),
+                'Adjusted: ' . number_format($adjustedAmount, 2)
+                    . ' | Balance: ' . number_format((float) ($row['balance_amount'] ?? 0), 2),
+                safe_delete_row_reference($job, ['job_number'], 'JOB'),
+                $advanceActions
+            );
+        }
+    }
+    $summary['groups'][] = safe_delete_make_group(
+        'job_advances',
+        'Advance Receipts',
+        count($advanceRows),
+        $advanceRows,
+        $advanceImpact,
+        ((int) ($dep['advance_receipt_count'] ?? 0) > 0)
+            ? ('Advance receipts must be cleared before job delete. Active receipts: ' . (int) ($dep['advance_receipt_count'] ?? 0))
+            : null
+    );
+
+    $laborRows = [];
+    $laborImpact = 0.0;
+    if (safe_delete_table_exists('job_labor')) {
+        $jlCols = table_columns('job_labor');
+        $select = ['jl.id'];
+        foreach (['description', 'total_amount', 'quantity', 'execution_type', 'outsource_payable_status', 'outsource_cost'] as $col) {
+            if (in_array($col, $jlCols, true)) {
+                $select[] = 'jl.' . $col;
+            }
+        }
+        $sql = 'SELECT ' . implode(', ', $select) . ' FROM job_labor jl WHERE jl.job_card_id = :job_id ORDER BY jl.id ASC';
+        foreach (safe_delete_fetch_rows($pdo, $sql, ['job_id' => $jobId]) as $row) {
+            $amt = safe_delete_pick_amount($row, ['total_amount']) ?? 0.0;
+            $laborImpact += $amt;
+            $lineActions = [];
+            if ($jobLockedForLineDelete) {
+                $lineActions[] = safe_delete_make_dependency_action_unavailable(
+                    'Reopen Job First',
+                    $jobStatusUpper === 'CLOSED'
+                        ? 'Reopen the job card to OPEN before deleting labor lines.'
+                        : 'Job card must be ACTIVE and open for line deletion.'
+                );
+            } else {
+                $lineActions[] = safe_delete_make_dependency_action(
+                    'Delete',
+                    'job_labor_line',
+                    (int) ($row['id'] ?? 0),
+                    'delete',
+                    null,
+                    true,
+                    'outline-danger',
+                    true,
+                    'Delete labor line before soft deleting the job card.'
+                );
+            }
+            $laborNoteParts = [];
+            if (trim((string) ($row['execution_type'] ?? '')) !== '') {
+                $laborNoteParts[] = 'Type: ' . (string) $row['execution_type'];
+            }
+            if (strtoupper(trim((string) ($row['execution_type'] ?? ''))) === 'OUTSOURCED') {
+                $laborNoteParts[] = 'Payable: ' . (string) ($row['outsource_payable_status'] ?? 'UNPAID');
+                if (array_key_exists('outsource_cost', $row)) {
+                    $laborNoteParts[] = 'Outsource Cost: ' . number_format((float) ($row['outsource_cost'] ?? 0), 2);
+                }
+            }
+            $laborRows[] = safe_delete_make_item(
+                trim((string) ($row['description'] ?? '')) !== '' ? (string) $row['description'] : ('Labor #' . (int) ($row['id'] ?? 0)),
+                null,
+                $amt,
+                (string) (($row['execution_type'] ?? 'LINE') ?: 'LINE'),
+                implode(' | ', $laborNoteParts),
+                safe_delete_row_reference($job, ['job_number'], 'JOB'),
+                $lineActions
+            );
+        }
+    }
+    $summary['groups'][] = safe_delete_make_group(
+        'job_labor',
+        'Labor Lines',
+        count($laborRows),
+        $laborRows,
+        $laborImpact,
+        ((int) ($dep['labor_line_count'] ?? 0) > 0) ? 'Delete all labor lines before soft deleting the job card.' : null
+    );
+
+    $partRows = [];
+    $partImpact = 0.0;
+    if (safe_delete_table_exists('job_parts')) {
+        $jpCols = table_columns('job_parts');
+        $select = ['jp.id', 'jp.part_id'];
+        foreach (['quantity', 'total_amount'] as $col) {
+            if (in_array($col, $jpCols, true)) {
+                $select[] = 'jp.' . $col;
+            }
+        }
+        $sql = 'SELECT ' . implode(', ', $select) . ', p.part_name, p.part_sku
+                FROM job_parts jp
+                LEFT JOIN parts p ON p.id = jp.part_id
+                WHERE jp.job_card_id = :job_id
+                ORDER BY jp.id ASC';
+        foreach (safe_delete_fetch_rows($pdo, $sql, ['job_id' => $jobId]) as $row) {
+            $amt = safe_delete_pick_amount($row, ['total_amount']) ?? 0.0;
+            $partImpact += $amt;
+            $lineActions = [];
+            if ($jobLockedForLineDelete) {
+                $lineActions[] = safe_delete_make_dependency_action_unavailable(
+                    'Reopen Job First',
+                    $jobStatusUpper === 'CLOSED'
+                        ? 'Reopen the job card to OPEN before deleting part lines.'
+                        : 'Job card must be ACTIVE and open for line deletion.'
+                );
+            } else {
+                $lineActions[] = safe_delete_make_dependency_action(
+                    'Delete',
+                    'job_part_line',
+                    (int) ($row['id'] ?? 0),
+                    'delete',
+                    null,
+                    true,
+                    'outline-danger',
+                    true,
+                    'Delete part line before soft deleting the job card.'
+                );
+            }
+            $partRows[] = safe_delete_make_item(
+                safe_delete_row_reference($row, ['part_sku', 'part_name'], 'JPART'),
+                null,
+                $amt,
+                'LINE',
+                'Qty: ' . number_format((float) ($row['quantity'] ?? 0), 2),
+                safe_delete_row_reference($job, ['job_number'], 'JOB'),
+                $lineActions
+            );
+        }
+    }
+    $summary['groups'][] = safe_delete_make_group(
+        'job_parts',
+        'Part Lines',
+        count($partRows),
+        $partRows,
+        $partImpact,
+        ((int) ($dep['part_line_count'] ?? 0) > 0) ? 'Delete all part lines before soft deleting the job card.' : null
+    );
 
     $invoiceRows = [];
     if (safe_delete_table_exists('invoices')) {
@@ -1573,11 +2048,30 @@ function safe_delete_analyze_job_card(PDO $pdo, int $jobId, array $scope, array 
         }
         $sql .= ' ORDER BY id DESC';
         foreach (safe_delete_fetch_rows($pdo, $sql, $params) as $row) {
+            $invoiceStatus = strtoupper(trim((string) ($row['invoice_status'] ?? '')));
+            $invoiceActions = ($invoiceStatus !== 'CANCELLED')
+                ? [
+                    safe_delete_make_dependency_action(
+                        'Cancel',
+                        'invoice',
+                        (int) ($row['id'] ?? 0),
+                        'cancel',
+                        null,
+                        true,
+                        'outline-danger',
+                        true,
+                        'Cancel linked invoices before deleting the job card.'
+                    ),
+                ]
+                : [safe_delete_make_dependency_action_unavailable('Already Cancelled', 'This invoice is already cancelled.')];
             $invoiceRows[] = safe_delete_make_item(
                 safe_delete_row_reference($row, ['invoice_number'], 'INV'),
                 safe_delete_pick_date($row, ['invoice_date']),
                 safe_delete_pick_amount($row, ['grand_total']),
-                (string) ($row['invoice_status'] ?? '')
+                (string) ($row['invoice_status'] ?? ''),
+                null,
+                safe_delete_row_reference($job, ['job_number'], 'JOB'),
+                $invoiceActions
             );
         }
     }
@@ -1605,7 +2099,10 @@ function safe_delete_analyze_job_card(PDO $pdo, int $jobId, array $scope, array 
                 safe_delete_row_reference($row, ['movement_uid'], 'MOV'),
                 safe_delete_pick_date($row, ['created_at']),
                 null,
-                (string) ($row['movement_type'] ?? '')
+                (string) ($row['movement_type'] ?? ''),
+                'Posted inventory movement linked to this job.',
+                safe_delete_row_reference($job, ['job_number'], 'JOB'),
+                [safe_delete_make_dependency_action_unavailable('Manage in Job/Stock', 'Stock movement reversals are enforced by job/stock workflows.')]
             );
         }
     }
@@ -1646,7 +2143,9 @@ function safe_delete_analyze_job_card(PDO $pdo, int $jobId, array $scope, array 
                 null,
                 round((float) ($row['paid_total'] ?? 0), 2),
                 (string) ($row['status_code'] ?? ''),
-                'Agreed: ' . number_format((float) ($row['agreed_cost'] ?? 0), 2)
+                'Agreed: ' . number_format((float) ($row['agreed_cost'] ?? 0), 2),
+                safe_delete_row_reference($job, ['job_number'], 'JOB'),
+                [safe_delete_make_dependency_action_unavailable('Manage Outsourced Work', 'Reverse outsourced payments / close work from job or outsourced module before job delete.')]
             );
         }
     }
@@ -1774,7 +2273,23 @@ function safe_delete_analyze_return(PDO $pdo, int $returnId, array $scope, array
                 safe_delete_pick_date($row, ['settlement_date']),
                 safe_delete_pick_amount($row, ['amount']),
                 (string) ($row['status_code'] ?? ''),
-                (string) ($row['settlement_type'] ?? '')
+                (string) ($row['settlement_type'] ?? ''),
+                null,
+                [
+                    $isActive
+                        ? safe_delete_make_dependency_action(
+                            'Reverse',
+                            'return_settlement',
+                            (int) ($row['id'] ?? 0),
+                            'reverse',
+                            null,
+                            true,
+                            'outline-danger',
+                            true,
+                            'Reverse active settlement before deleting return.'
+                        )
+                        : safe_delete_make_dependency_action_unavailable('Already Reversed', 'Settlement is not active.')
+                ]
             );
         }
     }
@@ -1843,7 +2358,22 @@ function safe_delete_analyze_return(PDO $pdo, int $returnId, array $scope, array
                 safe_delete_row_reference($row, ['file_name'], 'FILE'),
                 safe_delete_pick_date($row, ['created_at']),
                 null,
-                (string) ($row['status_code'] ?? '')
+                (string) ($row['status_code'] ?? ''),
+                null,
+                null,
+                [
+                    safe_delete_make_dependency_action(
+                        'Delete',
+                        'return_attachment',
+                        (int) ($row['id'] ?? 0),
+                        'delete',
+                        null,
+                        true,
+                        'outline-danger',
+                        true,
+                        'Delete attachment before final return delete.'
+                    )
+                ]
             );
         }
     }
@@ -1902,11 +2432,28 @@ function safe_delete_analyze_customer(PDO $pdo, int $customerId, array $scope, a
         }
         $sql .= ' ORDER BY id DESC';
         foreach (safe_delete_fetch_rows($pdo, $sql, $params) as $row) {
+            $rowActions = [];
+            if ((int) ($row['id'] ?? 0) > 0) {
+                $rowActions[] = safe_delete_make_dependency_action(
+                    'Delete',
+                    'vehicle',
+                    (int) ($row['id'] ?? 0),
+                    'delete',
+                    null,
+                    true,
+                    'outline-warning',
+                    true,
+                    'Delete or disable the linked vehicle before deleting the customer.'
+                );
+            }
             $vehicleRows[] = safe_delete_make_item(
                 safe_delete_row_reference($row, ['registration_no'], 'VH'),
                 null,
                 null,
-                (string) ($row['status_code'] ?? '')
+                (string) ($row['status_code'] ?? ''),
+                null,
+                (string) ($customer['full_name'] ?? '') !== '' ? ('Customer: ' . (string) $customer['full_name']) : null,
+                $rowActions
             );
         }
     }
@@ -1929,11 +2476,28 @@ function safe_delete_analyze_customer(PDO $pdo, int $customerId, array $scope, a
         foreach (safe_delete_fetch_rows($pdo, $sql, $params) as $row) {
             $amt = safe_delete_pick_amount($row, ['grand_total']) ?? 0.0;
             $invoiceImpact += $amt;
+            $rowActions = [];
+            if ((int) ($row['id'] ?? 0) > 0) {
+                $rowActions[] = safe_delete_make_dependency_action(
+                    'Cancel',
+                    'invoice',
+                    (int) ($row['id'] ?? 0),
+                    'cancel',
+                    null,
+                    true,
+                    'outline-danger',
+                    true,
+                    'Cancel this invoice (with safe reversals) before deleting the customer.'
+                );
+            }
             $invoiceRows[] = safe_delete_make_item(
                 safe_delete_row_reference($row, ['invoice_number'], 'INV'),
                 safe_delete_pick_date($row, ['invoice_date']),
                 $amt,
-                (string) ($row['invoice_status'] ?? '')
+                (string) ($row['invoice_status'] ?? ''),
+                null,
+                (string) ($customer['full_name'] ?? '') !== '' ? ('Customer: ' . (string) $customer['full_name']) : null,
+                $rowActions
             );
         }
     }
@@ -1942,10 +2506,14 @@ function safe_delete_analyze_customer(PDO $pdo, int $customerId, array $scope, a
     $paymentRows = [];
     $paymentImpact = 0.0;
     if (safe_delete_table_exists('payments') && safe_delete_table_exists('invoices') && safe_delete_table_has_column('invoices', 'customer_id')) {
-        $sql = 'SELECT p.id, p.amount'
-            . (safe_delete_table_has_column('payments', 'paid_on') ? ', p.paid_on' : '')
-            . (safe_delete_table_has_column('payments', 'reference_no') ? ', p.reference_no' : '')
-            . (safe_delete_table_has_column('payments', 'entry_type') ? ', p.entry_type' : '')
+        $paymentCols = table_columns('payments');
+        $sql = 'SELECT p.id, p.amount, i.id AS invoice_id'
+            . (in_array('paid_on', $paymentCols, true) ? ', p.paid_on' : '')
+            . (in_array('reference_no', $paymentCols, true) ? ', p.reference_no' : '')
+            . (in_array('entry_type', $paymentCols, true) ? ', p.entry_type' : '')
+            . (in_array('is_reversed', $paymentCols, true) ? ', p.is_reversed' : '')
+            . (safe_delete_table_has_column('invoices', 'invoice_number') ? ', i.invoice_number' : '')
+            . (safe_delete_table_has_column('invoices', 'invoice_status') ? ', i.invoice_status' : '')
             . ' FROM payments p
                INNER JOIN invoices i ON i.id = p.invoice_id
                WHERE i.customer_id = :customer_id';
@@ -1958,11 +2526,36 @@ function safe_delete_analyze_customer(PDO $pdo, int $customerId, array $scope, a
         foreach (safe_delete_fetch_rows($pdo, $sql, $params) as $row) {
             $amt = round((float) ($row['amount'] ?? 0), 2);
             $paymentImpact += abs($amt);
+            $entryType = strtoupper(trim((string) ($row['entry_type'] ?? ($amt < 0 ? 'REVERSAL' : 'PAYMENT'))));
+            $canReverseRow = $entryType === 'PAYMENT'
+                && $amt > 0
+                && !((int) ($row['is_reversed'] ?? 0) === 1);
+            $rowActions = $canReverseRow
+                ? [safe_delete_make_dependency_action(
+                    'Reverse',
+                    'invoice_payment',
+                    (int) ($row['id'] ?? 0),
+                    'reverse',
+                    null,
+                    true,
+                    'outline-danger',
+                    true,
+                    'Reverse this payment before deleting the customer.'
+                )]
+                : [safe_delete_make_dependency_action_unavailable(
+                    $entryType === 'REVERSAL' ? 'Already Reversal' : 'Protected',
+                    $entryType === 'REVERSAL'
+                        ? 'This row is already a reversal entry.'
+                        : 'Only original payment entries can be reversed from the summary.'
+                )];
             $paymentRows[] = safe_delete_make_item(
                 safe_delete_row_reference($row, ['reference_no'], 'PAY'),
                 safe_delete_pick_date($row, ['paid_on']),
                 $amt,
-                (string) ($row['entry_type'] ?? '')
+                $entryType,
+                null,
+                trim((string) ($row['invoice_number'] ?? '')) !== '' ? ('Invoice: ' . (string) $row['invoice_number']) : null,
+                $rowActions
             );
         }
     }
@@ -1985,7 +2578,15 @@ function safe_delete_analyze_customer(PDO $pdo, int $customerId, array $scope, a
     }
     if ($ledgerCount > 0) {
         $summary['groups'][] = safe_delete_make_group('ledger_entries', 'Customer Ledger Entries', $ledgerCount, [
-            safe_delete_make_item('Ledger History', null, $ledgerImpact, 'HISTORY')
+            safe_delete_make_item(
+                'Ledger History',
+                null,
+                $ledgerImpact,
+                'HISTORY',
+                'Historical ledger entries cannot be deleted from summary.',
+                (string) ($customer['full_name'] ?? '') !== '' ? ('Customer: ' . (string) $customer['full_name']) : null,
+                [safe_delete_make_dependency_action_unavailable('Protected History', 'Customer financial history is retained for audit and compliance.')]
+            )
         ], $ledgerImpact);
     }
 
@@ -2035,11 +2636,28 @@ function safe_delete_analyze_vendor(PDO $pdo, int $vendorId, array $scope, array
     $partsRows = [];
     if (safe_delete_table_exists('parts') && safe_delete_table_has_column('parts', 'vendor_id')) {
         foreach (safe_delete_fetch_rows($pdo, 'SELECT id, part_sku, part_name' . (safe_delete_table_has_column('parts', 'status_code') ? ', status_code' : '') . ' FROM parts WHERE vendor_id = :vendor_id ORDER BY id DESC', ['vendor_id' => $vendorId]) as $row) {
+            $rowActions = [];
+            if ((int) ($row['id'] ?? 0) > 0) {
+                $rowActions[] = safe_delete_make_dependency_action(
+                    'Delete',
+                    'inventory_part',
+                    (int) ($row['id'] ?? 0),
+                    'delete',
+                    null,
+                    true,
+                    'outline-warning',
+                    false,
+                    'Optional: delete or reassign linked parts before deleting the vendor.'
+                );
+            }
             $partsRows[] = safe_delete_make_item(
                 safe_delete_row_reference($row, ['part_sku', 'part_name'], 'PART'),
                 null,
                 null,
-                (string) ($row['status_code'] ?? '')
+                (string) ($row['status_code'] ?? ''),
+                trim((string) ($row['part_name'] ?? '')) !== '' ? (string) ($row['part_name'] ?? '') : null,
+                (string) ($vendor['vendor_name'] ?? '') !== '' ? ('Vendor: ' . (string) $vendor['vendor_name']) : null,
+                $rowActions
             );
         }
     }
@@ -2062,11 +2680,28 @@ function safe_delete_analyze_vendor(PDO $pdo, int $vendorId, array $scope, array
         foreach (safe_delete_fetch_rows($pdo, $sql, $params) as $row) {
             $amt = safe_delete_pick_amount($row, ['grand_total']) ?? 0.0;
             $purchaseImpact += $amt;
+            $rowActions = [];
+            if ((int) ($row['id'] ?? 0) > 0) {
+                $rowActions[] = safe_delete_make_dependency_action(
+                    'Delete',
+                    'purchase',
+                    (int) ($row['id'] ?? 0),
+                    'delete',
+                    null,
+                    true,
+                    'outline-danger',
+                    true,
+                    'Delete this purchase (with stock reversal) before deleting the vendor.'
+                );
+            }
             $purchaseRows[] = safe_delete_make_item(
                 safe_delete_row_reference($row, ['invoice_number'], 'PUR'),
                 safe_delete_pick_date($row, ['purchase_date']),
                 $amt,
-                (string) ($row['purchase_status'] ?? '')
+                (string) ($row['purchase_status'] ?? ''),
+                null,
+                (string) ($vendor['vendor_name'] ?? '') !== '' ? ('Vendor: ' . (string) $vendor['vendor_name']) : null,
+                $rowActions
             );
         }
     }
@@ -2075,10 +2710,12 @@ function safe_delete_analyze_vendor(PDO $pdo, int $vendorId, array $scope, array
     $paymentRows = [];
     $paymentImpact = 0.0;
     if (safe_delete_table_exists('purchase_payments') && safe_delete_table_exists('purchases') && safe_delete_table_has_column('purchases', 'vendor_id')) {
-        $sql = 'SELECT pp.id, pp.amount'
-            . (safe_delete_table_has_column('purchase_payments', 'payment_date') ? ', pp.payment_date' : '')
-            . (safe_delete_table_has_column('purchase_payments', 'reference_no') ? ', pp.reference_no' : '')
-            . (safe_delete_table_has_column('purchase_payments', 'entry_type') ? ', pp.entry_type' : '')
+        $ppCols = table_columns('purchase_payments');
+        $sql = 'SELECT pp.id, pp.amount, p.id AS purchase_id'
+            . (in_array('payment_date', $ppCols, true) ? ', pp.payment_date' : '')
+            . (in_array('reference_no', $ppCols, true) ? ', pp.reference_no' : '')
+            . (in_array('entry_type', $ppCols, true) ? ', pp.entry_type' : '')
+            . (safe_delete_table_has_column('purchases', 'invoice_number') ? ', p.invoice_number' : '')
             . ' FROM purchase_payments pp
                INNER JOIN purchases p ON p.id = pp.purchase_id
                WHERE p.vendor_id = :vendor_id';
@@ -2090,11 +2727,34 @@ function safe_delete_analyze_vendor(PDO $pdo, int $vendorId, array $scope, array
         foreach (safe_delete_fetch_rows($pdo, $sql, $params) as $row) {
             $amt = round((float) ($row['amount'] ?? 0), 2);
             $paymentImpact += abs($amt);
+            $entryType = strtoupper(trim((string) ($row['entry_type'] ?? ($amt < 0 ? 'REVERSAL' : 'PAYMENT'))));
+            $canReverseRow = $entryType === 'PAYMENT' && $amt > 0;
+            $rowActions = $canReverseRow
+                ? [safe_delete_make_dependency_action(
+                    'Reverse',
+                    'purchase_payment',
+                    (int) ($row['id'] ?? 0),
+                    'reverse',
+                    null,
+                    true,
+                    'outline-danger',
+                    true,
+                    'Reverse this purchase payment before deleting the vendor.'
+                )]
+                : [safe_delete_make_dependency_action_unavailable(
+                    $entryType === 'REVERSAL' ? 'Already Reversal' : 'Protected',
+                    $entryType === 'REVERSAL'
+                        ? 'This row is already a reversal entry.'
+                        : 'Only payment entries can be reversed from the summary.'
+                )];
             $paymentRows[] = safe_delete_make_item(
                 safe_delete_row_reference($row, ['reference_no'], 'PPAY'),
                 safe_delete_pick_date($row, ['payment_date']),
                 $amt,
-                (string) ($row['entry_type'] ?? '')
+                $entryType,
+                null,
+                trim((string) ($row['invoice_number'] ?? '')) !== '' ? ('Purchase: ' . (string) $row['invoice_number']) : null,
+                $rowActions
             );
         }
     }
@@ -2157,11 +2817,31 @@ function safe_delete_analyze_vehicle(PDO $pdo, int $vehicleId, array $scope, arr
         }
         $sql .= ' ORDER BY id DESC';
         foreach (safe_delete_fetch_rows($pdo, $sql, $params) as $row) {
+            $jobIdRow = (int) ($row['id'] ?? 0);
+            $jobActions = $jobIdRow > 0
+                ? [safe_delete_make_dependency_action(
+                    'Delete',
+                    'job_card',
+                    $jobIdRow,
+                    'delete',
+                    null,
+                    true,
+                    'outline-danger',
+                    true,
+                    'Delete the job card (after resolving its own blockers) before deleting the vehicle.'
+                )]
+                : [safe_delete_make_dependency_action_unavailable(
+                    'Delete in Job Cards',
+                    'Use Job Card screen safe delete to clear this dependency.'
+                )];
             $jobRows[] = safe_delete_make_item(
                 safe_delete_row_reference($row, ['job_number'], 'JOB'),
                 safe_delete_pick_date($row, ['created_at']),
                 null,
-                (string) (($row['status'] ?? '') ?: ($row['status_code'] ?? ''))
+                (string) (($row['status'] ?? '') ?: ($row['status_code'] ?? '')),
+                'Delete from Job Cards to clear vehicle dependency.',
+                safe_delete_row_reference($vehicle, ['registration_no'], 'VH'),
+                $jobActions
             );
         }
     }
@@ -2190,7 +2870,22 @@ function safe_delete_analyze_vehicle(PDO $pdo, int $vehicleId, array $scope, arr
                 safe_delete_row_reference($row, ['invoice_number'], 'INV'),
                 safe_delete_pick_date($row, ['invoice_date']),
                 $amt,
-                (string) ($row['invoice_status'] ?? '')
+                (string) ($row['invoice_status'] ?? ''),
+                null,
+                safe_delete_row_reference($vehicle, ['registration_no'], 'VH'),
+                [
+                    safe_delete_make_dependency_action(
+                        'Cancel',
+                        'invoice',
+                        (int) ($row['id'] ?? 0),
+                        'cancel',
+                        null,
+                        true,
+                        'outline-danger',
+                        true,
+                        'Cancel the linked invoice before deleting the vehicle.'
+                    ),
+                ]
             );
         }
     }
@@ -2211,7 +2906,10 @@ function safe_delete_analyze_vehicle(PDO $pdo, int $vehicleId, array $scope, arr
                 safe_delete_row_reference($row, ['claim_number'], 'CLM'),
                 safe_delete_pick_date($row, ['claim_date']),
                 null,
-                (string) ($row['status_code'] ?? '')
+                (string) ($row['status_code'] ?? ''),
+                'Delete or close claim from Insurance Claims module if required.',
+                safe_delete_row_reference($vehicle, ['registration_no'], 'VH'),
+                [safe_delete_make_dependency_action_unavailable('Manage in Claims', 'Insurance claim actions are not yet wired in this summary.')]
             );
         }
         if ($rows !== []) {

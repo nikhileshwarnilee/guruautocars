@@ -62,6 +62,7 @@ if ($appJsVersion === '') {
                   <div class="text-end">
                     <div class="small text-muted">Total Dependencies</div>
                     <div class="fw-semibold" id="gac-safe-delete-total-deps">0</div>
+                    <div class="small text-muted">Pending Dependency Actions: <span id="gac-safe-delete-pending-resolve">0</span></div>
                     <div class="small text-muted">Financial Impact: <span id="gac-safe-delete-fin-impact">INR 0.00</span></div>
                   </div>
                 </div>
@@ -117,7 +118,8 @@ if ($appJsVersion === '') {
 
     <script>
       window.GacSafeDeleteConfig = {
-        endpoint: <?= json_encode(url('modules/system/delete_impact_api.php')); ?>
+        endpoint: <?= json_encode(url('modules/system/delete_impact_api.php')); ?>,
+        dependencyActionEndpoint: <?= json_encode(url('modules/system/delete_dependency_action_api.php')); ?>
       };
     </script>
 

@@ -82,12 +82,14 @@ try {
 
     $normalizedItems = [];
     foreach ($items as $item) {
+        $partUnitCode = part_unit_normalize_code((string) ($item['part_unit'] ?? ''));
         $normalizedItems[] = [
             'source_item_id' => (int) ($item['source_item_id'] ?? 0),
             'part_id' => (int) ($item['part_id'] ?? 0),
             'part_name' => (string) ($item['part_name'] ?? ''),
             'part_sku' => (string) ($item['part_sku'] ?? ''),
-            'part_unit' => (string) ($item['part_unit'] ?? ''),
+            'part_unit' => $partUnitCode,
+            'allow_decimal_qty' => part_unit_allows_decimal($companyId, $partUnitCode),
             'description' => (string) ($item['description'] ?? ''),
             'source_qty' => returns_round((float) ($item['source_qty'] ?? 0)),
             'reserved_qty' => returns_round((float) ($item['reserved_qty'] ?? 0)),

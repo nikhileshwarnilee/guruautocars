@@ -1187,6 +1187,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $targetStatus = strtoupper(trim((string) ($_POST['next_status'] ?? '')));
         $statusNote = post_string('status_note', 255);
         $currentStatus = job_normalize_status((string) $jobForWrite['status']);
+        $isReopenFromClosed = ($currentStatus === 'CLOSED' && $targetStatus === 'OPEN');
         $reminderPreviewRows = [];
         $reminderOverrides = [];
 
@@ -1205,7 +1206,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             redirect('modules/jobs/view.php?id=' . $jobId);
         }
 
-        if (job_is_locked($jobForWrite)) {
+        if (job_is_locked($jobForWrite) && !$isReopenFromClosed) {
             flash_set('job_error', 'This job card is locked and status cannot be changed.', 'danger');
             redirect('modules/jobs/view.php?id=' . $jobId);
         }
@@ -1221,12 +1222,46 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
 
         $inventoryWarnings = [];
+        $reopenResult = [
+            'reversed' => false,
+            'reversal_count' => 0,
+            'movement_uids' => [],
+            'warnings' => [],
+        ];
         if ($targetStatus === 'CLOSED') {
             try {
                 $postResult = job_post_inventory_on_close($jobId, $companyId, $garageId, $userId);
                 $inventoryWarnings = $postResult['warnings'] ?? [];
             } catch (Throwable $exception) {
                 flash_set('job_error', 'Unable to post inventory while closing job: ' . $exception->getMessage(), 'danger');
+                redirect('modules/jobs/view.php?id=' . $jobId);
+            }
+        } elseif ($isReopenFromClosed) {
+            try {
+                $activeInvoiceStmt = db()->prepare(
+                    'SELECT id, invoice_number, invoice_status
+                     FROM invoices
+                     WHERE job_card_id = :job_id
+                       AND company_id = :company_id
+                       AND garage_id = :garage_id
+                       AND invoice_status IN ("DRAFT", "FINALIZED")
+                     ORDER BY id DESC
+                     LIMIT 1'
+                );
+                $activeInvoiceStmt->execute([
+                    'job_id' => $jobId,
+                    'company_id' => $companyId,
+                    'garage_id' => $garageId,
+                ]);
+                $activeInvoice = $activeInvoiceStmt->fetch() ?: null;
+                if ($activeInvoice) {
+                    throw new RuntimeException('Cancel the active invoice ' . (string) ($activeInvoice['invoice_number'] ?? ('#' . (int) ($activeInvoice['id'] ?? 0))) . ' before reopening this job.');
+                }
+
+                $reopenResult = job_reverse_inventory_on_reopen($jobId, $companyId, $garageId, $userId);
+                $inventoryWarnings = array_values(array_filter(array_map('trim', (array) ($reopenResult['warnings'] ?? []))));
+            } catch (Throwable $exception) {
+                flash_set('job_error', 'Unable to reopen job inventory posting: ' . $exception->getMessage(), 'danger');
                 redirect('modules/jobs/view.php?id=' . $jobId);
             }
         }
@@ -1240,6 +1275,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                  END,
                  closed_at = CASE
                      WHEN :status = "CLOSED" THEN NOW()
+                     WHEN :status = "OPEN" THEN NULL
                      ELSE closed_at
                  END,
                  status_code = CASE
@@ -1288,6 +1324,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $statusNote !== '' ? $statusNote : null,
             [
                 'inventory_warnings' => count($inventoryWarnings),
+                'reopen_stock_reversal_count' => (int) ($reopenResult['reversal_count'] ?? 0),
                 'reminders_created' => (int) ($reminderResult['created_count'] ?? 0),
                 'reminders_disabled' => (int) ($reminderResult['disabled_count'] ?? 0),
             ]
@@ -1321,15 +1358,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'metadata' => [
                 'workflow_note' => $statusNote !== '' ? $statusNote : null,
                 'inventory_warning_count' => count($inventoryWarnings),
+                'reopen_stock_reversal_count' => (int) ($reopenResult['reversal_count'] ?? 0),
                 'reminders_created' => (int) ($reminderResult['created_count'] ?? 0),
                 'reminders_disabled' => (int) ($reminderResult['disabled_count'] ?? 0),
                 'reminder_types' => (array) ($reminderResult['created_types'] ?? []),
+                'reopen_movement_uids' => (array) ($reopenResult['movement_uids'] ?? []),
             ],
         ]);
 
         flash_set('job_success', 'Job status updated to ' . $targetStatus . '.', 'success');
         if ($targetStatus === 'CLOSED' && (int) ($reminderResult['created_count'] ?? 0) > 0) {
             flash_set('job_success', 'Auto maintenance reminders created: ' . (int) $reminderResult['created_count'] . '.', 'success');
+        } elseif ($isReopenFromClosed && (int) ($reopenResult['reversal_count'] ?? 0) > 0) {
+            flash_set('job_success', 'Job reopened and stock postings reversed: ' . (int) ($reopenResult['reversal_count'] ?? 0) . ' line(s).', 'success');
         }
         if (!empty($inventoryWarnings)) {
             $preview = implode(' | ', array_slice($inventoryWarnings, 0, 3));
@@ -2464,11 +2505,19 @@ if (table_columns('job_advances') !== []) {
     $advanceSummary['balance_amount'] = round((float) ($advanceRow['balance_amount'] ?? 0), 2);
     $advanceSummary['receipt_count'] = (int) ($advanceRow['receipt_count'] ?? 0);
 }
-$invoiceTotalAmount = $invoice ? round((float) ($invoice['grand_total'] ?? 0), 2) : $estimatedTotal;
+$pendingBaseInvoice = null;
+if ($invoice) {
+    $invoiceStatusForPending = strtoupper(trim((string) ($invoice['invoice_status'] ?? '')));
+    if (in_array($invoiceStatusForPending, ['DRAFT', 'FINALIZED'], true)) {
+        $pendingBaseInvoice = $invoice;
+    }
+}
+
+$invoiceTotalAmount = $pendingBaseInvoice ? round((float) ($pendingBaseInvoice['grand_total'] ?? 0), 2) : $estimatedTotal;
 if ($invoiceTotalAmount <= 0.009) {
     $invoiceTotalAmount = $estimatedTotal;
 }
-$invoiceReceivedAmount = $invoice ? round((float) ($invoice['paid_amount'] ?? 0), 2) : 0.0;
+$invoiceReceivedAmount = $pendingBaseInvoice ? round((float) ($pendingBaseInvoice['paid_amount'] ?? 0), 2) : 0.0;
 $advanceReceivedAmount = (float) ($advanceSummary['advance_amount'] ?? 0);
 $advanceReceiptCount = (int) ($advanceSummary['receipt_count'] ?? 0);
 $advanceReceiptLabel = $advanceReceiptCount === 1 ? 'receipt' : 'receipts';
@@ -2514,6 +2563,7 @@ foreach (job_workflow_statuses(true) as $status) {
 
     $nextStatuses[] = $status;
 }
+$workflowTransitionLocked = $jobLocked && !($jobStatus === 'CLOSED' && in_array('OPEN', $nextStatuses, true));
 
 $serviceReminderFeatureReady = service_reminder_feature_ready();
 $activeServiceReminders = $serviceReminderFeatureReady
@@ -2955,7 +3005,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                   <?php else: ?>
                     <div class="mb-3">
                       <label class="form-label">Next Status</label>
-                      <select id="next-status-select" name="next_status" class="form-select" required <?= $jobLocked ? 'disabled' : ''; ?>>
+                      <select id="next-status-select" name="next_status" class="form-select" required <?= $workflowTransitionLocked ? 'disabled' : ''; ?>>
                         <?php foreach ($nextStatuses as $status): ?>
                           <option value="<?= e($status); ?>"><?= e($status); ?></option>
                         <?php endforeach; ?>
@@ -2974,7 +3024,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                   <?php endif; ?>
                 </div>
                 <div class="card-footer">
-                  <button type="submit" class="btn btn-primary" <?= $jobLocked || empty($nextStatuses) ? 'disabled' : ''; ?>>Apply Transition</button>
+                  <button type="submit" class="btn btn-primary" <?= $workflowTransitionLocked || empty($nextStatuses) ? 'disabled' : ''; ?>>Apply Transition</button>
                 </div>
               </form>
             </div>

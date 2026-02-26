@@ -109,6 +109,7 @@ if (migration_table_exists($pdo, 'permissions')) {
     foreach ([
         ['perm_key' => 'record.delete', 'perm_name' => 'Global Safe Record Delete'],
         ['perm_key' => 'financial.reverse', 'perm_name' => 'Financial Reversal & Safe Delete'],
+        ['perm_key' => 'dependency.resolve', 'perm_name' => 'Resolve Dependencies From Delete Summary'],
     ] as $permissionRow) {
         try {
             $existsStmt = $pdo->prepare('SELECT id FROM permissions WHERE perm_key = :perm_key LIMIT 1');
@@ -124,6 +125,49 @@ if (migration_table_exists($pdo, 'permissions')) {
             $changes['permissions'][] = $permissionRow['perm_key'];
         } catch (Throwable $exception) {
             $errors[] = 'permissions:' . $permissionRow['perm_key'] . ': ' . $exception->getMessage();
+        }
+    }
+
+    if (migration_table_exists($pdo, 'roles') && migration_table_exists($pdo, 'role_permissions')) {
+        try {
+            $permStmt = $pdo->prepare('SELECT id FROM permissions WHERE perm_key = :perm_key LIMIT 1');
+            $permStmt->execute(['perm_key' => 'dependency.resolve']);
+            $dependencyResolvePermId = (int) ($permStmt->fetchColumn() ?: 0);
+
+            if ($dependencyResolvePermId > 0) {
+                $rolesStmt = $pdo->query('SELECT id, role_key FROM roles');
+                $roles = $rolesStmt ? $rolesStmt->fetchAll() : [];
+                foreach ($roles as $roleRow) {
+                    $roleId = (int) ($roleRow['id'] ?? 0);
+                    $roleKey = strtolower(trim((string) ($roleRow['role_key'] ?? '')));
+                    if ($roleId <= 0 || !in_array($roleKey, ['super_admin', 'admin'], true)) {
+                        continue;
+                    }
+
+                    $mapCheck = $pdo->prepare(
+                        'SELECT 1
+                         FROM role_permissions
+                         WHERE role_id = :role_id
+                           AND permission_id = :permission_id
+                         LIMIT 1'
+                    );
+                    $mapCheck->execute([
+                        'role_id' => $roleId,
+                        'permission_id' => $dependencyResolvePermId,
+                    ]);
+                    if ($mapCheck->fetchColumn()) {
+                        continue;
+                    }
+
+                    table_insert_available_columns('role_permissions', [
+                        'role_id' => $roleId,
+                        'permission_id' => $dependencyResolvePermId,
+                    ]);
+                    $changes['role_permissions'][] = $roleKey . '=>dependency.resolve';
+                }
+            }
+        } catch (Throwable $exception) {
+            $errors[] = 'role_permissions:dependency.resolve: ' . $exception->getMessage();
         }
     }
 }

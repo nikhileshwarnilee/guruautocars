@@ -35,6 +35,24 @@ function inv_decimal(string $key, float $default = 0.0): float
     return (float) $normalized;
 }
 
+function inv_value_has_fraction(float $value): bool
+{
+    return abs($value - round($value)) > 0.00001;
+}
+
+function inv_assert_part_quantity_allowed(int $companyId, array $part, float $quantity, string $contextLabel): void
+{
+    $partUnitCode = part_unit_normalize_code((string) ($part['unit'] ?? ''));
+    if ($partUnitCode === '') {
+        $partUnitCode = 'PCS';
+    }
+
+    if (!part_unit_allows_decimal($companyId, $partUnitCode) && inv_value_has_fraction(abs($quantity))) {
+        $partName = trim((string) ($part['part_name'] ?? 'Selected part'));
+        throw new RuntimeException($contextLabel . ' quantity for ' . $partName . ' must be a whole number (' . $partUnitCode . ').');
+    }
+}
+
 function inv_issue_action_token(string $action): string
 {
     if (!isset($_SESSION['_inventory_action_tokens']) || !is_array($_SESSION['_inventory_action_tokens'])) {
@@ -265,6 +283,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             redirect('modules/inventory/index.php');
         }
 
+        try {
+            inv_assert_part_quantity_allowed($companyId, (array) $part, $quantity, 'Temporary stock');
+        } catch (Throwable $exception) {
+            flash_set('inventory_error', $exception->getMessage(), 'danger');
+            redirect('modules/inventory/index.php');
+        }
+
         $pdo = db();
         $pdo->beginTransaction();
         try {
@@ -375,7 +400,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         try {
             $entryStmt = $pdo->prepare(
                 'SELECT te.id, te.temp_ref, te.part_id, te.quantity, te.status_code,
-                        p.part_name, p.part_sku, p.purchase_price, p.gst_rate
+                        p.part_name, p.part_sku, p.unit, p.purchase_price, p.gst_rate
                  FROM temp_stock_entries te
                  INNER JOIN parts p
                     ON p.id = te.part_id
@@ -404,6 +429,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $purchaseId = null;
             $currentQty = null;
             $newQty = null;
+
+            if ($resolution === 'PURCHASED') {
+                inv_assert_part_quantity_allowed($companyId, (array) $entry, $qty, 'Temporary stock purchase conversion');
+            }
 
             if ($resolution === 'PURCHASED') {
                 $unitCost = round((float) ($entry['purchase_price'] ?? 0), 2);
@@ -629,7 +658,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
 
         $partStmt = db()->prepare(
-            'SELECT id, part_name, part_sku, purchase_price, gst_rate
+            'SELECT id, part_name, part_sku, unit, purchase_price, gst_rate
              FROM parts
              WHERE id = :id
                AND company_id = :company_id
@@ -644,6 +673,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         if (!$part) {
             flash_set('inventory_error', 'Invalid part selected for this company.', 'danger');
+            redirect('modules/inventory/index.php');
+        }
+        try {
+            inv_assert_part_quantity_allowed(
+                $companyId,
+                (array) $part,
+                $movementType === 'ADJUST' ? $quantityInput : $movementQuantity,
+                'Stock movement'
+            );
+        } catch (Throwable $exception) {
+            flash_set('inventory_error', $exception->getMessage(), 'danger');
             redirect('modules/inventory/index.php');
         }
 
@@ -824,7 +864,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
 
         $partStmt = db()->prepare(
-            'SELECT id, part_name, part_sku
+            'SELECT id, part_name, part_sku, unit
              FROM parts
              WHERE id = :id
                AND company_id = :company_id
@@ -838,6 +878,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $part = $partStmt->fetch();
         if (!$part) {
             flash_set('inventory_error', 'Invalid part selected for transfer.', 'danger');
+            redirect('modules/inventory/index.php');
+        }
+        try {
+            inv_assert_part_quantity_allowed($companyId, (array) $part, $quantity, 'Transfer');
+        } catch (Throwable $exception) {
+            flash_set('inventory_error', $exception->getMessage(), 'danger');
             redirect('modules/inventory/index.php');
         }
 
@@ -1507,10 +1553,17 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 
                     <div class="col-md-12">
                       <label class="form-label">Part</label>
-                      <select name="part_id" class="form-select" required>
+                      <select id="stock-adjust-part-select" name="part_id" class="form-select" required>
                         <option value="">Select Part</option>
                         <?php foreach ($parts as $part): ?>
-                          <option value="<?= (int) $part['id']; ?>">
+                          <?php
+                            $partUnitCode = part_unit_normalize_code((string) ($part['unit'] ?? ''));
+                            if ($partUnitCode === '') {
+                                $partUnitCode = 'PCS';
+                            }
+                            $partAllowsDecimal = part_unit_allows_decimal($companyId, $partUnitCode);
+                          ?>
+                          <option value="<?= (int) $part['id']; ?>" data-unit="<?= e($partUnitCode); ?>" data-allow-decimal="<?= $partAllowsDecimal ? '1' : '0'; ?>">
                             <?= e((string) $part['part_name']); ?> (<?= e((string) $part['part_sku']); ?>) | Stock <?= e(number_format((float) $part['stock_qty'], 2)); ?> <?= e((string) $part['unit']); ?>
                           </option>
                         <?php endforeach; ?>
@@ -1526,7 +1579,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                     </div>
                     <div class="col-md-6">
                       <label class="form-label">Quantity</label>
-                      <input type="number" step="0.01" name="quantity" class="form-control" required>
+                      <input id="stock-adjust-qty-input" type="number" step="0.01" name="quantity" class="form-control" required>
                     </div>
                     <div class="col-md-12">
                       <small class="text-muted">Stock In entries are auto-logged as unassigned purchases for later vendor and invoice assignment in Purchase Module.</small>
@@ -1564,11 +1617,18 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 
                     <div class="col-md-12">
                       <label class="form-label">Part</label>
-                      <select name="part_id" class="form-select" required>
+                      <select id="stock-transfer-part-select" name="part_id" class="form-select" required>
                         <option value="">Select Part</option>
                         <?php foreach ($parts as $part): ?>
-                          <option value="<?= (int) $part['id']; ?>">
-                            <?= e((string) $part['part_name']); ?> (<?= e((string) $part['part_sku']); ?>) | Source stock <?= e(number_format((float) $part['stock_qty'], 2)); ?>
+                          <?php
+                            $partUnitCode = part_unit_normalize_code((string) ($part['unit'] ?? ''));
+                            if ($partUnitCode === '') {
+                                $partUnitCode = 'PCS';
+                            }
+                            $partAllowsDecimal = part_unit_allows_decimal($companyId, $partUnitCode);
+                          ?>
+                          <option value="<?= (int) $part['id']; ?>" data-unit="<?= e($partUnitCode); ?>" data-allow-decimal="<?= $partAllowsDecimal ? '1' : '0'; ?>">
+                            <?= e((string) $part['part_name']); ?> (<?= e((string) $part['part_sku']); ?>) | Source stock <?= e(number_format((float) $part['stock_qty'], 2)); ?> <?= e($partUnitCode); ?>
                           </option>
                         <?php endforeach; ?>
                       </select>
@@ -1591,7 +1651,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                     </div>
                     <div class="col-md-6">
                       <label class="form-label">Quantity</label>
-                      <input type="number" step="0.01" min="0.01" name="quantity" class="form-control" required>
+                      <input id="stock-transfer-qty-input" type="number" step="0.01" min="0.01" name="quantity" class="form-control" required>
                     </div>
                     <?php if ($canNegative): ?>
                       <div class="col-md-6 d-flex align-items-end">
@@ -1670,18 +1730,25 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                 <input type="hidden" name="action_token" value="<?= e($tempInActionToken); ?>">
                 <div class="col-md-6">
                   <label class="form-label">Part</label>
-                  <select name="part_id" class="form-select" required>
+                  <select id="temp-stock-part-select" name="part_id" class="form-select" required>
                     <option value="">Select Part</option>
                     <?php foreach ($parts as $part): ?>
-                      <option value="<?= (int) $part['id']; ?>">
-                        <?= e((string) $part['part_name']); ?> (<?= e((string) $part['part_sku']); ?>)
+                      <?php
+                        $partUnitCode = part_unit_normalize_code((string) ($part['unit'] ?? ''));
+                        if ($partUnitCode === '') {
+                            $partUnitCode = 'PCS';
+                        }
+                        $partAllowsDecimal = part_unit_allows_decimal($companyId, $partUnitCode);
+                      ?>
+                      <option value="<?= (int) $part['id']; ?>" data-unit="<?= e($partUnitCode); ?>" data-allow-decimal="<?= $partAllowsDecimal ? '1' : '0'; ?>">
+                        <?= e((string) $part['part_name']); ?> (<?= e((string) $part['part_sku']); ?>) | <?= e($partUnitCode); ?>
                       </option>
                     <?php endforeach; ?>
                   </select>
                 </div>
                 <div class="col-md-2">
                   <label class="form-label">Quantity</label>
-                  <input type="number" step="0.01" min="0.01" name="quantity" class="form-control" required>
+                  <input id="temp-stock-qty-input" type="number" step="0.01" min="0.01" name="quantity" class="form-control" required>
                 </div>
                 <div class="col-md-4">
                   <label class="form-label">Notes</label>
@@ -2246,5 +2313,59 @@ require_once __DIR__ . '/../../includes/sidebar.php';
     </div>
   </div>
 </main>
+
+<script>
+  (function () {
+    function readSelectedOption(select) {
+      if (!select || !select.options || select.selectedIndex < 0) {
+        return null;
+      }
+      return select.options[select.selectedIndex] || null;
+    }
+
+    function applyPartQuantityRule(select, qtyInput, config) {
+      if (!select || !qtyInput) {
+        return;
+      }
+
+      var selected = readSelectedOption(select);
+      var hasSelection = !!(selected && selected.value);
+      var allowDecimal = hasSelection ? (selected.getAttribute('data-allow-decimal') || '1') === '1' : true;
+
+      qtyInput.step = allowDecimal ? '0.01' : '1';
+      if (config && config.manageMin === true) {
+        qtyInput.min = allowDecimal ? '0.01' : '1';
+      }
+
+      if (!allowDecimal && qtyInput.value !== '') {
+        var parsed = Number(qtyInput.value);
+        if (isFinite(parsed)) {
+          qtyInput.value = String((config && config.allowNegative === true)
+            ? Math.round(parsed)
+            : Math.max(0, Math.round(parsed)));
+        }
+      }
+    }
+
+    function wirePartQtyRule(selectId, qtyInputId, config) {
+      var select = document.getElementById(selectId);
+      var qtyInput = document.getElementById(qtyInputId);
+      if (!select || !qtyInput) {
+        return;
+      }
+
+      var refresh = function () {
+        applyPartQuantityRule(select, qtyInput, config || {});
+      };
+      select.addEventListener('change', refresh);
+      qtyInput.addEventListener('change', refresh);
+      refresh();
+    }
+
+    wirePartQtyRule('stock-adjust-part-select', 'stock-adjust-qty-input', { manageMin: false, allowNegative: true });
+    wirePartQtyRule('stock-transfer-part-select', 'stock-transfer-qty-input', { manageMin: true, allowNegative: false });
+    wirePartQtyRule('temp-stock-part-select', 'temp-stock-qty-input', { manageMin: true, allowNegative: false });
+  })();
+</script>
 
 <?php require_once __DIR__ . '/../../includes/footer.php'; ?>

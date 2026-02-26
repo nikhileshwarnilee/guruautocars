@@ -43,6 +43,11 @@ function estimate_post_decimal(string $key, float $default = 0.0): float
     return (float) $normalized;
 }
 
+function estimate_value_has_fraction(float $value): bool
+{
+    return abs($value - round($value)) > 0.00001;
+}
+
 function estimate_post_date(string $key): ?string
 {
     $value = trim((string) ($_POST[$key] ?? ''));
@@ -106,7 +111,7 @@ function estimate_fetch_services(int $estimateId): array
 function estimate_fetch_parts(int $estimateId, int $garageId): array
 {
     $stmt = db()->prepare(
-        'SELECT ep.*, p.part_name, p.part_sku, COALESCE(gi.quantity, 0) AS stock_qty
+        'SELECT ep.*, p.part_name, p.part_sku, p.unit, COALESCE(gi.quantity, 0) AS stock_qty
          FROM estimate_parts ep
          INNER JOIN parts p ON p.id = ep.part_id
          LEFT JOIN garage_inventory gi ON gi.part_id = ep.part_id AND gi.garage_id = :garage_id
@@ -140,7 +145,7 @@ function estimate_fetch_service_master(int $companyId): array
 function estimate_fetch_part_master(int $companyId, int $garageId): array
 {
     $stmt = db()->prepare(
-        'SELECT p.id, p.part_name, p.part_sku, p.selling_price, p.gst_rate, COALESCE(gi.quantity, 0) AS stock_qty
+        'SELECT p.id, p.part_name, p.part_sku, p.unit, p.selling_price, p.gst_rate, COALESCE(gi.quantity, 0) AS stock_qty
          FROM parts p
          LEFT JOIN garage_inventory gi ON gi.part_id = p.id AND gi.garage_id = :garage_id
          WHERE p.company_id = :company_id
@@ -555,7 +560,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
 
         $partStmt = db()->prepare(
-            'SELECT id, selling_price, gst_rate
+            'SELECT id, part_name, unit, selling_price, gst_rate
              FROM parts
              WHERE id = :id
                AND company_id = :company_id
@@ -577,6 +582,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
         if ($gstRate < 0) {
             $gstRate = (float) $part['gst_rate'];
+        }
+
+        $partUnitCode = part_unit_normalize_code((string) ($part['unit'] ?? ''));
+        if ($partUnitCode === '') {
+            $partUnitCode = 'PCS';
+        }
+        if (!part_unit_allows_decimal($companyId, $partUnitCode) && estimate_value_has_fraction($quantity)) {
+            flash_set(
+                'estimate_error',
+                'Quantity for ' . (string) ($part['part_name'] ?? 'selected part') . ' must be a whole number (' . $partUnitCode . ').',
+                'danger'
+            );
+            redirect('modules/estimates/view.php?id=' . $estimateId);
         }
 
         $unitPrice = max(0, $unitPrice);
@@ -618,9 +636,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
 
         $lineStmt = db()->prepare(
-            'SELECT ep.id
+            'SELECT ep.id, p.part_name, p.unit
              FROM estimate_parts ep
              INNER JOIN estimates e ON e.id = ep.estimate_id
+             INNER JOIN parts p ON p.id = ep.part_id
              WHERE ep.id = :line_id
                AND ep.estimate_id = :estimate_id
                AND e.company_id = :company_id
@@ -633,8 +652,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'company_id' => $companyId,
             'garage_id' => $garageId,
         ]);
-        if (!$lineStmt->fetch()) {
+        $line = $lineStmt->fetch();
+        if (!$line) {
             flash_set('estimate_error', 'Part line not found.', 'danger');
+            redirect('modules/estimates/view.php?id=' . $estimateId);
+        }
+
+        $partUnitCode = part_unit_normalize_code((string) ($line['unit'] ?? ''));
+        if ($partUnitCode === '') {
+            $partUnitCode = 'PCS';
+        }
+        if (!part_unit_allows_decimal($companyId, $partUnitCode) && estimate_value_has_fraction($quantity)) {
+            flash_set(
+                'estimate_error',
+                'Quantity for ' . (string) ($line['part_name'] ?? 'selected part') . ' must be a whole number (' . $partUnitCode . ').',
+                'danger'
+            );
             redirect('modules/estimates/view.php?id=' . $estimateId);
         }
 
@@ -1017,14 +1050,28 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                 <select id="estimate-add-part" name="part_id" class="form-select" required>
                   <option value="">Select Part</option>
                   <?php foreach ($partMaster as $part): ?>
-                    <option value="<?= (int) $part['id']; ?>" data-price="<?= e((string) $part['selling_price']); ?>" data-gst="<?= e((string) $part['gst_rate']); ?>" data-stock="<?= e((string) $part['stock_qty']); ?>">
+                    <?php
+                      $partUnitCode = part_unit_normalize_code((string) ($part['unit'] ?? ''));
+                      if ($partUnitCode === '') {
+                          $partUnitCode = 'PCS';
+                      }
+                      $partAllowsDecimal = part_unit_allows_decimal($companyId, $partUnitCode);
+                    ?>
+                    <option
+                      value="<?= (int) $part['id']; ?>"
+                      data-price="<?= e((string) $part['selling_price']); ?>"
+                      data-gst="<?= e((string) $part['gst_rate']); ?>"
+                      data-stock="<?= e((string) $part['stock_qty']); ?>"
+                      data-unit="<?= e($partUnitCode); ?>"
+                      data-allow-decimal="<?= $partAllowsDecimal ? '1' : '0'; ?>"
+                    >
                       <?= e((string) $part['part_name']); ?> (<?= e((string) $part['part_sku']); ?>) | Stock <?= e(number_format((float) $part['stock_qty'], 2)); ?>
                     </option>
                   <?php endforeach; ?>
                 </select>
                 <small id="estimate-add-part-stock-hint" class="text-muted"></small>
               </div>
-              <div class="col-md-2"><label class="form-label">Qty</label><input type="number" step="0.01" min="0.01" name="quantity" class="form-control" value="1" required /></div>
+              <div class="col-md-2"><label class="form-label">Qty</label><input id="estimate-add-part-qty" type="number" step="1" min="1" name="quantity" class="form-control" value="1" required /></div>
               <div class="col-md-2"><label class="form-label">Rate</label><input id="estimate-add-part-rate" type="number" step="0.01" min="0" name="unit_price" class="form-control" value="0" required /></div>
               <div class="col-md-2"><label class="form-label">GST%</label><input id="estimate-add-part-gst" type="number" step="0.01" min="0" max="100" name="gst_rate" class="form-control" value="18" required /></div>
               <div class="col-md-1 d-flex align-items-end"><button type="submit" class="btn btn-warning w-100">Add</button></div>
@@ -1039,14 +1086,23 @@ require_once __DIR__ . '/../../includes/sidebar.php';
               <?php if (empty($partLines)): ?>
                 <tr><td colspan="7" class="text-center text-muted py-4">No part lines added.</td></tr>
               <?php else: foreach ($partLines as $line): ?>
-                <?php $lineQty = (float) $line['quantity']; $lineStock = (float) ($line['stock_qty'] ?? 0); $stockClass = $lineStock >= $lineQty ? 'text-success' : 'text-danger'; ?>
+                <?php
+                  $lineQty = (float) $line['quantity'];
+                  $lineStock = (float) ($line['stock_qty'] ?? 0);
+                  $lineUnitCode = part_unit_normalize_code((string) ($line['unit'] ?? ''));
+                  if ($lineUnitCode === '') {
+                      $lineUnitCode = 'PCS';
+                  }
+                  $lineAllowsDecimal = part_unit_allows_decimal($companyId, $lineUnitCode);
+                  $stockClass = $lineStock >= $lineQty ? 'text-success' : 'text-danger';
+                ?>
                 <tr>
                   <td><?= e((string) $line['part_name']); ?> (<?= e((string) $line['part_sku']); ?>)</td>
-                  <td><?= e(number_format($lineQty, 2)); ?></td>
+                  <td><?= e(number_format($lineQty, 2)); ?> <?= e($lineUnitCode); ?></td>
                   <td><?= e(format_currency((float) $line['unit_price'])); ?></td>
                   <td><?= e(number_format((float) $line['gst_rate'], 2)); ?></td>
                   <td><?= e(format_currency((float) $line['total_amount'])); ?></td>
-                  <td><span class="<?= e($stockClass); ?>"><?= e(number_format($lineStock, 2)); ?></span></td>
+                  <td><span class="<?= e($stockClass); ?>"><?= e(number_format($lineStock, 2)); ?> <?= e($lineUnitCode); ?></span></td>
                   <td>
                     <?php if ($canEdit && $editable): ?>
                       <button class="btn btn-sm btn-outline-primary" type="button" data-bs-toggle="collapse" data-bs-target="#part-edit-<?= (int) $line['id']; ?>">Edit</button>
@@ -1071,7 +1127,10 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                       <?= csrf_field(); ?>
                       <input type="hidden" name="_action" value="update_part" />
                       <input type="hidden" name="estimate_part_id" value="<?= (int) $line['id']; ?>" />
-                      <div class="col-md-3"><input type="number" step="0.01" min="0.01" name="quantity" class="form-control form-control-sm" value="<?= e((string) $line['quantity']); ?>" required /></div>
+                      <div class="col-md-3">
+                        <input type="number" step="<?= $lineAllowsDecimal ? '0.01' : '1'; ?>" min="<?= $lineAllowsDecimal ? '0.01' : '1'; ?>" name="quantity" class="form-control form-control-sm" value="<?= e((string) $line['quantity']); ?>" required />
+                        <small class="text-muted"><?= e($lineUnitCode); ?><?= $lineAllowsDecimal ? ' (decimal allowed)' : ' (whole only)'; ?></small>
+                      </div>
                       <div class="col-md-3"><input type="number" step="0.01" min="0" name="unit_price" class="form-control form-control-sm" value="<?= e((string) $line['unit_price']); ?>" required /></div>
                       <div class="col-md-3"><input type="number" step="0.01" min="0" max="100" name="gst_rate" class="form-control form-control-sm" value="<?= e((string) $line['gst_rate']); ?>" required /></div>
                       <div class="col-md-3"><button type="submit" class="btn btn-sm btn-primary w-100">Save</button></div>
@@ -1156,19 +1215,36 @@ require_once __DIR__ . '/../../includes/sidebar.php';
     }
 
     var addPartSelect = document.getElementById('estimate-add-part');
+    var addPartQty = document.getElementById('estimate-add-part-qty');
     var addPartRate = document.getElementById('estimate-add-part-rate');
     var addPartGst = document.getElementById('estimate-add-part-gst');
     var addPartStockHint = document.getElementById('estimate-add-part-stock-hint');
-    if (addPartSelect && addPartRate && addPartGst && addPartStockHint) {
-      addPartSelect.addEventListener('change', function () {
+    if (addPartSelect && addPartQty && addPartRate && addPartGst && addPartStockHint) {
+      function applyAddPartSelection() {
         var selected = addPartSelect.options[addPartSelect.selectedIndex];
-        if (!selected) {
+        if (!selected || !selected.value) {
+          addPartQty.step = '1';
+          addPartQty.min = '1';
+          addPartStockHint.textContent = '';
           return;
         }
+        var allowDecimal = (selected.getAttribute('data-allow-decimal') || '1') === '1';
+        var partUnit = selected.getAttribute('data-unit') || 'PCS';
         addPartRate.value = selected.getAttribute('data-price') || addPartRate.value;
         addPartGst.value = selected.getAttribute('data-gst') || addPartGst.value;
-        addPartStockHint.textContent = 'Available stock in this garage: ' + (selected.getAttribute('data-stock') || '0');
-      });
+        addPartQty.step = allowDecimal ? '0.01' : '1';
+        addPartQty.min = allowDecimal ? '0.01' : '1';
+        if (!allowDecimal && addPartQty.value) {
+          addPartQty.value = String(Math.max(1, Math.round(Number(addPartQty.value) || 0)));
+        }
+        addPartStockHint.textContent = 'Available stock in this garage: '
+          + (selected.getAttribute('data-stock') || '0')
+          + ' ' + partUnit
+          + (allowDecimal ? ' (decimal allowed)' : ' (whole only)');
+      }
+
+      addPartSelect.addEventListener('change', applyAddPartSelection);
+      applyAddPartSelection();
     }
 
     var nextStatusSelect = document.getElementById('estimate-next-status');

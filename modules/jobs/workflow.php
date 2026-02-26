@@ -32,7 +32,7 @@ function job_can_transition(string $fromStatus, string $toStatus): bool
         'WAITING_PARTS' => ['IN_PROGRESS', 'COMPLETED', 'CANCELLED'],
         'READY_FOR_DELIVERY' => ['COMPLETED', 'CLOSED', 'CANCELLED'],
         'COMPLETED' => ['CLOSED', 'CANCELLED'],
-        'CLOSED' => [],
+        'CLOSED' => ['OPEN'],
         'CANCELLED' => [],
     ];
 
@@ -374,7 +374,7 @@ function job_post_inventory_on_close(int $jobId, int $companyId, int $garageId, 
                 'part_id' => $partId,
                 'quantity' => $requiredQty,
                 'reference_id' => $jobId,
-                'movement_uid' => sprintf('jobclose-%d-%d', $jobId, $partId),
+                'movement_uid' => sprintf('jobclose-%d-%d-%s', $jobId, $partId, substr(bin2hex(random_bytes(4)), 0, 8)),
                 'notes' => 'Auto posted on CLOSE for Job Card #' . $jobId,
                 'created_by' => $actorUserId,
             ]);
@@ -430,6 +430,203 @@ function job_post_inventory_on_close(int $jobId, int $companyId, int $garageId, 
         }
 
         return ['warnings' => $warnings, 'posted' => true];
+    } catch (Throwable $exception) {
+        $pdo->rollBack();
+        throw $exception;
+    }
+}
+
+function job_reverse_inventory_on_reopen(int $jobId, int $companyId, int $garageId, int $actorUserId): array
+{
+    $pdo = db();
+    $pdo->beginTransaction();
+
+    try {
+        $jobStmt = $pdo->prepare(
+            'SELECT id, status, status_code, stock_posted_at
+             FROM job_cards
+             WHERE id = :id
+               AND company_id = :company_id
+               AND garage_id = :garage_id
+             FOR UPDATE'
+        );
+        $jobStmt->execute([
+            'id' => $jobId,
+            'company_id' => $companyId,
+            'garage_id' => $garageId,
+        ]);
+        $job = $jobStmt->fetch();
+        if (!$job) {
+            throw new RuntimeException('Job card not found for reopen stock reversal.');
+        }
+
+        if ((string) ($job['status_code'] ?? 'ACTIVE') !== 'ACTIVE') {
+            throw new RuntimeException('Only ACTIVE jobs can be reopened.');
+        }
+        if (strtoupper((string) ($job['status'] ?? 'OPEN')) !== 'CLOSED') {
+            $pdo->commit();
+            return ['reversed' => false, 'reversal_count' => 0, 'warnings' => []];
+        }
+
+        $warnings = [];
+        $reversalRows = [];
+
+        $netStmt = $pdo->prepare(
+            'SELECT m.part_id,
+                    COALESCE(SUM(
+                        CASE
+                          WHEN m.movement_type = "OUT" THEN m.quantity
+                          WHEN m.movement_type = "IN" THEN -m.quantity
+                          ELSE 0
+                        END
+                    ), 0) AS net_out_qty,
+                    MAX(COALESCE(p.part_name, "")) AS part_name,
+                    MAX(COALESCE(p.part_sku, "")) AS part_sku
+             FROM inventory_movements m
+             LEFT JOIN parts p ON p.id = m.part_id
+             WHERE m.company_id = :company_id
+               AND m.garage_id = :garage_id
+               AND m.reference_type = "JOB_CARD"
+               AND m.reference_id = :job_id
+             GROUP BY m.part_id'
+        );
+        $netStmt->execute([
+            'company_id' => $companyId,
+            'garage_id' => $garageId,
+            'job_id' => $jobId,
+        ]);
+        $netRows = $netStmt->fetchAll() ?: [];
+
+        $seedStockStmt = $pdo->prepare(
+            'INSERT INTO garage_inventory (garage_id, part_id, quantity)
+             VALUES (:garage_id, :part_id, 0)
+             ON DUPLICATE KEY UPDATE quantity = quantity'
+        );
+        $lockStockStmt = $pdo->prepare(
+            'SELECT quantity
+             FROM garage_inventory
+             WHERE garage_id = :garage_id
+               AND part_id = :part_id
+             FOR UPDATE'
+        );
+        $updateStockStmt = $pdo->prepare(
+            'UPDATE garage_inventory
+             SET quantity = :quantity
+             WHERE garage_id = :garage_id
+               AND part_id = :part_id'
+        );
+        $insertMovementStmt = $pdo->prepare(
+            'INSERT INTO inventory_movements
+              (company_id, garage_id, part_id, movement_type, quantity, reference_type, reference_id, movement_uid, notes, created_by)
+             VALUES
+              (:company_id, :garage_id, :part_id, "IN", :quantity, "JOB_CARD", :reference_id, :movement_uid, :notes, :created_by)'
+        );
+
+        foreach ($netRows as $row) {
+            $partId = (int) ($row['part_id'] ?? 0);
+            $netOutQty = round((float) ($row['net_out_qty'] ?? 0), 2);
+            if ($partId <= 0 || abs($netOutQty) <= 0.00001) {
+                continue;
+            }
+
+            if ($netOutQty < 0) {
+                $warnings[] = 'Job stock movement history has net IN quantity for part #' . $partId . '; manual review recommended.';
+                continue;
+            }
+
+            $seedStockStmt->execute([
+                'garage_id' => $garageId,
+                'part_id' => $partId,
+            ]);
+            $lockStockStmt->execute([
+                'garage_id' => $garageId,
+                'part_id' => $partId,
+            ]);
+            $currentQty = (float) ($lockStockStmt->fetchColumn() ?: 0);
+            $nextQty = round($currentQty + $netOutQty, 2);
+
+            $updateStockStmt->execute([
+                'quantity' => $nextQty,
+                'garage_id' => $garageId,
+                'part_id' => $partId,
+            ]);
+
+            $movementUid = sprintf('jobreopen-%d-%d-%s', $jobId, $partId, substr(bin2hex(random_bytes(4)), 0, 8));
+            $insertMovementStmt->execute([
+                'company_id' => $companyId,
+                'garage_id' => $garageId,
+                'part_id' => $partId,
+                'quantity' => $netOutQty,
+                'reference_id' => $jobId,
+                'movement_uid' => $movementUid,
+                'notes' => 'Auto stock IN reversal on REOPEN for Job Card #' . $jobId,
+                'created_by' => $actorUserId > 0 ? $actorUserId : null,
+            ]);
+
+            $reversalRows[] = [
+                'part_id' => $partId,
+                'part_name' => (string) ($row['part_name'] ?? ''),
+                'part_sku' => (string) ($row['part_sku'] ?? ''),
+                'quantity' => $netOutQty,
+                'stock_before' => round($currentQty, 2),
+                'stock_after' => $nextQty,
+                'movement_uid' => $movementUid,
+            ];
+        }
+
+        $updateJobStmt = $pdo->prepare(
+            'UPDATE job_cards
+             SET stock_posted_at = NULL
+             WHERE id = :id
+               AND company_id = :company_id
+               AND garage_id = :garage_id'
+        );
+        $updateJobStmt->execute([
+            'id' => $jobId,
+            'company_id' => $companyId,
+            'garage_id' => $garageId,
+        ]);
+
+        $pdo->commit();
+
+        foreach ($reversalRows as $movement) {
+            log_audit(
+                'inventory',
+                'stock_in',
+                (int) $movement['part_id'],
+                'Auto stock IN posted from job reopen #' . $jobId,
+                [
+                    'entity' => 'inventory_movement',
+                    'source' => 'JOB-REOPEN',
+                    'company_id' => $companyId,
+                    'garage_id' => $garageId,
+                    'user_id' => $actorUserId,
+                    'before' => [
+                        'part_id' => (int) $movement['part_id'],
+                        'stock_qty' => (float) $movement['stock_before'],
+                    ],
+                    'after' => [
+                        'part_id' => (int) $movement['part_id'],
+                        'stock_qty' => (float) $movement['stock_after'],
+                        'movement_type' => 'IN',
+                        'movement_qty' => (float) $movement['quantity'],
+                    ],
+                    'metadata' => [
+                        'job_card_id' => $jobId,
+                        'part_name' => (string) $movement['part_name'],
+                        'part_sku' => (string) $movement['part_sku'],
+                        'movement_uid' => (string) $movement['movement_uid'],
+                    ],
+                ]
+            );
+        }
+
+        return [
+            'reversed' => !empty($reversalRows),
+            'reversal_count' => count($reversalRows),
+            'movement_uids' => array_values(array_map(static fn (array $row): string => (string) ($row['movement_uid'] ?? ''), $reversalRows)),
+            'warnings' => $warnings,
+        ];
     } catch (Throwable $exception) {
         $pdo->rollBack();
         throw $exception;

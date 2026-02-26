@@ -271,8 +271,7 @@ function reversal_invoice_cancel_dependency_report(PDO $pdo, int $invoiceId, int
         ]);
         $inventoryMovements = (int) $inventoryStmt->fetchColumn();
         if ($inventoryMovements > 0) {
-            $blockers[] = 'Job-linked inventory is already posted.';
-            $steps[] = 'Reverse stock-out entries posted from the linked job card before cancelling invoice.';
+            $steps[] = 'Job-linked stock postings remain on the job card. This does not block invoice cancellation, but it may block job-card deletion until the job is reopened and stock postings are reversed.';
         }
 
         if (table_columns('outsourced_works') !== []) {
@@ -302,8 +301,7 @@ function reversal_invoice_cancel_dependency_report(PDO $pdo, int $invoiceId, int
             $outstandingTotal = round((float) ($outsource['outstanding_total'] ?? 0), 2);
 
             if ($outsourcedLines > 0 && ($paidTotal > 0.009 || $outstandingTotal > 0.009)) {
-                $blockers[] = 'Linked outsourced work has financial entries.';
-                $steps[] = 'Reverse outsourced vendor payments and archive linked outsourced work before invoice cancellation.';
+                $steps[] = 'Linked outsourced work financial entries remain on the job card. This does not block invoice cancellation, but it may block job-card deletion.';
             }
         }
     }
@@ -350,6 +348,13 @@ function reversal_job_delete_dependency_report(PDO $pdo, int $jobId, int $compan
             'cancellable_outsourced_ids' => [],
             'outsourced_paid_total' => 0.0,
             'inventory_movements' => 0,
+            'inventory_history_count' => 0,
+            'inventory_net_out_qty' => 0.0,
+            'labor_line_count' => 0,
+            'part_line_count' => 0,
+            'advance_receipt_count' => 0,
+            'advance_receipt_total' => 0.0,
+            'advance_adjusted_total' => 0.0,
         ];
     }
 
@@ -380,24 +385,118 @@ function reversal_job_delete_dependency_report(PDO $pdo, int $jobId, int $compan
         $steps[] = 'Cancel linked invoice before deleting the job card.';
     }
 
-    $inventoryStmt = $pdo->prepare(
+    $inventoryHistoryStmt = $pdo->prepare(
         'SELECT COUNT(*)
          FROM inventory_movements
          WHERE company_id = :company_id
            AND garage_id = :garage_id
            AND reference_type = "JOB_CARD"
-           AND reference_id = :job_id
-           AND movement_type = "OUT"'
+           AND reference_id = :job_id'
     );
-    $inventoryStmt->execute([
+    $inventoryHistoryStmt->execute([
         'company_id' => $companyId,
         'garage_id' => $garageId,
         'job_id' => $jobId,
     ]);
-    $inventoryMovements = (int) $inventoryStmt->fetchColumn();
+    $inventoryHistoryCount = (int) ($inventoryHistoryStmt->fetchColumn() ?? 0);
+
+    $inventoryMovements = 0; // unresolved net stock postings count (by part)
+    $inventoryNetOutQty = 0.0;
+    $inventoryNetStmt = $pdo->prepare(
+        'SELECT part_id,
+                COALESCE(SUM(
+                    CASE
+                      WHEN movement_type = "OUT" THEN quantity
+                      WHEN movement_type = "IN" THEN -quantity
+                      ELSE 0
+                    END
+                ), 0) AS net_out_qty
+         FROM inventory_movements
+         WHERE company_id = :company_id
+           AND garage_id = :garage_id
+           AND reference_type = "JOB_CARD"
+           AND reference_id = :job_id
+         GROUP BY part_id'
+    );
+    $inventoryNetStmt->execute([
+        'company_id' => $companyId,
+        'garage_id' => $garageId,
+        'job_id' => $jobId,
+    ]);
+    foreach (($inventoryNetStmt->fetchAll() ?: []) as $inventoryRow) {
+        $netOutQty = round((float) ($inventoryRow['net_out_qty'] ?? 0), 2);
+        if ($netOutQty > 0.009) {
+            $inventoryMovements++;
+            $inventoryNetOutQty += $netOutQty;
+        }
+    }
+    $inventoryNetOutQty = round($inventoryNetOutQty, 2);
+
     if ($inventoryMovements > 0) {
         $blockers[] = 'Inventory already posted for this job.';
-        $steps[] = 'Reverse job stock postings before deleting the job card.';
+        $steps[] = 'Reopen the job card (CLOSED -> OPEN) to reverse close-posted stock, then retry delete.';
+    }
+
+    $laborLineCount = 0;
+    if (table_columns('job_labor') !== []) {
+        $laborStmt = $pdo->prepare('SELECT COUNT(*) FROM job_labor WHERE job_card_id = :job_id');
+        $laborStmt->execute(['job_id' => $jobId]);
+        $laborLineCount = (int) ($laborStmt->fetchColumn() ?? 0);
+    }
+
+    $partLineCount = 0;
+    if (table_columns('job_parts') !== []) {
+        $partStmt = $pdo->prepare('SELECT COUNT(*) FROM job_parts WHERE job_card_id = :job_id');
+        $partStmt->execute(['job_id' => $jobId]);
+        $partLineCount = (int) ($partStmt->fetchColumn() ?? 0);
+    }
+
+    if (($laborLineCount + $partLineCount) > 0) {
+        $blockers[] = 'Job card still has labor/part lines.';
+        $steps[] = 'Delete all job labor and job part lines before soft deleting the job card.';
+    }
+
+    $advanceReceiptCount = 0;
+    $advanceReceiptTotal = 0.0;
+    $advanceAdjustedTotal = 0.0;
+    if (table_columns('job_advances') !== []) {
+        $advCols = table_columns('job_advances');
+        $advanceSql = 'SELECT COUNT(*) AS receipt_count,
+                              COALESCE(SUM(COALESCE(advance_amount, 0)), 0) AS receipt_total,
+                              COALESCE(SUM(COALESCE(adjusted_amount, 0)), 0) AS adjusted_total
+                       FROM job_advances
+                       WHERE job_card_id = :job_id';
+        if (in_array('company_id', $advCols, true)) {
+            $advanceSql .= ' AND company_id = :company_id';
+        }
+        if (in_array('garage_id', $advCols, true)) {
+            $advanceSql .= ' AND garage_id = :garage_id';
+        }
+        if (in_array('status_code', $advCols, true)) {
+            $advanceSql .= ' AND status_code <> "DELETED"';
+        }
+        $advStmt = $pdo->prepare($advanceSql);
+        $advParams = ['job_id' => $jobId];
+        if (in_array('company_id', $advCols, true)) {
+            $advParams['company_id'] = $companyId;
+        }
+        if (in_array('garage_id', $advCols, true)) {
+            $advParams['garage_id'] = $garageId;
+        }
+        $advStmt->execute($advParams);
+        $advanceRow = $advStmt->fetch() ?: [];
+        $advanceReceiptCount = (int) ($advanceRow['receipt_count'] ?? 0);
+        $advanceReceiptTotal = round((float) ($advanceRow['receipt_total'] ?? 0), 2);
+        $advanceAdjustedTotal = round((float) ($advanceRow['adjusted_total'] ?? 0), 2);
+
+        if ($advanceReceiptCount > 0) {
+            $blockers[] = 'Advance receipts exist for this job.';
+            if ($advanceAdjustedTotal > 0.009) {
+                $steps[] = 'Reverse invoice-side advance adjustments first, then delete remaining advance receipts.';
+            } else {
+                $steps[] = 'Delete or reverse advance receipts before soft deleting the job card.';
+            }
+        }
     }
 
     $cancellableOutsourcedIds = [];
@@ -447,6 +546,13 @@ function reversal_job_delete_dependency_report(PDO $pdo, int $jobId, int $compan
         'cancellable_outsourced_ids' => array_values(array_filter($cancellableOutsourcedIds, static fn (int $id): bool => $id > 0)),
         'outsourced_paid_total' => round($outsourcedPaidTotal, 2),
         'inventory_movements' => $inventoryMovements,
+        'inventory_history_count' => $inventoryHistoryCount,
+        'inventory_net_out_qty' => $inventoryNetOutQty,
+        'labor_line_count' => $laborLineCount,
+        'part_line_count' => $partLineCount,
+        'advance_receipt_count' => $advanceReceiptCount,
+        'advance_receipt_total' => $advanceReceiptTotal,
+        'advance_adjusted_total' => $advanceAdjustedTotal,
     ];
 }
 

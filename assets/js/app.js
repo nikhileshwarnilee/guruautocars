@@ -814,6 +814,7 @@ function initSafeDeleteFlow() {
     previewToken: '',
     summary: null,
     pendingRequest: false,
+    pendingDependencyAction: false,
     loadingEl: document.getElementById('gac-safe-delete-loading'),
     contentEl: document.getElementById('gac-safe-delete-content'),
     alertEl: document.getElementById('gac-safe-delete-alert'),
@@ -821,6 +822,7 @@ function initSafeDeleteFlow() {
     recordLabelEl: document.getElementById('gac-safe-delete-record-label'),
     recordMetaEl: document.getElementById('gac-safe-delete-record-meta'),
     totalDepsEl: document.getElementById('gac-safe-delete-total-deps'),
+    pendingResolveEl: document.getElementById('gac-safe-delete-pending-resolve'),
     finImpactEl: document.getElementById('gac-safe-delete-fin-impact'),
     blockersWrapEl: document.getElementById('gac-safe-delete-blockers'),
     blockersListEl: document.getElementById('gac-safe-delete-blockers-list'),
@@ -952,6 +954,46 @@ function initSafeDeleteFlow() {
     }
   }
 
+  function renderDependencyActionsCell(container, item, group, itemIndex) {
+    if (!container) {
+      return;
+    }
+    var actions = Array.isArray(item && item.actions) ? item.actions : [];
+    if (!actions.length) {
+      actions = [{ label: 'Managed / Protected', enabled: false, style: 'outline-secondary', operation: 'none', hint: 'No direct safe action is configured for this row type yet. It may be auto-managed in the parent flow or require its own module workflow.' }];
+    }
+
+    for (var k = 0; k < actions.length; k++) {
+      var action = actions[k] || {};
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      var style = String(action.style || 'outline-secondary').trim();
+      btn.className = 'btn btn-xs btn-' + (style || 'outline-secondary') + (k > 0 ? ' ms-1' : '');
+      if (!String(btn.className).includes('btn-sm')) {
+        btn.className += ' btn-sm';
+      }
+      btn.textContent = String(action.label || 'Action');
+      var enabled = !!action.enabled && !!action.entity && (Number(action.record_id || 0) > 0 || String(action.record_key || '').trim());
+      if (!enabled) {
+        btn.disabled = true;
+      } else {
+        btn.setAttribute('data-safe-delete-dep-action', '1');
+        btn.setAttribute('data-entity', String(action.entity || ''));
+        btn.setAttribute('data-operation', String(action.operation || 'delete'));
+        btn.setAttribute('data-record-id', String(Number(action.record_id || 0)));
+        if (action.record_key) {
+          btn.setAttribute('data-record-key', String(action.record_key));
+        }
+        btn.setAttribute('data-item-index', String(itemIndex));
+        btn.setAttribute('data-group-key', String(group && group.key ? group.key : ''));
+      }
+      if (action.hint) {
+        btn.title = String(action.hint);
+      }
+      container.appendChild(btn);
+    }
+  }
+
   function renderGroups(groups, severity) {
     if (!state.groupsEl) {
       return;
@@ -987,6 +1029,14 @@ function initSafeDeleteFlow() {
         summaryEl.appendChild(impactBadge);
       }
 
+      var pendingResolutionCount = Number(group.pending_resolution_count || 0);
+      if (Number.isFinite(pendingResolutionCount) && pendingResolutionCount > 0) {
+        var resolveBadge = document.createElement('span');
+        resolveBadge.className = 'badge text-bg-danger';
+        resolveBadge.textContent = 'Resolve ' + formatNumber(pendingResolutionCount);
+        summaryEl.appendChild(resolveBadge);
+      }
+
       if (group.warning) {
         var warnBadge = document.createElement('span');
         warnBadge.className = 'badge text-bg-danger';
@@ -1017,25 +1067,47 @@ function initSafeDeleteFlow() {
         listWrap.className = 'table-responsive';
 
         var table = document.createElement('table');
-        table.className = 'table table-sm mb-0';
+        table.className = 'table table-sm mb-0 align-middle';
         var thead = document.createElement('thead');
-        thead.innerHTML = '<tr><th>Reference</th><th>Date</th><th class="text-end">Amount</th><th>Status</th><th>Note</th></tr>';
+        thead.innerHTML = '<tr><th>Reference</th><th>Date</th><th class="text-end">Amount</th><th>Status</th><th>Related / Note</th><th class="text-end">Actions</th></tr>';
         table.appendChild(thead);
 
         var tbody = document.createElement('tbody');
         for (var j = 0; j < items.length; j++) {
           var item = items[j] || {};
           var tr = document.createElement('tr');
-          var amountText = '';
+
+          var tdRef = document.createElement('td');
+          tdRef.innerHTML = '<div class="fw-semibold">' + escapeHtml(item.reference || '') + '</div>'
+            + (item.related ? ('<div class="small text-muted">' + escapeHtml(item.related) + '</div>') : '');
+          tr.appendChild(tdRef);
+
+          var tdDate = document.createElement('td');
+          tdDate.textContent = String(item.date || '');
+          tr.appendChild(tdDate);
+
+          var tdAmount = document.createElement('td');
+          tdAmount.className = 'text-end';
           if (item.amount !== null && typeof item.amount !== 'undefined' && item.amount !== '') {
-            amountText = formatCurrency(item.amount);
+            tdAmount.textContent = formatCurrency(item.amount);
+          } else {
+            tdAmount.textContent = '';
           }
-          tr.innerHTML =
-            '<td>' + escapeHtml(item.reference || '') + '</td>' +
-            '<td>' + escapeHtml(item.date || '') + '</td>' +
-            '<td class="text-end">' + escapeHtml(amountText) + '</td>' +
-            '<td>' + escapeHtml(item.status || '') + '</td>' +
-            '<td>' + escapeHtml(item.note || '') + '</td>';
+          tr.appendChild(tdAmount);
+
+          var tdStatus = document.createElement('td');
+          tdStatus.textContent = String(item.status || '');
+          tr.appendChild(tdStatus);
+
+          var tdNote = document.createElement('td');
+          tdNote.textContent = String(item.note || '');
+          tr.appendChild(tdNote);
+
+          var tdActions = document.createElement('td');
+          tdActions.className = 'text-end';
+          renderDependencyActionsCell(tdActions, item, group, j);
+          tr.appendChild(tdActions);
+
           tbody.appendChild(tr);
         }
         table.appendChild(tbody);
@@ -1102,6 +1174,10 @@ function initSafeDeleteFlow() {
     if (state.totalDepsEl) {
       state.totalDepsEl.textContent = formatNumber(data.total_dependencies || 0);
     }
+    if (state.pendingResolveEl) {
+      state.pendingResolveEl.textContent = formatNumber(data.pending_dependency_resolutions || 0);
+      state.pendingResolveEl.classList.toggle('text-danger', Number(data.pending_dependency_resolutions || 0) > 0);
+    }
     if (state.finImpactEl) {
       state.finImpactEl.textContent = formatCurrency(data.total_financial_impact || 0);
     }
@@ -1125,6 +1201,10 @@ function initSafeDeleteFlow() {
       state.submitBtn.textContent = resolveActionLabel(data.operation || (state.meta ? state.meta.operation : 'delete'));
     }
 
+    if ((data.can_proceed !== false) && data.requires_dependency_clearance && Number(data.pending_dependency_resolutions || 0) > 0) {
+      setAlert('Resolve the listed dependency actions before final deletion/reversal can proceed.', 'warning');
+    }
+
     syncSubmitEnabled();
   }
 
@@ -1133,6 +1213,7 @@ function initSafeDeleteFlow() {
     state.meta = null;
     state.previewToken = '';
     state.summary = null;
+    state.pendingDependencyAction = false;
     setAlert('', 'info');
     if (state.confirmTextEl) {
       state.confirmTextEl.value = '';
@@ -1157,6 +1238,9 @@ function initSafeDeleteFlow() {
     }
     if (state.totalDepsEl) {
       state.totalDepsEl.textContent = '0';
+    }
+    if (state.pendingResolveEl) {
+      state.pendingResolveEl.textContent = '0';
     }
     if (state.finImpactEl) {
       state.finImpactEl.textContent = formatCurrency(0);
@@ -1183,7 +1267,37 @@ function initSafeDeleteFlow() {
     }
     var hasSummary = !!state.summary;
     var canProceed = hasSummary && state.summary.can_proceed !== false;
-    state.submitBtn.disabled = state.pendingRequest || !hasSummary || !canProceed;
+    var requiresDependencyClearance = hasSummary && !!state.summary.requires_dependency_clearance;
+    var pendingResolutions = hasSummary ? Number(state.summary.pending_dependency_resolutions || 0) : 0;
+    var hasPendingResolutions = requiresDependencyClearance && Number.isFinite(pendingResolutions) && pendingResolutions > 0;
+    var typedText = state.confirmTextEl ? String(state.confirmTextEl.value || '').trim() : '';
+    var typedConfirmed = typedText.toUpperCase() === 'CONFIRM';
+    var checked = !!(state.confirmCheckEl && state.confirmCheckEl.checked);
+    var strongConfirmed = typedConfirmed || checked;
+
+    var reasonReady = true;
+    if (state.meta && state.meta.hasReasonField && state.meta.reasonField && state.form) {
+      reasonReady = String(readFieldValue(state.form, state.meta.reasonField) || '').trim() !== '';
+    } else if (state.reasonWrapEl && !state.reasonWrapEl.classList.contains('d-none')) {
+      reasonReady = !!(state.reasonEl && String(state.reasonEl.value || '').trim());
+    }
+
+    state.submitBtn.disabled = state.pendingRequest || state.pendingDependencyAction || !hasSummary || !canProceed || hasPendingResolutions || !strongConfirmed || !reasonReady;
+    if (state.submitBtn.disabled) {
+      if (!hasSummary) {
+        state.submitBtn.title = 'Load dependency summary first.';
+      } else if (!canProceed) {
+        state.submitBtn.title = 'Action is blocked by dependency rules. Resolve blockers listed above.';
+      } else if (hasPendingResolutions) {
+        state.submitBtn.title = 'Resolve pending dependency actions first.';
+      } else if (!strongConfirmed) {
+        state.submitBtn.title = 'Type CONFIRM or tick the confirmation checkbox.';
+      } else if (!reasonReady) {
+        state.submitBtn.title = 'Reason is required before proceeding.';
+      }
+    } else {
+      state.submitBtn.title = '';
+    }
   }
 
   function resolveMeta(form) {
@@ -1337,6 +1451,115 @@ function initSafeDeleteFlow() {
       });
   }
 
+  function currentDependencyActionReason() {
+    var modalReason = state.reasonEl ? String(state.reasonEl.value || '').trim() : '';
+    if (modalReason) {
+      if (state.meta && state.meta.reasonField && state.form) {
+        var reasonField = ensureHiddenField(state.form, state.meta.reasonField);
+        if (reasonField) {
+          reasonField.value = modalReason;
+        }
+      }
+      return modalReason;
+    }
+    if (state.meta && state.meta.reasonField && state.form) {
+      return String(readFieldValue(state.form, state.meta.reasonField) || '').trim();
+    }
+    return '';
+  }
+
+  function runDependencyAction(button) {
+    if (!button || state.pendingRequest || state.pendingDependencyAction) {
+      return;
+    }
+    if (!state.meta || !state.form) {
+      setAlert('Main delete context is missing. Reopen the summary and retry.', 'danger');
+      return;
+    }
+    if (!window.GacSafeDeleteConfig || !window.GacSafeDeleteConfig.dependencyActionEndpoint) {
+      setAlert('Dependency action endpoint is not configured.', 'danger');
+      return;
+    }
+
+    var entity = String(button.getAttribute('data-entity') || '').trim();
+    var operation = String(button.getAttribute('data-operation') || 'delete').trim();
+    var recordId = String(button.getAttribute('data-record-id') || '').trim();
+    var recordKey = String(button.getAttribute('data-record-key') || '').trim();
+    if (!entity || (!recordId && !recordKey)) {
+      setAlert('Dependency action metadata is incomplete.', 'danger');
+      return;
+    }
+
+    var reason = currentDependencyActionReason();
+    if (!reason) {
+      setAlert('Enter a deletion/reversal reason before resolving dependencies.', 'danger');
+      if (state.reasonWrapEl) {
+        state.reasonWrapEl.classList.remove('d-none');
+      }
+      return;
+    }
+
+    var verb = operation.toLowerCase() === 'reverse' ? 'reverse' : 'delete';
+    if (!window.confirm('Confirm ' + verb + ' for this dependency?')) {
+      return;
+    }
+
+    var csrf = state.meta && state.meta.csrf ? String(state.meta.csrf) : String(readFieldValue(state.form, '_csrf') || '');
+    if (!csrf) {
+      setAlert('CSRF token missing. Refresh the page and retry.', 'danger');
+      return;
+    }
+
+    state.pendingDependencyAction = true;
+    button.disabled = true;
+    syncSubmitEnabled();
+
+    var formData = new FormData();
+    formData.append('_csrf', csrf);
+    formData.append('entity', entity);
+    if (recordKey) {
+      formData.append('record_key', recordKey);
+    } else {
+      formData.append('record_id', recordId);
+    }
+    formData.append('operation', operation);
+    formData.append('reason', reason);
+
+    fetch(String(window.GacSafeDeleteConfig.dependencyActionEndpoint), {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: {
+        'X-Requested-With': 'XMLHttpRequest',
+        'Accept': 'application/json'
+      },
+      body: formData
+    })
+      .then(function (response) {
+        return response.text().then(function (text) {
+          return {
+            ok: response.ok,
+            status: response.status,
+            payload: safeParseJson(text)
+          };
+        });
+      })
+      .then(function (result) {
+        var payload = result.payload || null;
+        if (!payload || payload.ok === false) {
+          throw new Error(payload && payload.message ? String(payload.message) : 'Unable to complete dependency action.');
+        }
+        setAlert(payload.message || 'Dependency action completed successfully.', 'info');
+        openPreviewForForm(state.form, state.meta);
+      })
+      .catch(function (error) {
+        setAlert(error && error.message ? error.message : 'Unable to complete dependency action.', 'danger');
+      })
+      .finally(function () {
+        state.pendingDependencyAction = false;
+        syncSubmitEnabled();
+      });
+  }
+
   function applyAndSubmit() {
     if (!state.form || !state.meta) {
       return;
@@ -1352,7 +1575,7 @@ function initSafeDeleteFlow() {
 
     var typedText = state.confirmTextEl ? String(state.confirmTextEl.value || '').trim() : '';
     var checked = !!(state.confirmCheckEl && state.confirmCheckEl.checked);
-    if (typedText !== 'CONFIRM' && !checked) {
+    if (typedText.toUpperCase() !== 'CONFIRM' && !checked) {
       setAlert('Type CONFIRM or tick the checkbox to continue.', 'danger');
       return;
     }
@@ -1425,6 +1648,27 @@ function initSafeDeleteFlow() {
 
   if (state.submitBtn) {
     state.submitBtn.addEventListener('click', applyAndSubmit);
+  }
+  if (state.confirmTextEl) {
+    state.confirmTextEl.addEventListener('input', syncSubmitEnabled);
+  }
+  if (state.confirmCheckEl) {
+    state.confirmCheckEl.addEventListener('change', syncSubmitEnabled);
+  }
+  if (state.reasonEl) {
+    state.reasonEl.addEventListener('input', syncSubmitEnabled);
+  }
+
+  if (state.groupsEl) {
+    state.groupsEl.addEventListener('click', function (event) {
+      var target = event.target;
+      var button = target && target.closest ? target.closest('button[data-safe-delete-dep-action="1"]') : null;
+      if (!button) {
+        return;
+      }
+      event.preventDefault();
+      runDependencyAction(button);
+    });
   }
 
   modalEl.addEventListener('hidden.bs.modal', function () {

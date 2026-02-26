@@ -1100,6 +1100,45 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       return isFinite(parsed) ? parsed : 0;
     }
 
+    function rowAllowsDecimal(row) {
+      return !row || String(row.getAttribute('data-allow-decimal') || '1') === '1';
+    }
+
+    function normalizeQuantityInput(input, commitValue) {
+      if (!input) {
+        return 0;
+      }
+
+      var row = input.closest('tr');
+      var allowDecimal = rowAllowsDecimal(row);
+      var qty = Math.max(0, parseNumber(input.value));
+      var changed = false;
+
+      if (!allowDecimal) {
+        var wholeQty = Math.max(0, Math.round(qty));
+        if (Math.abs(wholeQty - qty) > 0.00001) {
+          qty = wholeQty;
+          changed = true;
+        } else {
+          qty = wholeQty;
+        }
+      } else {
+        qty = round2(qty);
+      }
+
+      var maxQty = round2(Math.max(0, parseNumber(input.getAttribute('max'))));
+      if (maxQty > 0 && qty > maxQty) {
+        qty = allowDecimal ? maxQty : Math.max(0, Math.floor(maxQty));
+        changed = true;
+      }
+
+      if (changed || commitValue) {
+        input.value = allowDecimal ? qty.toFixed(2) : String(Math.max(0, Math.round(qty)));
+      }
+
+      return qty;
+    }
+
     function formatCurrency(value) {
       return 'INR ' + round2(value).toFixed(2);
     }
@@ -1126,7 +1165,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       }
     }
 
-    function refreshLiveTotals() {
+    function refreshLiveTotals(commitInputs) {
       if (!liveTotalsWrap) {
         return;
       }
@@ -1144,12 +1183,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       var grandTotal = 0;
 
       quantityInputs.forEach(function (input) {
-        var qty = round2(Math.max(0, parseNumber(input.value)));
-        var maxQty = round2(Math.max(0, parseNumber(input.getAttribute('max'))));
-        if (maxQty > 0 && qty > maxQty) {
-          qty = maxQty;
-          input.value = qty.toFixed(2);
-        }
+        var qty = normalizeQuantityInput(input, !!commitInputs);
 
         if (qty <= 0.009) {
           return;
@@ -1273,11 +1307,13 @@ require_once __DIR__ . '/../../includes/sidebar.php';
           tbody.innerHTML = '';
           items.forEach(function (item) {
             var maxQty = Number(item.max_returnable_qty || 0);
-            var disabled = maxQty <= 0 ? 'disabled' : '';
+            var allowDecimal = String(item.allow_decimal_qty ? '1' : '0') === '1';
+            var inputMaxQty = allowDecimal ? maxQty : Math.max(0, Math.floor(maxQty));
+            var disabled = inputMaxQty <= 0 ? 'disabled' : '';
             var unitPrice = Number(item.unit_price || 0);
             var gstRate = Number(item.gst_rate || 0);
             var rowHtml = '' +
-              '<tr data-unit-price=\"' + esc(unitPrice.toFixed(2)) + '\" data-gst-rate=\"' + esc(gstRate.toFixed(2)) + '\">' +
+              '<tr data-unit-price=\"' + esc(unitPrice.toFixed(2)) + '\" data-gst-rate=\"' + esc(gstRate.toFixed(2)) + '\" data-allow-decimal=\"' + (allowDecimal ? '1' : '0') + '\">' +
               '<td>' + esc(item.description || '') +
                 '<input type=\"hidden\" name=\"item_source_id[]\" value=\"' + esc(item.source_item_id || 0) + '\">' +
               '</td>' +
@@ -1286,11 +1322,11 @@ require_once __DIR__ . '/../../includes/sidebar.php';
               '<td class=\"text-end\">' + esc(maxQty.toFixed(2)) + '</td>' +
               '<td class=\"text-end\">' + esc(unitPrice.toFixed(2)) + '</td>' +
               '<td class=\"text-end\">' + esc(gstRate.toFixed(2)) + '</td>' +
-              '<td><input type=\"number\" step=\"0.01\" min=\"0\" max=\"' + esc(maxQty.toFixed(2)) + '\" class=\"form-control form-control-sm\" name=\"item_quantity[]\" value=\"0\" ' + disabled + '></td>' +
+              '<td><input type=\"number\" step=\"' + (allowDecimal ? '0.01' : '1') + '\" min=\"0\" max=\"' + esc((allowDecimal ? inputMaxQty.toFixed(2) : String(inputMaxQty))) + '\" class=\"form-control form-control-sm\" name=\"item_quantity[]\" value=\"' + (allowDecimal ? '0.00' : '0') + '\" ' + disabled + '></td>' +
               '</tr>';
             tbody.insertAdjacentHTML('beforeend', rowHtml);
           });
-          refreshLiveTotals();
+          refreshLiveTotals(true);
         })
         .catch(function (error) {
           summary.classList.remove('d-none');
@@ -1310,13 +1346,13 @@ require_once __DIR__ . '/../../includes/sidebar.php';
     lineTable.addEventListener('input', function (event) {
       var target = event && event.target;
       if (target && target.name === 'item_quantity[]') {
-        refreshLiveTotals();
+        refreshLiveTotals(false);
       }
     });
     lineTable.addEventListener('change', function (event) {
       var target = event && event.target;
       if (target && target.name === 'item_quantity[]') {
-        refreshLiveTotals();
+        refreshLiveTotals(true);
       }
     });
 

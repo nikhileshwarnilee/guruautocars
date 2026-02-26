@@ -293,6 +293,11 @@ function returns_round(float $value): float
     return round($value, 2);
 }
 
+function returns_value_has_fraction(float $value): bool
+{
+    return abs($value - round($value)) > 0.00001;
+}
+
 function returns_generate_number(PDO $pdo, int $companyId, int $garageId, string $returnDate): array
 {
     if (!returns_module_ready()) {
@@ -668,6 +673,18 @@ function returns_create_rma(
             $source = $sourceLookup[$sourceItemId] ?? null;
             if (!is_array($source)) {
                 throw new RuntimeException('Invalid source line selected.');
+            }
+
+            $partUnitCode = part_unit_normalize_code((string) ($source['part_unit'] ?? ''));
+            if (!part_unit_allows_decimal($companyId, $partUnitCode) && returns_value_has_fraction($quantity)) {
+                $displayUnitCode = $partUnitCode !== '' ? $partUnitCode : 'PCS';
+                $displayName = trim((string) ($source['part_name'] ?? ''));
+                if ($displayName === '') {
+                    $displayName = trim((string) ($source['description'] ?? 'Item'));
+                }
+                throw new RuntimeException(
+                    'Return quantity for ' . $displayName . ' must be a whole number (' . $displayUnitCode . ').'
+                );
             }
 
             $maxQty = returns_round((float) ($source['max_returnable_qty'] ?? 0));

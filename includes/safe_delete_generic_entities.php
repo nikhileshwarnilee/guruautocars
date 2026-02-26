@@ -172,7 +172,7 @@ function safe_delete_generic_entity_configs(): array
                 safe_delete_make_item('Role Permission Mappings', null, null, $roleCount > 0 ? 'LINKED' : 'NONE')
             ], 0.0);
             $permKey = strtolower(trim((string) ($row['perm_key'] ?? '')));
-            if (in_array($permKey, ['record.delete', 'financial.reverse'], true)) {
+            if (in_array($permKey, ['record.delete', 'financial.reverse', 'dependency.resolve'], true)) {
                 $summary['blockers'][] = 'Protected global permission cannot be deleted. Set it INACTIVE only if required.';
             }
         },
