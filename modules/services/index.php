@@ -248,6 +248,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if ($action === 'change_status') {
         $serviceId = post_int('service_id');
         $nextStatus = normalize_status_code((string) ($_POST['next_status'] ?? 'INACTIVE'));
+        $safeDeleteValidation = null;
+        if ($nextStatus === 'DELETED') {
+            $safeDeleteValidation = safe_delete_validate_post_confirmation('service_master', $serviceId, [
+                'operation' => 'delete',
+                'reason_field' => 'deletion_reason',
+            ]);
+        }
         $beforeStatusStmt = db()->prepare(
             'SELECT status_code
              FROM services
@@ -284,6 +291,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'status_code' => $nextStatus,
             ],
         ]);
+        if ($nextStatus === 'DELETED' && is_array($safeDeleteValidation)) {
+            safe_delete_log_cascade('service_master', 'delete', $serviceId, $safeDeleteValidation, [
+                'metadata' => [
+                    'company_id' => $companyId,
+                    'requested_status' => 'DELETED',
+                    'applied_status' => $nextStatus,
+                ],
+            ]);
+        }
         flash_set('service_success', 'Service status updated.', 'success');
         redirect('modules/services/index.php');
     }
@@ -587,7 +603,13 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                             <button type="submit" class="btn btn-sm btn-outline-secondary"><?= ((string) $service['status_code'] === 'ACTIVE') ? 'Inactivate' : 'Activate'; ?></button>
                           </form>
                           <?php if ((string) $service['status_code'] !== 'DELETED'): ?>
-                            <form method="post" class="d-inline" data-confirm="Soft delete this service?">
+                            <form method="post"
+                                  class="d-inline"
+                                  data-safe-delete
+                                  data-safe-delete-entity="service_master"
+                                  data-safe-delete-record-field="service_id"
+                                  data-safe-delete-operation="delete"
+                                  data-safe-delete-reason-field="deletion_reason">
                               <?= csrf_field(); ?>
                               <input type="hidden" name="_action" value="change_status" />
                               <input type="hidden" name="service_id" value="<?= (int) $service['id']; ?>" />

@@ -389,6 +389,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if ($action === 'change_status') {
         $companyId = post_int('company_id');
         $nextStatus = normalize_status_code((string) ($_POST['next_status'] ?? 'INACTIVE'));
+        $safeDeleteValidation = null;
 
         if ($companyId <= 0) {
             flash_set('company_error', 'Invalid company selected.', 'danger');
@@ -403,6 +404,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         if (!$isSuperAdmin && $nextStatus === 'DELETED') {
             flash_set('company_error', 'Only Super Admin can delete a company.', 'danger');
             redirect('modules/organization/companies.php');
+        }
+        if ($nextStatus === 'DELETED') {
+            $safeDeleteValidation = safe_delete_validate_post_confirmation('org_company', $companyId, [
+                'operation' => 'delete',
+                'reason_field' => 'deletion_reason',
+            ]);
         }
 
         $legacyStatus = $nextStatus === 'ACTIVE' ? 'active' : 'inactive';
@@ -440,6 +447,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'status_code' => $nextStatus,
             ],
         ]);
+        if ($nextStatus === 'DELETED' && is_array($safeDeleteValidation)) {
+            safe_delete_log_cascade('org_company', 'delete', $companyId, $safeDeleteValidation, [
+                'metadata' => [
+                    'requested_status' => 'DELETED',
+                    'applied_status' => $nextStatus,
+                ],
+            ]);
+        }
         flash_set('company_success', 'Company status updated.', 'success');
         redirect('modules/organization/companies.php');
     }
@@ -690,7 +705,13 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                           </form>
                         <?php endif; ?>
                         <?php if ($isSuperAdmin && (string) $company['status_code'] !== 'DELETED'): ?>
-                          <form method="post" class="d-inline" data-confirm="Soft delete this company?">
+                          <form method="post"
+                                class="d-inline"
+                                data-safe-delete
+                                data-safe-delete-entity="org_company"
+                                data-safe-delete-record-field="company_id"
+                                data-safe-delete-operation="delete"
+                                data-safe-delete-reason-field="deletion_reason">
                             <?= csrf_field(); ?>
                             <input type="hidden" name="_action" value="change_status" />
                             <input type="hidden" name="company_id" value="<?= (int) $company['id']; ?>" />

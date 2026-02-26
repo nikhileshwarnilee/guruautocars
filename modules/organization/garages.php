@@ -219,6 +219,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if ($action === 'change_status') {
         $garageId = post_int('garage_id');
         $nextStatus = normalize_status_code((string) ($_POST['next_status'] ?? 'INACTIVE'));
+        $safeDeleteValidation = null;
 
         if ($garageId <= 0 || $companyId <= 0) {
             flash_set('garage_error', 'Invalid garage selected.', 'danger');
@@ -233,6 +234,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         if (!$isSuperAdmin && $nextStatus === 'DELETED') {
             flash_set('garage_error', 'Only Super Admin can delete garages.', 'danger');
             redirect('modules/organization/garages.php?company_id=' . $companyId);
+        }
+        if ($nextStatus === 'DELETED') {
+            $safeDeleteValidation = safe_delete_validate_post_confirmation('org_garage', $garageId, [
+                'operation' => 'delete',
+                'reason_field' => 'deletion_reason',
+            ]);
         }
 
         $legacyStatus = $nextStatus === 'ACTIVE' ? 'active' : 'inactive';
@@ -278,6 +285,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'status_code' => $nextStatus,
             ],
         ]);
+        if ($nextStatus === 'DELETED' && is_array($safeDeleteValidation)) {
+            safe_delete_log_cascade('org_garage', 'delete', $garageId, $safeDeleteValidation, [
+                'metadata' => [
+                    'company_id' => $companyId,
+                    'requested_status' => 'DELETED',
+                    'applied_status' => $nextStatus,
+                ],
+            ]);
+        }
         flash_set('garage_success', 'Garage status updated.', 'success');
         redirect('modules/organization/garages.php?company_id=' . $companyId);
     }
@@ -490,7 +506,13 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                             </form>
                           <?php endif; ?>
                           <?php if ($isSuperAdmin && $garageStatusCode !== 'DELETED'): ?>
-                            <form method="post" class="d-inline" data-confirm="Soft delete this garage?">
+                            <form method="post"
+                                  class="d-inline"
+                                  data-safe-delete
+                                  data-safe-delete-entity="org_garage"
+                                  data-safe-delete-record-field="garage_id"
+                                  data-safe-delete-operation="delete"
+                                  data-safe-delete-reason-field="deletion_reason">
                               <?= csrf_field(); ?>
                               <input type="hidden" name="_action" value="change_status" />
                               <input type="hidden" name="company_id" value="<?= (int) $selectedCompanyId; ?>" />

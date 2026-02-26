@@ -142,10 +142,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if ($action === 'change_status') {
         $categoryId = post_int('category_id');
         $nextStatus = normalize_status_code((string) ($_POST['next_status'] ?? 'INACTIVE'));
+        $safeDeleteValidation = null;
 
         if ($categoryId <= 0) {
             flash_set('service_category_error', 'Invalid category selected.', 'danger');
             redirect('modules/services/categories.php');
+        }
+        if ($nextStatus === 'DELETED') {
+            $safeDeleteValidation = safe_delete_validate_post_confirmation('service_category_master', $categoryId, [
+                'operation' => 'delete',
+                'reason_field' => 'deletion_reason',
+            ]);
         }
 
         $stmt = db()->prepare(
@@ -179,6 +186,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'source' => 'UI',
             'after' => ['status_code' => $nextStatus],
         ]);
+        if ($nextStatus === 'DELETED' && is_array($safeDeleteValidation)) {
+            safe_delete_log_cascade('service_category_master', 'delete', $categoryId, $safeDeleteValidation, [
+                'metadata' => [
+                    'company_id' => $companyId,
+                    'requested_status' => 'DELETED',
+                    'applied_status' => $nextStatus,
+                ],
+            ]);
+        }
 
         flash_set('service_category_success', 'Service category status updated.', 'success');
         redirect('modules/services/categories.php');
@@ -304,7 +320,13 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                           <button type="submit" class="btn btn-sm btn-outline-secondary"><?= ((string) $category['status_code'] === 'ACTIVE') ? 'Inactivate' : 'Activate'; ?></button>
                         </form>
                         <?php if ((string) $category['status_code'] !== 'DELETED'): ?>
-                          <form method="post" class="d-inline" data-confirm="Soft delete this category? Linked services will become Uncategorized.">
+                          <form method="post"
+                                class="d-inline"
+                                data-safe-delete
+                                data-safe-delete-entity="service_category_master"
+                                data-safe-delete-record-field="category_id"
+                                data-safe-delete-operation="delete"
+                                data-safe-delete-reason-field="deletion_reason">
                             <?= csrf_field(); ?>
                             <input type="hidden" name="_action" value="change_status" />
                             <input type="hidden" name="category_id" value="<?= (int) $category['id']; ?>" />

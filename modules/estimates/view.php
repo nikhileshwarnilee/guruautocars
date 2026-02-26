@@ -507,6 +507,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             flash_set('estimate_error', 'Invalid service line selected.', 'danger');
             redirect('modules/estimates/view.php?id=' . $estimateId);
         }
+        $safeDeleteValidation = safe_delete_validate_post_confirmation('estimate_service_line', $lineId, [
+            'operation' => 'delete',
+            'reason_field' => 'deletion_reason',
+        ]);
 
         $deleteStmt = db()->prepare(
             'DELETE es
@@ -527,6 +531,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         estimate_recalculate_total($estimateId);
         estimate_append_history($estimateId, 'SERVICE_REMOVE', null, null, 'Service line removed');
         log_audit('estimates', 'delete_service', $estimateId, 'Deleted service line #' . $lineId);
+        safe_delete_log_cascade('estimate_service_line', 'delete', $lineId, $safeDeleteValidation, [
+            'metadata' => [
+                'estimate_id' => $estimateId,
+                'company_id' => $companyId,
+                'garage_id' => $garageId,
+            ],
+        ]);
 
         flash_set('estimate_success', 'Service line removed.', 'success');
         redirect('modules/estimates/view.php?id=' . $estimateId);
@@ -662,6 +673,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             flash_set('estimate_error', 'Invalid part line selected.', 'danger');
             redirect('modules/estimates/view.php?id=' . $estimateId);
         }
+        $safeDeleteValidation = safe_delete_validate_post_confirmation('estimate_part_line', $lineId, [
+            'operation' => 'delete',
+            'reason_field' => 'deletion_reason',
+        ]);
 
         $deleteStmt = db()->prepare(
             'DELETE ep
@@ -682,6 +697,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         estimate_recalculate_total($estimateId);
         estimate_append_history($estimateId, 'PART_REMOVE', null, null, 'Part line removed');
         log_audit('estimates', 'delete_part', $estimateId, 'Deleted part line #' . $lineId);
+        safe_delete_log_cascade('estimate_part_line', 'delete', $lineId, $safeDeleteValidation, [
+            'metadata' => [
+                'estimate_id' => $estimateId,
+                'company_id' => $companyId,
+                'garage_id' => $garageId,
+            ],
+        ]);
 
         flash_set('estimate_success', 'Part line removed.', 'success');
         redirect('modules/estimates/view.php?id=' . $estimateId);
@@ -948,11 +970,17 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                   <td>
                     <?php if ($canEdit && $editable): ?>
                       <button class="btn btn-sm btn-outline-primary" type="button" data-bs-toggle="collapse" data-bs-target="#service-edit-<?= (int) $line['id']; ?>">Edit</button>
-                      <form method="post" class="d-inline">
+                      <form method="post"
+                            class="d-inline"
+                            data-safe-delete
+                            data-safe-delete-entity="estimate_service_line"
+                            data-safe-delete-record-field="estimate_service_id"
+                            data-safe-delete-operation="delete"
+                            data-safe-delete-reason-field="deletion_reason">
                         <?= csrf_field(); ?>
                         <input type="hidden" name="_action" value="delete_service" />
                         <input type="hidden" name="estimate_service_id" value="<?= (int) $line['id']; ?>" />
-                        <button type="submit" class="btn btn-sm btn-outline-danger" onclick="return confirm('Remove this service line?');">Remove</button>
+                        <button type="submit" class="btn btn-sm btn-outline-danger">Remove</button>
                       </form>
                     <?php else: ?><span class="text-muted">Locked</span><?php endif; ?>
                   </td>
@@ -1022,11 +1050,17 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                   <td>
                     <?php if ($canEdit && $editable): ?>
                       <button class="btn btn-sm btn-outline-primary" type="button" data-bs-toggle="collapse" data-bs-target="#part-edit-<?= (int) $line['id']; ?>">Edit</button>
-                      <form method="post" class="d-inline">
+                      <form method="post"
+                            class="d-inline"
+                            data-safe-delete
+                            data-safe-delete-entity="estimate_part_line"
+                            data-safe-delete-record-field="estimate_part_id"
+                            data-safe-delete-operation="delete"
+                            data-safe-delete-reason-field="deletion_reason">
                         <?= csrf_field(); ?>
                         <input type="hidden" name="_action" value="delete_part" />
                         <input type="hidden" name="estimate_part_id" value="<?= (int) $line['id']; ?>" />
-                        <button type="submit" class="btn btn-sm btn-outline-danger" onclick="return confirm('Remove this part line?');">Remove</button>
+                        <button type="submit" class="btn btn-sm btn-outline-danger">Remove</button>
                       </form>
                     <?php else: ?><span class="text-muted">Locked</span><?php endif; ?>
                   </td>

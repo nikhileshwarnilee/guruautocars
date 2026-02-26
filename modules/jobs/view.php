@@ -658,6 +658,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
 
         $photoId = post_int('photo_id');
+        $safeDeleteValidation = safe_delete_validate_post_confirmation('job_condition_photo', $photoId, [
+            'operation' => 'delete',
+            'reason_field' => 'deletion_reason',
+        ]);
         $deleteResult = job_condition_photo_delete($photoId, $companyId, $garageId);
         if (!(bool) ($deleteResult['ok'] ?? false)) {
             flash_set('job_error', (string) ($deleteResult['message'] ?? 'Unable to delete condition photo.'), 'danger');
@@ -674,6 +678,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'source' => 'UI',
             'metadata' => [
                 'photo_id' => $photoId,
+                'file_deleted' => (bool) ($deleteResult['file_deleted'] ?? false),
+            ],
+        ]);
+        safe_delete_log_cascade('job_condition_photo', 'delete', $photoId, $safeDeleteValidation, [
+            'metadata' => [
+                'company_id' => $companyId,
+                'garage_id' => $garageId,
+                'job_id' => $jobId,
                 'file_deleted' => (bool) ($deleteResult['file_deleted'] ?? false),
             ],
         ]);
@@ -914,6 +926,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
 
         $documentId = post_int('insurance_document_id');
+        $safeDeleteValidation = safe_delete_validate_post_confirmation('job_insurance_document', $documentId, [
+            'operation' => 'delete',
+            'reason_field' => 'deletion_reason',
+        ]);
         $deleteResult = job_insurance_delete_document($documentId, $companyId, $garageId);
         if (!(bool) ($deleteResult['ok'] ?? false)) {
             flash_set('job_error', (string) ($deleteResult['message'] ?? 'Unable to delete insurance document.'), 'danger');
@@ -936,6 +952,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'source' => 'UI',
             'metadata' => [
                 'document_id' => $documentId,
+                'file_deleted' => (bool) ($deleteResult['file_deleted'] ?? false),
+            ],
+        ]);
+        safe_delete_log_cascade('job_insurance_document', 'delete', $documentId, $safeDeleteValidation, [
+            'metadata' => [
+                'company_id' => $companyId,
+                'garage_id' => $garageId,
+                'job_id' => $jobId,
                 'file_deleted' => (bool) ($deleteResult['file_deleted'] ?? false),
             ],
         ]);
@@ -1942,6 +1966,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             flash_set('job_error', 'Invalid labor line selected.', 'danger');
             redirect('modules/jobs/view.php?id=' . $jobId);
         }
+        $safeDeleteValidation = safe_delete_validate_post_confirmation('job_labor_line', $laborId, [
+            'operation' => 'delete',
+            'reason_field' => 'deletion_reason',
+        ]);
 
         if ($outsourcedModuleReady) {
             $linkedWork = fetch_linked_outsourced_work($companyId, $garageId, $laborId);
@@ -1981,6 +2009,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             ['labor_id' => $laborId]
         );
         log_audit('job_cards', 'delete_labor', $jobId, 'Deleted labor line #' . $laborId);
+        safe_delete_log_cascade('job_labor_line', 'delete', $laborId, $safeDeleteValidation, [
+            'metadata' => [
+                'company_id' => $companyId,
+                'garage_id' => $garageId,
+                'job_id' => $jobId,
+            ],
+        ]);
 
         flash_set('job_success', 'Labor line removed.', 'success');
         redirect('modules/jobs/view.php?id=' . $jobId);
@@ -2284,6 +2319,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             flash_set('job_error', 'Invalid part line selected.', 'danger');
             redirect('modules/jobs/view.php?id=' . $jobId);
         }
+        $safeDeleteValidation = safe_delete_validate_post_confirmation('job_part_line', $jobPartId, [
+            'operation' => 'delete',
+            'reason_field' => 'deletion_reason',
+        ]);
 
         $deleteStmt = db()->prepare(
             'DELETE jp
@@ -2311,6 +2350,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             ['job_part_id' => $jobPartId]
         );
         log_audit('job_cards', 'delete_part', $jobId, 'Deleted part line #' . $jobPartId);
+        safe_delete_log_cascade('job_part_line', 'delete', $jobPartId, $safeDeleteValidation, [
+            'metadata' => [
+                'company_id' => $companyId,
+                'garage_id' => $garageId,
+                'job_id' => $jobId,
+            ],
+        ]);
 
         flash_set('job_success', 'Part line removed.', 'success');
         redirect('modules/jobs/view.php?id=' . $jobId);
@@ -2775,7 +2821,13 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                             <div class="small mt-1"><?= e((string) $photo['note']); ?></div>
                           <?php endif; ?>
                           <?php if ($canConditionPhotoUpload): ?>
-                            <form method="post" class="mt-2" data-confirm="Delete this condition photo?">
+                            <form method="post"
+                                  class="mt-2"
+                                  data-safe-delete
+                                  data-safe-delete-entity="job_condition_photo"
+                                  data-safe-delete-record-field="photo_id"
+                                  data-safe-delete-operation="delete"
+                                  data-safe-delete-reason-field="deletion_reason">
                               <?= csrf_field(); ?>
                               <input type="hidden" name="_action" value="delete_condition_photo">
                               <input type="hidden" name="photo_id" value="<?= (int) ($photo['id'] ?? 0); ?>">
@@ -2846,7 +2898,12 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                             <?php endif; ?>
                           </div>
                           <?php if ($canEdit): ?>
-                            <form method="post" data-confirm="Delete this insurance document?">
+                            <form method="post"
+                                  data-safe-delete
+                                  data-safe-delete-entity="job_insurance_document"
+                                  data-safe-delete-record-field="insurance_document_id"
+                                  data-safe-delete-operation="delete"
+                                  data-safe-delete-reason-field="deletion_reason">
                               <?= csrf_field(); ?>
                               <input type="hidden" name="_action" value="delete_insurance_document">
                               <input type="hidden" name="insurance_document_id" value="<?= (int) ($document['id'] ?? 0); ?>">
@@ -3251,11 +3308,17 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                             >
                               Edit
                             </button>
-                            <form method="post" class="d-inline">
+                            <form method="post"
+                                  class="d-inline"
+                                  data-safe-delete
+                                  data-safe-delete-entity="job_labor_line"
+                                  data-safe-delete-record-field="labor_id"
+                                  data-safe-delete-operation="delete"
+                                  data-safe-delete-reason-field="deletion_reason">
                               <?= csrf_field(); ?>
                               <input type="hidden" name="_action" value="delete_labor">
                               <input type="hidden" name="labor_id" value="<?= (int) $line['id']; ?>">
-                              <button type="submit" class="btn btn-sm btn-outline-danger" onclick="return confirm('Remove this labor line?');">Remove</button>
+                              <button type="submit" class="btn btn-sm btn-outline-danger">Remove</button>
                             </form>
                             <?php if ($lineIsOutsourced): ?>
                               <?php if ($outsourcedModuleReady && $lineOutsourcedWorkId > 0): ?>
@@ -3464,11 +3527,17 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                             >
                               Edit
                             </button>
-                            <form method="post" class="d-inline">
+                            <form method="post"
+                                  class="d-inline"
+                                  data-safe-delete
+                                  data-safe-delete-entity="job_part_line"
+                                  data-safe-delete-record-field="job_part_id"
+                                  data-safe-delete-operation="delete"
+                                  data-safe-delete-reason-field="deletion_reason">
                               <?= csrf_field(); ?>
                               <input type="hidden" name="_action" value="delete_part">
                               <input type="hidden" name="job_part_id" value="<?= (int) $line['id']; ?>">
-                              <button type="submit" class="btn btn-sm btn-outline-danger" onclick="return confirm('Remove this part line?');">Remove</button>
+                              <button type="submit" class="btn btn-sm btn-outline-danger">Remove</button>
                             </form>
                           <?php else: ?>
                             <span class="text-muted">Locked</span>

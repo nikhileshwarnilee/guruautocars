@@ -527,9 +527,27 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $id = post_int('id');
         $nextStatus = normalize_status_code((string) ($_POST['next_status'] ?? 'INACTIVE'));
         $table = vis_table_for_entity($entity);
+        $safeDeleteValidation = null;
+        $safeDeleteEntityMap = [
+            'brand' => 'vis_catalog_brand',
+            'model' => 'vis_catalog_model',
+            'variant' => 'vis_catalog_variant',
+            'spec' => 'vis_catalog_spec',
+        ];
+        $safeDeleteEntity = (string) ($safeDeleteEntityMap[$entity] ?? '');
         if ($id <= 0 || $table === null) {
             flash_set('vis_error', 'Invalid status payload.', 'danger');
             redirect('modules/vis/catalog.php');
+        }
+        if ($nextStatus === 'DELETED') {
+            if ($safeDeleteEntity === '') {
+                flash_set('vis_error', 'Safe delete mapping is not configured for VIS entity.', 'danger');
+                redirect('modules/vis/catalog.php');
+            }
+            $safeDeleteValidation = safe_delete_validate_post_confirmation($safeDeleteEntity, $id, [
+                'operation' => 'delete',
+                'reason_field' => 'deletion_reason',
+            ]);
         }
 
         $statusMeta = vis_catalog_resolve_status(db(), $entity, $id, $nextStatus, $companyId, $garageId);
@@ -554,6 +572,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'dependency_job_links' => (int) ($statusMeta['job_links'] ?? 0),
             ],
         ]);
+        if ($nextStatus === 'DELETED' && is_array($safeDeleteValidation) && $safeDeleteEntity !== '') {
+            safe_delete_log_cascade($safeDeleteEntity, 'delete', $id, $safeDeleteValidation, [
+                'metadata' => [
+                    'entity' => $entity,
+                    'requested_status' => $nextStatus,
+                    'applied_status' => $resolvedStatus,
+                    'dependency_part_links' => (int) ($statusMeta['part_links'] ?? 0),
+                    'dependency_job_links' => (int) ($statusMeta['job_links'] ?? 0),
+                ],
+            ]);
+        }
         flash_set('vis_success', 'Status updated.', 'success');
         if (($statusMeta['blocked'] ?? false) && !empty($statusMeta['message'])) {
             flash_set('vis_warning', (string) $statusMeta['message'], 'warning');
@@ -856,7 +885,12 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 <div class="modal fade" id="visDeleteModal" tabindex="-1" aria-hidden="true">
   <div class="modal-dialog">
     <div class="modal-content">
-      <form method="post">
+      <form method="post"
+            data-safe-delete
+            data-safe-delete-entity-field="safe_delete_entity"
+            data-safe-delete-record-field="id"
+            data-safe-delete-operation="delete"
+            data-safe-delete-reason-field="deletion_reason">
         <div class="modal-header bg-danger-subtle">
           <h5 class="modal-title">Delete VIS Record</h5>
           <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
@@ -865,6 +899,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
           <?= csrf_field(); ?>
           <input type="hidden" name="_action" value="change_status" />
           <input type="hidden" name="entity" id="vis-delete-entity" />
+          <input type="hidden" name="safe_delete_entity" id="vis-delete-safe-entity" />
           <input type="hidden" name="id" id="vis-delete-id" />
           <input type="hidden" name="next_status" value="DELETED" />
           <div class="mb-3">
@@ -901,6 +936,13 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       }
 
       setValue('vis-delete-entity', trigger.getAttribute('data-entity'));
+      var entity = trigger.getAttribute('data-entity') || '';
+      var safeEntity = '';
+      if (entity === 'brand') safeEntity = 'vis_catalog_brand';
+      if (entity === 'model') safeEntity = 'vis_catalog_model';
+      if (entity === 'variant') safeEntity = 'vis_catalog_variant';
+      if (entity === 'spec') safeEntity = 'vis_catalog_spec';
+      setValue('vis-delete-safe-entity', safeEntity);
       setValue('vis-delete-id', trigger.getAttribute('data-record-id'));
       setValue('vis-delete-label', trigger.getAttribute('data-record-label'));
     });

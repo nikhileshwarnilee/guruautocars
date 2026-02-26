@@ -7,6 +7,7 @@ if (!defined('SAFE_DELETE_PREVIEW_TTL_SECONDS')) {
 if (!defined('SAFE_DELETE_GROUP_ITEM_LIMIT')) {
     define('SAFE_DELETE_GROUP_ITEM_LIMIT', 25);
 }
+require_once __DIR__ . '/safe_delete_generic_entities.php';
 
 function safe_delete_normalize_entity(string $entity): string
 {
@@ -17,7 +18,7 @@ function safe_delete_normalize_entity(string $entity): string
 
 function safe_delete_supported_entities(): array
 {
-    return [
+    $entities = [
         'invoice',
         'invoice_payment',
         'billing_advance',
@@ -38,12 +39,19 @@ function safe_delete_supported_entities(): array
         'payroll_loan_payment',
         'payroll_salary_entry',
         'payroll_salary_payment',
+        'inventory_unit',
     ];
+
+    return array_values(array_unique(array_merge($entities, array_keys(safe_delete_generic_entity_configs()))));
 }
 
 function safe_delete_entity_label(string $entity): string
 {
     $entity = safe_delete_normalize_entity($entity);
+    $genericConfig = safe_delete_generic_entity_configs()[$entity] ?? null;
+    if (is_array($genericConfig) && trim((string) ($genericConfig['label'] ?? '')) !== '') {
+        return trim((string) $genericConfig['label']);
+    }
     return match ($entity) {
         'invoice' => 'Invoice',
         'invoice_payment' => 'Invoice Payment',
@@ -65,6 +73,7 @@ function safe_delete_entity_label(string $entity): string
         'payroll_loan_payment' => 'Payroll Loan Payment',
         'payroll_salary_entry' => 'Payroll Salary Entry',
         'payroll_salary_payment' => 'Payroll Salary Payment',
+        'inventory_unit' => 'Part Unit',
         default => ucwords(str_replace('_', ' ', $entity)),
     };
 }
@@ -219,6 +228,13 @@ function safe_delete_summary_base(string $entity, int $recordId, string $operati
     ];
 }
 
+function safe_delete_summary_base_key(string $entity, string $recordKey, string $operation = 'delete'): array
+{
+    $summary = safe_delete_summary_base($entity, 0, $operation);
+    $summary['record_key'] = trim($recordKey);
+    return $summary;
+}
+
 function safe_delete_summary_finalize(array $summary): array
 {
     $groups = [];
@@ -282,6 +298,7 @@ function safe_delete_compact_summary_for_token(array $summary): array
     return [
         'entity' => (string) ($summary['entity'] ?? ''),
         'record_id' => (int) ($summary['record_id'] ?? 0),
+        'record_key' => trim((string) ($summary['record_key'] ?? '')),
         'operation' => (string) ($summary['operation'] ?? 'delete'),
         'main_record' => [
             'label' => (string) (($summary['main_record']['label'] ?? '') ?: ''),
@@ -310,9 +327,10 @@ function safe_delete_issue_preview_token(array $summary): string
 {
     $entity = safe_delete_normalize_entity((string) ($summary['entity'] ?? ''));
     $recordId = (int) ($summary['record_id'] ?? 0);
+    $recordKey = trim((string) ($summary['record_key'] ?? ''));
     $operation = strtolower(trim((string) ($summary['operation'] ?? 'delete')));
 
-    if ($entity === '' || $recordId <= 0) {
+    if ($entity === '' || ($recordId <= 0 && $recordKey === '')) {
         throw new RuntimeException('Unable to issue safe-delete preview token for invalid summary.');
     }
 
@@ -326,6 +344,7 @@ function safe_delete_issue_preview_token(array $summary): string
     $_SESSION[safe_delete_preview_store_key()][$token] = [
         'entity' => $entity,
         'record_id' => $recordId,
+        'record_key' => $recordKey,
         'operation' => $operation !== '' ? $operation : 'delete',
         'summary' => $compactSummary,
         'user_id' => (int) ($_SESSION['user_id'] ?? 0),
@@ -459,6 +478,100 @@ function safe_delete_validate_post_confirmation(string $entity, int $recordId, a
         'token' => $previewToken,
         'entity' => $entity,
         'record_id' => $recordId,
+        'record_key' => trim((string) ($payload['record_key'] ?? '')),
+        'operation' => strtolower((string) ($payload['operation'] ?? $expectedOperation)),
+        'summary' => $summary,
+        'reason' => $reason,
+        'confirm_text' => $confirmText,
+        'confirm_checked' => $confirmChecked,
+    ];
+}
+
+function safe_delete_validate_post_confirmation_key(string $entity, string $recordKey, array $options = []): array
+{
+    $entity = safe_delete_normalize_entity($entity);
+    $recordKey = trim($recordKey);
+    $expectedOperation = strtolower(trim((string) ($options['operation'] ?? 'delete')));
+    $reasonField = trim((string) ($options['reason_field'] ?? ''));
+    $allowCheckboxOnly = (bool) ($options['allow_checkbox_only'] ?? true);
+    $consumeToken = (bool) ($options['consume_token'] ?? true);
+
+    if ($entity === '' || $recordKey === '') {
+        throw new RuntimeException('Invalid safe-delete validation scope.');
+    }
+
+    safe_delete_require_global_permissions($entity);
+
+    $previewToken = trim((string) ($_POST['_safe_delete_preview_token'] ?? ''));
+    if ($previewToken === '') {
+        throw new RuntimeException('Deletion impact preview is required before confirmation.');
+    }
+
+    $payload = safe_delete_get_preview_token_payload($previewToken);
+    if (!is_array($payload)) {
+        throw new RuntimeException('Deletion preview expired. Open the impact summary again and confirm.');
+    }
+
+    $createdAt = (int) ($payload['created_at'] ?? 0);
+    if ($createdAt <= 0 || (time() - $createdAt) > SAFE_DELETE_PREVIEW_TTL_SECONDS) {
+        safe_delete_consume_preview_token($previewToken);
+        throw new RuntimeException('Deletion preview expired. Open the impact summary again and confirm.');
+    }
+
+    if ((int) ($payload['user_id'] ?? 0) !== (int) ($_SESSION['user_id'] ?? 0)
+        || (int) ($payload['company_id'] ?? 0) !== active_company_id()
+        || (int) ($payload['garage_id'] ?? 0) !== active_garage_id()
+    ) {
+        safe_delete_consume_preview_token($previewToken);
+        throw new RuntimeException('Deletion preview scope changed. Re-open the impact summary and retry.');
+    }
+
+    if (safe_delete_normalize_entity((string) ($payload['entity'] ?? '')) !== $entity
+        || trim((string) ($payload['record_key'] ?? '')) !== $recordKey
+    ) {
+        safe_delete_consume_preview_token($previewToken);
+        throw new RuntimeException('Deletion preview does not match the selected record.');
+    }
+
+    if ($expectedOperation !== '' && strtolower((string) ($payload['operation'] ?? '')) !== $expectedOperation) {
+        safe_delete_consume_preview_token($previewToken);
+        throw new RuntimeException('Deletion preview action does not match this request.');
+    }
+
+    $confirmText = trim((string) ($_POST['_safe_delete_confirm_text'] ?? ''));
+    $confirmChecked = (string) ($_POST['_safe_delete_confirm_checked'] ?? '') === '1';
+    $typedConfirmed = $confirmText === 'CONFIRM';
+    if (!$typedConfirmed && !($allowCheckboxOnly && $confirmChecked)) {
+        throw new RuntimeException('Strong confirmation is required. Type CONFIRM or tick the confirmation checkbox.');
+    }
+
+    $reason = '';
+    if ($reasonField !== '') {
+        $reason = post_string($reasonField, 255);
+        if ($reason === '') {
+            throw new RuntimeException('A deletion/reversal reason is required.');
+        }
+    }
+
+    $summary = is_array($payload['summary'] ?? null) ? (array) $payload['summary'] : [];
+    if (!(bool) ($summary['can_proceed'] ?? false)) {
+        $blockers = array_values(array_filter(array_map('trim', (array) ($summary['blockers'] ?? []))));
+        $message = 'Deletion is blocked by dependency rules.';
+        if ($blockers !== []) {
+            $message .= ' ' . implode(' ', $blockers);
+        }
+        throw new RuntimeException($message);
+    }
+
+    if ($consumeToken) {
+        safe_delete_consume_preview_token($previewToken);
+    }
+
+    return [
+        'token' => $previewToken,
+        'entity' => $entity,
+        'record_id' => 0,
+        'record_key' => $recordKey,
         'operation' => strtolower((string) ($payload['operation'] ?? $expectedOperation)),
         'summary' => $summary,
         'reason' => $reason,
@@ -475,6 +588,7 @@ function safe_delete_log_cascade(string $targetEntity, string $event, int $recor
             'target_entity' => safe_delete_normalize_entity($targetEntity),
             'event' => trim($event),
             'record_id' => max(0, $recordId),
+            'record_key' => trim((string) ($validation['record_key'] ?? ($summary['record_key'] ?? ''))),
             'operation' => (string) ($validation['operation'] ?? ($summary['operation'] ?? 'delete')),
             'main_record' => (array) ($summary['main_record'] ?? []),
             'total_dependencies' => (int) ($summary['total_dependencies'] ?? 0),
@@ -616,8 +730,137 @@ function safe_delete_analyze(PDO $pdo, string $entity, int $recordId, array $sco
         'payroll_loan_payment' => safe_delete_analyze_payroll_loan_payment($pdo, $recordId, $scope, $options),
         'payroll_salary_entry' => safe_delete_analyze_payroll_salary_entry($pdo, $recordId, $scope, $options),
         'payroll_salary_payment' => safe_delete_analyze_payroll_salary_payment($pdo, $recordId, $scope, $options),
-        default => throw new RuntimeException('Safe delete preview handler missing.'),
+        default => safe_delete_analyze_generic_entity($pdo, $entity, $recordId, $scope, $options),
     };
+}
+
+function safe_delete_analyze_key(PDO $pdo, string $entity, string $recordKey, array $scope = [], array $options = []): array
+{
+    $entity = safe_delete_normalize_entity($entity);
+    $recordKey = trim($recordKey);
+
+    if (!in_array($entity, safe_delete_supported_entities(), true)) {
+        throw new RuntimeException('Safe delete preview is not configured for entity: ' . ($entity !== '' ? $entity : '(empty)'));
+    }
+    if ($recordKey === '') {
+        throw new RuntimeException('Invalid record selected for safe delete preview.');
+    }
+
+    return match ($entity) {
+        'inventory_unit' => safe_delete_analyze_inventory_unit($pdo, $recordKey, $scope, $options),
+        default => throw new RuntimeException('Safe delete preview does not support key-based lookup for entity: ' . $entity),
+    };
+}
+
+function safe_delete_analyze_inventory_unit(PDO $pdo, string $unitCode, array $scope, array $options = []): array
+{
+    $normalizedCode = function_exists('part_unit_normalize_code')
+        ? part_unit_normalize_code($unitCode)
+        : strtoupper(trim($unitCode));
+    if ($normalizedCode === '') {
+        throw new RuntimeException('Part unit code is required for preview.');
+    }
+
+    $companyId = (int) ($scope['company_id'] ?? 0);
+    $summary = safe_delete_summary_base_key('inventory_unit', $normalizedCode, (string) ($options['operation'] ?? 'delete'));
+
+    $catalogRows = function_exists('part_unit_catalog') ? part_unit_catalog($companyId) : [];
+    $unitRow = null;
+    foreach ($catalogRows as $row) {
+        if (!is_array($row)) {
+            continue;
+        }
+        $candidateCode = function_exists('part_unit_normalize_code')
+            ? part_unit_normalize_code((string) ($row['code'] ?? ''))
+            : strtoupper(trim((string) ($row['code'] ?? '')));
+        if ($candidateCode === $normalizedCode) {
+            $unitRow = $row;
+            break;
+        }
+    }
+
+    if (!is_array($unitRow)) {
+        throw new RuntimeException('Part unit not found for this company scope.');
+    }
+
+    $statusCode = normalize_status_code((string) ($unitRow['status_code'] ?? 'ACTIVE'));
+    $allowDecimal = (int) ($unitRow['allow_decimal'] ?? 0) === 1;
+
+    $summary['main_record'] = [
+        'label' => 'Part Unit ' . $normalizedCode,
+        'reference' => $normalizedCode,
+        'date' => null,
+        'amount' => null,
+        'status' => $statusCode,
+        'note' => trim((string) ($unitRow['name'] ?? '')) . ' | Decimal Qty: ' . ($allowDecimal ? 'Yes' : 'No'),
+    ];
+
+    $detectedColumns = [];
+    $partRefs = [];
+    $partCount = 0;
+    $seenPartIds = [];
+    if (safe_delete_table_exists('parts')) {
+        $partCols = table_columns('parts');
+        foreach (['unit_code', 'uom_code', 'part_unit_code'] as $column) {
+            if (!in_array($column, $partCols, true)) {
+                continue;
+            }
+            $detectedColumns[] = $column;
+            $sql = 'SELECT id, part_name, part_sku, status_code
+                    FROM parts
+                    WHERE ' . $column . ' = :unit_code';
+            if (in_array('company_id', $partCols, true) && $companyId > 0) {
+                $sql .= ' AND company_id = :company_id';
+            }
+            if (in_array('status_code', $partCols, true)) {
+                $sql .= ' AND status_code <> "DELETED"';
+            }
+            $sql .= ' ORDER BY id DESC';
+            $params = ['unit_code' => $normalizedCode];
+            if (str_contains($sql, ':company_id')) {
+                $params['company_id'] = $companyId;
+            }
+            $rows = safe_delete_fetch_rows($pdo, $sql, $params);
+            foreach ($rows as $row) {
+                $partId = (int) ($row['id'] ?? 0);
+                if ($partId > 0 && isset($seenPartIds[$partId])) {
+                    continue;
+                }
+                if ($partId > 0) {
+                    $seenPartIds[$partId] = true;
+                }
+                $partCount++;
+                if (count($partRefs) < SAFE_DELETE_GROUP_ITEM_LIMIT) {
+                    $partRefs[] = safe_delete_make_item(
+                        safe_delete_row_reference((array) $row, ['part_sku', 'part_name'], 'PART'),
+                        null,
+                        null,
+                        (string) ($row['status_code'] ?? '')
+                    );
+                }
+            }
+        }
+    }
+
+    if ($partCount > 0) {
+        $summary['groups'][] = safe_delete_make_group('parts', 'Parts', $partCount, $partRefs);
+        $summary['warnings'][] = 'Unit is referenced by part master records. Historical transaction rows may also reference this code.';
+    } else {
+        $summary['groups'][] = safe_delete_make_group('parts', 'Parts', 0, []);
+    }
+
+    if ($detectedColumns === []) {
+        $summary['warnings'][] = 'Part master unit reference column was not detected. Preview shows configured unit only.';
+    }
+    if ($statusCode === 'DELETED') {
+        $summary['blockers'][] = 'Part unit is already deleted.';
+    }
+
+    $summary['can_proceed'] = $summary['blockers'] === [];
+    $summary['recommended_action'] = $summary['can_proceed'] ? 'SOFT_DELETE' : 'BLOCK';
+    $summary['execution_mode'] = $summary['can_proceed'] ? 'soft_delete' : 'block';
+
+    return safe_delete_summary_finalize($summary);
 }
 
 function safe_delete_analyze_invoice(PDO $pdo, int $invoiceId, array $scope, array $options = []): array

@@ -88,6 +88,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if ($action === 'change_status') {
         $categoryId = post_int('category_id');
         $nextStatus = normalize_status_code((string) ($_POST['next_status'] ?? 'INACTIVE'));
+        $safeDeleteValidation = null;
+        if ($nextStatus === 'DELETED') {
+            $safeDeleteValidation = safe_delete_validate_post_confirmation('inventory_part_category', $categoryId, [
+                'operation' => 'delete',
+                'reason_field' => 'deletion_reason',
+            ]);
+        }
 
         $stmt = db()->prepare(
             'UPDATE part_categories
@@ -103,6 +110,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         ]);
 
         log_audit('part_categories', 'status', $categoryId, 'Changed status to ' . $nextStatus);
+        if ($nextStatus === 'DELETED' && is_array($safeDeleteValidation)) {
+            safe_delete_log_cascade('inventory_part_category', 'delete', $categoryId, $safeDeleteValidation, [
+                'metadata' => [
+                    'company_id' => $companyId,
+                    'requested_status' => 'DELETED',
+                    'applied_status' => $nextStatus,
+                ],
+            ]);
+        }
         flash_set('category_success', 'Part category status updated.', 'success');
         redirect('modules/inventory/categories.php');
     }
@@ -226,7 +242,13 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                           <button type="submit" class="btn btn-sm btn-outline-secondary"><?= ((string) $category['status_code'] === 'ACTIVE') ? 'Inactivate' : 'Activate'; ?></button>
                         </form>
                         <?php if ((string) $category['status_code'] !== 'DELETED'): ?>
-                          <form method="post" class="d-inline" data-confirm="Soft delete this category?">
+                          <form method="post"
+                                class="d-inline"
+                                data-safe-delete
+                                data-safe-delete-entity="inventory_part_category"
+                                data-safe-delete-record-field="category_id"
+                                data-safe-delete-operation="delete"
+                                data-safe-delete-reason-field="deletion_reason">
                             <?= csrf_field(); ?>
                             <input type="hidden" name="_action" value="change_status" />
                             <input type="hidden" name="category_id" value="<?= (int) $category['id']; ?>" />

@@ -167,6 +167,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if ($action === 'change_status') {
         $settingId = post_int('setting_id');
         $nextStatus = normalize_status_code((string) ($_POST['next_status'] ?? 'INACTIVE'));
+        $safeDeleteValidation = null;
+        if ($nextStatus === 'DELETED') {
+            $safeDeleteValidation = safe_delete_validate_post_confirmation('system_setting', $settingId, [
+                'operation' => 'delete',
+                'reason_field' => 'deletion_reason',
+            ]);
+        }
 
         $stmt = db()->prepare(
             'UPDATE system_settings
@@ -182,6 +189,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         ]);
 
         log_audit('system_settings', 'status', $settingId, 'Changed status to ' . $nextStatus);
+        if ($nextStatus === 'DELETED' && is_array($safeDeleteValidation)) {
+            safe_delete_log_cascade('system_setting', 'delete', $settingId, $safeDeleteValidation, [
+                'metadata' => [
+                    'company_id' => $companyId,
+                    'requested_status' => 'DELETED',
+                    'applied_status' => $nextStatus,
+                ],
+            ]);
+        }
         flash_set('settings_success', 'Setting status updated.', 'success');
         redirect('modules/system/settings.php');
     }
@@ -359,7 +375,13 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                           <button type="submit" class="btn btn-sm btn-outline-secondary"><?= ((string) $setting['status_code'] === 'ACTIVE') ? 'Inactivate' : 'Activate'; ?></button>
                         </form>
                         <?php if ((string) $setting['status_code'] !== 'DELETED'): ?>
-                          <form method="post" class="d-inline" data-confirm="Soft delete this setting?">
+                          <form method="post"
+                                class="d-inline"
+                                data-safe-delete
+                                data-safe-delete-entity="system_setting"
+                                data-safe-delete-record-field="setting_id"
+                                data-safe-delete-operation="delete"
+                                data-safe-delete-reason-field="deletion_reason">
                             <?= csrf_field(); ?>
                             <input type="hidden" name="_action" value="change_status" />
                             <input type="hidden" name="setting_id" value="<?= (int) $setting['id']; ?>" />

@@ -8,6 +8,7 @@ require_permission('permission.view');
 $page_title = 'Permission Management';
 $active_menu = 'people.permissions';
 $canManage = has_permission('permission.manage');
+$actorUserId = (int) ($_SESSION['user_id'] ?? 0);
 
 $rolesStmt = db()->query("SELECT id, role_key, role_name, status_code FROM roles WHERE status_code <> 'DELETED' ORDER BY id ASC");
 $roles = $rolesStmt->fetchAll();
@@ -31,6 +32,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $permKey = strtolower(post_string('perm_key', 80));
         $permName = post_string('perm_name', 120);
         $statusCode = normalize_status_code((string) ($_POST['status_code'] ?? 'ACTIVE'));
+
+        if ($statusCode === 'DELETED') {
+            flash_set('perm_error', 'Use the dedicated Soft Delete action after creating the permission.', 'danger');
+            redirect('modules/people/permissions.php?role_id=' . $selectedRoleId);
+        }
 
         if ($permKey === '' || $permName === '') {
             flash_set('perm_error', 'Permission key and name are required.', 'danger');
@@ -60,6 +66,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $permName = post_string('perm_name', 120);
         $statusCode = normalize_status_code((string) ($_POST['status_code'] ?? 'ACTIVE'));
 
+        if ($statusCode === 'DELETED') {
+            flash_set('perm_error', 'Use the dedicated Soft Delete action to mark a permission as deleted.', 'danger');
+            redirect('modules/people/permissions.php?role_id=' . $selectedRoleId);
+        }
+
         $stmt = db()->prepare(
             'UPDATE permissions
              SET perm_name = :perm_name,
@@ -80,14 +91,46 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if ($action === 'change_permission_status') {
         $permissionId = post_int('permission_id');
         $nextStatus = normalize_status_code((string) ($_POST['next_status'] ?? 'INACTIVE'));
+        $safeDeleteValidation = null;
+        if ($nextStatus === 'DELETED') {
+            $safeDeleteValidation = safe_delete_validate_post_confirmation('permission', $permissionId, [
+                'operation' => 'delete',
+                'reason_field' => 'deletion_reason',
+            ]);
+        }
 
-        $stmt = db()->prepare('UPDATE permissions SET status_code = :status_code WHERE id = :id');
-        $stmt->execute([
+        $permCols = table_columns('permissions');
+        $sets = ['status_code = :status_code'];
+        $params = [
             'status_code' => $nextStatus,
             'id' => $permissionId,
-        ]);
+        ];
+        if (in_array('deleted_at', $permCols, true)) {
+            $sets[] = 'deleted_at = :deleted_at';
+            $params['deleted_at'] = $nextStatus === 'DELETED' ? date('Y-m-d H:i:s') : null;
+        }
+        if (in_array('deleted_by', $permCols, true)) {
+            $sets[] = 'deleted_by = :deleted_by';
+            $params['deleted_by'] = $nextStatus === 'DELETED' ? $actorUserId : null;
+        }
+        if (in_array('deletion_reason', $permCols, true)) {
+            $sets[] = 'deletion_reason = :deletion_reason';
+            $params['deletion_reason'] = $nextStatus === 'DELETED'
+                ? (string) ($safeDeleteValidation['reason'] ?? '')
+                : null;
+        }
+
+        $stmt = db()->prepare('UPDATE permissions SET ' . implode(', ', $sets) . ' WHERE id = :id');
+        $stmt->execute($params);
 
         log_audit('permissions', 'status', $permissionId, 'Changed permission status to ' . $nextStatus);
+        if ($safeDeleteValidation !== null) {
+            safe_delete_log_cascade('permission', 'permission_soft_delete', $permissionId, $safeDeleteValidation, [
+                'metadata' => [
+                    'next_status' => $nextStatus,
+                ],
+            ]);
+        }
         flash_set('perm_success', 'Permission status updated.', 'success');
         redirect('modules/people/permissions.php?role_id=' . $selectedRoleId);
     }
@@ -197,6 +240,9 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                 <label class="form-label">Status</label>
                 <select name="status_code" class="form-select" required>
                   <?php foreach (status_options((string) ($editPermission['status_code'] ?? 'ACTIVE')) as $option): ?>
+                    <?php if ((string) ($option['value'] ?? '') === 'DELETED'): ?>
+                      <?php continue; ?>
+                    <?php endif; ?>
                     <option value="<?= e($option['value']); ?>" <?= $option['selected'] ? 'selected' : ''; ?>><?= e($option['value']); ?></option>
                   <?php endforeach; ?>
                 </select>
@@ -245,6 +291,23 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                               <input type="hidden" name="next_status" value="<?= e(((string) $permission['status_code'] === 'ACTIVE') ? 'INACTIVE' : 'ACTIVE'); ?>" />
                               <button type="submit" class="btn btn-sm btn-outline-secondary"><?= ((string) $permission['status_code'] === 'ACTIVE') ? 'Inactivate' : 'Activate'; ?></button>
                             </form>
+                            <?php if (normalize_status_code((string) ($permission['status_code'] ?? 'ACTIVE')) !== 'DELETED'): ?>
+                              <form
+                                method="post"
+                                class="d-inline"
+                                data-safe-delete
+                                data-safe-delete-entity="permission"
+                                data-safe-delete-record-field="permission_id"
+                                data-safe-delete-operation="delete"
+                                data-safe-delete-reason-field="deletion_reason">
+                                <?= csrf_field(); ?>
+                                <input type="hidden" name="_action" value="change_permission_status" />
+                                <input type="hidden" name="permission_id" value="<?= (int) $permission['id']; ?>" />
+                                <input type="hidden" name="next_status" value="DELETED" />
+                                <input type="hidden" name="deletion_reason" value="" />
+                                <button type="submit" class="btn btn-sm btn-outline-danger">Soft Delete</button>
+                              </form>
+                            <?php endif; ?>
                           <?php endif; ?>
                         </td>
                       </tr>

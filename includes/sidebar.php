@@ -330,18 +330,6 @@ if ($sidebarBrandName === '') {
                   <p>Inventory Reports</p>
                 </a>
               </li>
-              <li class="nav-item">
-                <a href="<?= e(url('modules/reports/inventory_valuation.php')); ?>" class="nav-link <?= e(is_active_menu('reports.inventory_valuation', $activeMenu)); ?>">
-                  <i class="nav-icon bi bi-calculator"></i>
-                  <p>Inventory Valuation</p>
-                </a>
-              </li>
-              <li class="nav-item">
-                <a href="<?= e(url('modules/reports/returns.php')); ?>" class="nav-link <?= e(is_active_menu('reports.returns', $activeMenu)); ?>">
-                  <i class="nav-icon bi bi-arrow-counterclockwise"></i>
-                  <p>Returns Report</p>
-                </a>
-              </li>
               <?php if ($canViewFinancialReports): ?>
                 <li class="nav-item">
                   <a href="<?= e(url('modules/reports/billing_gst.php')); ?>" class="nav-link <?= e(($activeMenu === 'reports.sales' || $activeMenu === 'reports.billing') ? 'active' : ''); ?>">
@@ -367,13 +355,37 @@ if ($sidebarBrandName === '') {
                     <p>Profit &amp; Loss</p>
                   </a>
                 </li>
-                <li class="nav-item">
-                  <a href="<?= e(url('modules/reports/gst_compliance.php')); ?>" class="nav-link <?= e(is_active_menu('reports.gst_compliance', $activeMenu)); ?>">
-                    <i class="nav-icon bi bi-journal-text"></i>
-                    <p>GST Compliance</p>
-                  </a>
-                </li>
               <?php endif; ?>
+              <li class="nav-item">
+                <a href="<?= e(url('modules/reports/inventory_valuation.php')); ?>" class="nav-link <?= e(is_active_menu('reports.inventory_valuation', $activeMenu)); ?>">
+                  <i class="nav-icon bi bi-calculator"></i>
+                  <p>Inventory Valuation</p>
+                </a>
+              </li>
+              <li class="nav-item">
+                <a href="<?= e(url('modules/reports/returns.php')); ?>" class="nav-link <?= e(is_active_menu('reports.returns', $activeMenu)); ?>">
+                  <i class="nav-icon bi bi-arrow-counterclockwise"></i>
+                  <p>Returns Report</p>
+                </a>
+              </li>
+              <li class="nav-item">
+                <a href="<?= e(url('modules/reports/customers.php')); ?>" class="nav-link <?= e(is_active_menu('reports.customers', $activeMenu)); ?>">
+                  <i class="nav-icon bi bi-people-fill"></i>
+                  <p>Customer Reports</p>
+                </a>
+              </li>
+              <li class="nav-item">
+                <a href="<?= e(url('modules/reports/vehicles.php')); ?>" class="nav-link <?= e(is_active_menu('reports.vehicles', $activeMenu)); ?>">
+                  <i class="nav-icon bi bi-car-front-fill"></i>
+                  <p>Vehicle Reports</p>
+                </a>
+              </li>
+              <li class="nav-item">
+                <a href="<?= e(url('modules/reports/service_reminders.php')); ?>" class="nav-link <?= e(is_active_menu('reports.service_reminders', $activeMenu)); ?>">
+                  <i class="nav-icon bi bi-bell"></i>
+                  <p>Maintenance Reminders</p>
+                </a>
+              </li>
               <?php if (has_permission('job.view') || has_permission('job.manage') || has_permission('reports.financial')): ?>
                 <li class="nav-item">
                   <a href="<?= e(url('modules/reports/insurance_claims.php')); ?>" class="nav-link <?= e(is_active_menu('reports.insurance_claims', $activeMenu)); ?>">
@@ -414,18 +426,14 @@ if ($sidebarBrandName === '') {
                   </a>
                 </li>
               <?php endif; ?>
-              <li class="nav-item">
-                <a href="<?= e(url('modules/reports/customers.php')); ?>" class="nav-link <?= e(is_active_menu('reports.customers', $activeMenu)); ?>">
-                  <i class="nav-icon bi bi-people-fill"></i>
-                  <p>Customer Reports</p>
-                </a>
-              </li>
-              <li class="nav-item">
-                <a href="<?= e(url('modules/reports/vehicles.php')); ?>" class="nav-link <?= e(is_active_menu('reports.vehicles', $activeMenu)); ?>">
-                  <i class="nav-icon bi bi-car-front-fill"></i>
-                  <p>Vehicle Reports</p>
-                </a>
-              </li>
+              <?php if (has_permission('gst.reports') || has_permission('financial.reports')): ?>
+                <li class="nav-item">
+                  <a href="<?= e(url('modules/reports/gst_compliance.php')); ?>" class="nav-link <?= e(is_active_menu('reports.gst_compliance', $activeMenu)); ?>">
+                    <i class="nav-icon bi bi-journal-text"></i>
+                    <p>GST Compliance</p>
+                  </a>
+                </li>
+              <?php endif; ?>
             </ul>
           </li>
         <?php endif; ?>

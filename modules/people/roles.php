@@ -96,6 +96,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if ($action === 'change_status') {
         $roleId = post_int('role_id');
         $nextStatus = normalize_status_code((string) ($_POST['next_status'] ?? 'INACTIVE'));
+        $safeDeleteValidation = null;
 
         $roleStmt = db()->prepare('SELECT role_key FROM roles WHERE id = :id LIMIT 1');
         $roleStmt->execute(['id' => $roleId]);
@@ -110,6 +111,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             flash_set('role_error', 'Super Admin role cannot be deactivated or deleted.', 'danger');
             redirect('modules/people/roles.php');
         }
+        if ($nextStatus === 'DELETED') {
+            $safeDeleteValidation = safe_delete_validate_post_confirmation('role', $roleId, [
+                'operation' => 'delete',
+                'reason_field' => 'deletion_reason',
+            ]);
+        }
 
         $stmt = db()->prepare('UPDATE roles SET status_code = :status_code WHERE id = :id');
         $stmt->execute([
@@ -118,6 +125,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         ]);
 
         log_audit('roles', 'status', $roleId, 'Changed role status to ' . $nextStatus);
+        if ($nextStatus === 'DELETED' && is_array($safeDeleteValidation)) {
+            safe_delete_log_cascade('role', 'delete', $roleId, $safeDeleteValidation, [
+                'metadata' => [
+                    'requested_status' => 'DELETED',
+                    'applied_status' => $nextStatus,
+                    'role_key' => (string) ($role['role_key'] ?? ''),
+                ],
+            ]);
+        }
         flash_set('role_success', 'Role status updated.', 'success');
         redirect('modules/people/roles.php');
     }
@@ -244,7 +260,13 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                             <button type="submit" class="btn btn-sm btn-outline-secondary"><?= ((string) $role['status_code'] === 'ACTIVE') ? 'Inactivate' : 'Activate'; ?></button>
                           </form>
                           <?php if ((string) $role['status_code'] !== 'DELETED'): ?>
-                            <form method="post" class="d-inline" data-confirm="Soft delete this role?">
+                            <form method="post"
+                                  class="d-inline"
+                                  data-safe-delete
+                                  data-safe-delete-entity="role"
+                                  data-safe-delete-record-field="role_id"
+                                  data-safe-delete-operation="delete"
+                                  data-safe-delete-reason-field="deletion_reason">
                               <?= csrf_field(); ?>
                               <input type="hidden" name="_action" value="change_status" />
                               <input type="hidden" name="role_id" value="<?= (int) $role['id']; ?>" />

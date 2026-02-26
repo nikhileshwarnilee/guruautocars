@@ -59,6 +59,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $allowDecimal = (int) ($_POST['allow_decimal'] ?? 0) === 1 ? 1 : 0;
         $statusCode = normalize_status_code((string) ($_POST['status_code'] ?? 'ACTIVE'));
 
+        if ($statusCode === 'DELETED') {
+            flash_set('parts_error', 'Use the dedicated Soft Delete action after creating a unit.', 'danger');
+            redirect('modules/inventory/units.php');
+        }
+
         if ($code === '' || $name === '') {
             flash_set('parts_error', 'Unit code and unit name are required.', 'danger');
             redirect('modules/inventory/units.php');
@@ -104,6 +109,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $allowDecimal = (int) ($_POST['allow_decimal'] ?? 0) === 1 ? 1 : 0;
         $statusCode = normalize_status_code((string) ($_POST['status_code'] ?? 'ACTIVE'));
 
+        if ($statusCode === 'DELETED') {
+            flash_set('parts_error', 'Use the dedicated Soft Delete action to mark a unit as deleted.', 'danger');
+            redirect('modules/inventory/units.php');
+        }
+
         if ($code === '' || $name === '') {
             flash_set('parts_error', 'Unit code and unit name are required.', 'danger');
             redirect('modules/inventory/units.php');
@@ -144,10 +154,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if ($action === 'change_status') {
         $code = part_unit_normalize_code(post_string('unit_code', 20));
         $nextStatus = normalize_status_code((string) ($_POST['next_status'] ?? 'INACTIVE'));
+        $safeDeleteValidation = null;
 
         if ($code === '' || !isset($unitsByCode[$code])) {
             flash_set('parts_error', 'Unit not found for status update.', 'danger');
             redirect('modules/inventory/units.php');
+        }
+
+        if ($nextStatus === 'DELETED') {
+            $safeDeleteValidation = safe_delete_validate_post_confirmation_key('inventory_unit', $code, [
+                'operation' => 'delete',
+                'reason_field' => 'deletion_reason',
+            ]);
         }
 
         $before = part_unit_find($unitsByCode, $code);
@@ -167,8 +185,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'after' => $unitsByCode[$code],
             'metadata' => [
                 'setting_id' => $settingId,
+                'deletion_reason' => $safeDeleteValidation['reason'] ?? null,
             ],
         ]);
+        if ($safeDeleteValidation !== null) {
+            safe_delete_log_cascade('inventory_unit', 'inventory_unit_soft_delete', 0, $safeDeleteValidation, [
+                'metadata' => [
+                    'record_key' => $code,
+                    'setting_id' => $settingId,
+                ],
+            ]);
+        }
         flash_set('parts_success', 'Unit status updated.', 'success');
         redirect('modules/inventory/units.php');
     }
@@ -258,6 +285,9 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                 <label class="form-label">Status</label>
                 <select name="status_code" class="form-select" required>
                   <?php foreach (status_options((string) ($editUnit['status_code'] ?? 'ACTIVE')) as $option): ?>
+                    <?php if ((string) ($option['value'] ?? '') === 'DELETED'): ?>
+                      <?php continue; ?>
+                    <?php endif; ?>
                     <option value="<?= e((string) $option['value']); ?>" <?= !empty($option['selected']) ? 'selected' : ''; ?>>
                       <?= e((string) $option['value']); ?>
                     </option>
@@ -318,11 +348,19 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                             <input type="hidden" name="next_status" value="<?= e($nextStatus); ?>" />
                             <button type="submit" class="btn btn-sm btn-outline-secondary"><?= $unitStatus === 'ACTIVE' ? 'Inactivate' : 'Activate'; ?></button>
                           </form>
-                          <form method="post" class="d-inline" data-confirm="Soft delete this unit?">
+                          <form
+                            method="post"
+                            class="d-inline"
+                            data-safe-delete
+                            data-safe-delete-entity="inventory_unit"
+                            data-safe-delete-record-key-field="unit_code"
+                            data-safe-delete-operation="delete"
+                            data-safe-delete-reason-field="deletion_reason">
                             <?= csrf_field(); ?>
                             <input type="hidden" name="_action" value="change_status" />
                             <input type="hidden" name="unit_code" value="<?= e($unitCode); ?>" />
                             <input type="hidden" name="next_status" value="DELETED" />
+                            <input type="hidden" name="deletion_reason" value="" />
                             <button type="submit" class="btn btn-sm btn-outline-danger">Soft Delete</button>
                           </form>
                         <?php endif; ?>

@@ -14,6 +14,13 @@ $recordId = post_int('record_id');
 if ($recordId <= 0) {
     $recordId = post_int('id');
 }
+$recordKey = trim((string) ($_POST['record_key'] ?? ''));
+if ($recordKey === '' && $recordId <= 0) {
+    $rawRecordId = trim((string) ($_POST['record_id'] ?? ''));
+    if ($rawRecordId !== '' && !preg_match('/^\d+$/', $rawRecordId)) {
+        $recordKey = $rawRecordId;
+    }
+}
 $operation = strtolower(trim((string) ($_POST['operation'] ?? 'delete')));
 if ($operation === '') {
     $operation = 'delete';
@@ -23,23 +30,34 @@ try {
     if ($entity === '') {
         throw new RuntimeException('Entity is required for deletion preview.');
     }
-    if ($recordId <= 0) {
+    if ($recordId <= 0 && $recordKey === '') {
         throw new RuntimeException('Record is required for deletion preview.');
     }
 
     safe_delete_require_global_permissions($entity);
 
-    $summary = safe_delete_analyze(
-        db(),
-        $entity,
-        $recordId,
-        [
-            'company_id' => active_company_id(),
-            'garage_id' => active_garage_id(),
-            'user_id' => (int) ($_SESSION['user_id'] ?? 0),
-        ],
-        ['operation' => $operation]
-    );
+    $scope = [
+        'company_id' => active_company_id(),
+        'garage_id' => active_garage_id(),
+        'user_id' => (int) ($_SESSION['user_id'] ?? 0),
+    ];
+    if ($recordId > 0) {
+        $summary = safe_delete_analyze(
+            db(),
+            $entity,
+            $recordId,
+            $scope,
+            ['operation' => $operation]
+        );
+    } else {
+        $summary = safe_delete_analyze_key(
+            db(),
+            $entity,
+            $recordKey,
+            $scope,
+            ['operation' => $operation]
+        );
+    }
     $token = safe_delete_issue_preview_token($summary);
 
     ajax_json([
@@ -53,6 +71,6 @@ try {
         'message' => $exception->getMessage(),
         'entity' => $entity,
         'record_id' => $recordId,
+        'record_key' => $recordKey,
     ], 422);
 }
-

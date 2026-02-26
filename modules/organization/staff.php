@@ -376,6 +376,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if ($action === 'change_status') {
         $userId = post_int('user_id');
         $nextStatus = normalize_status_code((string) ($_POST['next_status'] ?? 'INACTIVE'));
+        $safeDeleteValidation = null;
 
         if ($userId <= 0 || $companyId <= 0) {
             flash_set('staff_error', 'Invalid staff user selected.', 'danger');
@@ -404,6 +405,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         if ($userId === (int) ($_SESSION['user_id'] ?? 0) && $nextStatus !== 'ACTIVE') {
             flash_set('staff_error', 'You cannot inactivate or delete your own account.', 'danger');
             redirect('modules/organization/staff.php?company_id=' . $companyId);
+        }
+        if ($nextStatus === 'DELETED') {
+            $safeDeleteValidation = safe_delete_validate_post_confirmation('org_staff_user', $userId, [
+                'operation' => 'delete',
+                'reason_field' => 'deletion_reason',
+            ]);
         }
 
         $isActive = $nextStatus === 'ACTIVE' ? 1 : 0;
@@ -436,6 +443,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'is_active' => $isActive,
             ],
         ]);
+        if ($nextStatus === 'DELETED' && is_array($safeDeleteValidation)) {
+            safe_delete_log_cascade('org_staff_user', 'delete', $userId, $safeDeleteValidation, [
+                'metadata' => [
+                    'company_id' => $companyId,
+                    'garage_id' => (int) ($user['primary_garage_id'] ?? 0),
+                    'requested_status' => 'DELETED',
+                    'applied_status' => $nextStatus,
+                ],
+            ]);
+        }
         flash_set('staff_success', 'Staff status updated.', 'success');
         redirect('modules/organization/staff.php?company_id=' . $companyId);
     }
@@ -677,7 +694,13 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                           </form>
                         <?php endif; ?>
                         <?php if ($isSuperAdmin && !$isSelf && (string) $member['status_code'] !== 'DELETED'): ?>
-                          <form method="post" class="d-inline" data-confirm="Soft delete this user?">
+                          <form method="post"
+                                class="d-inline"
+                                data-safe-delete
+                                data-safe-delete-entity="org_staff_user"
+                                data-safe-delete-record-field="user_id"
+                                data-safe-delete-operation="delete"
+                                data-safe-delete-reason-field="deletion_reason">
                             <?= csrf_field(); ?>
                             <input type="hidden" name="_action" value="change_status" />
                             <input type="hidden" name="company_id" value="<?= (int) $selectedCompanyId; ?>" />

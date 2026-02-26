@@ -1199,6 +1199,11 @@ function initSafeDeleteFlow() {
 
     var recordField = String(form.getAttribute('data-safe-delete-record-field') || 'id').trim();
     var recordId = String(readFieldValue(form, recordField) || '').trim();
+    var recordKeyField = String(form.getAttribute('data-safe-delete-record-key-field') || '').trim();
+    var recordKey = '';
+    if (recordKeyField) {
+      recordKey = String(readFieldValue(form, recordKeyField) || '').trim();
+    }
 
     var operation = String(form.getAttribute('data-safe-delete-operation') || '').trim();
     var operationField = String(form.getAttribute('data-safe-delete-operation-field') || '').trim();
@@ -1213,7 +1218,7 @@ function initSafeDeleteFlow() {
     var hasReasonField = !!(reasonField && form.elements && form.elements.namedItem(reasonField));
     var csrf = String(readFieldValue(form, '_csrf') || '').trim();
 
-    if (!entity || !recordId) {
+    if (!entity || (!recordId && !recordKey)) {
       return null;
     }
 
@@ -1221,6 +1226,8 @@ function initSafeDeleteFlow() {
       entity: entity,
       recordField: recordField,
       recordId: recordId,
+      recordKeyField: recordKeyField,
+      recordKey: recordKey,
       operation: operation,
       reasonField: reasonField,
       hasReasonField: hasReasonField,
@@ -1279,7 +1286,11 @@ function initSafeDeleteFlow() {
     var formData = new FormData();
     formData.append('_csrf', meta.csrf);
     formData.append('entity', meta.entity);
-    formData.append('record_id', meta.recordId);
+    if (meta.recordKey) {
+      formData.append('record_key', meta.recordKey);
+    } else {
+      formData.append('record_id', meta.recordId);
+    }
     formData.append('operation', meta.operation);
 
     fetch(String(window.GacSafeDeleteConfig.endpoint), {

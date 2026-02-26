@@ -389,9 +389,28 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if ($action === 'delete_attachment') {
         $attachmentId = post_int('attachment_id');
         $returnId = post_int('return_id');
+        $safeDeleteValidation = null;
+        try {
+            $safeDeleteValidation = safe_delete_validate_post_confirmation('return_attachment', $attachmentId, [
+                'operation' => 'delete',
+                'reason_field' => 'deletion_reason',
+            ]);
+        } catch (Throwable $exception) {
+            flash_set('return_error', $exception->getMessage(), 'danger');
+            redirect('modules/returns/index.php?view_id=' . $returnId);
+        }
         if (!returns_delete_attachment($pdo, $attachmentId, $companyId, $garageId, $userId)) {
             flash_set('return_error', 'Attachment not found.', 'danger');
         } else {
+            if (is_array($safeDeleteValidation)) {
+                safe_delete_log_cascade('return_attachment', 'delete', $attachmentId, $safeDeleteValidation, [
+                    'metadata' => [
+                        'company_id' => $companyId,
+                        'garage_id' => $garageId,
+                        'return_id' => $returnId,
+                    ],
+                ]);
+            }
             flash_set('return_success', 'Attachment deleted.', 'success');
         }
         redirect('modules/returns/index.php?view_id=' . $returnId);
@@ -1019,7 +1038,12 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                       <?php $attachmentUrl = returns_upload_url((string) ($attachment['file_path'] ?? '')); ?>
                       <li class="list-group-item d-flex justify-content-between align-items-center">
                         <a href="<?= e((string) ($attachmentUrl ?? '#')); ?>" target="_blank"><?= e((string) ($attachment['file_name'] ?? 'Attachment')); ?></a>
-                        <form method="post" data-confirm="Delete this attachment?">
+                        <form method="post"
+                              data-safe-delete
+                              data-safe-delete-entity="return_attachment"
+                              data-safe-delete-record-field="attachment_id"
+                              data-safe-delete-operation="delete"
+                              data-safe-delete-reason-field="deletion_reason">
                           <?= csrf_field(); ?>
                           <input type="hidden" name="_action" value="delete_attachment" />
                           <input type="hidden" name="attachment_id" value="<?= (int) ($attachment['id'] ?? 0); ?>" />

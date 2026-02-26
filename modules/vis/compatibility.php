@@ -488,9 +488,25 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $entity = (string) ($_POST['entity'] ?? '');
         $recordId = post_int('record_id');
         $nextStatus = normalize_status_code((string) ($_POST['next_status'] ?? 'INACTIVE'));
+        $safeDeleteValidation = null;
+        $safeDeleteEntityMap = [
+            'compatibility' => 'vis_part_compatibility_map',
+            'service_map' => 'vis_service_part_map',
+        ];
+        $safeDeleteEntity = (string) ($safeDeleteEntityMap[$entity] ?? '');
         if (!in_array($entity, ['compatibility', 'service_map'], true) || $recordId <= 0) {
             flash_set('vis_map_error', 'Invalid mapping status request.', 'danger');
             redirect('modules/vis/compatibility.php');
+        }
+        if ($nextStatus === 'DELETED') {
+            if ($safeDeleteEntity === '') {
+                flash_set('vis_map_error', 'Safe delete mapping is not configured for this VIS entity.', 'danger');
+                redirect('modules/vis/compatibility.php');
+            }
+            $safeDeleteValidation = safe_delete_validate_post_confirmation($safeDeleteEntity, $recordId, [
+                'operation' => 'delete',
+                'reason_field' => 'deletion_reason',
+            ]);
         }
         $statusMeta = vis_mapping_resolve_status(db(), $entity, $recordId, $nextStatus, $companyId, $garageId);
         $resolvedStatus = (string) ($statusMeta['status_code'] ?? $nextStatus);
@@ -525,6 +541,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'entity' => 'vis_service_part_map',
                 'source' => 'UI',
                 'metadata' => [
+                    'requested_status' => $nextStatus,
+                    'applied_status' => $resolvedStatus,
+                    'job_links' => (int) ($statusMeta['job_links'] ?? 0),
+                    'active_links' => (int) ($statusMeta['active_links'] ?? 0),
+                ],
+            ]);
+        }
+
+        if ($nextStatus === 'DELETED' && is_array($safeDeleteValidation) && $safeDeleteEntity !== '') {
+            safe_delete_log_cascade($safeDeleteEntity, 'delete', $recordId, $safeDeleteValidation, [
+                'metadata' => [
+                    'entity' => $entity,
+                    'company_id' => $companyId,
+                    'garage_id' => $garageId,
                     'requested_status' => $nextStatus,
                     'applied_status' => $resolvedStatus,
                     'job_links' => (int) ($statusMeta['job_links'] ?? 0),
@@ -893,7 +923,12 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 <div class="modal fade" id="visMapStatusModal" tabindex="-1" aria-hidden="true">
   <div class="modal-dialog">
     <div class="modal-content">
-      <form method="post">
+      <form method="post"
+            data-safe-delete
+            data-safe-delete-entity-field="safe_delete_entity"
+            data-safe-delete-record-field="record_id"
+            data-safe-delete-operation="delete"
+            data-safe-delete-reason-field="deletion_reason">
         <div class="modal-header bg-warning-subtle">
           <h5 class="modal-title">Change Mapping Status</h5>
           <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
@@ -934,6 +969,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
           <?= csrf_field(); ?>
           <input type="hidden" name="_action" value="change_status" />
           <input type="hidden" name="entity" id="vis-map-delete-entity" />
+          <input type="hidden" name="safe_delete_entity" id="vis-map-delete-safe-entity" />
           <input type="hidden" name="record_id" id="vis-map-delete-record-id" />
           <input type="hidden" name="next_status" value="DELETED" />
           <div class="mb-3">
@@ -976,7 +1012,9 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 
       var deleteTrigger = event.target.closest('.js-vis-map-delete-btn');
       if (deleteTrigger) {
-        setValue('vis-map-delete-entity', deleteTrigger.getAttribute('data-entity'));
+        var deleteEntity = deleteTrigger.getAttribute('data-entity') || '';
+        setValue('vis-map-delete-entity', deleteEntity);
+        setValue('vis-map-delete-safe-entity', deleteEntity === 'compatibility' ? 'vis_part_compatibility_map' : (deleteEntity === 'service_map' ? 'vis_service_part_map' : ''));
         setValue('vis-map-delete-record-id', deleteTrigger.getAttribute('data-record-id'));
         setValue('vis-map-delete-label', deleteTrigger.getAttribute('data-record-label'));
       }

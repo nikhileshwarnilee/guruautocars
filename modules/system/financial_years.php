@@ -132,6 +132,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if ($action === 'change_status') {
         $fyId = post_int('fy_id');
         $nextStatus = normalize_status_code((string) ($_POST['next_status'] ?? 'INACTIVE'));
+        $safeDeleteValidation = null;
+        if ($nextStatus === 'DELETED') {
+            $safeDeleteValidation = safe_delete_validate_post_confirmation('financial_year', $fyId, [
+                'operation' => 'delete',
+                'reason_field' => 'deletion_reason',
+            ]);
+        }
 
         $stmt = db()->prepare(
             'UPDATE financial_years
@@ -147,6 +154,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         ]);
 
         log_audit('financial_year', 'status', $fyId, 'Changed status to ' . $nextStatus);
+        if ($nextStatus === 'DELETED' && is_array($safeDeleteValidation)) {
+            safe_delete_log_cascade('financial_year', 'delete', $fyId, $safeDeleteValidation, [
+                'metadata' => [
+                    'company_id' => $companyId,
+                    'requested_status' => 'DELETED',
+                    'applied_status' => $nextStatus,
+                ],
+            ]);
+        }
         flash_set('fy_success', 'Financial year status updated.', 'success');
         redirect('modules/system/financial_years.php?company_id=' . $companyId);
     }
@@ -307,7 +323,13 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                           <button type="submit" class="btn btn-sm btn-outline-secondary"><?= ((string) $fy['status_code'] === 'ACTIVE') ? 'Inactivate' : 'Activate'; ?></button>
                         </form>
                         <?php if ((string) $fy['status_code'] !== 'DELETED'): ?>
-                          <form method="post" class="d-inline" data-confirm="Soft delete this financial year?">
+                          <form method="post"
+                                class="d-inline"
+                                data-safe-delete
+                                data-safe-delete-entity="financial_year"
+                                data-safe-delete-record-field="fy_id"
+                                data-safe-delete-operation="delete"
+                                data-safe-delete-reason-field="deletion_reason">
                             <?= csrf_field(); ?>
                             <input type="hidden" name="_action" value="change_status" />
                             <input type="hidden" name="company_id" value="<?= (int) $selectedCompanyId; ?>" />
