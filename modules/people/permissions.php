@@ -2,6 +2,7 @@
 declare(strict_types=1);
 
 require_once __DIR__ . '/../../includes/app.php';
+require_once __DIR__ . '/../../includes/permission_sync.php';
 require_login();
 require_permission('permission.view');
 
@@ -176,6 +177,56 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         redirect('modules/people/permissions.php?role_id=' . $roleId);
     }
+
+    if ($action === 'sync_permissions_from_code') {
+        $syncResult = permission_sync_run(db(), APP_ROOT, [
+            'assign_super_admin' => true,
+        ]);
+
+        $inserted = array_keys((array) ($syncResult['inserted'] ?? []));
+        $assigned = array_values((array) ($syncResult['assigned'] ?? []));
+        $errors = array_values((array) ($syncResult['errors'] ?? []));
+
+        log_audit('permissions', 'sync_from_code', 0, 'Synced permission keys from code usage', [
+            'entity' => 'permissions',
+            'source' => 'UI',
+            'metadata' => [
+                'inserted_count' => count($inserted),
+                'assigned_count' => count($assigned),
+                'code_key_count' => (int) ($syncResult['code_key_count'] ?? 0),
+                'db_key_count_before' => (int) ($syncResult['db_key_count_before'] ?? 0),
+                'db_key_count_after' => (int) ($syncResult['db_key_count_after'] ?? 0),
+                'inserted_keys' => $inserted,
+                'assigned' => $assigned,
+                'errors' => $errors,
+            ],
+        ]);
+
+        if ($errors !== []) {
+            $preview = implode('; ', array_slice($errors, 0, 2));
+            if (count($errors) > 2) {
+                $preview .= '; +' . (count($errors) - 2) . ' more';
+            }
+            flash_set('perm_error', 'Permission sync completed with errors. ' . $preview, 'danger');
+            redirect('modules/people/permissions.php?role_id=' . $selectedRoleId);
+        }
+
+        if ($inserted === []) {
+            flash_set('perm_success', 'Permission sync complete. No missing permission keys found.', 'success');
+            redirect('modules/people/permissions.php?role_id=' . $selectedRoleId);
+        }
+
+        $insertedLabel = implode(', ', array_slice($inserted, 0, 5));
+        if (count($inserted) > 5) {
+            $insertedLabel .= ', +' . (count($inserted) - 5) . ' more';
+        }
+        flash_set(
+            'perm_success',
+            'Permission sync complete. Added ' . count($inserted) . ' key(s): ' . $insertedLabel,
+            'success'
+        );
+        redirect('modules/people/permissions.php?role_id=' . $selectedRoleId);
+    }
 }
 
 $permissionsStmt = db()->query('SELECT * FROM permissions ORDER BY perm_key ASC');
@@ -261,7 +312,16 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       <div class="row g-3">
         <div class="col-lg-5">
           <div class="card">
-            <div class="card-header"><h3 class="card-title">Permission Master</h3></div>
+            <div class="card-header d-flex justify-content-between align-items-center gap-2">
+              <h3 class="card-title mb-0">Permission Master</h3>
+              <?php if ($canManage): ?>
+                <form method="post" class="d-inline">
+                  <?= csrf_field(); ?>
+                  <input type="hidden" name="_action" value="sync_permissions_from_code" />
+                  <button type="submit" class="btn btn-sm btn-outline-info">Sync From Code</button>
+                </form>
+              <?php endif; ?>
+            </div>
             <div class="card-body table-responsive p-0">
               <table class="table table-striped mb-0">
                 <thead>
