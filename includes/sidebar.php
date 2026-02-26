@@ -51,12 +51,30 @@ $sidebarBrandName = trim((string) ($sidebarUser['company_name'] ?? APP_SHORT_NAM
 if ($sidebarBrandName === '') {
     $sidebarBrandName = APP_SHORT_NAME;
 }
+$sidebarBrandLayout = 'side';
+if ($sidebarCompanyLogo !== null && function_exists('company_logo_fs_path')) {
+    $logoFsPath = company_logo_fs_path($sidebarCompanyId, active_garage_id());
+    if ($logoFsPath !== null && is_file($logoFsPath)) {
+        $logoInfo = @getimagesize($logoFsPath);
+        if (is_array($logoInfo)) {
+            $logoWidth = (int) ($logoInfo[0] ?? 0);
+            $logoHeight = (int) ($logoInfo[1] ?? 0);
+            $logoAspect = $logoHeight > 0 ? ($logoWidth / $logoHeight) : 0.0;
+            if ($logoWidth >= 180 || $logoHeight >= 70 || $logoAspect >= 3.0) {
+                $sidebarBrandLayout = 'stacked';
+            }
+        }
+    }
+}
+$sidebarBrandLinkClass = 'brand-link gac-sidebar-brand-link gac-sidebar-brand-link--' . $sidebarBrandLayout;
 ?>
 <aside class="app-sidebar gac-sidebar-theme">
   <div class="sidebar-brand">
-    <a href="<?= e(url('dashboard.php')); ?>" class="brand-link">
-      <img src="<?= e($sidebarBrandLogo); ?>" alt="<?= e($sidebarBrandName); ?>" class="brand-image opacity-75" />
-      <span class="brand-text fw-light"><?= e($sidebarBrandName); ?></span>
+    <a href="<?= e(url('dashboard.php')); ?>" class="<?= e($sidebarBrandLinkClass); ?>">
+      <span class="gac-sidebar-brand-logo-wrap">
+        <img src="<?= e($sidebarBrandLogo); ?>" alt="<?= e($sidebarBrandName); ?>" class="brand-image opacity-75 gac-sidebar-brand-logo" />
+      </span>
+      <span class="brand-text fw-light gac-sidebar-brand-name"><?= e($sidebarBrandName); ?></span>
     </a>
   </div>
   <div class="sidebar-wrapper">

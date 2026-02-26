@@ -211,6 +211,69 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         redirect($redirectPath);
     }
 
+    if ($action === 'remove_logo') {
+        $targetCompanyId = post_int('company_id');
+        if (!$isSuperAdmin) {
+            $targetCompanyId = $activeCompanyId;
+        }
+
+        if ($targetCompanyId <= 0) {
+            flash_set('company_error', 'Invalid company selected for logo removal.', 'danger');
+            redirect('modules/organization/companies.php');
+        }
+
+        if (!$isSuperAdmin && $targetCompanyId !== $activeCompanyId) {
+            flash_set('company_error', 'You can only remove logo for your own company.', 'danger');
+            redirect('modules/organization/companies.php');
+        }
+
+        $existingPath = company_logo_relative_path($targetCompanyId, 0);
+        if ($existingPath === null) {
+            flash_set('company_success', 'No business logo is configured for this company.', 'success');
+            $redirectPath = 'modules/organization/companies.php';
+            if ($isSuperAdmin) {
+                $redirectPath .= '?edit_id=' . $targetCompanyId;
+            }
+            redirect($redirectPath);
+        }
+
+        $settingId = system_setting_upsert_value(
+            $targetCompanyId,
+            null,
+            'ORGANIZATION',
+            'business_logo_path',
+            null,
+            'STRING',
+            'ACTIVE',
+            (int) ($_SESSION['user_id'] ?? 0)
+        );
+        if ($settingId <= 0) {
+            flash_set('company_error', 'Unable to remove business logo right now.', 'danger');
+            $redirectPath = 'modules/organization/companies.php';
+            if ($isSuperAdmin) {
+                $redirectPath .= '?edit_id=' . $targetCompanyId;
+            }
+            redirect($redirectPath);
+        }
+
+        company_logo_remove_file($existingPath);
+        log_audit('companies', 'remove_logo', $targetCompanyId, 'Removed business logo', [
+            'entity' => 'company',
+            'source' => 'UI',
+            'company_id' => $targetCompanyId,
+            'before' => ['business_logo_path' => $existingPath],
+            'after' => ['business_logo_path' => null],
+            'metadata' => ['setting_id' => $settingId],
+        ]);
+        flash_set('company_success', 'Business logo removed successfully.', 'success');
+
+        $redirectPath = 'modules/organization/companies.php';
+        if ($isSuperAdmin) {
+            $redirectPath .= '?edit_id=' . $targetCompanyId;
+        }
+        redirect($redirectPath);
+    }
+
     if ($action === 'create') {
         if (!$isSuperAdmin) {
             flash_set('company_error', 'Only Super Admin can create companies.', 'danger');
@@ -652,6 +715,14 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                       <button type="submit" class="btn btn-info"><?= $businessLogoUrl !== null ? 'Replace Logo' : 'Upload Logo'; ?></button>
                     </div>
                   </form>
+                  <?php if ($businessLogoUrl !== null): ?>
+                    <form method="post" class="mt-3" data-confirm="Remove business logo for this company?">
+                      <?= csrf_field(); ?>
+                      <input type="hidden" name="_action" value="remove_logo" />
+                      <input type="hidden" name="company_id" value="<?= (int) ($logoTargetCompany['id'] ?? 0); ?>" />
+                      <button type="submit" class="btn btn-outline-danger btn-sm">Remove Business Logo</button>
+                    </form>
+                  <?php endif; ?>
                 </div>
               </div>
             <?php endif; ?>
