@@ -242,6 +242,7 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'charts') {
              FROM expenses e
              WHERE e.company_id = :company_id
                AND e.entry_type <> "DELETED"
+               AND COALESCE(e.entry_type, "EXPENSE") <> "REVERSAL"
                ' . $expenseScopeSql . '
                AND e.expense_date BETWEEN :from_date AND :to_date
              GROUP BY DATE_FORMAT(e.expense_date, "%Y-%m")
@@ -285,6 +286,7 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'charts') {
                AND i.invoice_status = "FINALIZED"
                AND jc.status = "CLOSED"
                AND jc.status_code = "ACTIVE"
+               AND ' . reversal_sales_payment_unreversed_filter_sql('p') . '
                ' . $paymentScopeSql . '
                AND p.paid_on BETWEEN :from_date AND :to_date
              GROUP BY payment_bucket'

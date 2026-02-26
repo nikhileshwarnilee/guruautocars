@@ -1,7 +1,32 @@
 <?php
 declare(strict_types=1);
 
-require_once __DIR__ . '/../includes/db.php';
+$isCli = PHP_SAPI === 'cli';
+
+if ($isCli) {
+    require_once __DIR__ . '/../includes/db.php';
+} else {
+    require_once __DIR__ . '/../includes/app.php';
+    require_login();
+
+    $roleKey = strtolower(trim((string) ($_SESSION['role_key'] ?? '')));
+    if ($roleKey !== 'super_admin') {
+        http_response_code(403);
+        header('Content-Type: text/plain; charset=UTF-8');
+        echo "Forbidden: super_admin access is required.\n";
+        exit(1);
+    }
+
+    if (strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET')) !== 'POST' || (string) ($_POST['run_cleanup'] ?? '') !== '1') {
+        http_response_code(405);
+        header('Content-Type: text/plain; charset=UTF-8');
+        echo "Method not allowed. Use the temporary header test button to run this cleanup.\n";
+        exit(1);
+    }
+
+    require_csrf();
+    header('Content-Type: text/plain; charset=UTF-8');
+}
 
 $pdo = db();
 
@@ -118,7 +143,13 @@ try {
     if ($started && $pdo->inTransaction()) {
         $pdo->rollBack();
     }
-    fwrite(STDERR, 'Cleanup failed: ' . $e->getMessage() . PHP_EOL);
+    $errorMessage = 'Cleanup failed: ' . $e->getMessage() . PHP_EOL;
+    if ($isCli && defined('STDERR')) {
+        fwrite(STDERR, $errorMessage);
+    } else {
+        http_response_code(500);
+        echo $errorMessage;
+    }
     exit(1);
 }
 
@@ -149,4 +180,3 @@ echo " - Master/reference tables (companies, garages, parts, services, categorie
 echo " - Customers, vendors, vehicles\n";
 echo " - VIS catalog/compatibility data\n";
 echo " - Users, roles, permissions\n";
-

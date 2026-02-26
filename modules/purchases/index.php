@@ -649,7 +649,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $pdo->beginTransaction();
         try {
             $purchaseLockSql =
-                'SELECT p.id, p.assignment_status, p.purchase_status, p.notes, p.grand_total
+                'SELECT p.id, p.assignment_status, p.purchase_status, p.notes, p.taxable_amount, p.gst_amount, p.grand_total
                  FROM purchases p
                  WHERE p.id = :id
                    AND p.company_id = :company_id
@@ -679,6 +679,136 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 throw new RuntimeException('Cannot assign purchase without items.');
             }
 
+            $updatedTotals = [
+                'taxable' => round((float) ($purchase['taxable_amount'] ?? 0), 2),
+                'gst' => round((float) ($purchase['gst_amount'] ?? 0), 2),
+                'grand' => round((float) ($purchase['grand_total'] ?? 0), 2),
+            ];
+
+            $assignItemIds = $_POST['assign_item_id'] ?? [];
+            $assignUnitCosts = $_POST['assign_item_unit_cost'] ?? [];
+            $assignGstRates = $_POST['assign_item_gst_rate'] ?? [];
+            $hasAssignItemPayload =
+                array_key_exists('assign_item_id', $_POST)
+                || array_key_exists('assign_item_unit_cost', $_POST)
+                || array_key_exists('assign_item_gst_rate', $_POST);
+            if ($hasAssignItemPayload) {
+                if (!is_array($assignItemIds) || !is_array($assignUnitCosts) || !is_array($assignGstRates)) {
+                    throw new RuntimeException('Invalid assign item payload.');
+                }
+
+                $existingItemsStmt = $pdo->prepare(
+                    'SELECT pi.id, pi.part_id, pi.quantity, p.part_name, p.part_sku, p.unit
+                     FROM purchase_items pi
+                     INNER JOIN parts p ON p.id = pi.part_id
+                     WHERE pi.purchase_id = :purchase_id
+                     ORDER BY pi.id ASC
+                     FOR UPDATE'
+                );
+                $existingItemsStmt->execute(['purchase_id' => $purchaseId]);
+                $existingItems = $existingItemsStmt->fetchAll();
+
+                $existingItemsById = [];
+                foreach ($existingItems as $existingItem) {
+                    $itemId = (int) ($existingItem['id'] ?? 0);
+                    if ($itemId > 0) {
+                        $existingItemsById[$itemId] = $existingItem;
+                    }
+                }
+                if ($existingItemsById === []) {
+                    throw new RuntimeException('Cannot assign purchase without item rows.');
+                }
+
+                $rowCount = max(count($assignItemIds), count($assignUnitCosts), count($assignGstRates));
+                if ($rowCount !== count($existingItemsById)) {
+                    throw new RuntimeException('Assign item rows are incomplete. Reload and retry assignment.');
+                }
+
+                $seenItemIds = [];
+                $recalculatedRows = [];
+                for ($i = 0; $i < $rowCount; $i++) {
+                    $itemId = filter_var($assignItemIds[$i] ?? 0, FILTER_VALIDATE_INT);
+                    $itemId = $itemId !== false ? (int) $itemId : 0;
+                    $unitCost = pur_decimal($assignUnitCosts[$i] ?? 0.0, 0.0);
+                    $gstRate = pur_decimal($assignGstRates[$i] ?? 0.0, 0.0);
+
+                    if ($itemId <= 0 || !isset($existingItemsById[$itemId])) {
+                        throw new RuntimeException('Invalid item row found while assigning purchase.');
+                    }
+                    if (isset($seenItemIds[$itemId])) {
+                        throw new RuntimeException('Duplicate item row found while assigning purchase.');
+                    }
+                    if ($unitCost < 0 || $gstRate < 0 || $gstRate > 100) {
+                        throw new RuntimeException('Assigned unit cost/GST values are out of range.');
+                    }
+
+                    $existingItem = $existingItemsById[$itemId];
+                    $partId = (int) ($existingItem['part_id'] ?? 0);
+                    $quantity = round((float) ($existingItem['quantity'] ?? 0), 2);
+                    if ($partId <= 0 || $quantity <= 0) {
+                        throw new RuntimeException('Invalid quantity found in assigned item rows.');
+                    }
+
+                    $partName = trim((string) ($existingItem['part_name'] ?? ('Part #' . $partId)));
+                    $partUnitCode = part_unit_normalize_code((string) ($existingItem['unit'] ?? ''));
+                    if ($partUnitCode === '') {
+                        $partUnitCode = 'PCS';
+                    }
+                    if (!part_unit_allows_decimal($companyId, $partUnitCode) && pur_value_has_fraction($quantity)) {
+                        throw new RuntimeException('Part "' . $partName . '" uses unit ' . $partUnitCode . ' and allows only whole quantity.');
+                    }
+
+                    $taxableAmount = round($quantity * $unitCost, 2);
+                    $gstAmount = round(($taxableAmount * $gstRate) / 100, 2);
+                    $totalAmount = round($taxableAmount + $gstAmount, 2);
+
+                    $recalculatedRows[] = [
+                        'id' => $itemId,
+                        'unit_cost' => round($unitCost, 2),
+                        'gst_rate' => round($gstRate, 2),
+                        'taxable_amount' => $taxableAmount,
+                        'gst_amount' => $gstAmount,
+                        'total_amount' => $totalAmount,
+                    ];
+                    $seenItemIds[$itemId] = true;
+                }
+
+                if (count($seenItemIds) !== count($existingItemsById)) {
+                    throw new RuntimeException('Some purchase item rows were not submitted. Reload and retry assignment.');
+                }
+
+                $itemUpdateStmt = $pdo->prepare(
+                    'UPDATE purchase_items
+                     SET unit_cost = :unit_cost,
+                         gst_rate = :gst_rate,
+                         taxable_amount = :taxable_amount,
+                         gst_amount = :gst_amount,
+                         total_amount = :total_amount
+                     WHERE id = :id
+                       AND purchase_id = :purchase_id'
+                );
+                $updatedTotals = ['taxable' => 0.0, 'gst' => 0.0, 'grand' => 0.0];
+                foreach ($recalculatedRows as $row) {
+                    $itemUpdateStmt->execute([
+                        'unit_cost' => (float) $row['unit_cost'],
+                        'gst_rate' => (float) $row['gst_rate'],
+                        'taxable_amount' => (float) $row['taxable_amount'],
+                        'gst_amount' => (float) $row['gst_amount'],
+                        'total_amount' => (float) $row['total_amount'],
+                        'id' => (int) $row['id'],
+                        'purchase_id' => $purchaseId,
+                    ]);
+                    $updatedTotals['taxable'] += (float) $row['taxable_amount'];
+                    $updatedTotals['gst'] += (float) $row['gst_amount'];
+                    $updatedTotals['grand'] += (float) $row['total_amount'];
+                }
+                $updatedTotals = [
+                    'taxable' => round($updatedTotals['taxable'], 2),
+                    'gst' => round($updatedTotals['gst'], 2),
+                    'grand' => round($updatedTotals['grand'], 2),
+                ];
+            }
+
             $finalizedAt = $finalizeRequested ? date('Y-m-d H:i:s') : null;
             $finalizedBy = $finalizeRequested ? $userId : null;
             $nextStatus = $finalizeRequested ? 'FINALIZED' : 'DRAFT';
@@ -691,6 +821,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                      assignment_status = "ASSIGNED",
                      purchase_status = :purchase_status,
                      payment_status = :payment_status,
+                     taxable_amount = :taxable_amount,
+                     gst_amount = :gst_amount,
+                     grand_total = :grand_total,
                      notes = :notes,
                      finalized_by = :finalized_by,
                      finalized_at = :finalized_at
@@ -702,6 +835,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'purchase_date' => $purchaseDate,
                 'purchase_status' => $nextStatus,
                 'payment_status' => $paymentStatus,
+                'taxable_amount' => (float) $updatedTotals['taxable'],
+                'gst_amount' => (float) $updatedTotals['gst'],
+                'grand_total' => (float) $updatedTotals['grand'],
                 'notes' => $notes !== '' ? $notes : ((string) ($purchase['notes'] ?? '') !== '' ? (string) $purchase['notes'] : null),
                 'finalized_by' => $finalizedBy,
                 'finalized_at' => $finalizedAt,
@@ -709,7 +845,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             ]);
 
             if ($purchasePaymentsReady && $paymentStatus === 'PAID') {
-              $grandTotal = round((float) ($purchase['grand_total'] ?? 0), 2);
+              $grandTotal = round((float) ($updatedTotals['grand'] ?? 0), 2);
               if ($grandTotal > 0) {
                 $paymentStmt = $pdo->prepare(
                   'INSERT INTO purchase_payments
@@ -746,6 +882,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         'purchase_status' => $nextStatus,
                         'assignment_status' => 'ASSIGNED',
                         'payment_status' => $paymentStatus,
+                        'taxable_amount' => (float) $updatedTotals['taxable'],
+                        'gst_amount' => (float) $updatedTotals['gst'],
+                        'grand_total' => (float) $updatedTotals['grand'],
                     ],
                 ]
             );
@@ -972,12 +1111,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         $pdo = db();
         $pdo->beginTransaction();
-        $safeDeleteValidation = null;
         try {
-            $safeDeleteValidation = safe_delete_validate_post_confirmation('purchase', $purchaseId, [
-                'operation' => 'delete',
-                'reason_field' => 'delete_reason',
-            ]);
             $purchase = pur_fetch_purchase_for_update($pdo, $purchaseId, $companyId, $activeGarageId);
             if (!$purchase) {
                 throw new RuntimeException('Purchase not found for this garage.');
@@ -1212,7 +1346,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         $pdo = db();
         $pdo->beginTransaction();
+        $safeDeleteValidation = null;
         try {
+            $safeDeleteValidation = safe_delete_validate_post_confirmation('purchase', $purchaseId, [
+                'operation' => 'delete',
+                'reason_field' => 'delete_reason',
+            ]);
             $purchase = pur_fetch_purchase_for_update($pdo, $purchaseId, $companyId, $activeGarageId);
             if (!$purchase) {
                 throw new RuntimeException('Purchase not found for this garage.');
@@ -1726,6 +1865,7 @@ $toDate = (string) ($purchaseDateFilter['to_date'] ?? $purchaseRangeEnd);
 $assignPurchaseId = get_int('assign_purchase_id', 0);
 $payPurchaseId = get_int('pay_purchase_id', 0);
 $editPurchaseId = get_int('edit_purchase_id', 0);
+$viewPurchaseId = get_int('view_purchase_id', 0);
 
 $allowedPaymentStatuses = ['UNPAID', 'PARTIAL', 'PAID'];
 $allowedPurchaseStatuses = ['DRAFT', 'FINALIZED'];
@@ -1798,6 +1938,16 @@ $summary = [
 ];
 $topParts = [];
 $unassignedRows = [];
+$assignPurchase = null;
+$assignPurchaseItems = [];
+$viewPurchase = null;
+$viewPurchaseItems = [];
+$viewPurchasePayments = [];
+$viewPurchasePaymentSummary = [
+    'unreversed_count' => 0,
+    'unreversed_amount' => 0.0,
+    'net_paid_amount' => 0.0,
+];
 $vendorOutstandingRows = [];
 $agingSummary = [
   'bucket_0_30' => 0,
@@ -1932,6 +2082,107 @@ if ($purchasesReady) {
         'garage_id' => $activeGarageId,
     ]);
     $unassignedRows = $unassignedStmt->fetchAll();
+
+    if ($canManage && $assignPurchaseId > 0) {
+      $assignStmt = db()->prepare(
+        'SELECT p.*, v.vendor_name
+         FROM purchases p
+         LEFT JOIN vendors v ON v.id = p.vendor_id
+         WHERE p.id = :id
+           AND p.company_id = :company_id
+           AND p.garage_id = :garage_id
+           ' . $purchaseDeletedScopeSql . '
+           AND p.assignment_status = "UNASSIGNED"
+           AND p.purchase_status = "DRAFT"
+         LIMIT 1'
+      );
+      $assignStmt->execute([
+        'id' => $assignPurchaseId,
+        'company_id' => $companyId,
+        'garage_id' => $activeGarageId,
+      ]);
+      $assignPurchase = $assignStmt->fetch() ?: null;
+
+      if ($assignPurchase) {
+        $assignItemsStmt = db()->prepare(
+          'SELECT pi.*, p.part_name, p.part_sku, p.unit
+           FROM purchase_items pi
+           INNER JOIN parts p ON p.id = pi.part_id
+           WHERE pi.purchase_id = :purchase_id
+           ORDER BY pi.id ASC'
+        );
+        $assignItemsStmt->execute(['purchase_id' => (int) ($assignPurchase['id'] ?? 0)]);
+        $assignPurchaseItems = $assignItemsStmt->fetchAll();
+      }
+    }
+
+    if ($viewPurchaseId > 0) {
+      $viewPaySelectSql = $purchasePaymentsReady
+        ? ',
+            COALESCE(pay.total_paid, 0) AS total_paid,
+            GREATEST(p.grand_total - COALESCE(pay.total_paid, 0), 0) AS outstanding_total'
+        : ',
+            0 AS total_paid,
+            GREATEST(p.grand_total, 0) AS outstanding_total';
+      $viewPayJoinSql = $purchasePaymentsReady
+        ? '
+         LEFT JOIN (
+           SELECT purchase_id, SUM(amount) AS total_paid
+           FROM purchase_payments
+           GROUP BY purchase_id
+         ) pay ON pay.purchase_id = p.id'
+        : '';
+      $viewStmt = db()->prepare(
+        'SELECT p.*, v.vendor_name, v.vendor_code, g.name AS garage_name, g.code AS garage_code,
+            u.name AS created_by_name, fu.name AS finalized_by_name,
+            ' . ltrim($viewPaySelectSql, ',') . '
+         FROM purchases p
+         LEFT JOIN vendors v ON v.id = p.vendor_id
+         LEFT JOIN garages g ON g.id = p.garage_id
+         LEFT JOIN users u ON u.id = p.created_by
+         LEFT JOIN users fu ON fu.id = p.finalized_by'
+         . $viewPayJoinSql . '
+         WHERE p.id = :id
+           AND p.company_id = :company_id
+           AND p.garage_id = :garage_id
+           ' . $purchaseDeletedScopeSql . '
+         LIMIT 1'
+      );
+      $viewStmt->execute([
+        'id' => $viewPurchaseId,
+        'company_id' => $companyId,
+        'garage_id' => $activeGarageId,
+      ]);
+      $viewPurchase = $viewStmt->fetch() ?: null;
+
+      if ($viewPurchase) {
+        $viewItemsStmt = db()->prepare(
+          'SELECT pi.*, p.part_name, p.part_sku, p.unit
+           FROM purchase_items pi
+           INNER JOIN parts p ON p.id = pi.part_id
+           WHERE pi.purchase_id = :purchase_id
+           ORDER BY pi.id ASC'
+        );
+        $viewItemsStmt->execute(['purchase_id' => (int) ($viewPurchase['id'] ?? 0)]);
+        $viewPurchaseItems = $viewItemsStmt->fetchAll();
+
+        if ($purchasePaymentsReady) {
+          $viewPurchasePaymentSummary = reversal_purchase_payment_summary(db(), (int) ($viewPurchase['id'] ?? 0));
+          $viewPaymentsStmt = db()->prepare(
+            'SELECT pp.id, pp.payment_date, pp.entry_type, pp.amount, pp.payment_mode, pp.reference_no, pp.notes,
+                    pp.reversed_payment_id, u.name AS created_by_name
+             FROM purchase_payments pp
+             LEFT JOIN users u ON u.id = pp.created_by
+             WHERE pp.purchase_id = :purchase_id
+             ORDER BY pp.id DESC'
+          );
+          $viewPaymentsStmt->execute(['purchase_id' => (int) ($viewPurchase['id'] ?? 0)]);
+          $viewPurchasePayments = $viewPaymentsStmt->fetchAll();
+        }
+      } else {
+        flash_set('purchase_warning', 'Selected purchase not found for details view in this garage scope.', 'warning');
+      }
+    }
 
     $payPurchase = null;
     $paymentHistory = [];
@@ -2462,7 +2713,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 
           <?php if ($canManage): ?>
             <div class="col-lg-4">
-              <div class="card card-warning">
+              <div class="card card-warning" id="purchase-assign-section">
                 <div class="card-header"><h3 class="card-title">Assign Unassigned Purchase</h3></div>
                 <?php if (empty($unassignedRows)): ?>
                   <div class="card-body text-muted">No unassigned draft purchases available.</div>
@@ -2472,6 +2723,13 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                       <?= csrf_field(); ?>
                       <input type="hidden" name="_action" value="assign_unassigned">
                       <input type="hidden" name="action_token" value="<?= e($assignToken); ?>">
+                      <?php
+                        $assignSelectedVendorId = (int) ($assignPurchase['vendor_id'] ?? 0);
+                        $assignInvoiceValue = (string) ($assignPurchase['invoice_number'] ?? '');
+                        $assignDateValue = (string) ($assignPurchase['purchase_date'] ?? date('Y-m-d'));
+                        $assignPaymentStatusValue = (string) ($assignPurchase['payment_status'] ?? 'UNPAID');
+                        $assignNotesValue = (string) ($assignPurchase['notes'] ?? '');
+                      ?>
 
                       <div class="mb-2">
                         <label class="form-label">Unassigned Purchase</label>
@@ -2489,7 +2747,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                         <select name="vendor_id" class="form-select" required>
                           <option value="">Select Vendor</option>
                           <?php foreach ($vendors as $vendor): ?>
-                            <option value="<?= (int) $vendor['id']; ?>">
+                            <option value="<?= (int) $vendor['id']; ?>" <?= $assignSelectedVendorId === (int) $vendor['id'] ? 'selected' : ''; ?>>
                               <?= e((string) $vendor['vendor_name']); ?> (<?= e((string) $vendor['vendor_code']); ?>)
                             </option>
                           <?php endforeach; ?>
@@ -2497,24 +2755,110 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                       </div>
                       <div class="mb-2">
                         <label class="form-label">Invoice Number</label>
-                        <input type="text" name="invoice_number" class="form-control" maxlength="80" required>
+                        <input type="text" name="invoice_number" class="form-control" maxlength="80" value="<?= e($assignInvoiceValue); ?>" required>
                       </div>
                       <div class="mb-2">
                         <label class="form-label">Date</label>
-                        <input type="date" name="purchase_date" class="form-control" value="<?= e(date('Y-m-d')); ?>" required>
+                        <input type="date" name="purchase_date" class="form-control" value="<?= e($assignDateValue); ?>" required>
                       </div>
                       <div class="mb-2">
                         <label class="form-label">Payment Status</label>
                         <select name="payment_status" class="form-select" required>
-                          <option value="UNPAID">UNPAID</option>
-                          <option value="PARTIAL">PARTIAL</option>
-                          <option value="PAID">PAID</option>
+                          <option value="UNPAID" <?= strtoupper($assignPaymentStatusValue) === 'UNPAID' ? 'selected' : ''; ?>>UNPAID</option>
+                          <option value="PARTIAL" <?= strtoupper($assignPaymentStatusValue) === 'PARTIAL' ? 'selected' : ''; ?>>PARTIAL</option>
+                          <option value="PAID" <?= strtoupper($assignPaymentStatusValue) === 'PAID' ? 'selected' : ''; ?>>PAID</option>
                         </select>
                       </div>
                       <div class="mb-2">
                         <label class="form-label">Notes</label>
-                        <input type="text" name="notes" class="form-control" maxlength="255" placeholder="Optional assignment note">
+                        <input type="text" name="notes" class="form-control" maxlength="255" value="<?= e($assignNotesValue); ?>" placeholder="Optional assignment note">
                       </div>
+                      <?php if ($assignPurchase && !empty($assignPurchaseItems)): ?>
+                        <div class="alert alert-light border mb-2 py-2">
+                          <div><strong>Selected:</strong> #<?= (int) ($assignPurchase['id'] ?? 0); ?> | <?= e((string) ($assignPurchase['purchase_source'] ?? '-')); ?></div>
+                          <div class="small text-muted">Update line item Unit Cost / GST % before assigning (quantities remain unchanged).</div>
+                        </div>
+                        <div class="table-responsive mb-2">
+                          <table class="table table-sm table-bordered align-middle mb-0" id="assign-purchase-item-table">
+                            <thead>
+                              <tr>
+                                <th>Part</th>
+                                <th class="text-end">Qty</th>
+                                <th class="text-end">Unit Cost</th>
+                                <th class="text-end">GST %</th>
+                                <th class="text-end">Taxable</th>
+                                <th class="text-end">Line Total</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              <?php foreach ($assignPurchaseItems as $assignItem): ?>
+                                <?php
+                                  $assignQty = (float) ($assignItem['quantity'] ?? 0);
+                                  $assignUnitCost = (float) ($assignItem['unit_cost'] ?? 0);
+                                  $assignGstRate = (float) ($assignItem['gst_rate'] ?? 0);
+                                  $assignTaxable = round($assignQty * $assignUnitCost, 2);
+                                  $assignLineGst = round(($assignTaxable * $assignGstRate) / 100, 2);
+                                  $assignLineTotal = round($assignTaxable + $assignLineGst, 2);
+                                ?>
+                                <tr>
+                                  <td>
+                                    <?= e((string) ($assignItem['part_name'] ?? '')); ?> (<?= e((string) ($assignItem['part_sku'] ?? '')); ?>)
+                                    <div class="small text-muted"><?= e((string) ($assignItem['unit'] ?? 'PCS')); ?></div>
+                                    <input type="hidden" name="assign_item_id[]" value="<?= (int) ($assignItem['id'] ?? 0); ?>">
+                                    <input type="hidden" name="item_quantity[]" value="<?= e(number_format($assignQty, 2, '.', '')); ?>">
+                                  </td>
+                                  <td class="text-end">
+                                    <?= e(number_format($assignQty, 2)); ?>
+                                  </td>
+                                  <td>
+                                    <input
+                                      type="number"
+                                      name="assign_item_unit_cost[]"
+                                      class="form-control form-control-sm text-end js-item-cost"
+                                      step="0.01"
+                                      min="0"
+                                      value="<?= e(number_format($assignUnitCost, 2, '.', '')); ?>"
+                                      required
+                                    >
+                                  </td>
+                                  <td>
+                                    <input
+                                      type="number"
+                                      name="assign_item_gst_rate[]"
+                                      class="form-control form-control-sm text-end js-item-gst"
+                                      step="0.01"
+                                      min="0"
+                                      max="100"
+                                      value="<?= e(number_format($assignGstRate, 2, '.', '')); ?>"
+                                      required
+                                    >
+                                  </td>
+                                  <td class="text-end"><?= e(number_format($assignTaxable, 2)); ?></td>
+                                  <td class="text-end"><?= e(number_format($assignLineTotal, 2)); ?></td>
+                                </tr>
+                              <?php endforeach; ?>
+                            </tbody>
+                          </table>
+                        </div>
+                        <div class="row g-2 mt-1 mb-1" id="assign-purchase-live-summary">
+                          <div class="col-6">
+                            <div class="border rounded p-2 bg-light-subtle">
+                              <div class="text-muted small">Taxable Total</div>
+                              <div class="fw-semibold js-live-total-taxable"><?= e(number_format((float) ($assignPurchase['taxable_amount'] ?? 0), 2)); ?></div>
+                            </div>
+                          </div>
+                          <div class="col-6">
+                            <div class="border rounded p-2 bg-light-subtle">
+                              <div class="text-muted small">Grand Total</div>
+                              <div class="fw-semibold js-live-total-grand"><?= e(number_format((float) ($assignPurchase['grand_total'] ?? 0), 2)); ?></div>
+                            </div>
+                          </div>
+                        </div>
+                      <?php elseif ($assignPurchaseId > 0): ?>
+                        <div class="alert alert-warning py-2 mb-2">Selected unassigned purchase was not found in this garage or has no item rows.</div>
+                      <?php else: ?>
+                        <div class="small text-muted mb-2">Tip: use the row-level <strong>Assign</strong> button to load item lines and enter Unit Cost / GST before assignment.</div>
+                      <?php endif; ?>
                       <?php if ($canFinalize): ?>
                         <div class="form-check mt-2">
                           <input class="form-check-input" type="checkbox" name="finalize_purchase" value="1" id="finalize_purchase_assign" checked>
@@ -2540,7 +2884,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             $editAssignmentStatus = strtoupper((string) ($editPurchase['assignment_status'] ?? 'ASSIGNED'));
             $editVendorRequired = $editAssignmentStatus !== 'UNASSIGNED';
           ?>
-          <div class="card card-warning mb-3">
+          <div class="card card-warning mb-3" id="purchase-edit-section">
             <div class="card-header d-flex justify-content-between align-items-center">
               <h3 class="card-title mb-0">Edit Purchase #<?= (int) ($editPurchase['id'] ?? 0); ?></h3>
               <a href="<?= e(url('modules/purchases/index.php')); ?>" class="btn btn-sm btn-outline-secondary">Close Edit</a>
@@ -2730,6 +3074,163 @@ require_once __DIR__ . '/../../includes/sidebar.php';
           </div>
         <?php endif; ?>
 
+        <?php if ($viewPurchase): ?>
+          <div class="card mb-3" id="purchase-detail-print-card">
+            <div class="card-header d-flex justify-content-between align-items-center gap-2">
+              <h3 class="card-title mb-0">Purchase Details #<?= (int) ($viewPurchase['id'] ?? 0); ?></h3>
+              <div class="d-flex gap-2 purchase-detail-screen-controls">
+                <button type="button" class="btn btn-sm btn-outline-primary js-print-purchase-details">Print</button>
+                <?php if ($canManage): ?>
+                  <a href="<?= e(url('modules/purchases/index.php?edit_purchase_id=' . (int) ($viewPurchase['id'] ?? 0))); ?>" class="btn btn-sm btn-outline-warning">Edit</a>
+                <?php endif; ?>
+                <?php if ($purchasePaymentsReady && $canPayPurchases): ?>
+                  <a href="<?= e(url('modules/purchases/index.php?pay_purchase_id=' . (int) ($viewPurchase['id'] ?? 0))); ?>" class="btn btn-sm btn-outline-success">Payments</a>
+                <?php endif; ?>
+                <a href="<?= e(url('modules/purchases/index.php')); ?>" class="btn btn-sm btn-outline-secondary">Close</a>
+              </div>
+            </div>
+            <div class="card-body">
+              <div class="row g-2 mb-3">
+                <div class="col-md-2"><strong>Purchase ID:</strong> #<?= (int) ($viewPurchase['id'] ?? 0); ?></div>
+                <div class="col-md-3"><strong>Vendor:</strong> <?= e((string) ($viewPurchase['vendor_name'] ?? 'UNASSIGNED')); ?></div>
+                <div class="col-md-2"><strong>Vendor Code:</strong> <?= e((string) ($viewPurchase['vendor_code'] ?? '-')); ?></div>
+                <div class="col-md-2"><strong>Invoice:</strong> <?= e((string) (($viewPurchase['invoice_number'] ?? '') !== '' ? $viewPurchase['invoice_number'] : '-')); ?></div>
+                <div class="col-md-3"><strong>Garage:</strong> <?= e((string) ($viewPurchase['garage_name'] ?? $garageName)); ?><?= trim((string) ($viewPurchase['garage_code'] ?? '')) !== '' ? ' (' . e((string) $viewPurchase['garage_code']) . ')' : ''; ?></div>
+              </div>
+
+              <div class="row g-2 mb-3">
+                <div class="col-md-2"><strong>Date:</strong> <?= e((string) ($viewPurchase['purchase_date'] ?? '-')); ?></div>
+                <div class="col-md-2"><strong>Source:</strong> <?= e((string) ($viewPurchase['purchase_source'] ?? '-')); ?></div>
+                <div class="col-md-2">
+                  <strong>Assignment:</strong>
+                  <span class="badge text-bg-<?= e(pur_assignment_badge_class((string) ($viewPurchase['assignment_status'] ?? 'UNASSIGNED'))); ?>">
+                    <?= e((string) ($viewPurchase['assignment_status'] ?? 'UNASSIGNED')); ?>
+                  </span>
+                </div>
+                <div class="col-md-2">
+                  <strong>Status:</strong>
+                  <span class="badge text-bg-<?= e(pur_purchase_badge_class((string) ($viewPurchase['purchase_status'] ?? 'DRAFT'))); ?>">
+                    <?= e((string) ($viewPurchase['purchase_status'] ?? 'DRAFT')); ?>
+                  </span>
+                </div>
+                <div class="col-md-2">
+                  <strong>Payment:</strong>
+                  <span class="badge text-bg-<?= e(pur_payment_badge_class((string) ($viewPurchase['payment_status'] ?? 'UNPAID'))); ?>">
+                    <?= e((string) ($viewPurchase['payment_status'] ?? 'UNPAID')); ?>
+                  </span>
+                </div>
+                <div class="col-md-2"><strong>Created By:</strong> <?= e((string) ($viewPurchase['created_by_name'] ?? '-')); ?></div>
+              </div>
+
+              <div class="row g-2 mb-3">
+                <div class="col-md-3"><strong>Taxable:</strong> <?= e(format_currency((float) ($viewPurchase['taxable_amount'] ?? 0))); ?></div>
+                <div class="col-md-3"><strong>GST:</strong> <?= e(format_currency((float) ($viewPurchase['gst_amount'] ?? 0))); ?></div>
+                <div class="col-md-3"><strong>Grand Total:</strong> <?= e(format_currency((float) ($viewPurchase['grand_total'] ?? 0))); ?></div>
+                <?php if ($purchasePaymentsReady): ?>
+                  <div class="col-md-3"><strong>Paid / Outstanding:</strong> <?= e(format_currency((float) ($viewPurchase['total_paid'] ?? 0))); ?> / <?= e(format_currency((float) ($viewPurchase['outstanding_total'] ?? 0))); ?></div>
+                <?php else: ?>
+                  <div class="col-md-3"><strong>Finalized By:</strong> <?= e((string) ($viewPurchase['finalized_by_name'] ?? '-')); ?></div>
+                <?php endif; ?>
+              </div>
+
+              <div class="row g-2 mb-3">
+                <div class="col-md-6"><strong>Notes:</strong> <?= e((string) (($viewPurchase['notes'] ?? '') !== '' ? $viewPurchase['notes'] : '-')); ?></div>
+                <div class="col-md-3"><strong>Created At:</strong> <?= e((string) ($viewPurchase['created_at'] ?? '-')); ?></div>
+                <div class="col-md-3"><strong>Finalized At:</strong> <?= e((string) ($viewPurchase['finalized_at'] ?? '-')); ?></div>
+              </div>
+
+              <div class="table-responsive mb-3">
+                <table class="table table-sm table-bordered align-middle mb-0">
+                  <thead>
+                    <tr>
+                      <th>#</th>
+                      <th>Part</th>
+                      <th>SKU</th>
+                      <th>Unit</th>
+                      <th class="text-end">Qty</th>
+                      <th class="text-end">Unit Cost</th>
+                      <th class="text-end">GST %</th>
+                      <th class="text-end">Taxable</th>
+                      <th class="text-end">GST Amt</th>
+                      <th class="text-end">Line Total</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <?php if (empty($viewPurchaseItems)): ?>
+                      <tr><td colspan="10" class="text-center text-muted py-4">No purchase items found.</td></tr>
+                    <?php else: ?>
+                      <?php foreach ($viewPurchaseItems as $index => $item): ?>
+                        <tr>
+                          <td><?= (int) $index + 1; ?></td>
+                          <td><?= e((string) ($item['part_name'] ?? '')); ?></td>
+                          <td><code><?= e((string) ($item['part_sku'] ?? '')); ?></code></td>
+                          <td><?= e((string) ($item['unit'] ?? 'PCS')); ?></td>
+                          <td class="text-end"><?= e(number_format((float) ($item['quantity'] ?? 0), 2)); ?></td>
+                          <td class="text-end"><?= e(number_format((float) ($item['unit_cost'] ?? 0), 2)); ?></td>
+                          <td class="text-end"><?= e(number_format((float) ($item['gst_rate'] ?? 0), 2)); ?></td>
+                          <td class="text-end"><?= e(number_format((float) ($item['taxable_amount'] ?? 0), 2)); ?></td>
+                          <td class="text-end"><?= e(number_format((float) ($item['gst_amount'] ?? 0), 2)); ?></td>
+                          <td class="text-end fw-semibold"><?= e(number_format((float) ($item['total_amount'] ?? 0), 2)); ?></td>
+                        </tr>
+                      <?php endforeach; ?>
+                    <?php endif; ?>
+                  </tbody>
+                  <tfoot>
+                    <tr>
+                      <th colspan="7" class="text-end">Totals</th>
+                      <th class="text-end"><?= e(number_format((float) ($viewPurchase['taxable_amount'] ?? 0), 2)); ?></th>
+                      <th class="text-end"><?= e(number_format((float) ($viewPurchase['gst_amount'] ?? 0), 2)); ?></th>
+                      <th class="text-end"><?= e(number_format((float) ($viewPurchase['grand_total'] ?? 0), 2)); ?></th>
+                    </tr>
+                  </tfoot>
+                </table>
+              </div>
+
+              <?php if ($purchasePaymentsReady): ?>
+                <div class="mb-2">
+                  <strong>Payment Summary:</strong>
+                  Net Paid <?= e(format_currency((float) ($viewPurchasePaymentSummary['net_paid_amount'] ?? 0))); ?>,
+                  Active Payment Rows <?= e((string) ((int) ($viewPurchasePaymentSummary['unreversed_count'] ?? 0))); ?>
+                </div>
+                <div class="table-responsive">
+                  <table class="table table-sm table-striped mb-0">
+                    <thead>
+                      <tr>
+                        <th>ID</th>
+                        <th>Date</th>
+                        <th>Type</th>
+                        <th>Amount</th>
+                        <th>Mode</th>
+                        <th>Reference</th>
+                        <th>User</th>
+                        <th>Notes</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <?php if (empty($viewPurchasePayments)): ?>
+                        <tr><td colspan="8" class="text-center text-muted py-3">No payment history.</td></tr>
+                      <?php else: ?>
+                        <?php foreach ($viewPurchasePayments as $payment): ?>
+                          <tr>
+                            <td>#<?= (int) ($payment['id'] ?? 0); ?></td>
+                            <td><?= e((string) ($payment['payment_date'] ?? '-')); ?></td>
+                            <td><?= e((string) ($payment['entry_type'] ?? '-')); ?></td>
+                            <td><?= e(format_currency((float) ($payment['amount'] ?? 0))); ?></td>
+                            <td><?= e((string) ($payment['payment_mode'] ?? '-')); ?></td>
+                            <td><?= e((string) ($payment['reference_no'] ?? '-')); ?></td>
+                            <td><?= e((string) ($payment['created_by_name'] ?? '-')); ?></td>
+                            <td><?= e((string) ($payment['notes'] ?? '-')); ?></td>
+                          </tr>
+                        <?php endforeach; ?>
+                      <?php endif; ?>
+                    </tbody>
+                  </table>
+                </div>
+              <?php endif; ?>
+            </div>
+          </div>
+        <?php endif; ?>
+
         <?php if ($purchasePaymentsReady): ?>
           <div class="row g-3 mb-3">
             <div class="col-md-6">
@@ -2754,7 +3255,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         <?php endif; ?>
 
         <?php if ($purchasePaymentsReady && $canPayPurchases && $payPurchase): ?>
-          <div class="card mb-3">
+          <div class="card mb-3" id="purchase-payments-section">
             <div class="card-header"><h3 class="card-title">Purchase Payments</h3></div>
             <div class="card-body">
               <div class="row g-2 mb-3">
@@ -3127,7 +3628,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
           <div class="alert alert-warning">Vendor payable summaries require `vendor.payments` permission.</div>
         <?php endif; ?>
 
-        <div class="card mb-3">
+        <div class="card mb-3" id="purchase-list-section">
           <div class="card-header"><h3 class="card-title mb-0">Purchase List</h3></div>
           <div class="card-body border-bottom">
             <form method="get" class="row g-2 align-items-end">
@@ -3238,6 +3739,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                         <?php if ($isUnassigned && $canManage): ?>
                           <a class="btn btn-sm btn-outline-warning" href="<?= e(url('modules/purchases/index.php?assign_purchase_id=' . $purchaseId)); ?>">Assign</a>
                         <?php endif; ?>
+                        <a class="btn btn-sm btn-outline-dark" href="<?= e(url('modules/purchases/index.php?view_purchase_id=' . $purchaseId)); ?>">View</a>
                         <?php if ($canManage): ?>
                           <a class="btn btn-sm btn-outline-secondary" href="<?= e(url('modules/purchases/index.php?edit_purchase_id=' . $purchaseId)); ?>">Edit</a>
                         <?php endif; ?>
@@ -3341,6 +3843,34 @@ require_once __DIR__ . '/../../includes/sidebar.php';
     </div>
   </div>
 </div>
+
+<style>
+  @media print {
+    body.purchase-detail-print-mode * {
+      visibility: hidden !important;
+    }
+
+    body.purchase-detail-print-mode #purchase-detail-print-card,
+    body.purchase-detail-print-mode #purchase-detail-print-card * {
+      visibility: visible !important;
+    }
+
+    body.purchase-detail-print-mode #purchase-detail-print-card {
+      position: absolute;
+      left: 0;
+      top: 0;
+      width: 100%;
+      border: 0 !important;
+      box-shadow: none !important;
+      margin: 0 !important;
+      background: #fff !important;
+    }
+
+    body.purchase-detail-print-mode .purchase-detail-screen-controls {
+      display: none !important;
+    }
+  }
+</style>
 
 <script>
   (function () {
@@ -3560,7 +4090,180 @@ require_once __DIR__ . '/../../includes/sidebar.php';
     }
 
     initItemTable('purchase-item-table', 'add-item-row', 'purchase-live-summary');
+    initItemTable('assign-purchase-item-table', 'add-assign-item-row', 'assign-purchase-live-summary');
     initItemTable('purchase-edit-item-table', 'add-edit-item-row', 'purchase-edit-live-summary');
+
+    function normalizeText(value) {
+      return String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+    }
+
+    function findCardByTitleText(expectedTitle) {
+      var normalizedExpected = normalizeText(expectedTitle);
+      var cards = document.querySelectorAll('.card');
+      for (var i = 0; i < cards.length; i += 1) {
+        var titleEl = cards[i].querySelector('.card-header .card-title');
+        if (titleEl && normalizeText(titleEl.textContent) === normalizedExpected) {
+          return cards[i];
+        }
+      }
+      return null;
+    }
+
+    function findCardByTitlePrefix(prefix) {
+      var normalizedPrefix = normalizeText(prefix);
+      var cards = document.querySelectorAll('.card');
+      for (var i = 0; i < cards.length; i += 1) {
+        var titleEl = cards[i].querySelector('.card-header .card-title');
+        if (!titleEl) {
+          continue;
+        }
+        if (normalizeText(titleEl.textContent).indexOf(normalizedPrefix) === 0) {
+          return cards[i];
+        }
+      }
+      return null;
+    }
+
+    function getPurchaseActionParams() {
+      try {
+        return new URLSearchParams(window.location.search || '');
+      } catch (error) {
+        return null;
+      }
+    }
+
+    function ensurePurchaseActionMount(listCard) {
+      if (!listCard) {
+        return null;
+      }
+      var existing = document.getElementById('purchase-list-action-sections');
+      if (existing) {
+        return existing;
+      }
+      var mount = document.createElement('div');
+      mount.id = 'purchase-list-action-sections';
+      mount.className = 'mb-3';
+      listCard.insertAdjacentElement('afterend', mount);
+      return mount;
+    }
+
+    function smoothScrollToNode(node) {
+      if (!node) {
+        return;
+      }
+      window.requestAnimationFrame(function () {
+        var stickyHeader = document.querySelector('.main-header, .app-header, .navbar');
+        var headerOffset = stickyHeader ? stickyHeader.offsetHeight : 76;
+        var top = window.pageYOffset + node.getBoundingClientRect().top - headerOffset - 12;
+        window.scrollTo({
+          top: Math.max(0, top),
+          behavior: 'smooth'
+        });
+      });
+    }
+
+    function movePurchaseActionSectionsBelowList() {
+      var params = getPurchaseActionParams();
+      if (!params) {
+        return;
+      }
+
+      var hasAssign = params.has('assign_purchase_id');
+      var hasView = params.has('view_purchase_id');
+      var hasEdit = params.has('edit_purchase_id');
+      var hasPay = params.has('pay_purchase_id');
+
+      if (!hasAssign && !hasView && !hasEdit && !hasPay) {
+        return;
+      }
+
+      var listCard = document.getElementById('purchase-list-section') || findCardByTitleText('Purchase List');
+      if (!listCard) {
+        return;
+      }
+
+      var mount = ensurePurchaseActionMount(listCard);
+      if (!mount) {
+        return;
+      }
+
+      var movedNodes = [];
+
+      if (hasAssign) {
+        var assignCard = document.getElementById('purchase-assign-section') || findCardByTitleText('Assign Unassigned Purchase');
+        if (assignCard) {
+          var assignCol = assignCard.closest('.col-lg-4');
+          if (assignCol && assignCol.parentElement) {
+            var assignParentRow = assignCol.parentElement;
+            var createCol = assignParentRow.querySelector('.col-lg-8');
+            if (createCol) {
+              createCol.classList.remove('col-lg-8');
+              createCol.classList.add('col-lg-12');
+            }
+            assignCol.classList.remove('col-lg-4');
+            assignCol.classList.add('col-lg-12');
+
+            var assignRowMount = document.getElementById('purchase-list-assign-section-row');
+            if (!assignRowMount) {
+              assignRowMount = document.createElement('div');
+              assignRowMount.id = 'purchase-list-assign-section-row';
+              assignRowMount.className = 'row g-3 mb-3';
+              mount.appendChild(assignRowMount);
+            }
+            assignRowMount.appendChild(assignCol);
+            movedNodes.push(assignCol);
+          } else if (assignCard.parentElement !== mount) {
+            mount.appendChild(assignCard);
+            movedNodes.push(assignCard);
+          }
+        }
+      }
+
+      if (hasView) {
+        var viewSection = document.getElementById('purchase-detail-print-card');
+        if (viewSection && viewSection.parentElement !== mount) {
+          mount.appendChild(viewSection);
+          movedNodes.push(viewSection);
+        }
+      }
+
+      if (hasEdit) {
+        var editSection = document.getElementById('purchase-edit-section') || findCardByTitlePrefix('Edit Purchase');
+        if (editSection && editSection.parentElement !== mount) {
+          mount.appendChild(editSection);
+          movedNodes.push(editSection);
+        }
+      }
+
+      if (hasPay) {
+        var paymentSection = document.getElementById('purchase-payments-section') || findCardByTitleText('Purchase Payments');
+        if (paymentSection && paymentSection.parentElement !== mount) {
+          mount.appendChild(paymentSection);
+          movedNodes.push(paymentSection);
+        } else {
+          var payAlerts = Array.prototype.slice.call(document.querySelectorAll('.alert'));
+          payAlerts.forEach(function (alertEl) {
+            var text = normalizeText(alertEl.textContent);
+            if (
+              text.indexOf('purchase payment access requires') !== -1 ||
+              text.indexOf('selected purchase not found for this garage') !== -1
+            ) {
+              if (alertEl.parentElement !== mount) {
+                mount.appendChild(alertEl);
+                movedNodes.push(alertEl);
+              }
+            }
+          });
+        }
+      }
+
+      if (movedNodes.length > 0) {
+        mount.dataset.gacPurchaseActionsMoved = '1';
+        smoothScrollToNode(movedNodes[0]);
+      }
+    }
+
+    movePurchaseActionSectionsBelowList();
 
     function setValue(id, value) {
       var field = document.getElementById(id);
@@ -3571,6 +4274,20 @@ require_once __DIR__ . '/../../includes/sidebar.php';
     }
 
     document.addEventListener('click', function (event) {
+      var printButton = event.target.closest('.js-print-purchase-details');
+      if (printButton) {
+        event.preventDefault();
+        document.body.classList.add('purchase-detail-print-mode');
+        var cleanup = function () {
+          document.body.classList.remove('purchase-detail-print-mode');
+          window.removeEventListener('afterprint', cleanup);
+        };
+        window.addEventListener('afterprint', cleanup);
+        window.print();
+        window.setTimeout(cleanup, 1000);
+        return;
+      }
+
       var deleteTrigger = event.target.closest('.js-purchase-delete-btn');
       if (!deleteTrigger) {
         return;

@@ -456,6 +456,7 @@ if ($download && $moduleKey !== '') {
              INNER JOIN invoices i ON i.id = p.invoice_id
              WHERE i.company_id = :company_id
                AND i.invoice_status = "FINALIZED"
+               AND ' . reversal_sales_payment_unreversed_filter_sql('p') . '
                ' . $invoiceScopeSql . '
                AND p.paid_on BETWEEN :from_date AND :to_date'
         );

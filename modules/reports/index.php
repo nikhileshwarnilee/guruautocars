@@ -170,6 +170,7 @@ if ((has_permission('expense.view') || has_permission('expense.manage')) && tabl
          FROM expenses e
          WHERE e.company_id = :company_id
            AND e.entry_type <> "DELETED"
+           AND COALESCE(e.entry_type, "EXPENSE") <> "REVERSAL"
            AND e.expense_date BETWEEN :from_date AND :to_date
            ' . $expenseScopeSql
     );
@@ -186,6 +187,7 @@ if ($canViewFinancial && table_columns('payments') !== [] && table_columns('invo
          FROM payments p
          INNER JOIN invoices i ON i.id = p.invoice_id
          WHERE i.company_id = :company_id
+           AND ' . reversal_sales_payment_unreversed_filter_sql('p') . '
            AND p.paid_on BETWEEN :from_date AND :to_date
            ' . $paymentsScopeSql
     );

@@ -25,6 +25,101 @@ function reversal_chain_message(string $intro, array $steps): string
     return implode(' ', $parts);
 }
 
+function reversal_sql_safe_alias(string $alias, string $fallback = 'p'): string
+{
+    $alias = trim($alias);
+    if ($alias !== '' && preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $alias) === 1) {
+        return $alias;
+    }
+    return $fallback;
+}
+
+function reversal_payment_sql_capabilities(string $tableName): array
+{
+    static $cache = [];
+    if (isset($cache[$tableName])) {
+        return $cache[$tableName];
+    }
+
+    $columns = table_columns($tableName);
+    $cache[$tableName] = [
+        'columns' => $columns,
+        'has_entry_type' => in_array('entry_type', $columns, true),
+        'has_reversed_payment_id' => in_array('reversed_payment_id', $columns, true),
+        'has_is_reversed' => in_array('is_reversed', $columns, true),
+    ];
+
+    return $cache[$tableName];
+}
+
+function reversal_payment_unreversed_filter_sql_for_table(string $tableName, string $alias = 'p'): string
+{
+    $alias = reversal_sql_safe_alias($alias, 'p');
+    $caps = reversal_payment_sql_capabilities($tableName);
+    $conditions = [];
+
+    if ((bool) ($caps['has_entry_type'] ?? false)) {
+        $conditions[] = 'COALESCE(' . $alias . '.entry_type, "PAYMENT") = "PAYMENT"';
+    } else {
+        $conditions[] = $alias . '.amount > 0';
+    }
+
+    if ((bool) ($caps['has_reversed_payment_id'] ?? false)) {
+        $reversalAlias = reversal_sql_safe_alias($alias . '_rev', 'rev');
+        $reversalJoinCondition = $reversalAlias . '.reversed_payment_id = ' . $alias . '.id';
+        if ((bool) ($caps['has_entry_type'] ?? false)) {
+            $reversalJoinCondition .= ' AND (' . $reversalAlias . '.entry_type = "REVERSAL" OR ' . $reversalAlias . '.entry_type IS NULL)';
+        }
+        $conditions[] = 'NOT EXISTS (
+            SELECT 1
+            FROM ' . $tableName . ' ' . $reversalAlias . '
+            WHERE ' . $reversalJoinCondition . '
+        )';
+    }
+
+    if ($tableName === 'payments' && (bool) ($caps['has_is_reversed'] ?? false)) {
+        $conditions[] = 'COALESCE(' . $alias . '.is_reversed, 0) = 0';
+    }
+
+    if ($conditions === []) {
+        return '1=1';
+    }
+
+    return implode(' AND ', $conditions);
+}
+
+function reversal_payment_reversal_filter_sql_for_table(string $tableName, string $alias = 'p'): string
+{
+    $alias = reversal_sql_safe_alias($alias, 'p');
+    $caps = reversal_payment_sql_capabilities($tableName);
+
+    if ((bool) ($caps['has_entry_type'] ?? false)) {
+        return 'COALESCE(' . $alias . '.entry_type, "PAYMENT") = "REVERSAL"';
+    }
+
+    return $alias . '.amount < 0';
+}
+
+function reversal_sales_payment_unreversed_filter_sql(string $alias = 'p'): string
+{
+    return reversal_payment_unreversed_filter_sql_for_table('payments', $alias);
+}
+
+function reversal_sales_payment_reversal_filter_sql(string $alias = 'p'): string
+{
+    return reversal_payment_reversal_filter_sql_for_table('payments', $alias);
+}
+
+function reversal_purchase_payment_unreversed_filter_sql(string $alias = 'pp'): string
+{
+    return reversal_payment_unreversed_filter_sql_for_table('purchase_payments', $alias);
+}
+
+function reversal_purchase_payment_reversal_filter_sql(string $alias = 'pp'): string
+{
+    return reversal_payment_reversal_filter_sql_for_table('purchase_payments', $alias);
+}
+
 function reversal_invoice_payment_summary(PDO $pdo, int $invoiceId): array
 {
     $invoiceId = max(0, $invoiceId);

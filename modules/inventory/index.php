@@ -215,6 +215,8 @@ function inv_movement_source_label(string $source): string
         'PURCHASE' => 'PURCHASE',
         'TRANSFER' => 'TRANSFER',
         'OPENING' => 'OPENING',
+        'CUSTOMER_RETURN' => 'CUSTOMER RETURN',
+        'VENDOR_RETURN' => 'VENDOR RETURN',
         default => $source,
     };
 }
@@ -594,6 +596,199 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             } else {
                 flash_set('inventory_success', 'Temporary stock marked as ' . $resolution . '.', 'success');
             }
+        } catch (Throwable $exception) {
+            $pdo->rollBack();
+            flash_set('inventory_error', $exception->getMessage(), 'danger');
+        }
+
+        redirect('modules/inventory/index.php');
+    }
+
+    if ($action === 'link_consumed_temp_purchase') {
+        if (!$canAdjust) {
+            flash_set('inventory_error', 'You do not have permission to update temporary stock.', 'danger');
+            redirect('modules/inventory/index.php');
+        }
+        if (!$tempStockReady) {
+            flash_set('inventory_error', 'Temporary stock tables are missing. Run database/temporary_stock_management_upgrade.sql first.', 'danger');
+            redirect('modules/inventory/index.php');
+        }
+        if (!$purchaseTablesReady) {
+            flash_set('inventory_error', 'Purchase module tables are missing. Run database/purchase_module_upgrade.sql before linking to purchase.', 'danger');
+            redirect('modules/inventory/index.php');
+        }
+
+        $entryId = post_int('temp_entry_id');
+        if ($entryId <= 0) {
+            flash_set('inventory_error', 'Invalid temporary stock reference.', 'danger');
+            redirect('modules/inventory/index.php');
+        }
+
+        $actionToken = trim((string) ($_POST['action_token'] ?? ''));
+        if (!inv_consume_action_token('link_consumed_temp_purchase_' . $entryId, $actionToken)) {
+            flash_set('inventory_warning', 'Duplicate or expired consumed-to-purchase request ignored.', 'warning');
+            redirect('modules/inventory/index.php');
+        }
+
+        $pdo = db();
+        $pdo->beginTransaction();
+        try {
+            $entryStmt = $pdo->prepare(
+                'SELECT te.id, te.temp_ref, te.part_id, te.quantity, te.status_code, te.purchase_id, te.notes, te.resolution_notes,
+                        p.part_name, p.part_sku, p.unit, p.purchase_price, p.gst_rate
+                 FROM temp_stock_entries te
+                 INNER JOIN parts p
+                    ON p.id = te.part_id
+                   AND p.company_id = te.company_id
+                   AND p.status_code <> "DELETED"
+                 WHERE te.id = :id
+                   AND te.company_id = :company_id
+                   AND te.garage_id = :garage_id
+                 FOR UPDATE'
+            );
+            $entryStmt->execute([
+                'id' => $entryId,
+                'company_id' => $companyId,
+                'garage_id' => $activeGarageId,
+            ]);
+            $entry = $entryStmt->fetch();
+            if (!$entry) {
+                throw new RuntimeException('Temporary stock entry not found for this garage.');
+            }
+            if ((string) ($entry['status_code'] ?? '') !== 'CONSUMED') {
+                throw new RuntimeException('Only CONSUMED temporary stock entries can be shifted to purchase.');
+            }
+            if ((int) ($entry['purchase_id'] ?? 0) > 0) {
+                throw new RuntimeException('This consumed temporary stock entry is already linked to a purchase.');
+            }
+
+            $partId = (int) ($entry['part_id'] ?? 0);
+            $qty = round((float) ($entry['quantity'] ?? 0), 2);
+            if ($partId <= 0 || $qty <= 0) {
+                throw new RuntimeException('Invalid part/quantity in temporary stock entry.');
+            }
+
+            inv_assert_part_quantity_allowed($companyId, (array) $entry, $qty, 'Consumed temporary stock purchase link');
+
+            $unitCost = round((float) ($entry['purchase_price'] ?? 0), 2);
+            $gstRate = round((float) ($entry['gst_rate'] ?? 0), 2);
+            if ($gstRate < 0) {
+                $gstRate = 0.0;
+            }
+            if ($gstRate > 100) {
+                $gstRate = 100.0;
+            }
+
+            $taxableAmount = round($qty * $unitCost, 2);
+            $gstAmount = round(($taxableAmount * $gstRate) / 100, 2);
+            $lineTotal = round($taxableAmount + $gstAmount, 2);
+            $tempRef = (string) ($entry['temp_ref'] ?? ('TMP-' . $entryId));
+
+            $baseNotes = trim((string) ($entry['notes'] ?? ''));
+            $resolutionNotes = trim((string) ($entry['resolution_notes'] ?? ''));
+            $purchaseNote = 'Linked from consumed temporary stock ' . $tempRef;
+            if ($baseNotes !== '') {
+                $purchaseNote .= ' | TEMP_NOTE: ' . $baseNotes;
+            }
+            if ($resolutionNotes !== '') {
+                $purchaseNote .= ' | RESOLUTION: ' . $resolutionNotes;
+            }
+
+            $purchaseInsert = $pdo->prepare(
+                'INSERT INTO purchases
+                  (company_id, garage_id, vendor_id, invoice_number, purchase_date, purchase_source, assignment_status, purchase_status, payment_status, taxable_amount, gst_amount, grand_total, notes, created_by)
+                 VALUES
+                  (:company_id, :garage_id, NULL, NULL, :purchase_date, "TEMP_CONVERSION", "UNASSIGNED", "DRAFT", "UNPAID", :taxable_amount, :gst_amount, :grand_total, :notes, :created_by)'
+            );
+            $purchaseInsert->execute([
+                'company_id' => $companyId,
+                'garage_id' => $activeGarageId,
+                'purchase_date' => date('Y-m-d'),
+                'taxable_amount' => $taxableAmount,
+                'gst_amount' => $gstAmount,
+                'grand_total' => $lineTotal,
+                'notes' => $purchaseNote,
+                'created_by' => $userId,
+            ]);
+            $purchaseId = (int) $pdo->lastInsertId();
+
+            $purchaseItemInsert = $pdo->prepare(
+                'INSERT INTO purchase_items
+                  (purchase_id, part_id, quantity, unit_cost, gst_rate, taxable_amount, gst_amount, total_amount)
+                 VALUES
+                  (:purchase_id, :part_id, :quantity, :unit_cost, :gst_rate, :taxable_amount, :gst_amount, :total_amount)'
+            );
+            $purchaseItemInsert->execute([
+                'purchase_id' => $purchaseId,
+                'part_id' => $partId,
+                'quantity' => $qty,
+                'unit_cost' => $unitCost,
+                'gst_rate' => $gstRate,
+                'taxable_amount' => $taxableAmount,
+                'gst_amount' => $gstAmount,
+                'total_amount' => $lineTotal,
+            ]);
+
+            $entryUpdate = $pdo->prepare(
+                'UPDATE temp_stock_entries
+                 SET purchase_id = :purchase_id
+                 WHERE id = :id'
+            );
+            $entryUpdate->execute([
+                'purchase_id' => $purchaseId,
+                'id' => $entryId,
+            ]);
+
+            $eventInsert = $pdo->prepare(
+                'INSERT INTO temp_stock_events
+                  (temp_entry_id, company_id, garage_id, event_type, quantity, from_status, to_status, notes, purchase_id, created_by)
+                 VALUES
+                  (:temp_entry_id, :company_id, :garage_id, "PURCHASE_LINKED", :quantity, "CONSUMED", "CONSUMED", :notes, :purchase_id, :created_by)'
+            );
+            $eventInsert->execute([
+                'temp_entry_id' => $entryId,
+                'company_id' => $companyId,
+                'garage_id' => $activeGarageId,
+                'quantity' => $qty,
+                'notes' => 'Consumed temp stock linked to purchase #' . $purchaseId,
+                'purchase_id' => $purchaseId,
+                'created_by' => $userId,
+            ]);
+
+            $pdo->commit();
+
+            log_audit(
+                'inventory',
+                'temp_consumed_purchase_linked',
+                $entryId,
+                'Consumed temporary stock ' . $tempRef . ' linked to purchase #' . $purchaseId,
+                [
+                    'entity' => 'temp_stock_entry',
+                    'source' => 'UI',
+                    'before' => [
+                        'temp_ref' => $tempRef,
+                        'status_code' => 'CONSUMED',
+                        'purchase_id' => null,
+                    ],
+                    'after' => [
+                        'temp_ref' => $tempRef,
+                        'status_code' => 'CONSUMED',
+                        'purchase_id' => $purchaseId,
+                    ],
+                    'metadata' => [
+                        'part_id' => $partId,
+                        'part_name' => (string) ($entry['part_name'] ?? ''),
+                        'part_sku' => (string) ($entry['part_sku'] ?? ''),
+                        'quantity' => $qty,
+                        'taxable_amount' => $taxableAmount,
+                        'gst_amount' => $gstAmount,
+                        'grand_total' => $lineTotal,
+                        'stock_movement_posted' => false,
+                    ],
+                ]
+            );
+
+            flash_set('inventory_success', 'Consumed temporary stock linked to purchase #' . $purchaseId . '.', 'success');
         } catch (Throwable $exception) {
             $pdo->rollBack();
             flash_set('inventory_error', $exception->getMessage(), 'danger');
@@ -1095,8 +1290,29 @@ if (!in_array($historyGarageId, $accessibleGarageIds, true)) {
 }
 
 $historyPartId = get_int('history_part_id', 0);
+$allowedSourceFilter = ['PURCHASE', 'JOB_CARD', 'ADJUSTMENT', 'OPENING', 'TRANSFER', 'CUSTOMER_RETURN', 'VENDOR_RETURN'];
+try {
+    $sourceFilterStmt = db()->prepare(
+        'SELECT DISTINCT reference_type
+         FROM inventory_movements
+         WHERE company_id = :company_id
+           AND reference_type IS NOT NULL
+           AND reference_type <> ""
+         ORDER BY reference_type ASC'
+    );
+    $sourceFilterStmt->execute(['company_id' => $companyId]);
+    foreach ($sourceFilterStmt->fetchAll(PDO::FETCH_COLUMN) as $referenceType) {
+        $normalizedReferenceType = strtoupper(trim((string) $referenceType));
+        if ($normalizedReferenceType === '' || in_array($normalizedReferenceType, $allowedSourceFilter, true)) {
+            continue;
+        }
+        $allowedSourceFilter[] = $normalizedReferenceType;
+    }
+} catch (Throwable $exception) {
+    // Keep base filter options if distinct source discovery fails.
+}
+
 $sourceFilter = strtoupper(trim((string) ($_GET['source'] ?? '')));
-$allowedSourceFilter = ['PURCHASE', 'JOB_CARD', 'ADJUSTMENT', 'OPENING', 'TRANSFER'];
 if (!in_array($sourceFilter, $allowedSourceFilter, true)) {
     $sourceFilter = '';
 }
@@ -1461,16 +1677,22 @@ $adjustActionToken = inv_issue_action_token('stock_adjust');
 $transferActionToken = inv_issue_action_token('stock_transfer');
 $tempInActionToken = $tempStockReady ? inv_issue_action_token('temp_stock_in') : '';
 $tempResolveTokens = [];
+$tempConsumedPurchaseLinkTokens = [];
 if ($tempStockReady) {
     foreach ($tempEntries as $tempEntry) {
-        if ((string) ($tempEntry['status_code'] ?? '') !== 'OPEN') {
-            continue;
-        }
         $entryId = (int) ($tempEntry['id'] ?? 0);
         if ($entryId <= 0) {
             continue;
         }
-        $tempResolveTokens[$entryId] = inv_issue_action_token('resolve_temp_stock_' . $entryId);
+        $statusCode = (string) ($tempEntry['status_code'] ?? '');
+        $purchaseId = (int) ($tempEntry['purchase_id'] ?? 0);
+        if ($statusCode === 'OPEN') {
+            $tempResolveTokens[$entryId] = inv_issue_action_token('resolve_temp_stock_' . $entryId);
+            continue;
+        }
+        if ($statusCode === 'CONSUMED' && $purchaseId <= 0 && $purchaseTablesReady) {
+            $tempConsumedPurchaseLinkTokens[$entryId] = inv_issue_action_token('link_consumed_temp_purchase_' . $entryId);
+        }
     }
 }
 
@@ -1874,6 +2096,19 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                             <label class="form-check-label small" for="confirm_consumed_<?= (int) $entryId; ?>">Confirm</label>
                             <button type="submit" class="btn btn-sm btn-outline-danger">Consumed</button>
                           </form>
+                        <?php elseif ($status === 'CONSUMED' && $purchaseRef <= 0 && $canAdjust): ?>
+                          <?php if ($purchaseTablesReady): ?>
+                            <?php $consumedPurchaseLinkToken = (string) ($tempConsumedPurchaseLinkTokens[$entryId] ?? ''); ?>
+                            <form method="post" class="d-inline" data-confirm="Create an unassigned purchase for this consumed temporary stock? Stock quantity will not be increased.">
+                              <?= csrf_field(); ?>
+                              <input type="hidden" name="_action" value="link_consumed_temp_purchase">
+                              <input type="hidden" name="temp_entry_id" value="<?= (int) $entryId; ?>">
+                              <input type="hidden" name="action_token" value="<?= e($consumedPurchaseLinkToken); ?>">
+                              <button type="submit" class="btn btn-sm btn-outline-success">Shift to Purchase</button>
+                            </form>
+                          <?php else: ?>
+                            <button type="button" class="btn btn-sm btn-outline-success" disabled>Shift to Purchase</button>
+                          <?php endif; ?>
                         <?php else: ?>
                           <span class="text-muted">Resolved</span>
                         <?php endif; ?>
@@ -1914,6 +2149,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                       $eventBadge = match ($eventType) {
                           'TEMP_IN' => 'primary',
                           'PURCHASED' => 'success',
+                          'PURCHASE_LINKED' => 'success',
                           'RETURNED' => 'secondary',
                           'CONSUMED' => 'danger',
                           default => 'secondary',

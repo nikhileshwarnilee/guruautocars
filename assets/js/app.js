@@ -19,6 +19,8 @@ function gacBoot() {
   runInitTask(initVehicleAttributeSelectors, 'initVehicleAttributeSelectors');
   runInitTask(initMasterInsightsFilters, 'initMasterInsightsFilters');
   runInitTask(initStandardizedTables, 'initStandardizedTables');
+  runInitTask(initUniversalActionColorSystem, 'initUniversalActionColorSystem');
+  runInitTask(initUniversalSectionFocusUx, 'initUniversalSectionFocusUx');
 }
 
 function runInitTask(task, label) {
@@ -33,6 +35,624 @@ function runInitTask(task, label) {
       window.console.error('GAC init failed: ' + String(label || 'unknown'), error);
     }
   }
+}
+
+function initUniversalActionColorSystem() {
+  if (!document.body || document.body.getAttribute('data-gac-universal-action-colors-init') === '1') {
+    return;
+  }
+  document.body.setAttribute('data-gac-universal-action-colors-init', '1');
+
+  decorateUniversalActionButtons(document);
+  bindUniversalUxIntentPersistence();
+
+  if (typeof MutationObserver === 'function') {
+    var refreshButtons = debounce(function () {
+      decorateUniversalActionButtons(document);
+    }, 120);
+
+    var observer = new MutationObserver(function (mutations) {
+      for (var i = 0; i < mutations.length; i++) {
+        if (mutations[i] && mutations[i].type === 'childList') {
+          refreshButtons();
+          return;
+        }
+      }
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+  }
+}
+
+function decorateUniversalActionButtons(root) {
+  var scope = root && root.querySelectorAll ? root : document;
+  var buttons = scope.querySelectorAll('.btn');
+  for (var i = 0; i < buttons.length; i++) {
+    var button = buttons[i];
+    if (!button || button.classList.contains('btn-close')) {
+      continue;
+    }
+
+    var role = resolveUniversalActionRole(button);
+    applyUniversalActionRole(button, role);
+  }
+}
+
+function resolveUniversalActionRole(button) {
+  if (!button || !button.classList) {
+    return '';
+  }
+
+  if (button.id === 'gac-safe-delete-submit-btn') {
+    return 'delete';
+  }
+
+  var explicitRole = String(button.getAttribute('data-gac-action-role') || '').trim().toLowerCase();
+  if (explicitRole) {
+    return normalizeUniversalUxContext(explicitRole);
+  }
+
+  var parentForm = button.closest ? button.closest('form') : null;
+  if (parentForm && parentForm.hasAttribute('data-safe-delete')) {
+    var safeDeleteOperation = String(parentForm.getAttribute('data-safe-delete-operation') || 'delete').trim().toLowerCase();
+    if (safeDeleteOperation === 'reverse' || safeDeleteOperation === 'cancel') {
+      return 'reverse';
+    }
+    return 'delete';
+  }
+
+  var text = collapseWhitespace(button.textContent || '').trim().toLowerCase();
+  if (text === '') {
+    return '';
+  }
+
+  if (/(^|\\b)(delete|remove|trash)(\\b|$)/i.test(text)) {
+    return 'delete';
+  }
+  if (/(^|\\b)(reverse|cancel|void|revert)(\\b|$)/i.test(text)) {
+    return 'reverse';
+  }
+  if (/(^|\\b)(finalize|approve|approved)(\\b|$)/i.test(text)) {
+    return 'approve';
+  }
+  if (/(^|\\b)(edit|update|modify|assign)(\\b|$)/i.test(text)) {
+    return 'edit';
+  }
+  if (/(^|\\b)(view|details|preview|print)(\\b|$)/i.test(text)) {
+    return 'view';
+  }
+  if (/(^|\\b)(save|submit|create|add|record|apply|load|search|post|upload|generate)(\\b|$)/i.test(text)) {
+    return 'primary';
+  }
+  if (button.classList.contains('btn-outline-secondary') || button.classList.contains('btn-secondary')) {
+    return 'secondary';
+  }
+
+  return '';
+}
+
+function applyUniversalActionRole(button, role) {
+  if (!button || !button.classList) {
+    return;
+  }
+
+  var roleClasses = [
+    'gac-action-primary',
+    'gac-action-edit',
+    'gac-action-delete',
+    'gac-action-view',
+    'gac-action-approve',
+    'gac-action-reverse',
+    'gac-action-secondary'
+  ];
+  for (var i = 0; i < roleClasses.length; i++) {
+    button.classList.remove(roleClasses[i]);
+  }
+
+  if (!role) {
+    return;
+  }
+
+  var normalized = normalizeUniversalUxContext(role);
+  if (normalized === '') {
+    return;
+  }
+  button.classList.add('gac-action-' + normalized);
+}
+
+function initUniversalSectionFocusUx() {
+  if (!document.body || document.body.getAttribute('data-gac-universal-section-focus-init') === '1') {
+    return;
+  }
+  document.body.setAttribute('data-gac-universal-section-focus-init', '1');
+
+  window.setTimeout(function () {
+    applyUniversalSectionFocusFromState();
+  }, 40);
+}
+
+function bindUniversalUxIntentPersistence() {
+  if (!document.body || document.body.getAttribute('data-gac-universal-intent-bind') === '1') {
+    return;
+  }
+  document.body.setAttribute('data-gac-universal-intent-bind', '1');
+
+  document.addEventListener('click', function (event) {
+    var target = event.target;
+    if (!target || typeof target.closest !== 'function') {
+      return;
+    }
+
+    var link = target.closest('a[href]');
+    if (link) {
+      storeUniversalFocusIntentFromLink(link);
+    }
+  }, true);
+
+  document.addEventListener('submit', function (event) {
+    var form = event.target;
+    if (!form || form.tagName !== 'FORM' || typeof form.closest !== 'function') {
+      return;
+    }
+
+    var focusedSection = form.closest('.gac-ux-focus-section');
+    if (!focusedSection) {
+      return;
+    }
+
+    storeUniversalFocusIntent({
+      path: String(window.location.pathname || ''),
+      search: String(window.location.search || ''),
+      hash: '',
+      context: String(focusedSection.getAttribute('data-gac-ux-context') || '').trim(),
+      sectionId: ensureUniversalSectionId(focusedSection),
+      titleHint: readUniversalSectionTitle(focusedSection),
+      ts: Date.now()
+    });
+  }, true);
+}
+
+function storeUniversalFocusIntentFromLink(link) {
+  if (!link || !link.getAttribute) {
+    return;
+  }
+
+  var href = String(link.getAttribute('href') || '').trim();
+  if (href === '' || href === '#' || href.indexOf('javascript:') === 0) {
+    return;
+  }
+
+  try {
+    var targetUrl = new URL(link.href, window.location.href);
+    var intent = resolveUniversalSectionIntentFromUrl(targetUrl);
+    if (!intent) {
+      return;
+    }
+    intent.path = String(targetUrl.pathname || '');
+    intent.search = String(targetUrl.search || '');
+    intent.hash = String(targetUrl.hash || '');
+    intent.ts = Date.now();
+    storeUniversalFocusIntent(intent);
+  } catch (error) {
+    // Ignore malformed URLs.
+  }
+}
+
+function storeUniversalFocusIntent(intent) {
+  try {
+    if (!window.sessionStorage || !intent || typeof intent !== 'object') {
+      return;
+    }
+    window.sessionStorage.setItem('gac.ux.focus.intent', JSON.stringify(intent));
+  } catch (error) {
+    // Ignore storage permission issues.
+  }
+}
+
+function consumeUniversalFocusIntent() {
+  try {
+    if (!window.sessionStorage) {
+      return null;
+    }
+
+    var raw = window.sessionStorage.getItem('gac.ux.focus.intent') || '';
+    if (!raw) {
+      return null;
+    }
+
+    var parsed = safeParseJson(raw);
+    window.sessionStorage.removeItem('gac.ux.focus.intent');
+    if (!parsed || typeof parsed !== 'object') {
+      return null;
+    }
+
+    var ts = parseInt(String(parsed.ts || ''), 10);
+    if (isNaN(ts) || (Date.now() - ts) > 180000) {
+      return null;
+    }
+
+    return parsed;
+  } catch (error) {
+    return null;
+  }
+}
+
+function applyUniversalSectionFocusFromState() {
+  var currentIntent = resolveUniversalSectionIntentFromUrl(window.location);
+  var storedIntent = consumeUniversalFocusIntent();
+  var intent = currentIntent || storedIntent;
+  if (!intent) {
+    return;
+  }
+
+  if (storedIntent && !currentIntent) {
+    var currentPath = String(window.location.pathname || '');
+    if (String(storedIntent.path || '') && String(storedIntent.path || '') !== currentPath) {
+      return;
+    }
+  }
+
+  var section = findUniversalFocusSection(intent);
+  if (!section) {
+    return;
+  }
+
+  var normalizedContext = normalizeUniversalUxContext(intent.context || 'view') || 'view';
+  decorateUniversalFocusSection(section, normalizedContext);
+  smoothScrollToUniversalSection(section);
+}
+
+function resolveUniversalSectionIntentFromUrl(locationLike) {
+  if (!locationLike) {
+    return null;
+  }
+
+  var search = String(locationLike.search || '');
+  var hash = String(locationLike.hash || '');
+  var context = '';
+
+  try {
+    var params = new URLSearchParams(search);
+    var keys = [];
+    params.forEach(function (value, key) {
+      keys.push(String(key || '').toLowerCase());
+    });
+
+    for (var i = 0; i < keys.length; i++) {
+      var key = keys[i];
+      if (key.indexOf('edit_') === 0) {
+        context = 'edit';
+        break;
+      }
+      if (key.indexOf('view_') === 0) {
+        context = 'view';
+        break;
+      }
+      if (key.indexOf('assign_') === 0) {
+        context = 'assign';
+        break;
+      }
+      if (key.indexOf('pay_') === 0 || key.indexOf('payment_') === 0) {
+        context = 'pay';
+        break;
+      }
+      if (key.indexOf('approve_') === 0 || key.indexOf('finalize_') === 0) {
+        context = 'approve';
+        break;
+      }
+      if (key.indexOf('delete_') === 0) {
+        context = 'delete';
+        break;
+      }
+    }
+
+    if (context === '' && params.has('action')) {
+      var actionValue = String(params.get('action') || '').toLowerCase();
+      if (actionValue.indexOf('edit') >= 0) {
+        context = 'edit';
+      } else if (actionValue.indexOf('view') >= 0) {
+        context = 'view';
+      } else if (actionValue.indexOf('delete') >= 0) {
+        context = 'delete';
+      } else if (actionValue.indexOf('reverse') >= 0 || actionValue.indexOf('cancel') >= 0) {
+        context = 'reverse';
+      } else if (actionValue.indexOf('approve') >= 0 || actionValue.indexOf('finalize') >= 0) {
+        context = 'approve';
+      }
+    }
+  } catch (error) {
+    // Ignore URLSearchParams errors and continue with hash matching.
+  }
+
+  if (context === '' && hash) {
+    var hashText = String(hash).toLowerCase();
+    if (hashText.indexOf('edit') >= 0) {
+      context = 'edit';
+    } else if (hashText.indexOf('view') >= 0 || hashText.indexOf('detail') >= 0) {
+      context = 'view';
+    } else if (hashText.indexOf('delete') >= 0) {
+      context = 'delete';
+    } else if (hashText.indexOf('reverse') >= 0 || hashText.indexOf('cancel') >= 0) {
+      context = 'reverse';
+    } else if (hashText.indexOf('approve') >= 0 || hashText.indexOf('finalize') >= 0) {
+      context = 'approve';
+    } else if (hashText.indexOf('assign') >= 0) {
+      context = 'assign';
+    } else if (hashText.indexOf('pay') >= 0 || hashText.indexOf('payment') >= 0) {
+      context = 'pay';
+    }
+  }
+
+  if (context === '' && hash !== '') {
+    context = 'view';
+  }
+
+  if (context === '' && hash === '' && search === '') {
+    return null;
+  }
+
+  if (context === '') {
+    return null;
+  }
+
+  return {
+    context: context,
+    hash: hash
+  };
+}
+
+function findUniversalFocusSection(intent) {
+  if (!intent || typeof intent !== 'object') {
+    return null;
+  }
+
+  var hash = String(intent.hash || '').trim();
+  if (hash) {
+    var hashId = hash.charAt(0) === '#' ? hash.slice(1) : hash;
+    if (hashId) {
+      var hashTarget = document.getElementById(hashId);
+      var hashSection = findUniversalSectionContainer(hashTarget);
+      if (hashSection) {
+        return hashSection;
+      }
+    }
+  }
+
+  var sectionId = String(intent.sectionId || '').trim();
+  if (sectionId) {
+    var storedTarget = document.getElementById(sectionId);
+    if (storedTarget) {
+      return findUniversalSectionContainer(storedTarget) || storedTarget;
+    }
+  }
+
+  var context = normalizeUniversalUxContext(intent.context || '');
+  if (!context) {
+    return null;
+  }
+
+  var keywords = universalSectionKeywordsForContext(context);
+  if (keywords.length === 0) {
+    return null;
+  }
+
+  var cards = document.querySelectorAll('.app-content .card');
+  for (var i = 0; i < cards.length; i++) {
+    var card = cards[i];
+    var titleText = readUniversalSectionTitle(card).toLowerCase();
+    if (!titleText) {
+      continue;
+    }
+    for (var j = 0; j < keywords.length; j++) {
+      if (titleText.indexOf(keywords[j]) >= 0) {
+        return card;
+      }
+    }
+  }
+
+  return null;
+}
+
+function universalSectionKeywordsForContext(context) {
+  var normalized = normalizeUniversalUxContext(context);
+  switch (normalized) {
+    case 'edit':
+      return ['edit ', 'edit', 'update '];
+    case 'view':
+      return ['view ', 'details', 'detail', 'snapshot'];
+    case 'assign':
+      return ['assign '];
+    case 'pay':
+      return ['payment', 'payments'];
+    case 'approve':
+      return ['finalize', 'approve'];
+    case 'delete':
+      return ['delete', 'deletion impact'];
+    case 'reverse':
+      return ['reverse', 'reversal'];
+    default:
+      return [];
+  }
+}
+
+function findUniversalSectionContainer(node) {
+  if (!node || typeof node.closest !== 'function') {
+    return null;
+  }
+  return node.closest('.card, section, .accordion-item');
+}
+
+function decorateUniversalFocusSection(section, context) {
+  if (!section || !section.classList) {
+    return;
+  }
+
+  var normalizedContext = normalizeUniversalUxContext(context || 'view') || 'view';
+  var contextClasses = [
+    'gac-ux-context-primary',
+    'gac-ux-context-edit',
+    'gac-ux-context-delete',
+    'gac-ux-context-view',
+    'gac-ux-context-approve',
+    'gac-ux-context-reverse',
+    'gac-ux-context-secondary',
+    'gac-ux-context-assign',
+    'gac-ux-context-pay'
+  ];
+  for (var i = 0; i < contextClasses.length; i++) {
+    section.classList.remove(contextClasses[i]);
+  }
+
+  section.classList.add('gac-ux-focus-section', 'gac-ux-context-' + normalizedContext);
+  section.setAttribute('data-gac-ux-context', normalizedContext);
+  ensureUniversalSectionId(section);
+
+  var header = findUniversalCardHeader(section);
+  if (header) {
+    header.classList.add('gac-ux-focus-header');
+    var title = header.querySelector('.card-title, h1, h2, h3, h4, h5, h6');
+    if (title) {
+      title.classList.add('gac-ux-section-title');
+      if (!title.querySelector('.gac-ux-section-icon')) {
+        var icon = document.createElement('i');
+        icon.className = resolveUniversalSectionIconClass(normalizedContext) + ' gac-ux-section-icon';
+        icon.setAttribute('aria-hidden', 'true');
+        title.insertBefore(icon, title.firstChild);
+      }
+    }
+  }
+
+  section.classList.remove('gac-ux-fade-in');
+  void section.offsetWidth;
+  section.classList.add('gac-ux-fade-in', 'gac-ux-focus-glow');
+  window.setTimeout(function () {
+    if (section && section.classList) {
+      section.classList.remove('gac-ux-focus-glow');
+    }
+  }, 1800);
+}
+
+function findUniversalCardHeader(section) {
+  if (!section || !section.querySelectorAll) {
+    return null;
+  }
+
+  var headers = section.querySelectorAll('.card-header');
+  for (var i = 0; i < headers.length; i++) {
+    var header = headers[i];
+    var ownerCard = header.closest ? header.closest('.card') : null;
+    if (!ownerCard || ownerCard === section) {
+      return header;
+    }
+  }
+
+  return null;
+}
+
+function ensureUniversalSectionId(section) {
+  if (!section) {
+    return '';
+  }
+  if (section.id) {
+    return section.id;
+  }
+
+  var titleHint = readUniversalSectionTitle(section);
+  var slug = titleHint
+    ? titleHint.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')
+    : 'section';
+  if (!slug) {
+    slug = 'section';
+  }
+
+  var id = 'gac-focus-' + slug;
+  var suffix = 1;
+  while (document.getElementById(id)) {
+    suffix += 1;
+    id = 'gac-focus-' + slug + '-' + suffix;
+  }
+  section.id = id;
+  return id;
+}
+
+function readUniversalSectionTitle(section) {
+  if (!section || !section.querySelector) {
+    return '';
+  }
+  var titleNode = section.querySelector('.card-header .card-title, .card-header h1, .card-header h2, .card-header h3, .card-header h4, .card-header h5, .card-header h6, h1, h2, h3, h4, h5, h6');
+  if (!titleNode) {
+    return '';
+  }
+  return collapseWhitespace(titleNode.textContent || '').trim();
+}
+
+function smoothScrollToUniversalSection(section) {
+  if (!section || !section.getBoundingClientRect) {
+    return;
+  }
+
+  var header = document.querySelector('.app-header');
+  var headerHeight = header ? Math.ceil(header.getBoundingClientRect().height) : 0;
+  var targetTop = Math.max(0, Math.round((window.pageYOffset || 0) + section.getBoundingClientRect().top - headerHeight - 18));
+  var prefersReduced = false;
+  try {
+    prefersReduced = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+  } catch (error) {
+    prefersReduced = false;
+  }
+
+  var scrollBehavior = prefersReduced ? 'auto' : 'smooth';
+  if (typeof window.scrollTo === 'function') {
+    try {
+      window.scrollTo({ top: targetTop, behavior: scrollBehavior });
+    } catch (error) {
+      window.scrollTo(0, targetTop);
+    }
+  }
+}
+
+function resolveUniversalSectionIconClass(context) {
+  switch (normalizeUniversalUxContext(context)) {
+    case 'edit':
+    case 'assign':
+      return 'bi bi-pencil-square';
+    case 'delete':
+      return 'bi bi-trash3';
+    case 'approve':
+      return 'bi bi-check-circle';
+    case 'reverse':
+      return 'bi bi-arrow-counterclockwise';
+    case 'pay':
+      return 'bi bi-cash-coin';
+    case 'view':
+    default:
+      return 'bi bi-eye';
+  }
+}
+
+function normalizeUniversalUxContext(value) {
+  var normalized = String(value || '').trim().toLowerCase();
+  if (normalized === '') {
+    return '';
+  }
+  if (normalized === 'payment') {
+    return 'pay';
+  }
+  if (normalized === 'finalize') {
+    return 'approve';
+  }
+  if (normalized === 'cancel') {
+    return 'reverse';
+  }
+  if (normalized === 'details' || normalized === 'detail' || normalized === 'preview' || normalized === 'print') {
+    return 'view';
+  }
+  if (normalized === 'update' || normalized === 'modify') {
+    return 'edit';
+  }
+  if (normalized === 'save' || normalized === 'submit' || normalized === 'create' || normalized === 'add' || normalized === 'record' || normalized === 'apply' || normalized === 'load' || normalized === 'search' || normalized === 'post') {
+    return 'primary';
+  }
+  return normalized;
 }
 
 function initPageScrollPersistence() {

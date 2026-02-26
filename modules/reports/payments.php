@@ -77,6 +77,9 @@ $vendors = $vendorsStmt->fetchAll();
 
 $salesRows = [];
 $salesSummary = ['payment_count' => 0, 'payment_total' => 0.0];
+$salesReversalSummary = ['payment_count' => 0, 'payment_total' => 0.0];
+$salesModeSummaryRows = [];
+$salesDailyCashRows = [];
 if ($canViewSalesPayments) {
     $salesParams = [
         'company_id' => $companyId,
@@ -102,16 +105,30 @@ if ($canViewSalesPayments) {
         $salesParams['invoice_like'] = '%' . $invoiceFilter . '%';
     }
     $salesWhereSql = implode(' AND ', $salesWhere);
+    $salesUnreversedFilterSql = reversal_sales_payment_unreversed_filter_sql('p');
+    $salesReversalFilterSql = reversal_sales_payment_reversal_filter_sql('p');
 
     $salesSummaryStmt = db()->prepare(
         'SELECT COUNT(*) AS payment_count,
                 COALESCE(SUM(p.amount), 0) AS payment_total
          FROM payments p
          INNER JOIN invoices i ON i.id = p.invoice_id
-         WHERE ' . $salesWhereSql . ' ' . $salesScopeSql
+         WHERE ' . $salesWhereSql . '
+           AND ' . $salesUnreversedFilterSql . ' ' . $salesScopeSql
     );
     $salesSummaryStmt->execute($salesParams);
     $salesSummary = $salesSummaryStmt->fetch() ?: $salesSummary;
+
+    $salesReversalSummaryStmt = db()->prepare(
+        'SELECT COUNT(*) AS payment_count,
+                COALESCE(SUM(ABS(p.amount)), 0) AS payment_total
+         FROM payments p
+         INNER JOIN invoices i ON i.id = p.invoice_id
+         WHERE ' . $salesWhereSql . '
+           AND ' . $salesReversalFilterSql . ' ' . $salesScopeSql
+    );
+    $salesReversalSummaryStmt->execute($salesParams);
+    $salesReversalSummary = $salesReversalSummaryStmt->fetch() ?: $salesReversalSummary;
 
     $salesRowsStmt = db()->prepare(
         'SELECT p.id, p.paid_on AS payment_date, p.entry_type, p.payment_mode, p.amount, p.reference_no,
@@ -130,10 +147,41 @@ if ($canViewSalesPayments) {
     );
     $salesRowsStmt->execute($salesParams);
     $salesRows = $salesRowsStmt->fetchAll();
+
+    $salesModeSummaryStmt = db()->prepare(
+        'SELECT UPPER(COALESCE(NULLIF(TRIM(p.payment_mode), ""), "UNKNOWN")) AS payment_mode,
+                COUNT(*) AS entries,
+                COALESCE(SUM(p.amount), 0) AS amount
+         FROM payments p
+         INNER JOIN invoices i ON i.id = p.invoice_id
+         WHERE ' . $salesWhereSql . '
+           AND ' . $salesUnreversedFilterSql . ' ' . $salesScopeSql . '
+         GROUP BY payment_mode
+         ORDER BY payment_mode ASC'
+    );
+    $salesModeSummaryStmt->execute($salesParams);
+    $salesModeSummaryRows = $salesModeSummaryStmt->fetchAll();
+
+    $salesDailyCashStmt = db()->prepare(
+        'SELECT p.paid_on AS payment_date,
+                COALESCE(SUM(p.amount), 0) AS cash_in
+         FROM payments p
+         INNER JOIN invoices i ON i.id = p.invoice_id
+         WHERE ' . $salesWhereSql . '
+           AND ' . $salesUnreversedFilterSql . ' ' . $salesScopeSql . '
+           AND p.payment_mode = "CASH"
+         GROUP BY p.paid_on
+         ORDER BY p.paid_on ASC'
+    );
+    $salesDailyCashStmt->execute($salesParams);
+    $salesDailyCashRows = $salesDailyCashStmt->fetchAll();
 }
 
 $purchaseRows = [];
 $purchaseSummary = ['payment_count' => 0, 'payment_total' => 0.0];
+$purchaseReversalSummary = ['payment_count' => 0, 'payment_total' => 0.0];
+$purchaseModeSummaryRows = [];
+$purchaseDailyCashRows = [];
 if ($canViewPurchasePayments && table_columns('purchase_payments') !== []) {
     $purchaseParams = [
         'company_id' => $companyId,
@@ -158,16 +206,30 @@ if ($canViewPurchasePayments && table_columns('purchase_payments') !== []) {
         $purchaseParams['invoice_like'] = '%' . $invoiceFilter . '%';
     }
     $purchaseWhereSql = implode(' AND ', $purchaseWhere);
+    $purchaseUnreversedFilterSql = reversal_purchase_payment_unreversed_filter_sql('pp');
+    $purchaseReversalFilterSql = reversal_purchase_payment_reversal_filter_sql('pp');
 
     $purchaseSummaryStmt = db()->prepare(
         'SELECT COUNT(*) AS payment_count,
                 COALESCE(SUM(pp.amount), 0) AS payment_total
          FROM purchase_payments pp
          INNER JOIN purchases p ON p.id = pp.purchase_id
-         WHERE ' . $purchaseWhereSql . ' ' . $purchaseScopeSql
+         WHERE ' . $purchaseWhereSql . '
+           AND ' . $purchaseUnreversedFilterSql . ' ' . $purchaseScopeSql
     );
     $purchaseSummaryStmt->execute($purchaseParams);
     $purchaseSummary = $purchaseSummaryStmt->fetch() ?: $purchaseSummary;
+
+    $purchaseReversalSummaryStmt = db()->prepare(
+        'SELECT COUNT(*) AS payment_count,
+                COALESCE(SUM(ABS(pp.amount)), 0) AS payment_total
+         FROM purchase_payments pp
+         INNER JOIN purchases p ON p.id = pp.purchase_id
+         WHERE ' . $purchaseWhereSql . '
+           AND ' . $purchaseReversalFilterSql . ' ' . $purchaseScopeSql
+    );
+    $purchaseReversalSummaryStmt->execute($purchaseParams);
+    $purchaseReversalSummary = $purchaseReversalSummaryStmt->fetch() ?: $purchaseReversalSummary;
 
     $purchaseRowsStmt = db()->prepare(
         'SELECT pp.id, pp.payment_date, pp.entry_type, pp.payment_mode, pp.amount, pp.reference_no,
@@ -186,6 +248,34 @@ if ($canViewPurchasePayments && table_columns('purchase_payments') !== []) {
     );
     $purchaseRowsStmt->execute($purchaseParams);
     $purchaseRows = $purchaseRowsStmt->fetchAll();
+
+    $purchaseModeSummaryStmt = db()->prepare(
+        'SELECT UPPER(COALESCE(NULLIF(TRIM(pp.payment_mode), ""), "UNKNOWN")) AS payment_mode,
+                COUNT(*) AS entries,
+                COALESCE(SUM(pp.amount), 0) AS amount
+         FROM purchase_payments pp
+         INNER JOIN purchases p ON p.id = pp.purchase_id
+         WHERE ' . $purchaseWhereSql . '
+           AND ' . $purchaseUnreversedFilterSql . ' ' . $purchaseScopeSql . '
+         GROUP BY payment_mode
+         ORDER BY payment_mode ASC'
+    );
+    $purchaseModeSummaryStmt->execute($purchaseParams);
+    $purchaseModeSummaryRows = $purchaseModeSummaryStmt->fetchAll();
+
+    $purchaseDailyCashStmt = db()->prepare(
+        'SELECT pp.payment_date,
+                COALESCE(SUM(pp.amount), 0) AS cash_out
+         FROM purchase_payments pp
+         INNER JOIN purchases p ON p.id = pp.purchase_id
+         WHERE ' . $purchaseWhereSql . '
+           AND ' . $purchaseUnreversedFilterSql . ' ' . $purchaseScopeSql . '
+           AND pp.payment_mode = "CASH"
+         GROUP BY pp.payment_date
+         ORDER BY pp.payment_date ASC'
+    );
+    $purchaseDailyCashStmt->execute($purchaseParams);
+    $purchaseDailyCashRows = $purchaseDailyCashStmt->fetchAll();
 }
 
 $returnSettlementRows = [];
@@ -195,6 +285,8 @@ $returnSettlementSummary = [
     'pay_total' => 0.0,
     'receive_total' => 0.0,
 ];
+$returnModeSummaryRows = [];
+$returnDailyCashRows = [];
 if ($canViewReturnSettlements && $returnsModuleReady && table_columns('return_settlements') !== []) {
     $returnParams = [
         'company_id' => $companyId,
@@ -271,6 +363,37 @@ if ($canViewReturnSettlements && $returnsModuleReady && table_columns('return_se
     );
     $returnRowsStmt->execute($returnParams);
     $returnSettlementRows = $returnRowsStmt->fetchAll();
+
+    $returnModeSummaryStmt = db()->prepare(
+        'SELECT UPPER(COALESCE(NULLIF(TRIM(rs.payment_mode), ""), "UNKNOWN")) AS payment_mode,
+                COUNT(*) AS entries,
+                COALESCE(SUM(rs.amount), 0) AS amount
+         FROM return_settlements rs
+         INNER JOIN returns_rma r ON r.id = rs.return_id
+         LEFT JOIN invoices i ON i.id = r.invoice_id
+         LEFT JOIN purchases p ON p.id = r.purchase_id
+         WHERE ' . $returnWhereSql . ' ' . $returnScopeSql . '
+         GROUP BY payment_mode
+         ORDER BY payment_mode ASC'
+    );
+    $returnModeSummaryStmt->execute($returnParams);
+    $returnModeSummaryRows = $returnModeSummaryStmt->fetchAll();
+
+    $returnDailyCashStmt = db()->prepare(
+        'SELECT rs.settlement_date AS payment_date,
+                COALESCE(SUM(CASE WHEN rs.settlement_type = "RECEIVE" THEN rs.amount ELSE 0 END), 0) AS cash_in,
+                COALESCE(SUM(CASE WHEN rs.settlement_type = "PAY" THEN rs.amount ELSE 0 END), 0) AS cash_out
+         FROM return_settlements rs
+         INNER JOIN returns_rma r ON r.id = rs.return_id
+         LEFT JOIN invoices i ON i.id = r.invoice_id
+         LEFT JOIN purchases p ON p.id = r.purchase_id
+         WHERE ' . $returnWhereSql . ' ' . $returnScopeSql . '
+           AND rs.payment_mode = "CASH"
+         GROUP BY rs.settlement_date
+         ORDER BY rs.settlement_date ASC'
+    );
+    $returnDailyCashStmt->execute($returnParams);
+    $returnDailyCashRows = $returnDailyCashStmt->fetchAll();
 }
 
 $allRows = array_merge($salesRows, $purchaseRows, $returnSettlementRows);
@@ -284,35 +407,59 @@ usort($allRows, static function (array $a, array $b): int {
 });
 
 $modeSummary = [];
-$dailyCash = [];
-foreach ($allRows as $row) {
-    $mode = strtoupper(trim((string) ($row['payment_mode'] ?? '')));
-    if ($mode === '') {
-        $mode = 'UNKNOWN';
-    }
-    if (!isset($modeSummary[$mode])) {
-        $modeSummary[$mode] = ['entries' => 0, 'amount' => 0.0];
-    }
-    $modeSummary[$mode]['entries']++;
-    $modeSummary[$mode]['amount'] += (float) ($row['amount'] ?? 0);
-
-    if ($mode === 'CASH') {
-        $dateKey = (string) ($row['payment_date'] ?? ($row['paid_on'] ?? ''));
-        if ($dateKey !== '') {
-            if (!isset($dailyCash[$dateKey])) {
-                $dailyCash[$dateKey] = ['cash_in' => 0.0, 'cash_out' => 0.0, 'net_cash' => 0.0];
-            }
-
-            $amount = (float) ($row['amount'] ?? 0);
-            $side = (string) ($row['payment_side'] ?? '');
-            if ($side === 'SALES' || $side === 'RETURN_RECEIVE') {
-                $dailyCash[$dateKey]['cash_in'] += $amount;
-            } else {
-                $dailyCash[$dateKey]['cash_out'] += $amount;
-            }
-            $dailyCash[$dateKey]['net_cash'] = $dailyCash[$dateKey]['cash_in'] - $dailyCash[$dateKey]['cash_out'];
+$mergeModeSummaryRows = static function (array &$summary, array $rows): void {
+    foreach ($rows as $row) {
+        $mode = strtoupper(trim((string) ($row['payment_mode'] ?? '')));
+        if ($mode === '') {
+            $mode = 'UNKNOWN';
         }
+        if (!isset($summary[$mode])) {
+            $summary[$mode] = ['entries' => 0, 'amount' => 0.0];
+        }
+        $summary[$mode]['entries'] += (int) ($row['entries'] ?? 0);
+        $summary[$mode]['amount'] += (float) ($row['amount'] ?? 0);
     }
+};
+$mergeModeSummaryRows($modeSummary, $salesModeSummaryRows);
+$mergeModeSummaryRows($modeSummary, $purchaseModeSummaryRows);
+$mergeModeSummaryRows($modeSummary, $returnModeSummaryRows);
+ksort($modeSummary);
+
+$dailyCash = [];
+$mergeDailyCashRow = static function (array &$summary, string $dateKey, float $cashInDelta, float $cashOutDelta): void {
+    if ($dateKey === '') {
+        return;
+    }
+    if (!isset($summary[$dateKey])) {
+        $summary[$dateKey] = ['cash_in' => 0.0, 'cash_out' => 0.0, 'net_cash' => 0.0];
+    }
+    $summary[$dateKey]['cash_in'] += $cashInDelta;
+    $summary[$dateKey]['cash_out'] += $cashOutDelta;
+    $summary[$dateKey]['net_cash'] = $summary[$dateKey]['cash_in'] - $summary[$dateKey]['cash_out'];
+};
+foreach ($salesDailyCashRows as $row) {
+    $mergeDailyCashRow(
+        $dailyCash,
+        (string) ($row['payment_date'] ?? ''),
+        (float) ($row['cash_in'] ?? 0),
+        0.0
+    );
+}
+foreach ($purchaseDailyCashRows as $row) {
+    $mergeDailyCashRow(
+        $dailyCash,
+        (string) ($row['payment_date'] ?? ''),
+        0.0,
+        (float) ($row['cash_out'] ?? 0)
+    );
+}
+foreach ($returnDailyCashRows as $row) {
+    $mergeDailyCashRow(
+        $dailyCash,
+        (string) ($row['payment_date'] ?? ''),
+        (float) ($row['cash_in'] ?? 0),
+        (float) ($row['cash_out'] ?? 0)
+    );
 }
 ksort($dailyCash);
 
@@ -436,6 +583,22 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         <div class="col-md-4"><div class="small-box text-bg-secondary"><div class="inner"><h4><?= number_format((int) ($purchaseSummary['payment_count'] ?? 0)); ?></h4><p>Purchase Entries</p></div><span class="small-box-icon"><i class="bi bi-list-ul"></i></span></div></div>
         <div class="col-md-4"><div class="small-box text-bg-info"><div class="inner"><h4><?= number_format((int) ($returnSettlementSummary['payment_count'] ?? 0)); ?></h4><p>Return Entries</p></div><span class="small-box-icon"><i class="bi bi-arrow-repeat"></i></span></div></div>
       </div>
+
+      <?php
+        $salesReversalExcludedAmount = (float) ($salesReversalSummary['payment_total'] ?? 0);
+        $salesReversalExcludedCount = (int) ($salesReversalSummary['payment_count'] ?? 0);
+        $purchaseReversalExcludedAmount = (float) ($purchaseReversalSummary['payment_total'] ?? 0);
+        $purchaseReversalExcludedCount = (int) ($purchaseReversalSummary['payment_count'] ?? 0);
+        $hasExcludedReversalPayments = $salesReversalExcludedAmount > 0.009 || $purchaseReversalExcludedAmount > 0.009;
+      ?>
+      <?php if ($hasExcludedReversalPayments): ?>
+        <div class="alert alert-warning mb-3">
+          Reversed payment amounts are shown in the ledger, but excluded from summary cards, mode-wise totals, and Daily Cash Summary.
+          Sales Reversed (Excluded): <strong><?= e(format_currency($salesReversalExcludedAmount)); ?></strong> (<?= number_format($salesReversalExcludedCount); ?>)
+          |
+          Purchase Reversed (Excluded): <strong><?= e(format_currency($purchaseReversalExcludedAmount)); ?></strong> (<?= number_format($purchaseReversalExcludedCount); ?>)
+        </div>
+      <?php endif; ?>
 
       <div class="card mb-3">
         <div class="card-header d-flex justify-content-between align-items-center">

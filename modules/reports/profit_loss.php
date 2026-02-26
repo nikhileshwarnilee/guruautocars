@@ -57,6 +57,7 @@ $invoiceIncome = (float) ($incomeRow['invoice_income'] ?? 0);
 $invoiceCount = (int) ($incomeRow['invoice_count'] ?? 0);
 
 $otherIncome = 0.0;
+$reversalEntriesExcluded = 0.0;
 if (table_columns('expenses') !== []) {
     $otherIncomeParams = [
         'company_id' => $companyId,
@@ -69,12 +70,24 @@ if (table_columns('expenses') !== []) {
          FROM expenses e
          WHERE e.company_id = :company_id
            AND e.entry_type <> "DELETED"
+           AND COALESCE(e.entry_type, "EXPENSE") <> "REVERSAL"
            AND e.amount < 0
            ' . $otherIncomeScopeSql . '
            AND e.expense_date BETWEEN :from_date AND :to_date'
     );
     $otherIncomeStmt->execute($otherIncomeParams);
     $otherIncome = (float) ($otherIncomeStmt->fetchColumn() ?? 0);
+
+    $reversalExcludedStmt = db()->prepare(
+        'SELECT COALESCE(SUM(ABS(e.amount)), 0)
+         FROM expenses e
+         WHERE e.company_id = :company_id
+           AND COALESCE(e.entry_type, "") = "REVERSAL"
+           ' . $otherIncomeScopeSql . '
+           AND e.expense_date BETWEEN :from_date AND :to_date'
+    );
+    $reversalExcludedStmt->execute($otherIncomeParams);
+    $reversalEntriesExcluded = (float) ($reversalExcludedStmt->fetchColumn() ?? 0);
 }
 
 $avgCostMap = [];
@@ -205,6 +218,7 @@ if (table_columns('expenses') !== []) {
          FROM expenses e
          WHERE e.company_id = :company_id
            AND e.entry_type <> "DELETED"
+           AND COALESCE(e.entry_type, "EXPENSE") <> "REVERSAL"
            AND e.amount > 0
            AND (e.source_type IS NULL OR (
              e.source_type NOT LIKE "PAYROLL%"
@@ -235,6 +249,7 @@ if ($exportKey !== '') {
         $rows = [
             ['Income - Finalized Invoices', $invoiceIncome],
             ['Income - Other Income', $otherIncome],
+            ['Info - Reversal Entries (Excluded)', $reversalEntriesExcluded],
             ['Direct Cost - Parts Cost', $partsCost],
             ['Direct Cost - Outsourced Cost', $outsourcedCost],
             ['Expenses - Payroll', $payrollExpense],
@@ -317,6 +332,9 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             <tbody>
               <tr><td>Income</td><td>Finalized Invoices (<?= number_format($invoiceCount); ?>)</td><td><?= e(format_currency($invoiceIncome)); ?></td></tr>
               <tr><td>Income</td><td>Other Income</td><td><?= e(format_currency($otherIncome)); ?></td></tr>
+              <?php if ($reversalEntriesExcluded > 0.009): ?>
+                <tr class="table-warning"><td>Info</td><td>Reversal Entries (Excluded from P&amp;L)</td><td><?= e(format_currency($reversalEntriesExcluded)); ?></td></tr>
+              <?php endif; ?>
               <tr><td>Direct Cost</td><td>Parts Cost (stock issue cost)</td><td><?= e(format_currency($partsCost)); ?></td></tr>
               <tr><td>Direct Cost</td><td>Outsourced Work Cost</td><td><?= e(format_currency($outsourcedCost)); ?></td></tr>
               <tr><td>Expenses</td><td>Payroll</td><td><?= e(format_currency($payrollExpense)); ?></td></tr>

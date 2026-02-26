@@ -177,6 +177,7 @@ if ($canViewFinancial) {
            AND i.invoice_status = "FINALIZED"
            AND jc.status = "CLOSED"
            AND jc.status_code = "ACTIVE"
+           AND ' . reversal_sales_payment_unreversed_filter_sql('p') . '
            ' . $collectionMonthlyScopeSql . '
            AND p.paid_on BETWEEN :from_date AND :to_date
          GROUP BY DATE_FORMAT(p.paid_on, "%Y-%m")
@@ -196,6 +197,7 @@ if ($canViewFinancial) {
            AND i.invoice_status = "FINALIZED"
            AND jc.status = "CLOSED"
            AND jc.status_code = "ACTIVE"
+           AND ' . reversal_sales_payment_unreversed_filter_sql('p') . '
            ' . $paymentModeScopeSql . '
            AND p.paid_on BETWEEN :from_date AND :to_date
          GROUP BY p.payment_mode

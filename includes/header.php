@@ -22,6 +22,7 @@ $globalVehicleSearchEnabled = $user !== null && has_permission('vehicle.view');
 $globalVehicleSearchApiUrl = $globalVehicleSearchEnabled ? url('modules/vehicles/search_api.php') : '';
 $headerCompanyId = (int) ($user['company_id'] ?? active_company_id());
 $headerCompanyLogoUrl = $headerCompanyId > 0 ? company_logo_url($headerCompanyId, active_garage_id()) : null;
+$showTxnCleanupTestButton = $user !== null && strtolower(trim((string) ($user['role_key'] ?? ''))) === 'super_admin';
 $quickAccessLinks = [];
 if (has_permission('job.view')) {
     $quickAccessLinks[] = [
@@ -156,6 +157,21 @@ if ($appCssVersion === '') {
           <?php endif; ?>
           <ul class="navbar-nav ms-auto align-items-center">
             <?php if ($user !== null): ?>
+              <?php if ($showTxnCleanupTestButton): ?>
+                <li class="nav-item me-2">
+                  <form
+                    method="post"
+                    action="<?= e(url('database/cleanup_transactional_data_keep_masters.php')); ?>"
+                    target="_blank"
+                    class="d-flex align-items-center"
+                    onsubmit="return window.confirm('Run transactional cleanup and zero inventory quantities? This is destructive and intended only for test data reset.');"
+                  >
+                    <?= csrf_field(); ?>
+                    <input type="hidden" name="run_cleanup" value="1" />
+                    <button type="submit" class="btn btn-sm btn-outline-danger">Test Cleanup</button>
+                  </form>
+                </li>
+              <?php endif; ?>
               <li class="nav-item me-2 d-none d-md-block">
                 <span class="d-inline-flex align-items-center gap-2">
                   <?php if ($headerCompanyLogoUrl !== null): ?>
