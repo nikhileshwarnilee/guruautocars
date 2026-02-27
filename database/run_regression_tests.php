@@ -219,6 +219,7 @@ final class RegressionCrudRunner
         $this->runVehicleCrud();
         $this->runJobCardCrud();
         $this->runPurchaseCrud();
+        $this->runPurchasePaymentCrud();
         $this->runInvoiceCrud();
         $this->runPaymentCrud();
         $this->runAdvanceCrud();
@@ -244,6 +245,71 @@ final class RegressionCrudRunner
         if ($payload !== []) {
             $this->h->updateById($table, $id, $payload);
         }
+    }
+
+    private function purchaseDependencyState(int $purchaseId, int $partId, int $vendorId): array
+    {
+        $purchase = $this->h->qr(
+            'SELECT id, grand_total, payment_status, purchase_status
+             FROM purchases
+             WHERE id = :id AND company_id = :c LIMIT 1',
+            ['id' => $purchaseId, 'c' => $this->h->companyId]
+        );
+        $grand = round((float) ($purchase['grand_total'] ?? 0), 2);
+        $paid = $this->h->effectivePaymentTotal('purchase_payments', 'purchase_id', $purchaseId);
+        $outstanding = round(max($grand - $paid, 0.0), 2);
+
+        $stockQty = (float) ($this->h->qv(
+            'SELECT COALESCE(quantity, 0)
+             FROM garage_inventory
+             WHERE garage_id = :g AND part_id = :p
+             LIMIT 1',
+            ['g' => $this->h->garageId, 'p' => $partId]
+        ) ?? 0);
+        $movementQty = (float) ($this->h->qv(
+            'SELECT COALESCE(SUM(CASE
+                WHEN deleted_at IS NOT NULL THEN 0
+                WHEN movement_type = "IN" THEN ABS(quantity)
+                WHEN movement_type = "OUT" THEN -ABS(quantity)
+                ELSE quantity
+            END), 0)
+             FROM inventory_movements
+             WHERE company_id = :c
+               AND garage_id = :g
+               AND part_id = :p',
+            ['c' => $this->h->companyId, 'g' => $this->h->garageId, 'p' => $partId]
+        ) ?? 0);
+
+        $vendorOutstanding = 0.0;
+        if ($this->h->tableExists('purchase_payments')) {
+            $vendorOutstanding = (float) ($this->h->qv(
+                'SELECT ROUND(COALESCE(SUM(GREATEST(p.grand_total - COALESCE(pay.total_paid, 0), 0)),0),2)
+                 FROM purchases p
+                 LEFT JOIN (
+                    SELECT purchase_id, COALESCE(SUM(CASE WHEN entry_type = "REVERSAL" THEN -ABS(amount) ELSE ABS(amount) END), 0) AS total_paid
+                    FROM purchase_payments
+                    WHERE deleted_at IS NULL
+                    GROUP BY purchase_id
+                 ) pay ON pay.purchase_id = p.id
+                 WHERE p.company_id = :c
+                   AND p.vendor_id = :v
+                   AND p.purchase_status = "FINALIZED"
+                   AND COALESCE(p.status_code, "ACTIVE") <> "DELETED"',
+                ['c' => $this->h->companyId, 'v' => $vendorId]
+            ) ?? 0);
+        }
+
+        return [
+            'purchase_id' => $purchaseId,
+            'purchase_status' => (string) ($purchase['purchase_status'] ?? ''),
+            'purchase_payment_status' => (string) ($purchase['payment_status'] ?? ''),
+            'purchase_grand_total' => $grand,
+            'purchase_paid_total' => $paid,
+            'purchase_outstanding_total' => $outstanding,
+            'vendor_outstanding_total' => round($vendorOutstanding, 2),
+            'stock_quantity_part' => round($stockQty, 2),
+            'stock_movement_part' => round($movementQty, 2),
+        ];
     }
 
     private function runConcurrencyPhase(): void
@@ -710,6 +776,145 @@ final class RegressionCrudRunner
             'ledger_totals.by_account.1300.net' => -$taxable,
             'ledger_totals.by_account.1215.net' => -$gst,
             'ledger_totals.by_account.2100.net' => $grand,
+        ]);
+    }
+
+    private function runPurchasePaymentCrud(): void
+    {
+        $module = 'purchase_payments';
+        if (!$this->h->tableExists('purchase_payments')) {
+            $this->results[] = [
+                'module' => $module,
+                'step' => 'SKIP_MODULE',
+                'status' => 'WARN',
+                'message' => 'purchase_payments table not available in this schema.',
+            ];
+            return;
+        }
+
+        $purchaseId = 911205; // seeded finalized purchase with no baseline payment
+        $paymentId = 995231;
+        $reversalId = 995232;
+
+        $purchase = $this->h->qr(
+            'SELECT * FROM purchases WHERE id = :id AND company_id = :c LIMIT 1',
+            ['id' => $purchaseId, 'c' => $this->h->companyId]
+        );
+        $this->h->assert($purchase !== [], 'Seeded purchase not found for purchase payment regression.');
+
+        $partId = (int) ($this->h->qv(
+            'SELECT part_id FROM purchase_items WHERE purchase_id = :pid ORDER BY id ASC LIMIT 1',
+            ['pid' => $purchaseId]
+        ) ?? 0);
+        $this->h->assert($partId > 0, 'Purchase item part not found for purchase payment regression.');
+
+        $vendorId = (int) ($purchase['vendor_id'] ?? 0);
+        $grand = round((float) ($purchase['grand_total'] ?? 0), 2);
+        $amount = round($grand * 0.35, 2);
+        if ($amount >= $grand && $grand > 1.0) {
+            $amount = round($grand - 1.0, 2);
+        }
+        if ($amount <= 0) {
+            $amount = min(max($grand, 1.0), 50.0);
+        }
+
+        $baselineState = $this->purchaseDependencyState($purchaseId, $partId, $vendorId);
+        $baselineStockQty = (float) ($baselineState['stock_quantity_part'] ?? 0.0);
+
+        $this->withValidationAndSnapshot($module, 'CREATE', function () use ($purchaseId, $paymentId, $purchase, $amount, $partId, $vendorId, $grand, $baselineStockQty): array {
+            $payment = [
+                'id' => $paymentId,
+                'purchase_id' => $purchaseId,
+                'company_id' => $this->h->companyId,
+                'garage_id' => $this->h->garageId,
+                'payment_date' => date('Y-m-d'),
+                'entry_type' => 'PAYMENT',
+                'amount' => $amount,
+                'payment_mode' => 'BANK_TRANSFER',
+                'reference_no' => 'REG-TEST-PPAY-0001',
+                'notes' => $this->h->datasetTag . ' TEST purchase payment create',
+                'reversed_payment_id' => null,
+                'created_by' => $this->h->adminUserId,
+            ];
+            $this->h->insert('purchase_payments', $payment);
+            ledger_post_vendor_payment($this->h->pdo, $purchase, $payment, $this->h->adminUserId);
+            $this->h->recalcPurchasePaymentStatus($purchaseId);
+
+            $state = $this->purchaseDependencyState($purchaseId, $partId, $vendorId);
+            $this->h->assert((string) ($state['purchase_payment_status'] ?? '') === 'PARTIAL', 'Purchase payment status should be PARTIAL after payment create.');
+            $this->h->assert(abs((float) ($state['purchase_paid_total'] ?? 0) - $amount) <= 0.01, 'Purchase paid total mismatch after payment create.');
+            $this->h->assert(abs((float) ($state['purchase_outstanding_total'] ?? 0) - round($grand - $amount, 2)) <= 0.01, 'Purchase outstanding mismatch after payment create.');
+            $this->h->assert(abs((float) ($state['stock_quantity_part'] ?? 0) - $baselineStockQty) <= 0.01, 'Stock should not change when posting purchase payment.');
+
+            return ['payment_id' => $paymentId, 'state' => $state];
+        }, [
+            'counts.purchase_payments' => 1,
+            'stock_totals.garage_quantity_total' => 0,
+            'stock_totals.movement_quantity_total' => 0,
+            'report_totals.purchases.purchase_count' => 0,
+            'report_totals.payables.paid_total' => $amount,
+            'report_totals.payables.outstanding_total' => -$amount,
+            'ledger_totals.by_account.2100.net' => $amount,
+            'ledger_totals.by_account.1110.net' => -$amount,
+        ]);
+
+        $this->withValidationAndSnapshot($module, 'EDIT', function () use ($paymentId, $purchaseId, $partId, $vendorId, $amount, $baselineStockQty): array {
+            $this->h->updateById('purchase_payments', $paymentId, [
+                'notes' => $this->h->datasetTag . ' TEST purchase payment edited',
+                'reference_no' => 'REG-TEST-PPAY-EDIT',
+            ]);
+            $this->h->recalcPurchasePaymentStatus($purchaseId);
+
+            $state = $this->purchaseDependencyState($purchaseId, $partId, $vendorId);
+            $this->h->assert((string) ($state['purchase_payment_status'] ?? '') === 'PARTIAL', 'Purchase payment status should stay PARTIAL after edit.');
+            $this->h->assert(abs((float) ($state['purchase_paid_total'] ?? 0) - $amount) <= 0.01, 'Purchase paid total should stay unchanged after payment edit.');
+            $this->h->assert(abs((float) ($state['stock_quantity_part'] ?? 0) - $baselineStockQty) <= 0.01, 'Stock should not change when editing purchase payment metadata.');
+
+            return ['payment_id' => $paymentId, 'state' => $state];
+        });
+
+        $this->withValidationAndSnapshot($module, 'DELETE_REVERSE', function () use ($paymentId, $reversalId, $purchaseId, $partId, $vendorId, $grand, $amount, $baselineStockQty): array {
+            $reversal = [
+                'id' => $reversalId,
+                'purchase_id' => $purchaseId,
+                'company_id' => $this->h->companyId,
+                'garage_id' => $this->h->garageId,
+                'payment_date' => date('Y-m-d'),
+                'entry_type' => 'REVERSAL',
+                'amount' => -$amount,
+                'payment_mode' => 'ADJUSTMENT',
+                'reference_no' => 'REG-TEST-PPAY-REV-' . $paymentId,
+                'notes' => $this->h->datasetTag . ' TEST purchase payment reversal audit',
+                'reversed_payment_id' => $paymentId,
+                'created_by' => $this->h->adminUserId,
+            ];
+            $this->h->insert('purchase_payments', $reversal);
+            $this->h->reverseLedgerReference(
+                'PURCHASE_PAYMENT',
+                $paymentId,
+                'REG_TEST_PURCHASE_PAYMENT_REV',
+                $reversalId,
+                date('Y-m-d'),
+                'Regression test purchase payment reversal'
+            );
+            $this->h->recalcPurchasePaymentStatus($purchaseId);
+
+            $state = $this->purchaseDependencyState($purchaseId, $partId, $vendorId);
+            $this->h->assert((string) ($state['purchase_payment_status'] ?? '') === 'UNPAID', 'Purchase payment status should return to UNPAID after reversal.');
+            $this->h->assert(abs((float) ($state['purchase_paid_total'] ?? 0)) <= 0.01, 'Purchase paid total should return to zero after reversal.');
+            $this->h->assert(abs((float) ($state['purchase_outstanding_total'] ?? 0) - $grand) <= 0.01, 'Purchase outstanding should return to purchase grand total after reversal.');
+            $this->h->assert(abs((float) ($state['stock_quantity_part'] ?? 0) - $baselineStockQty) <= 0.01, 'Stock should not change when reversing purchase payment.');
+
+            return ['payment_id' => $paymentId, 'reversal_id' => $reversalId, 'state' => $state];
+        }, [
+            'counts.purchase_payments' => -1,
+            'stock_totals.garage_quantity_total' => 0,
+            'stock_totals.movement_quantity_total' => 0,
+            'report_totals.purchases.purchase_count' => 0,
+            'report_totals.payables.paid_total' => -$amount,
+            'report_totals.payables.outstanding_total' => $amount,
+            'ledger_totals.by_account.2100.net' => -$amount,
+            'ledger_totals.by_account.1110.net' => $amount,
         ]);
     }
 

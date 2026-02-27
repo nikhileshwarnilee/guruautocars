@@ -26,6 +26,10 @@ final class RegressionDatasetSeeder
     /** @var array<int,array<string,mixed>> */
     private array $purchaseItems = [];
     /** @var array<int,array<string,mixed>> */
+    private array $purchasePayments = [];
+    /** @var array<int,array<string,mixed>> */
+    private array $purchasePaymentReversals = [];
+    /** @var array<int,array<string,mixed>> */
     private array $invoices = [];
     /** @var array<int,array<string,mixed>> */
     private array $invoiceItems = [];
@@ -68,6 +72,7 @@ final class RegressionDatasetSeeder
         $this->seedCustomers();
         $this->seedVehicles();
         $this->seedPurchasesAndStock();
+        $this->seedPurchasePaymentsAndAudit();
         $this->seedJobsAndOutsourced();
         $this->seedInvoices();
         $this->seedPayments();
@@ -135,6 +140,8 @@ final class RegressionDatasetSeeder
             'advance_adjustments' => array_keys($this->advanceAdjustments),
             'returns_rma' => array_keys($this->returns),
             'purchases' => array_keys($this->purchases),
+            'purchase_payments' => array_keys($this->purchasePayments),
+            'purchase_payment_reversals' => array_keys($this->purchasePaymentReversals),
             'payroll_salary_sheets' => array_keys($this->payrollSheets),
             'payroll_salary_items' => array_keys($this->payrollItems),
             'expenses' => array_keys($this->expenses),
@@ -342,6 +349,98 @@ final class RegressionDatasetSeeder
 
             ledger_post_purchase_finalized($this->h->pdo, $purchase, $this->h->adminUserId);
         }
+    }
+
+    private function seedPurchasePaymentsAndAudit(): void
+    {
+        if (!$this->h->tableExists('purchase_payments')) {
+            return;
+        }
+
+        $scenarios = [
+            ['purchase_index' => 1, 'ratio' => 0.50, 'mode' => 'UPI'],
+            ['purchase_index' => 2, 'ratio' => 1.00, 'mode' => 'BANK_TRANSFER'],
+            ['purchase_index' => 3, 'ratio' => 0.40, 'mode' => 'CASH'],
+            ['purchase_index' => 4, 'ratio' => 0.25, 'mode' => 'CHEQUE'],
+        ];
+
+        $sequence = 0;
+        foreach ($scenarios as $scenario) {
+            $sequence++;
+            $purchaseId = $this->purchaseId((int) $scenario['purchase_index']);
+            $purchase = $this->purchases[$purchaseId] ?? [];
+            if ($purchase === []) {
+                continue;
+            }
+
+            $grand = $this->round2((float) ($purchase['grand_total'] ?? 0));
+            $amount = $this->round2($grand * (float) $scenario['ratio']);
+            if ($amount <= 0) {
+                continue;
+            }
+
+            $paymentId = 917200 + $sequence;
+            $payment = [
+                'id' => $paymentId,
+                'purchase_id' => $purchaseId,
+                'company_id' => $this->h->companyId,
+                'garage_id' => $this->h->garageId,
+                'payment_date' => $this->h->datePlus(12 + $sequence),
+                'entry_type' => 'PAYMENT',
+                'amount' => $amount,
+                'payment_mode' => (string) $scenario['mode'],
+                'reference_no' => 'REG-PPAY-' . str_pad((string) $sequence, 4, '0', STR_PAD_LEFT),
+                'notes' => $this->h->datasetTag . ' purchase payment ' . $sequence,
+                'reversed_payment_id' => null,
+                'created_by' => $this->h->adminUserId,
+            ];
+            $this->h->insert('purchase_payments', $payment);
+            $this->purchasePayments[$paymentId] = $payment;
+
+            ledger_post_vendor_payment($this->h->pdo, $purchase, $payment, $this->h->adminUserId);
+            $this->h->recalcPurchasePaymentStatus($purchaseId);
+        }
+
+        $firstPayment = reset($this->purchasePayments);
+        if (!is_array($firstPayment) || $firstPayment === []) {
+            return;
+        }
+
+        $origPaymentId = (int) ($firstPayment['id'] ?? 0);
+        $purchaseId = (int) ($firstPayment['purchase_id'] ?? 0);
+        $amount = $this->round2((float) ($firstPayment['amount'] ?? 0));
+        if ($origPaymentId <= 0 || $purchaseId <= 0 || $amount <= 0) {
+            return;
+        }
+
+        $reversalId = 917900;
+        $reversalDate = $this->h->datePlus(22);
+        $reversal = [
+            'id' => $reversalId,
+            'purchase_id' => $purchaseId,
+            'company_id' => $this->h->companyId,
+            'garage_id' => $this->h->garageId,
+            'payment_date' => $reversalDate,
+            'entry_type' => 'REVERSAL',
+            'amount' => -$amount,
+            'payment_mode' => 'ADJUSTMENT',
+            'reference_no' => 'REG-PPAY-REV-' . $origPaymentId,
+            'notes' => $this->h->datasetTag . ' purchase payment reversal audit',
+            'reversed_payment_id' => $origPaymentId,
+            'created_by' => $this->h->adminUserId,
+        ];
+        $this->h->insert('purchase_payments', $reversal);
+        $this->purchasePaymentReversals[$reversalId] = $reversal;
+
+        $this->h->reverseLedgerReference(
+            'PURCHASE_PAYMENT',
+            $origPaymentId,
+            'SEED_PURCHASE_PAYMENT_REV',
+            $reversalId,
+            $reversalDate,
+            'Seed purchase payment reversal audit'
+        );
+        $this->h->recalcPurchasePaymentStatus($purchaseId);
     }
 
     private function seedJobsAndOutsourced(): void

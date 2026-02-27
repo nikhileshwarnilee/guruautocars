@@ -108,6 +108,83 @@ final class RegressionHarness
         return in_array($column, $this->columns($table), true);
     }
 
+    /**
+     * Build SQL filter for operational payment rows while treating reversals as audit-only.
+     * Reversed payment rows are excluded from calculations via NOT EXISTS on reversal link.
+     */
+    private function unreversedPaymentFilterSql(string $table, string $alias): string
+    {
+        if (!preg_match('/^[A-Za-z0-9_]+$/', $table)) {
+            return '1 = 0';
+        }
+        if (!preg_match('/^[A-Za-z0-9_]+$/', $alias)) {
+            $alias = 'p';
+        }
+
+        $cols = $this->columns($table);
+        $hasEntryType = in_array('entry_type', $cols, true);
+        $hasReversedPaymentId = in_array('reversed_payment_id', $cols, true);
+        $hasIsReversed = in_array('is_reversed', $cols, true);
+        $hasDeletedAt = in_array('deleted_at', $cols, true);
+
+        $conditions = [];
+        if ($hasDeletedAt) {
+            $conditions[] = $alias . '.deleted_at IS NULL';
+        }
+
+        if ($hasEntryType) {
+            $conditions[] = 'COALESCE(' . $alias . '.entry_type, "PAYMENT") = "PAYMENT"';
+        } else {
+            $conditions[] = $alias . '.amount > 0';
+        }
+
+        if ($table === 'payments' && $hasIsReversed) {
+            $conditions[] = 'COALESCE(' . $alias . '.is_reversed, 0) = 0';
+        }
+
+        if ($hasReversedPaymentId) {
+            $reverseAlias = $alias . '_rev';
+            $reverseConditions = [
+                $reverseAlias . '.reversed_payment_id = ' . $alias . '.id',
+            ];
+            if ($hasEntryType) {
+                $reverseConditions[] = 'COALESCE(' . $reverseAlias . '.entry_type, "REVERSAL") = "REVERSAL"';
+            }
+            if ($hasDeletedAt) {
+                $reverseConditions[] = $reverseAlias . '.deleted_at IS NULL';
+            }
+            $conditions[] = 'NOT EXISTS (
+                SELECT 1
+                FROM ' . $table . ' ' . $reverseAlias . '
+                WHERE ' . implode(' AND ', $reverseConditions) . '
+            )';
+        }
+
+        return $conditions === [] ? '1 = 1' : implode(' AND ', $conditions);
+    }
+
+    public function effectivePaymentTotal(string $table, string $scopeColumn, int $scopeId): float
+    {
+        if ($scopeId <= 0 || !$this->tableExists($table)) {
+            return 0.0;
+        }
+        if (!preg_match('/^[A-Za-z0-9_]+$/', $table) || !preg_match('/^[A-Za-z0-9_]+$/', $scopeColumn)) {
+            return 0.0;
+        }
+        if (!$this->hasColumn($table, $scopeColumn)) {
+            return 0.0;
+        }
+
+        $filterSql = $this->unreversedPaymentFilterSql($table, 'p');
+        $sql =
+            'SELECT COALESCE(SUM(ABS(p.amount)),0)
+             FROM ' . $table . ' p
+             WHERE p.' . $scopeColumn . ' = :scope_id
+               AND ' . $filterSql;
+
+        return round((float) ($this->qv($sql, ['scope_id' => $scopeId]) ?? 0), 2);
+    }
+
     public function qv(string $sql, array $params = []): mixed
     {
         $stmt = $this->pdo->prepare($sql);
@@ -608,11 +685,7 @@ final class RegressionHarness
             $this->updateById('invoices', $invoiceId, ['payment_status' => 'CANCELLED']);
             return;
         }
-        $paid = (float) ($this->qv(
-            'SELECT COALESCE(SUM(CASE WHEN entry_type = "REVERSAL" THEN -ABS(amount) ELSE ABS(amount) END),0)
-             FROM payments WHERE invoice_id = :invoice_id AND deleted_at IS NULL',
-            ['invoice_id' => $invoiceId]
-        ) ?? 0);
+        $paid = $this->effectivePaymentTotal('payments', 'invoice_id', $invoiceId);
         $adv = $this->tableExists('advance_adjustments')
             ? (float) ($this->qv('SELECT COALESCE(SUM(adjusted_amount),0) FROM advance_adjustments WHERE company_id = :company_id AND invoice_id = :invoice_id', ['company_id' => $this->companyId, 'invoice_id' => $invoiceId]) ?? 0)
             : 0.0;
@@ -633,11 +706,7 @@ final class RegressionHarness
         if ($purchase === []) {
             return;
         }
-        $net = (float) ($this->qv(
-            'SELECT COALESCE(SUM(CASE WHEN entry_type = "REVERSAL" THEN -ABS(amount) ELSE ABS(amount) END),0)
-             FROM purchase_payments WHERE purchase_id = :purchase_id AND company_id = :company_id AND deleted_at IS NULL',
-            ['purchase_id' => $purchaseId, 'company_id' => $this->companyId]
-        ) ?? 0);
+        $net = $this->effectivePaymentTotal('purchase_payments', 'purchase_id', $purchaseId);
         $grand = round((float) ($purchase['grand_total'] ?? 0), 2);
         $status = 'UNPAID';
         if ($net + 0.009 >= $grand && $grand > 0) {
@@ -770,10 +839,32 @@ final class RegressionHarness
         if ($this->tableExists('vehicles')) $counts['vehicles'] = (int) ($this->qv('SELECT COUNT(*) FROM vehicles WHERE company_id=:c AND COALESCE(status_code,"ACTIVE")<>"DELETED"', ['c' => $this->companyId]) ?? 0);
         if ($this->tableExists('job_cards')) $counts['job_cards'] = (int) ($this->qv('SELECT COUNT(*) FROM job_cards WHERE company_id=:c AND COALESCE(status_code,"ACTIVE")<>"DELETED"', ['c' => $this->companyId]) ?? 0);
         if ($this->tableExists('invoices')) $counts['invoices'] = (int) ($this->qv('SELECT COUNT(*) FROM invoices WHERE company_id=:c AND deleted_at IS NULL', ['c' => $this->companyId]) ?? 0);
-        if ($this->tableExists('payments') && $this->tableExists('invoices')) $counts['payments'] = (int) ($this->qv('SELECT COUNT(*) FROM payments p INNER JOIN invoices i ON i.id=p.invoice_id WHERE i.company_id=:c AND p.deleted_at IS NULL AND p.entry_type="PAYMENT"', ['c' => $this->companyId]) ?? 0);
+        if ($this->tableExists('payments') && $this->tableExists('invoices')) {
+            $salesPaymentFilterSql = $this->unreversedPaymentFilterSql('payments', 'p');
+            $counts['payments'] = (int) ($this->qv(
+                'SELECT COUNT(*)
+                 FROM payments p
+                 INNER JOIN invoices i ON i.id = p.invoice_id
+                 WHERE i.company_id = :c
+                   AND ' . $salesPaymentFilterSql,
+                ['c' => $this->companyId]
+            ) ?? 0);
+        }
         if ($this->tableExists('job_advances')) $counts['advances'] = (int) ($this->qv('SELECT COUNT(*) FROM job_advances WHERE company_id=:c AND COALESCE(status_code,"ACTIVE")<>"DELETED"', ['c' => $this->companyId]) ?? 0);
         if ($this->tableExists('returns_rma')) $counts['returns'] = (int) ($this->qv('SELECT COUNT(*) FROM returns_rma WHERE company_id=:c AND COALESCE(status_code,"ACTIVE")<>"DELETED"', ['c' => $this->companyId]) ?? 0);
         if ($this->tableExists('purchases')) $counts['purchases'] = (int) ($this->qv('SELECT COUNT(*) FROM purchases WHERE company_id=:c AND COALESCE(status_code,"ACTIVE")<>"DELETED"', ['c' => $this->companyId]) ?? 0);
+        if ($this->tableExists('purchase_payments') && $this->tableExists('purchases')) {
+            $purchasePaymentFilterSql = $this->unreversedPaymentFilterSql('purchase_payments', 'pp');
+            $counts['purchase_payments'] = (int) ($this->qv(
+                'SELECT COUNT(*)
+                 FROM purchase_payments pp
+                 INNER JOIN purchases p ON p.id = pp.purchase_id
+                 WHERE p.company_id = :c
+                   AND COALESCE(p.status_code,"ACTIVE") <> "DELETED"
+                   AND ' . $purchasePaymentFilterSql,
+                ['c' => $this->companyId]
+            ) ?? 0);
+        }
         if ($this->tableExists('payroll_salary_items') && $this->tableExists('payroll_salary_sheets')) $counts['payroll_entries'] = (int) ($this->qv('SELECT COUNT(*) FROM payroll_salary_items psi INNER JOIN payroll_salary_sheets pss ON pss.id=psi.sheet_id WHERE pss.company_id=:c AND psi.deleted_at IS NULL', ['c' => $this->companyId]) ?? 0);
         if ($this->tableExists('expenses')) $counts['expenses'] = (int) ($this->qv('SELECT COUNT(*) FROM expenses WHERE company_id=:c AND deleted_at IS NULL AND entry_type="EXPENSE"', ['c' => $this->companyId]) ?? 0);
         if ($this->tableExists('outsourced_works')) $counts['outsourced_jobs'] = (int) ($this->qv('SELECT COUNT(*) FROM outsourced_works WHERE company_id=:c AND COALESCE(status_code,"ACTIVE")<>"DELETED"', ['c' => $this->companyId]) ?? 0);
@@ -794,20 +885,23 @@ final class RegressionHarness
                  WHERE company_id = :c AND deleted_at IS NULL',
                 ['c' => $this->companyId]
             );
+            $salesPaymentFilterSql = $this->tableExists('payments')
+                ? $this->unreversedPaymentFilterSql('payments', 'pay')
+                : '1 = 0';
             $totals['receivables'] = $this->qr(
                 'SELECT
                     ROUND(COALESCE(SUM(i.grand_total),0),2) AS invoiced_total,
-                    ROUND(COALESCE(SUM(COALESCE(p.paid,0)),0),2) AS paid_total,
+                    ROUND(COALESCE(SUM(COALESCE(pay.paid,0)),0),2) AS paid_total,
                     ROUND(COALESCE(SUM(COALESCE(a.adv,0)),0),2) AS advance_adjusted_total,
-                    ROUND(COALESCE(SUM(GREATEST(i.grand_total - COALESCE(p.paid,0) - COALESCE(a.adv,0),0)),0),2) AS outstanding_total
+                    ROUND(COALESCE(SUM(GREATEST(i.grand_total - COALESCE(pay.paid,0) - COALESCE(a.adv,0),0)),0),2) AS outstanding_total
                  FROM invoices i
                  LEFT JOIN (
-                     SELECT invoice_id,
-                            SUM(CASE WHEN entry_type="REVERSAL" THEN -ABS(amount) ELSE ABS(amount) END) AS paid
-                     FROM payments
-                     WHERE deleted_at IS NULL
-                     GROUP BY invoice_id
-                 ) p ON p.invoice_id = i.id
+                     SELECT pay.invoice_id,
+                            SUM(ABS(pay.amount)) AS paid
+                     FROM payments pay
+                     WHERE ' . $salesPaymentFilterSql . '
+                     GROUP BY pay.invoice_id
+                 ) pay ON pay.invoice_id = i.id
                  LEFT JOIN (
                      SELECT invoice_id, SUM(adjusted_amount) AS adv
                      FROM advance_adjustments
@@ -833,6 +927,7 @@ final class RegressionHarness
                 ['c' => $this->companyId]
             );
             if ($this->tableExists('purchase_payments')) {
+                $purchasePaymentFilterSql = $this->unreversedPaymentFilterSql('purchase_payments', 'pp_raw');
                 $totals['payables'] = $this->qr(
                     'SELECT
                         ROUND(COALESCE(SUM(p.grand_total),0),2) AS purchases_total,
@@ -840,11 +935,11 @@ final class RegressionHarness
                         ROUND(COALESCE(SUM(GREATEST(p.grand_total - COALESCE(pp.paid,0),0)),0),2) AS outstanding_total
                      FROM purchases p
                      LEFT JOIN (
-                         SELECT purchase_id,
-                                SUM(CASE WHEN entry_type="REVERSAL" THEN -ABS(amount) ELSE ABS(amount) END) AS paid
-                         FROM purchase_payments
-                         WHERE deleted_at IS NULL
-                         GROUP BY purchase_id
+                         SELECT pp_raw.purchase_id,
+                                SUM(ABS(pp_raw.amount)) AS paid
+                         FROM purchase_payments pp_raw
+                         WHERE ' . $purchasePaymentFilterSql . '
+                         GROUP BY pp_raw.purchase_id
                      ) pp ON pp.purchase_id = p.id
                      WHERE p.company_id = :c
                        AND p.purchase_status = "FINALIZED"
@@ -1402,6 +1497,9 @@ final class RegressionHarness
         $issues = [];
 
         if ($this->tableExists('invoices')) {
+            $salesPaymentFilterSql = $this->tableExists('payments')
+                ? $this->unreversedPaymentFilterSql('payments', 'p')
+                : '1 = 0';
             $rows = $this->qa(
                 'SELECT * FROM (
                     SELECT i.id,
@@ -1414,10 +1512,10 @@ final class RegressionHarness
                            END AS calc_status
                     FROM invoices i
                     LEFT JOIN (
-                        SELECT invoice_id, SUM(CASE WHEN entry_type="REVERSAL" THEN -ABS(amount) ELSE ABS(amount) END) AS paid
-                        FROM payments
-                        WHERE deleted_at IS NULL
-                        GROUP BY invoice_id
+                        SELECT p.invoice_id, SUM(ABS(p.amount)) AS paid
+                        FROM payments p
+                        WHERE ' . $salesPaymentFilterSql . '
+                        GROUP BY p.invoice_id
                     ) p ON p.invoice_id = i.id
                     LEFT JOIN (
                         SELECT invoice_id, SUM(adjusted_amount) AS adv
@@ -1437,6 +1535,7 @@ final class RegressionHarness
         }
 
         if ($this->tableExists('purchases') && $this->tableExists('purchase_payments')) {
+            $purchasePaymentFilterSql = $this->unreversedPaymentFilterSql('purchase_payments', 'pp');
             $rows = $this->qa(
                 'SELECT * FROM (
                     SELECT p.id,
@@ -1448,10 +1547,10 @@ final class RegressionHarness
                            END AS calc_status
                     FROM purchases p
                     LEFT JOIN (
-                        SELECT purchase_id, SUM(CASE WHEN entry_type="REVERSAL" THEN -ABS(amount) ELSE ABS(amount) END) AS paid
-                        FROM purchase_payments
-                        WHERE deleted_at IS NULL
-                        GROUP BY purchase_id
+                        SELECT pp.purchase_id, SUM(ABS(pp.amount)) AS paid
+                        FROM purchase_payments pp
+                        WHERE ' . $purchasePaymentFilterSql . '
+                        GROUP BY pp.purchase_id
                     ) pay ON pay.purchase_id = p.id
                     WHERE p.company_id = :c
                       AND COALESCE(p.status_code,"ACTIVE") <> "DELETED"
