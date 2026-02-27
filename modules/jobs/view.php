@@ -1164,9 +1164,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $successMessage = 'Reminder item added to job lines.';
             if ($selectedType === 'SERVICE') {
                 if ($visPartAddCount > 0) {
-                    $successMessage = 'Service added. VIS compatible parts also added: ' . $visPartAddCount . '.';
+                    $successMessage = 'Labour added. VIS compatible parts also added: ' . $visPartAddCount . '.';
                 } else {
-                    $successMessage = 'Service added. No VIS compatible mapped parts found for this vehicle/service.';
+                    $successMessage = 'Labour added. No VIS compatible mapped parts found for this vehicle/service.';
                 }
             }
             flash_set('job_success', $successMessage, 'success');
@@ -2748,7 +2748,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
               <p class="mb-2"><strong>Job Type:</strong> <?= e($jobTypeLabel); ?></p>
               <p class="mb-2"><strong>Opened At:</strong> <?= e((string) $job['opened_at']); ?></p>
               <p class="mb-2"><strong>Promised At:</strong> <?= e((string) ($job['promised_at'] ?? '-')); ?></p>
-              <p class="mb-2"><strong>Service Advisor:</strong> <?= e((string) ($job['advisor_name'] ?? '-')); ?></p>
+              <p class="mb-2"><strong>Labour Advisor:</strong> <?= e((string) ($job['advisor_name'] ?? '-')); ?></p>
               <p class="mb-2"><strong>Assigned Staff:</strong> <?= e((string) (($job['assigned_staff'] ?? '') !== '' ? $job['assigned_staff'] : 'Unassigned')); ?></p>
               <p class="mb-2"><strong>Customer:</strong> <?= e((string) $job['customer_name']); ?> (<?= e((string) $job['customer_phone']); ?>)</p>
               <?php if ($advanceReceivedAmount > 0.009): ?>
@@ -3071,7 +3071,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             </div>
             <div class="card-body">
               <?php if (!$hasVisData): ?>
-                <p class="text-muted mb-0">No VIS mapping found for this vehicle. Continue with manual service/parts entry.</p>
+                <p class="text-muted mb-0">No VIS mapping found for this vehicle. Continue with manual Labour/Parts entry.</p>
               <?php else: ?>
                 <?php if ($visVariant): ?>
                   <p class="mb-3">
@@ -3082,7 +3082,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                   </p>
                 <?php endif; ?>
 
-                <h6 class="mb-2">Suggested Services</h6>
+                <h6 class="mb-2">Suggested Labour</h6>
                 <?php if (empty($visServiceSuggestions)): ?>
                   <p class="text-muted small">No service suggestions.</p>
                 <?php else: ?>
@@ -3164,7 +3164,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 
         <div class="col-xl-8">
           <div class="card card-success">
-            <div class="card-header"><h3 class="card-title">Service / Labour Lines</h3></div>
+            <div class="card-header"><h3 class="card-title">Labour Lines</h3></div>
             <div class="card-body border-bottom py-2">
               <div class="row g-2">
                 <div class="col-md-4">
@@ -3201,7 +3201,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                     </select>
                   </div>
                   <div class="col-md-3">
-                    <label class="form-label">Service Master</label>
+                    <label class="form-label">Labour Master</label>
                     <select id="add-labor-service" name="service_id" class="form-select" <?= $jobLocked ? 'disabled' : ''; ?>>
                       <option value="0" data-category-key="">Custom Labor Item</option>
                       <?php foreach ($servicesMaster as $service): ?>
@@ -3277,7 +3277,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
               <table class="table table-sm table-striped mb-0">
                 <thead>
                   <tr>
-                    <th>Service</th>
+                    <th>Labour</th>
                     <th>Description</th>
                     <th>Execution</th>
                     <th>Qty</th>
@@ -3664,7 +3664,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                           <?= csrf_field(); ?>
                           <input type="hidden" name="_action" value="add_manual_service_reminder">
                           <div class="col-lg-5">
-                            <label class="form-label">Service / Part</label>
+                            <label class="form-label">Labour / Part</label>
                             <select name="item_key" class="form-select" required>
                               <option value="">Select Reminder-Enabled Item</option>
                               <?php foreach ($manualReminderItems as $manualItem): ?>
@@ -3736,7 +3736,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                   <table class="table table-sm table-bordered align-middle mb-0">
                     <thead>
                       <tr>
-                        <th>Service/Part</th>
+                        <th>Labour/Part</th>
                         <th>Due KM</th>
                         <th>Due Date</th>
                         <th>Predicted Visit</th>
@@ -4370,3 +4370,4 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 </script>
 
 <?php require_once __DIR__ . '/../../includes/footer.php'; ?>
+

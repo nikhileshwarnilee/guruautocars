@@ -2254,7 +2254,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                 name="part_name"
                 value="<?= e($partsStockFilterPartName); ?>"
                 class="form-control form-control-sm"
-                placeholder="Part name or SKU"
+                placeholder="Part name or SKU/Part No"
               >
             </div>
             <div class="col-lg-2 col-md-6">
@@ -2325,7 +2325,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
           <table class="table table-striped mb-0">
             <thead>
               <tr>
-                <th>SKU</th>
+                <th>SKU/Part No</th>
                 <th>Part Name</th>
                 <th>Category</th>
                 <th>Vendor</th>
@@ -2605,3 +2605,4 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 </script>
 
 <?php require_once __DIR__ . '/../../includes/footer.php'; ?>
+

@@ -349,7 +349,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $statusCode = normalize_status_code((string) ($_POST['status_code'] ?? 'ACTIVE'));
 
         if ($serviceId <= 0 || $partIds === []) {
-            flash_set('vis_map_error', 'Service and at least one valid part are required for service-to-part mapping.', 'danger');
+            flash_set('vis_map_error', 'Labour and at least one valid part are required for Labour-to-Part mapping.', 'danger');
             redirect('modules/vis/compatibility.php');
         }
 
@@ -414,7 +414,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $pdo->commit();
 
             if ($createdCount > 0) {
-                log_audit('vis_mapping', 'create_service_part_map', $firstInsertId, 'Created VIS service-to-part mapping', [
+                log_audit('vis_mapping', 'create_service_part_map', $firstInsertId, 'Created VIS Labour-to-Part mapping', [
                     'entity' => 'vis_service_part_map',
                     'source' => 'UI',
                     'after' => [
@@ -428,9 +428,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         'skipped_duplicates' => $skippedCount,
                     ],
                 ]);
-                flash_set('vis_map_success', 'Service-to-part mappings created for ' . $createdCount . ' part(s).', 'success');
+                flash_set('vis_map_success', 'Labour-to-Part mappings created for ' . $createdCount . ' part(s).', 'success');
             } elseif ($skippedCount > 0) {
-                flash_set('vis_map_warning', 'No new service-to-part mappings were created because selected parts are already mapped to this service.', 'warning');
+                flash_set('vis_map_warning', 'No new Labour-to-Part mappings were created because selected parts are already mapped to this service.', 'warning');
             }
 
             if ($createdCount > 0 && $skippedCount > 0) {
@@ -468,7 +468,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'company_id' => $companyId,
         ]);
 
-        log_audit('vis_mapping', 'update_service_part_map', $serviceMapId, 'Updated VIS service-to-part mapping', [
+        log_audit('vis_mapping', 'update_service_part_map', $serviceMapId, 'Updated VIS Labour-to-Part mapping', [
             'entity' => 'vis_service_part_map',
             'source' => 'UI',
             'metadata' => [
@@ -477,7 +477,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'job_links' => (int) ($statusMeta['job_links'] ?? 0),
             ],
         ]);
-        flash_set('vis_map_success', 'Service-to-part mapping updated.', 'success');
+        flash_set('vis_map_success', 'Labour-to-Part mapping updated.', 'success');
         if (($statusMeta['blocked'] ?? false) && !empty($statusMeta['message'])) {
             flash_set('vis_map_warning', (string) $statusMeta['message'], 'warning');
         }
@@ -727,7 +727,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 
           <div class="col-lg-6">
             <div class="card card-info">
-              <div class="card-header"><h3 class="card-title"><?= $editServiceMap ? 'Edit Service-to-Part Mapping' : 'Map Service-to-Part'; ?></h3></div>
+              <div class="card-header"><h3 class="card-title"><?= $editServiceMap ? 'Edit Labour-to-Part Mapping' : 'Map Labour-to-Part'; ?></h3></div>
               <form method="post">
                 <div class="card-body row g-2">
                   <?= csrf_field(); ?>
@@ -735,9 +735,9 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                   <input type="hidden" name="service_map_id" value="<?= (int) ($editServiceMap['id'] ?? 0); ?>" />
 
                   <div class="col-md-6">
-                    <label class="form-label">Service</label>
+                    <label class="form-label">Labour</label>
                     <select name="service_id" class="form-select" required <?= $editServiceMap ? 'disabled' : ''; ?>>
-                      <option value="">Select Service</option>
+                      <option value="">Select Labour</option>
                       <?php foreach ($services as $service): ?>
                         <option value="<?= (int) $service['id']; ?>" <?= ((int) ($editServiceMap['service_id'] ?? 0) === (int) $service['id']) ? 'selected' : ''; ?>>
                           <?= e((string) $service['service_name']); ?> (<?= e((string) $service['service_code']); ?>)
@@ -859,12 +859,12 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       </div>
 
       <div class="card mt-3">
-        <div class="card-header"><h3 class="card-title">Service-to-Part Mapping</h3></div>
+        <div class="card-header"><h3 class="card-title">Labour-to-Part Mapping</h3></div>
         <div class="card-body table-responsive p-0">
           <table class="table table-striped mb-0">
             <thead>
               <tr>
-                <th>Service</th>
+                <th>Labour</th>
                 <th>Part</th>
                 <th>Required</th>
                 <th>Status</th>
@@ -873,7 +873,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             </thead>
             <tbody>
               <?php if (empty($serviceMappings)): ?>
-                <tr><td colspan="5" class="text-center text-muted py-4">No service-to-part mappings.</td></tr>
+                <tr><td colspan="5" class="text-center text-muted py-4">No Labour-to-Part mappings.</td></tr>
               <?php else: ?>
                 <?php foreach ($serviceMappings as $mapping): ?>
                   <tr>
@@ -892,7 +892,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                           data-entity="service_map"
                           data-record-id="<?= (int) $mapping['id']; ?>"
                           data-next-status="<?= e(((string) $mapping['status_code'] === 'ACTIVE') ? 'INACTIVE' : 'ACTIVE'); ?>"
-                          data-record-label="Service Map: <?= e((string) $mapping['service_name']); ?> / <?= e((string) $mapping['part_name']); ?>"
+                          data-record-label="Labour Map: <?= e((string) $mapping['service_name']); ?> / <?= e((string) $mapping['part_name']); ?>"
                         >Toggle</button>
                         <?php if ((string) ($mapping['status_code'] ?? '') !== 'DELETED'): ?>
                           <button
@@ -902,7 +902,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                             data-bs-target="#visMapDeleteModal"
                             data-entity="service_map"
                             data-record-id="<?= (int) $mapping['id']; ?>"
-                            data-record-label="Service Map: <?= e((string) $mapping['service_name']); ?> / <?= e((string) $mapping['part_name']); ?>"
+                            data-record-label="Labour Map: <?= e((string) $mapping['service_name']); ?> / <?= e((string) $mapping['part_name']); ?>"
                           >Delete</button>
                         <?php endif; ?>
                       <?php else: ?>
@@ -1023,3 +1023,4 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 </script>
 
 <?php require_once __DIR__ . '/../../includes/footer.php'; ?>
+

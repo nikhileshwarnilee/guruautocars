@@ -110,7 +110,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
               </select>
             </div>
             <div class="col-md-2">
-              <label class="form-label">Service Type</label>
+              <label class="form-label">Labour Type</label>
               <select name="service_type" class="form-select" id="maintenance-filter-service-type">
                 <option value="">All</option>
                 <?php foreach (service_reminder_supported_types() as $serviceType): ?>
@@ -174,7 +174,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                 </select>
               </div>
               <div class="col-md-4">
-                <label class="form-label">Service / Part</label>
+                <label class="form-label">Labour / Part</label>
                 <select name="item_key" class="form-select" required>
                   <option value="">Select Reminder-Enabled Item</option>
                   <?php foreach ($manualItems as $item): ?>
@@ -246,8 +246,8 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                 <th>Vehicle</th>
                 <th>Customer</th>
                 <th>Job Card</th>
-                <th>Service/Part</th>
-                <th class="text-end">Last Service KM</th>
+                <th>Labour/Part</th>
+                <th class="text-end">Last Labour KM</th>
                 <th class="text-end">Next Due KM</th>
                 <th>Next Due Date</th>
                 <th>Predicted Visit</th>
@@ -538,3 +538,4 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 </script>
 
 <?php require_once __DIR__ . '/../../includes/footer.php'; ?>
+

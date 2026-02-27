@@ -198,7 +198,7 @@ try {
             CASE
               WHEN s.service_name IS NOT NULL AND TRIM(s.service_name) <> "" THEN s.service_name
               WHEN jl.description IS NOT NULL AND TRIM(jl.description) <> "" THEN jl.description
-              ELSE "Unlabeled Service"
+              ELSE "Unlabeled Labour"
             END AS service_label,
             COALESCE(sc.category_name, "Uncategorized") AS category_name,
             COUNT(*) AS line_count,
@@ -736,7 +736,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             <table class="table table-sm table-striped mb-0">
               <thead>
                 <tr>
-                  <th>Service/Part</th>
+                  <th>Labour/Part</th>
                   <th class="text-end">Due KM</th>
                   <th>Due Date</th>
                   <th>Predicted Visit</th>
@@ -781,7 +781,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                 <th>Status</th>
                 <th>Priority</th>
                 <th>Complaint</th>
-                <th>Services</th>
+                <th>Labour</th>
                 <th>Parts</th>
                 <th>Estimate</th>
                 <th>Invoice</th>
@@ -846,14 +846,14 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         <div class="col-lg-6">
           <div class="card h-100">
             <div class="card-header d-flex justify-content-between align-items-center">
-              <h3 class="card-title mb-0">Services Used</h3>
+              <h3 class="card-title mb-0">Labour Used</h3>
               <span class="badge text-bg-light border"><?= e(format_currency($serviceUsageTotal)); ?></span>
             </div>
             <div class="card-body p-0 table-responsive">
               <table class="table table-sm table-striped mb-0">
                 <thead>
                   <tr>
-                    <th>Service</th>
+                    <th>Labour</th>
                     <th>Category</th>
                     <th>Count</th>
                     <th>Qty</th>
@@ -893,7 +893,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                 <thead>
                   <tr>
                     <th>Part</th>
-                    <th>SKU</th>
+                    <th>SKU/Part No</th>
                     <th>Count</th>
                     <th>Qty</th>
                     <th>Total</th>
@@ -1041,7 +1041,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
               <thead>
                 <tr>
                   <th>Part</th>
-                  <th>SKU</th>
+                  <th>SKU/Part No</th>
                   <th>Compatibility Note</th>
                   <th>Stock Qty</th>
                   <th>Selling Price</th>
@@ -1075,14 +1075,14 @@ require_once __DIR__ . '/../../includes/sidebar.php';
           </div>
 
           <div class="mt-3">
-            <h6 class="mb-2">VIS Service Suggestions</h6>
+            <h6 class="mb-2">VIS Labour Suggestions</h6>
             <?php if (empty($visServiceSuggestions)): ?>
               <div class="text-muted small">No VIS service mappings found.</div>
             <?php else: ?>
               <div class="d-flex flex-wrap gap-2">
                 <?php foreach ($visServiceSuggestions as $service): ?>
                   <span class="badge text-bg-info">
-                    <?= e((string) ($service['service_name'] ?? 'Service')); ?>
+                    <?= e((string) ($service['service_name'] ?? 'Labour')); ?>
                     (<?= (int) ($service['mapped_parts'] ?? 0); ?> mapped parts)
                   </span>
                 <?php endforeach; ?>
@@ -1096,3 +1096,4 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 </main>
 
 <?php require_once __DIR__ . '/../../includes/footer.php'; ?>
+

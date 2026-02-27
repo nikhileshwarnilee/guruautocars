@@ -122,7 +122,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $selectedVariantIds = array_keys($selectedVariantIds);
 
         if ($partSku === '' || $partName === '') {
-            flash_set('parts_error', 'Part SKU and part name are required.', 'danger');
+            flash_set('parts_error', 'SKU/Part No and part name are required.', 'danger');
             redirect('modules/inventory/parts_master.php');
         }
         if ($unit === '') {
@@ -265,7 +265,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             flash_set('parts_success', 'Part created successfully.', 'success');
         } catch (Throwable $exception) {
             $pdo->rollBack();
-            flash_set('parts_error', 'Unable to create part. SKU must be unique.', 'danger');
+            flash_set('parts_error', 'Unable to create part. SKU/Part No must be unique.', 'danger');
         }
 
         redirect('modules/inventory/parts_master.php');
@@ -541,7 +541,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
               <input type="hidden" name="part_id" value="<?= (int) ($editPart['id'] ?? 0); ?>" />
 
               <div class="col-md-2">
-                <label class="form-label">SKU</label>
+                <label class="form-label">SKU/Part No</label>
                 <input type="text" name="part_sku" class="form-control" <?= $editPart ? 'readonly' : 'required'; ?> value="<?= e((string) ($editPart['part_sku'] ?? '')); ?>" />
               </div>
               <div class="col-md-4">
@@ -682,7 +682,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
           <table class="table table-striped mb-0">
             <thead>
               <tr>
-                <th>SKU</th>
+                <th>SKU/Part No</th>
                 <th>Name</th>
                 <th>Category</th>
                 <th>Vendor</th>
@@ -762,3 +762,4 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 </main>
 
 <?php require_once __DIR__ . '/../../includes/footer.php'; ?>
+

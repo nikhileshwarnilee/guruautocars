@@ -2473,7 +2473,7 @@ if ($purchasesReady) {
             'Payment Status',
             'Vendor',
             'Invoice Number',
-            'Part SKU',
+            'SKU/Part No',
             'Part Name',
             'Quantity',
             'Unit Cost',
@@ -3254,7 +3254,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                     <tr>
                       <th>#</th>
                       <th>Part</th>
-                      <th>SKU</th>
+                      <th>SKU/Part No</th>
                       <th>Unit</th>
                       <th class="text-end">Qty</th>
                       <th class="text-end">Unit Cost</th>
@@ -3890,7 +3890,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
               <thead>
                 <tr>
                   <th>Part</th>
-                  <th>SKU</th>
+                  <th>SKU/Part No</th>
                   <th>Total Qty</th>
                   <th>Total Value</th>
                 </tr>
@@ -4409,3 +4409,4 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 </script>
 
 <?php require_once __DIR__ . '/../../includes/footer.php'; ?>
+

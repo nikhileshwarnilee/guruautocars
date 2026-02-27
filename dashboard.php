@@ -850,7 +850,7 @@ require_once __DIR__ . '/includes/sidebar.php';
             <thead>
               <tr>
                 <th>Vehicle</th>
-                <th>Service/Part</th>
+                <th>Labour/Part</th>
                 <th class="text-end">Due KM</th>
                 <th>Due Date</th>
                 <th>Predicted Next Visit</th>
@@ -953,7 +953,7 @@ require_once __DIR__ . '/includes/sidebar.php';
             </div>
             <div class="col-lg-6">
               <div class="card h-100">
-                <div class="card-header"><h3 class="card-title mb-0">Top Services (Count)</h3></div>
+                <div class="card-header"><h3 class="card-title mb-0">Top Labour (Count)</h3></div>
                 <div class="card-body">
                   <div class="gac-chart-wrap"><canvas id="dashboard-chart-top-services"></canvas></div>
                 </div>
@@ -1180,7 +1180,7 @@ require_once __DIR__ . '/includes/sidebar.php';
         data: {
           labels: payload.charts.top_services ? payload.charts.top_services.labels : [],
           datasets: [{
-            label: 'Service Count',
+            label: 'Labour Count',
             data: payload.charts.top_services ? payload.charts.top_services.counts : [],
             backgroundColor: window.GacCharts.pickColors(8)
           }]
@@ -1308,3 +1308,4 @@ require_once __DIR__ . '/includes/sidebar.php';
 </script>
 
 <?php require_once __DIR__ . '/includes/footer.php'; ?>
+

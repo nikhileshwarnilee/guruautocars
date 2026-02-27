@@ -71,6 +71,24 @@ if ($restrictedPrint && !$canPrintRestricted) {
     redirect('modules/jobs/view.php?id=' . $jobId);
 }
 
+$jobCardPrintSettings = job_card_print_settings((int) ($job['company_id'] ?? $companyId), $garageId);
+$showCompanyLogo = !empty($jobCardPrintSettings['show_company_logo']);
+$showCompanyGstin = !empty($jobCardPrintSettings['show_company_gstin']);
+$showCustomerGstin = !empty($jobCardPrintSettings['show_customer_gstin']);
+$showAssignedStaff = !empty($jobCardPrintSettings['show_assigned_staff']);
+$showJobMeta = !empty($jobCardPrintSettings['show_job_meta']);
+$showComplaint = !empty($jobCardPrintSettings['show_complaint']);
+$showDiagnosis = !empty($jobCardPrintSettings['show_diagnosis']);
+$showRecommendationNote = !empty($jobCardPrintSettings['show_recommendation_note']);
+$showInsuranceSection = !empty($jobCardPrintSettings['show_insurance_section']);
+$showLaborLines = !empty($jobCardPrintSettings['show_labor_lines']);
+$showPartLines = !empty($jobCardPrintSettings['show_parts_lines']);
+$showNextServiceReminders = !empty($jobCardPrintSettings['show_next_service_reminders']);
+$showCostsInPrint = !empty($jobCardPrintSettings['show_costs_in_job_card_print']);
+$showTotals = !empty($jobCardPrintSettings['show_totals']) && $showCostsInPrint;
+$showCancelNote = !empty($jobCardPrintSettings['show_cancel_note']);
+$canManagePrintSettings = has_permission('job.manage') || has_permission('settings.manage');
+
 $laborStmt = db()->prepare(
     'SELECT jl.*, s.service_name
      FROM job_labor jl
@@ -100,7 +118,7 @@ foreach ($partLines as $line) {
     $partsTotal += (float) ($line['total_amount'] ?? 0);
 }
 $grandTotal = round($serviceTotal + $partsTotal, 2);
-$nextServiceReminders = service_reminder_feature_ready()
+$nextServiceReminders = $showNextServiceReminders && service_reminder_feature_ready()
     ? service_reminder_fetch_active_by_vehicle($companyId, (int) ($job['vehicle_id'] ?? 0), $garageId, 6)
     : [];
 $companyLogoUrl = company_logo_url((int) ($job['company_id'] ?? $companyId), $garageId);
@@ -159,7 +177,12 @@ $companyLogoUrl = company_logo_url((int) ($job['company_id'] ?? $companyId), $ga
   <body>
     <div class="container-fluid print-sheet">
       <div class="d-flex justify-content-between mb-3 no-print">
-        <a href="<?= e(url('modules/jobs/view.php?id=' . $jobId)); ?>" class="btn btn-outline-secondary btn-sm">Back</a>
+        <div class="d-flex gap-2">
+          <a href="<?= e(url('modules/jobs/view.php?id=' . $jobId)); ?>" class="btn btn-outline-secondary btn-sm">Back</a>
+          <?php if ($canManagePrintSettings): ?>
+            <a href="<?= e(url('modules/jobs/print_settings.php')); ?>" class="btn btn-outline-dark btn-sm">Print Settings</a>
+          <?php endif; ?>
+        </div>
         <button onclick="window.print()" class="btn btn-primary btn-sm">Print / Save PDF</button>
       </div>
 
@@ -167,12 +190,14 @@ $companyLogoUrl = company_logo_url((int) ($job['company_id'] ?? $companyId), $ga
         <div class="card-body">
           <div class="row mb-3">
             <div class="col-8">
-              <?php if ($companyLogoUrl !== null): ?>
+              <?php if ($showCompanyLogo && $companyLogoUrl !== null): ?>
                 <div class="mb-2"><img src="<?= e($companyLogoUrl); ?>" alt="Company Logo" class="brand-logo" /></div>
               <?php endif; ?>
               <div class="title"><?= e((string) ($job['company_name'] ?? '')); ?></div>
               <div><?= e((string) ($job['company_address'] ?? '')); ?>, <?= e((string) ($job['company_city'] ?? '')); ?>, <?= e((string) ($job['company_state'] ?? '')); ?></div>
-              <div>GSTIN: <?= e((string) ($job['company_gstin'] ?? '-')); ?></div>
+              <?php if ($showCompanyGstin): ?>
+                <div>GSTIN: <?= e((string) ($job['company_gstin'] ?? '-')); ?></div>
+              <?php endif; ?>
             </div>
             <div class="col-4 text-end">
               <h4 class="mb-1">Job Card</h4>
@@ -188,7 +213,9 @@ $companyLogoUrl = company_logo_url((int) ($job['company_id'] ?? $companyId), $ga
               <h6 class="mb-1">Customer</h6>
               <div><strong><?= e((string) ($job['customer_name'] ?? '-')); ?></strong></div>
               <div>Phone: <?= e((string) ($job['customer_phone'] ?? '-')); ?></div>
-              <div>GSTIN: <?= e((string) ($job['customer_gstin'] ?? '-')); ?></div>
+              <?php if ($showCustomerGstin): ?>
+                <div>GSTIN: <?= e((string) ($job['customer_gstin'] ?? '-')); ?></div>
+              <?php endif; ?>
               <div><?= e((string) ($job['customer_address'] ?? '')); ?></div>
               <div><?= e((string) ($job['customer_city'] ?? '')); ?><?= (string) ($job['customer_city'] ?? '') !== '' && (string) ($job['customer_state'] ?? '') !== '' ? ', ' : ''; ?><?= e((string) ($job['customer_state'] ?? '')); ?></div>
             </div>
@@ -203,36 +230,50 @@ $companyLogoUrl = company_logo_url((int) ($job['company_id'] ?? $companyId), $ga
             </div>
           </div>
 
-          <div class="row mb-3">
-            <div class="col-6">
-              <h6 class="mb-1">Assigned Staff</h6>
-              <div><?= e((string) (($job['assigned_staff'] ?? '') !== '' ? $job['assigned_staff'] : 'Unassigned')); ?></div>
+          <?php if ($showAssignedStaff || $showJobMeta): ?>
+            <div class="row mb-3">
+              <?php if ($showAssignedStaff): ?>
+                <div class="<?= $showJobMeta ? 'col-6' : 'col-12'; ?>">
+                  <h6 class="mb-1">Assigned Staff</h6>
+                  <div><?= e((string) (($job['assigned_staff'] ?? '') !== '' ? $job['assigned_staff'] : 'Unassigned')); ?></div>
+                </div>
+              <?php endif; ?>
+              <?php if ($showJobMeta): ?>
+                <div class="<?= $showAssignedStaff ? 'col-6 text-end' : 'col-12'; ?>">
+                  <h6 class="mb-1">Job Meta</h6>
+                  <div>Priority: <?= e((string) ($job['priority'] ?? '-')); ?></div>
+                  <div>Advisor: <?= e((string) (($job['advisor_name'] ?? '') !== '' ? $job['advisor_name'] : '-')); ?></div>
+                </div>
+              <?php endif; ?>
             </div>
-            <div class="col-6 text-end">
-              <h6 class="mb-1">Job Meta</h6>
-              <div>Priority: <?= e((string) ($job['priority'] ?? '-')); ?></div>
-              <div>Advisor: <?= e((string) (($job['advisor_name'] ?? '') !== '' ? $job['advisor_name'] : '-')); ?></div>
+          <?php endif; ?>
+
+          <?php if ($showComplaint): ?>
+            <div class="mb-3">
+              <h6 class="mb-1">Complaint</h6>
+              <div class="border rounded p-2"><?= nl2br(e((string) ($job['complaint'] ?? ''))); ?></div>
             </div>
-          </div>
+          <?php endif; ?>
 
-          <div class="mb-3">
-            <h6 class="mb-1">Complaint</h6>
-            <div class="border rounded p-2"><?= nl2br(e((string) ($job['complaint'] ?? ''))); ?></div>
-          </div>
+          <?php if ($showDiagnosis): ?>
+            <div class="mb-3">
+              <h6 class="mb-1">Notes / Diagnosis</h6>
+              <div class="border rounded p-2"><?= nl2br(e((string) (($job['diagnosis'] ?? '') !== '' ? $job['diagnosis'] : '-'))); ?></div>
+            </div>
+          <?php endif; ?>
 
-          <div class="mb-3">
-            <h6 class="mb-1">Notes / Diagnosis</h6>
-            <div class="border rounded p-2"><?= nl2br(e((string) (($job['diagnosis'] ?? '') !== '' ? $job['diagnosis'] : '-'))); ?></div>
-          </div>
-
-          <?php if (trim((string) ($job['recommendation_note'] ?? '')) !== ''): ?>
+          <?php if ($showRecommendationNote && trim((string) ($job['recommendation_note'] ?? '')) !== ''): ?>
             <div class="mb-3">
               <h6 class="mb-1">Recommendation Note</h6>
               <div class="border rounded p-2"><?= nl2br(e((string) $job['recommendation_note'])); ?></div>
             </div>
           <?php endif; ?>
 
-          <?php if (trim((string) ($job['insurance_company_name'] ?? '')) !== '' || trim((string) ($job['insurance_claim_number'] ?? '')) !== ''): ?>
+          <?php
+            $hasInsuranceDetails = trim((string) ($job['insurance_company_name'] ?? '')) !== ''
+                || trim((string) ($job['insurance_claim_number'] ?? '')) !== '';
+          ?>
+          <?php if ($showInsuranceSection && $hasInsuranceDetails): ?>
             <div class="mb-3">
               <h6 class="mb-1">Insurance Claim</h6>
               <div class="border rounded p-2">
@@ -240,124 +281,169 @@ $companyLogoUrl = company_logo_url((int) ($job['company_id'] ?? $companyId), $ga
                 <div><strong>Claim Number:</strong> <?= e((string) (($job['insurance_claim_number'] ?? '') !== '' ? $job['insurance_claim_number'] : '-')); ?></div>
                 <div><strong>Surveyor:</strong> <?= e((string) (($job['insurance_surveyor_name'] ?? '') !== '' ? $job['insurance_surveyor_name'] : '-')); ?></div>
                 <div><strong>Status:</strong> <?= e((string) (($job['insurance_claim_status'] ?? '') !== '' ? $job['insurance_claim_status'] : 'PENDING')); ?></div>
-                <div><strong>Approved Claim:</strong> <?= e(number_format((float) ($job['insurance_claim_amount_approved'] ?? 0), 2)); ?></div>
-                <div><strong>Customer Payable:</strong> <?= e(number_format((float) ($job['insurance_customer_payable_amount'] ?? 0), 2)); ?></div>
+                <?php if ($showCostsInPrint): ?>
+                  <div><strong>Approved Claim:</strong> <?= e(number_format((float) ($job['insurance_claim_amount_approved'] ?? 0), 2)); ?></div>
+                  <div><strong>Customer Payable:</strong> <?= e(number_format((float) ($job['insurance_customer_payable_amount'] ?? 0), 2)); ?></div>
+                <?php endif; ?>
               </div>
             </div>
           <?php endif; ?>
 
-          <div class="table-responsive mb-3">
-            <table class="table table-bordered table-sm">
-              <thead>
-                <tr>
-                  <th>#</th>
-                  <th>Service</th>
-                  <th class="text-end">Qty</th>
-                  <th class="text-end">Rate</th>
-                  <th class="text-end">GST%</th>
-                  <th class="text-end">Total</th>
-                </tr>
-              </thead>
-              <tbody>
-                <?php if (empty($laborLines)): ?>
-                  <tr><td colspan="6" class="text-center text-muted">No services added.</td></tr>
-                <?php else: ?>
-                  <?php $rowNo = 1; ?>
-                  <?php foreach ($laborLines as $line): ?>
-                    <tr>
-                      <td><?= $rowNo++; ?></td>
-                      <td><?= e((string) (($line['service_name'] ?? '') !== '' ? $line['service_name'] : ($line['description'] ?? ''))); ?></td>
-                      <td class="text-end"><?= e(number_format((float) ($line['quantity'] ?? 0), 2)); ?></td>
-                      <td class="text-end"><?= e(number_format((float) ($line['unit_price'] ?? 0), 2)); ?></td>
-                      <td class="text-end"><?= e(number_format((float) ($line['gst_rate'] ?? 0), 2)); ?></td>
-                      <td class="text-end"><?= e(number_format((float) ($line['total_amount'] ?? 0), 2)); ?></td>
-                    </tr>
-                  <?php endforeach; ?>
-                <?php endif; ?>
-              </tbody>
-            </table>
-          </div>
-
-          <div class="table-responsive mb-3">
-            <table class="table table-bordered table-sm">
-              <thead>
-                <tr>
-                  <th>#</th>
-                  <th>Part</th>
-                  <th class="text-end">Qty</th>
-                  <th class="text-end">Rate</th>
-                  <th class="text-end">GST%</th>
-                  <th class="text-end">Total</th>
-                </tr>
-              </thead>
-              <tbody>
-                <?php if (empty($partLines)): ?>
-                  <tr><td colspan="6" class="text-center text-muted">No parts added.</td></tr>
-                <?php else: ?>
-                  <?php $rowNo = 1; ?>
-                  <?php foreach ($partLines as $line): ?>
-                    <tr>
-                      <td><?= $rowNo++; ?></td>
-                      <td><?= e((string) ($line['part_name'] ?? '')); ?> (<?= e((string) ($line['part_sku'] ?? '')); ?>)</td>
-                      <td class="text-end"><?= e(number_format((float) ($line['quantity'] ?? 0), 2)); ?></td>
-                      <td class="text-end"><?= e(number_format((float) ($line['unit_price'] ?? 0), 2)); ?></td>
-                      <td class="text-end"><?= e(number_format((float) ($line['gst_rate'] ?? 0), 2)); ?></td>
-                      <td class="text-end"><?= e(number_format((float) ($line['total_amount'] ?? 0), 2)); ?></td>
-                    </tr>
-                  <?php endforeach; ?>
-                <?php endif; ?>
-              </tbody>
-            </table>
-          </div>
-
-          <div class="mb-3">
-            <h6 class="mb-1">Next Recommended Service</h6>
-            <div class="table-responsive">
-              <table class="table table-bordered table-sm mb-0">
+          <?php if ($showLaborLines): ?>
+            <?php $laborColspan = $showCostsInPrint ? 6 : 3; ?>
+            <div class="table-responsive mb-3">
+              <table class="table table-bordered table-sm">
                 <thead>
                   <tr>
-                    <th>Service</th>
-                    <th class="text-end">Due KM</th>
-                    <th>Due Date</th>
-                    <th>Predicted Visit</th>
-                    <th>Status</th>
+                    <th>#</th>
+                    <th>Labour</th>
+                    <th class="text-end">Qty</th>
+                    <?php if ($showCostsInPrint): ?>
+                      <th class="text-end">Rate</th>
+                      <th class="text-end">GST%</th>
+                      <th class="text-end">Total</th>
+                    <?php endif; ?>
                   </tr>
                 </thead>
                 <tbody>
-                  <?php if (empty($nextServiceReminders)): ?>
-                    <tr><td colspan="5" class="text-center text-muted">No active service reminders.</td></tr>
+                  <?php if (empty($laborLines)): ?>
+                    <tr><td colspan="<?= $laborColspan; ?>" class="text-center text-muted">No labour lines added.</td></tr>
                   <?php else: ?>
-                    <?php foreach ($nextServiceReminders as $reminder): ?>
+                    <?php $rowNo = 1; ?>
+                    <?php foreach ($laborLines as $line): ?>
                       <tr>
-                        <td><?= e((string) ($reminder['service_label'] ?? service_reminder_type_label((string) ($reminder['service_type'] ?? '')))); ?></td>
-                        <td class="text-end"><?= isset($reminder['next_due_km']) && $reminder['next_due_km'] !== null ? e(number_format((float) $reminder['next_due_km'], 0)) : '-'; ?></td>
-                        <td><?= e((string) (($reminder['next_due_date'] ?? '') !== '' ? $reminder['next_due_date'] : '-')); ?></td>
-                        <td><?= e((string) (($reminder['predicted_next_visit_date'] ?? '') !== '' ? $reminder['predicted_next_visit_date'] : '-')); ?></td>
-                        <td><?= e((string) ($reminder['due_state'] ?? 'UNSCHEDULED')); ?></td>
+                        <td><?= $rowNo++; ?></td>
+                        <td><?= e((string) (($line['service_name'] ?? '') !== '' ? $line['service_name'] : ($line['description'] ?? ''))); ?></td>
+                        <td class="text-end"><?= e(number_format((float) ($line['quantity'] ?? 0), 2)); ?></td>
+                        <?php if ($showCostsInPrint): ?>
+                          <td class="text-end"><?= e(number_format((float) ($line['unit_price'] ?? 0), 2)); ?></td>
+                          <td class="text-end"><?= e(number_format((float) ($line['gst_rate'] ?? 0), 2)); ?></td>
+                          <td class="text-end"><?= e(number_format((float) ($line['total_amount'] ?? 0), 2)); ?></td>
+                        <?php endif; ?>
                       </tr>
                     <?php endforeach; ?>
                   <?php endif; ?>
                 </tbody>
               </table>
             </div>
-          </div>
+          <?php endif; ?>
 
-          <div class="row">
-            <div class="col-7">
-              <?php if (!empty($job['cancel_note'])): ?>
-                <div class="alert alert-danger py-2 mb-0">
-                  <strong>Cancel Note:</strong> <?= e((string) $job['cancel_note']); ?>
+          <?php if ($showPartLines): ?>
+            <?php $partColspan = $showCostsInPrint ? 6 : 3; ?>
+            <div class="table-responsive mb-3">
+              <table class="table table-bordered table-sm">
+                <thead>
+                  <tr>
+                    <th>#</th>
+                    <th>Part</th>
+                    <th class="text-end">Qty</th>
+                    <?php if ($showCostsInPrint): ?>
+                      <th class="text-end">Rate</th>
+                      <th class="text-end">GST%</th>
+                      <th class="text-end">Total</th>
+                    <?php endif; ?>
+                  </tr>
+                </thead>
+                <tbody>
+                  <?php if (empty($partLines)): ?>
+                    <tr><td colspan="<?= $partColspan; ?>" class="text-center text-muted">No parts added.</td></tr>
+                  <?php else: ?>
+                    <?php $rowNo = 1; ?>
+                    <?php foreach ($partLines as $line): ?>
+                      <tr>
+                        <td><?= $rowNo++; ?></td>
+                        <td><?= e((string) ($line['part_name'] ?? '')); ?> (<?= e((string) ($line['part_sku'] ?? '')); ?>)</td>
+                        <td class="text-end"><?= e(number_format((float) ($line['quantity'] ?? 0), 2)); ?></td>
+                        <?php if ($showCostsInPrint): ?>
+                          <td class="text-end"><?= e(number_format((float) ($line['unit_price'] ?? 0), 2)); ?></td>
+                          <td class="text-end"><?= e(number_format((float) ($line['gst_rate'] ?? 0), 2)); ?></td>
+                          <td class="text-end"><?= e(number_format((float) ($line['total_amount'] ?? 0), 2)); ?></td>
+                        <?php endif; ?>
+                      </tr>
+                    <?php endforeach; ?>
+                  <?php endif; ?>
+                </tbody>
+              </table>
+            </div>
+          <?php endif; ?>
+
+          <?php if ($showNextServiceReminders): ?>
+            <?php
+              $manualServiceReminders = [];
+              $nextServiceTitles = [];
+              foreach ($nextServiceReminders as $reminder) {
+                  $serviceTitle = trim((string) ($reminder['service_label'] ?? service_reminder_type_label((string) ($reminder['service_type'] ?? ''))));
+                  $sourceType = strtoupper(trim((string) ($reminder['source_type'] ?? 'AUTO')));
+                  $isManualReminder = $sourceType !== '' && strpos($sourceType, 'MANUAL') !== false;
+                  if ($isManualReminder) {
+                      $manualServiceReminders[] = $reminder;
+                      continue;
+                  }
+                  if ($serviceTitle !== '') {
+                      $nextServiceTitles[] = $serviceTitle;
+                  }
+              }
+              $nextServiceTitles = array_values(array_unique($nextServiceTitles));
+            ?>
+            <div class="mb-3">
+              <h6 class="mb-1">Next Recommended Service</h6>
+              <?php if (empty($nextServiceReminders)): ?>
+                <div class="text-muted">No active service reminders.</div>
+              <?php else: ?>
+                <?php if (!empty($nextServiceTitles)): ?>
+                  <div class="mb-2"><?= e(implode(', ', $nextServiceTitles)); ?></div>
+                <?php endif; ?>
+                <?php if (!empty($manualServiceReminders)): ?>
+                  <div class="table-responsive">
+                    <table class="table table-bordered table-sm mb-0">
+                      <thead>
+                        <tr>
+                          <th>Service</th>
+                          <th class="text-end">Due KM</th>
+                          <th>Due Date</th>
+                          <th>Predicted Visit</th>
+                          <th>Status</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        <?php foreach ($manualServiceReminders as $reminder): ?>
+                          <tr>
+                            <td><?= e((string) ($reminder['service_label'] ?? service_reminder_type_label((string) ($reminder['service_type'] ?? '')))); ?></td>
+                            <td class="text-end"><?= isset($reminder['next_due_km']) && $reminder['next_due_km'] !== null ? e(number_format((float) $reminder['next_due_km'], 0)) : '-'; ?></td>
+                            <td><?= e((string) (($reminder['next_due_date'] ?? '') !== '' ? $reminder['next_due_date'] : '-')); ?></td>
+                            <td><?= e((string) (($reminder['predicted_next_visit_date'] ?? '') !== '' ? $reminder['predicted_next_visit_date'] : '-')); ?></td>
+                            <td><?= e((string) ($reminder['due_state'] ?? 'UNSCHEDULED')); ?></td>
+                          </tr>
+                        <?php endforeach; ?>
+                      </tbody>
+                    </table>
+                  </div>
+                <?php endif; ?>
+              <?php endif; ?>
+            </div>
+          <?php endif; ?>
+
+          <?php $cancelNoteText = trim((string) ($job['cancel_note'] ?? '')); ?>
+          <?php if ($showTotals || ($showCancelNote && $cancelNoteText !== '')): ?>
+            <div class="row">
+              <div class="<?= $showTotals ? 'col-7' : 'col-12'; ?>">
+                <?php if ($showCancelNote && $cancelNoteText !== ''): ?>
+                  <div class="alert alert-danger py-2 mb-0">
+                    <strong>Cancel Note:</strong> <?= e($cancelNoteText); ?>
+                  </div>
+                <?php endif; ?>
+              </div>
+              <?php if ($showTotals): ?>
+                <div class="col-5">
+                  <table class="table table-sm table-bordered">
+                    <tr><th>Labour Total</th><td class="text-end"><?= e(number_format($serviceTotal, 2)); ?></td></tr>
+                    <tr><th>Parts Total</th><td class="text-end"><?= e(number_format($partsTotal, 2)); ?></td></tr>
+                    <tr><th>Grand Total</th><td class="text-end"><strong><?= e(number_format($grandTotal, 2)); ?></strong></td></tr>
+                  </table>
                 </div>
               <?php endif; ?>
             </div>
-            <div class="col-5">
-              <table class="table table-sm table-bordered">
-                <tr><th>Service Total</th><td class="text-end"><?= e(number_format($serviceTotal, 2)); ?></td></tr>
-                <tr><th>Parts Total</th><td class="text-end"><?= e(number_format($partsTotal, 2)); ?></td></tr>
-                <tr><th>Grand Total</th><td class="text-end"><strong><?= e(number_format($grandTotal, 2)); ?></strong></td></tr>
-              </table>
-            </div>
-          </div>
+          <?php endif; ?>
 
           <p class="mb-0 text-muted">System generated from Guru Auto Cars ERP job workflow.</p>
         </div>
@@ -365,3 +451,4 @@ $companyLogoUrl = company_logo_url((int) ($job['company_id'] ?? $companyId), $ga
     </div>
   </body>
 </html>
+

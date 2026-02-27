@@ -349,7 +349,7 @@ if ($download && $moduleKey !== '') {
         $listStmt->execute($params);
         $data = $listStmt->fetchAll();
 
-        $headers = ['Created At', 'Garage', 'Part', 'SKU', 'Movement Type', 'Signed Qty', 'Absolute Qty', 'Source', 'Reference ID', 'Created By'];
+        $headers = ['Created At', 'Garage', 'Part', 'SKU/Part No', 'Movement Type', 'Signed Qty', 'Absolute Qty', 'Source', 'Reference ID', 'Created By'];
         foreach ($data as $row) {
             $rows[] = [
                 (string) ($row['created_at'] ?? ''),
@@ -663,3 +663,4 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 </main>
 
 <?php require_once __DIR__ . '/../../includes/footer.php'; ?>
+

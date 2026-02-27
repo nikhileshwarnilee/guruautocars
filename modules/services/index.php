@@ -5,7 +5,7 @@ require_once __DIR__ . '/../../includes/app.php';
 require_login();
 require_permission('service.view');
 
-$page_title = 'Service / Labour Master';
+$page_title = 'Labour Master';
 $active_menu = 'services.master';
 $canManage = has_permission('service.manage');
 $companyId = active_company_id();
@@ -96,7 +96,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         $category = find_service_category($companyId, $categoryId);
         if ($serviceCode === '' || $serviceName === '' || !$category) {
-            flash_set('service_error', 'Service code, service name and category are required.', 'danger');
+            flash_set('service_error', 'Labour code, service name and category are required.', 'danger');
             redirect('modules/services/index.php');
         }
 
@@ -147,9 +147,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'enable_reminder' => $hasEnableReminder ? $enableReminder : 0,
                 ],
             ]);
-            flash_set('service_success', 'Service created successfully.', 'success');
+            flash_set('service_success', 'Labour created successfully.', 'success');
         } catch (Throwable $exception) {
-            flash_set('service_error', 'Unable to create service. Service code must be unique.', 'danger');
+            flash_set('service_error', 'Unable to create service. Labour code must be unique.', 'danger');
         }
 
         redirect('modules/services/index.php');
@@ -241,7 +241,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'enable_reminder' => $hasEnableReminder ? $enableReminder : 0,
             ],
         ]);
-        flash_set('service_success', 'Service updated successfully.', 'success');
+        flash_set('service_success', 'Labour updated successfully.', 'success');
         redirect('modules/services/index.php');
     }
 
@@ -300,7 +300,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 ],
             ]);
         }
-        flash_set('service_success', 'Service status updated.', 'success');
+        flash_set('service_success', 'Labour status updated.', 'success');
         redirect('modules/services/index.php');
     }
 }
@@ -415,7 +415,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
   <div class="app-content-header">
     <div class="container-fluid">
       <div class="row">
-        <div class="col-sm-6"><h3 class="mb-0">Service / Labour Master</h3></div>
+        <div class="col-sm-6"><h3 class="mb-0">Labour Master</h3></div>
         <div class="col-sm-6">
           <div class="d-flex justify-content-sm-end align-items-center gap-2 flex-wrap">
             <a href="<?= e(url('modules/services/categories.php')); ?>" class="btn btn-sm btn-outline-primary">
@@ -423,7 +423,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             </a>
             <ol class="breadcrumb mb-0">
               <li class="breadcrumb-item"><a href="<?= e(url('dashboard.php')); ?>">Home</a></li>
-              <li class="breadcrumb-item active">Service Master</li>
+              <li class="breadcrumb-item active">Labour Master</li>
             </ol>
           </div>
         </div>
@@ -470,7 +470,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 
       <?php if ($canManage): ?>
         <div class="card card-primary">
-          <div class="card-header"><h3 class="card-title"><?= $editService ? 'Edit Service' : 'Add Service'; ?></h3></div>
+          <div class="card-header"><h3 class="card-title"><?= $editService ? 'Edit Labour' : 'Add Labour'; ?></h3></div>
           <form method="post">
             <div class="card-body row g-3">
               <?= csrf_field(); ?>
@@ -494,11 +494,11 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                 </select>
               </div>
               <div class="col-md-2">
-                <label class="form-label">Service Code</label>
+                <label class="form-label">Labour Code</label>
                 <input type="text" name="service_code" class="form-control" <?= $editService ? 'readonly' : 'required'; ?> value="<?= e((string) ($editService['service_code'] ?? '')); ?>" />
               </div>
               <div class="col-md-3">
-                <label class="form-label">Service Name</label>
+                <label class="form-label">Labour Name</label>
                 <input type="text" name="service_name" class="form-control" required value="<?= e((string) ($editService['service_name'] ?? '')); ?>" />
               </div>
               <div class="col-md-1">
@@ -536,7 +536,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
               </div>
             </div>
             <div class="card-footer d-flex gap-2">
-              <button type="submit" class="btn btn-primary"><?= $editService ? 'Update Service' : 'Create Service'; ?></button>
+              <button type="submit" class="btn btn-primary"><?= $editService ? 'Update Labour' : 'Create Labour'; ?></button>
               <?php if ($editService): ?>
                 <a href="<?= e(url('modules/services/index.php')); ?>" class="btn btn-outline-secondary">Cancel Edit</a>
               <?php endif; ?>
@@ -547,7 +547,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 
       <div class="card">
         <div class="card-header d-flex justify-content-between align-items-center gap-2 flex-wrap">
-          <h3 class="card-title mb-0">Service List</h3>
+          <h3 class="card-title mb-0">Labour List</h3>
           <div class="btn-group btn-group-sm" role="group" aria-label="Reminder filter">
             <a href="<?= e($serviceListAllUrl); ?>" class="btn <?= $filterReminderEnabled ? 'btn-outline-secondary' : 'btn-secondary'; ?>">All</a>
             <a href="<?= e($serviceListReminderUrl); ?>" class="btn <?= $filterReminderEnabled ? 'btn-success' : 'btn-outline-success'; ?>">Reminder Enabled</a>
@@ -632,4 +632,5 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 </main>
 
 <?php require_once __DIR__ . '/../../includes/footer.php'; ?>
+
 

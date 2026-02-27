@@ -94,8 +94,8 @@ if ($exportKey !== '') {
                 'Variant',
                 'Customer',
                 'Job Number',
-                'Service/Part',
-                'Last Service KM',
+                'Labour/Part',
+                'Last Labour KM',
                 'Next Due KM',
                 'Next Due Date',
                 'Predicted Next Visit',
@@ -208,7 +208,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
               <input type="date" name="to" class="form-control" value="<?= e($toDate); ?>" required>
             </div>
             <div class="col-md-2">
-              <label class="form-label">Service Type</label>
+              <label class="form-label">Labour Type</label>
               <select name="service_type" class="form-select">
                 <option value="">All</option>
                 <?php foreach (service_reminder_supported_types() as $serviceType): ?>
@@ -262,7 +262,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                 <th>Vehicle</th>
                 <th>Customer</th>
                 <th>Job</th>
-                <th>Service/Part</th>
+                <th>Labour/Part</th>
                 <th class="text-end">Last KM</th>
                 <th class="text-end">Due KM</th>
                 <th>Due Date</th>
@@ -308,3 +308,4 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 </main>
 
 <?php require_once __DIR__ . '/../../includes/footer.php'; ?>
+

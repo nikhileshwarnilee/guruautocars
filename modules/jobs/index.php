@@ -17,6 +17,7 @@ $canCreate = has_permission('job.create') || has_permission('job.manage');
 $canEdit = has_permission('job.edit') || has_permission('job.update') || has_permission('job.manage');
 $canAssign = has_permission('job.assign') || has_permission('job.manage');
 $canJobTypeSettingsManage = has_permission('settings.manage');
+$canJobCardPrintSettingsManage = has_permission('job.manage') || has_permission('settings.manage');
 $canInlineVehicleCreate = has_permission('vehicle.view') && has_permission('vehicle.manage');
 $canConditionPhotoManage = has_permission('job.manage') || has_permission('settings.manage');
 $jobCardColumns = table_columns('job_cards');
@@ -905,6 +906,13 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 <main class="app-main">
   <div class="app-content-header"><div class="container-fluid"><div class="row"><div class="col-sm-6"><h3 class="mb-0">Job Cards / Work Orders</h3></div><div class="col-sm-6"><ol class="breadcrumb float-sm-end"><li class="breadcrumb-item"><a href="<?= e(url('dashboard.php')); ?>">Home</a></li><li class="breadcrumb-item active">Job Cards</li></ol></div></div></div></div>
   <div class="app-content"><div class="container-fluid">
+    <?php if ($canJobCardPrintSettingsManage): ?>
+      <div class="d-flex justify-content-end mb-2">
+        <a href="<?= e(url('modules/jobs/print_settings.php')); ?>" class="btn btn-outline-secondary btn-sm">
+          <i class="bi bi-sliders me-1"></i>Job Card Print Settings
+        </a>
+      </div>
+    <?php endif; ?>
     <?php if ($canCreate || ($canEdit && $editJob)): ?>
     <div class="card card-primary">
       <div class="card-header d-flex justify-content-between align-items-center">
@@ -1508,7 +1516,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       var services = data.service_suggestions || [], parts = data.part_suggestions || [], variant = data.variant;
       if (!variant && services.length === 0 && parts.length === 0) { target.innerHTML = 'No VIS data for this vehicle. Continue manually.'; return; }
       var html = variant ? '<p><strong>Variant:</strong> ' + variant.brand_name + ' / ' + variant.model_name + ' / ' + variant.variant_name + '</p>' : '';
-      html += '<p class="mb-1"><strong>Suggested Services:</strong> ' + services.length + '</p><p class="mb-0"><strong>Compatible Parts:</strong> ' + parts.length + '</p>';
+      html += '<p class="mb-1"><strong>Suggested Labour:</strong> ' + services.length + '</p><p class="mb-0"><strong>Compatible Parts:</strong> ' + parts.length + '</p>';
       target.innerHTML = html;
     }
 
@@ -1530,7 +1538,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       var html = '';
       html += '<div class="table-responsive">';
       html += '<table class="table table-sm table-bordered align-middle mb-0">';
-      html += '<thead><tr><th>Service/Part</th><th class="text-end">Due KM</th><th>Due Date</th><th>Predicted Visit</th><th>Status</th><th>Source</th><th>Recommendation</th><th style="width: 170px;">Action</th></tr></thead><tbody>';
+      html += '<thead><tr><th>Labour/Part</th><th class="text-end">Due KM</th><th>Due Date</th><th>Predicted Visit</th><th>Status</th><th>Source</th><th>Recommendation</th><th style="width: 170px;">Action</th></tr></thead><tbody>';
       for (var i = 0; i < rows.length; i++) {
         var row = rows[i] || {};
         var reminderId = Number(row.reminder_id || 0);
@@ -1624,3 +1632,4 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 </script>
 <?php endif; ?>
 <?php require_once __DIR__ . '/../../includes/footer.php'; ?>
+

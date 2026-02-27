@@ -263,7 +263,7 @@ if ($exportKey !== '') {
         ], $valuationRows);
         reports_csv_download(
             'inventory_valuation_' . $timestamp . '.csv',
-            ['Part', 'SKU', 'Category', 'Unit', 'Total Qty', 'Avg Purchase Cost', 'Weighted Value', 'FIFO Value', 'Total Purchased Qty', 'Purchase History'],
+            ['Part', 'SKU/Part No', 'Category', 'Unit', 'Total Qty', 'Avg Purchase Cost', 'Weighted Value', 'FIFO Value', 'Total Purchased Qty', 'Purchase History'],
             $csvRows
         );
     }
@@ -320,7 +320,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             <div class="col-md-2"><label class="form-label">From</label><input type="date" name="from" class="form-control" value="<?= e($fromDate); ?>" required></div>
             <div class="col-md-2"><label class="form-label">To</label><input type="date" name="to" class="form-control" value="<?= e($toDate); ?>" required></div>
             <div class="col-md-2"><label class="form-label">As On Date</label><input type="date" name="as_on" class="form-control" value="<?= e($asOnDate); ?>" required></div>
-            <div class="col-md-3"><label class="form-label">Part Search</label><input type="text" name="q" class="form-control" value="<?= e($search); ?>" placeholder="Part name or SKU"></div>
+            <div class="col-md-3"><label class="form-label">Part Search</label><input type="text" name="q" class="form-control" value="<?= e($search); ?>" placeholder="Part name or SKU/Part No"></div>
             <div class="col-md-2 d-flex gap-2"><button type="submit" class="btn btn-primary">Apply</button><a href="<?= e(url('modules/reports/inventory_valuation.php')); ?>" class="btn btn-outline-secondary">Reset</a></div>
           </form>
         </div>
@@ -342,7 +342,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             <thead>
               <tr>
                 <th>Part</th>
-                <th>SKU</th>
+                <th>SKU/Part No</th>
                 <th>Category</th>
                 <th>Unit</th>
                 <th>Total Qty</th>
@@ -381,3 +381,4 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 </main>
 
 <?php require_once __DIR__ . '/../../includes/footer.php'; ?>
+

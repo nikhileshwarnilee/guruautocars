@@ -202,7 +202,7 @@ if ($exportKey !== '') {
                 ],
                 $repeatCustomers
             );
-            reports_csv_download('customers_repeat_' . $timestamp . '.csv', ['Customer', 'Phone', 'Services', 'Last Service'], $rows);
+            reports_csv_download('customers_repeat_' . $timestamp . '.csv', ['Customer', 'Phone', 'Labour', 'Last Labour'], $rows);
 
         case 'top_customers':
             $rows = array_map(
@@ -228,7 +228,7 @@ if ($exportKey !== '') {
                 ],
                 $customerValueRows
             );
-            reports_csv_download('customers_value_' . $timestamp . '.csv', ['Customer', 'Phone', 'Closed Jobs', 'Finalized Invoices', 'Revenue', 'Last Service'], $rows);
+            reports_csv_download('customers_value_' . $timestamp . '.csv', ['Customer', 'Phone', 'Closed Jobs', 'Finalized Invoices', 'Revenue', 'Last Labour'], $rows);
 
         default:
             flash_set('report_error', 'Unknown export requested.', 'warning');
@@ -420,7 +420,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             </div>
             <div class="card-body p-0 table-responsive">
               <table class="table table-sm table-striped mb-0">
-                <thead><tr><th>Customer</th><th>Phone</th><th>Services</th><th>Last Service</th></tr></thead>
+                <thead><tr><th>Customer</th><th>Phone</th><th>Labour</th><th>Last Labour</th></tr></thead>
                 <tbody>
                   <?php if (empty($repeatCustomers)): ?>
                     <tr><td colspan="4" class="text-center text-muted py-4">No repeat customers in selected range.</td></tr>
@@ -471,7 +471,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         </div>
         <div class="card-body p-0 table-responsive">
           <table class="table table-sm table-striped mb-0">
-            <thead><tr><th>Customer</th><th>Closed Jobs</th><th>Finalized Invoices</th><th>Revenue</th><th>Last Service</th></tr></thead>
+            <thead><tr><th>Customer</th><th>Closed Jobs</th><th>Finalized Invoices</th><th>Revenue</th><th>Last Labour</th></tr></thead>
             <tbody>
               <?php if (empty($customerValueRows)): ?>
                 <tr><td colspan="5" class="text-center text-muted py-4">No customer value data for selected range.</td></tr>
@@ -573,3 +573,4 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 </script>
 
 <?php require_once __DIR__ . '/../../includes/footer.php'; ?>
+

@@ -258,7 +258,7 @@ $moduleCards = [
         'description' => 'FIFO and weighted-average stock valuation with purchase history summary.',
         'path' => 'modules/reports/inventory_valuation.php',
         'icon' => 'bi bi-calculator',
-        'badge' => 'In-stock SKU',
+        'badge' => 'In-stock SKU/Part No',
         'metric' => number_format($inStockSkuCount),
     ],
     [
@@ -542,3 +542,4 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 </main>
 
 <?php require_once __DIR__ . '/../../includes/footer.php'; ?>
+

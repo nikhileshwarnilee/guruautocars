@@ -228,6 +228,75 @@ function job_type_feature_ready(bool $refresh = false): bool
     return $cached;
 }
 
+function job_card_print_default_settings(): array
+{
+    return [
+        'show_company_logo' => true,
+        'show_company_gstin' => true,
+        'show_customer_gstin' => true,
+        'show_assigned_staff' => true,
+        'show_job_meta' => true,
+        'show_complaint' => true,
+        'show_diagnosis' => true,
+        'show_recommendation_note' => true,
+        'show_insurance_section' => true,
+        'show_labor_lines' => true,
+        'show_parts_lines' => true,
+        'show_next_service_reminders' => true,
+        'show_totals' => true,
+        'show_cancel_note' => true,
+        'show_costs_in_job_card_print' => true,
+    ];
+}
+
+function job_card_setting_to_bool(mixed $value, bool $default = false): bool
+{
+    if (is_bool($value)) {
+        return $value;
+    }
+    if (is_int($value) || is_float($value)) {
+        return ((float) $value) > 0;
+    }
+    if (!is_string($value)) {
+        return $default;
+    }
+
+    $normalized = strtolower(trim($value));
+    if ($normalized === '') {
+        return $default;
+    }
+
+    if (in_array($normalized, ['1', 'true', 'yes', 'on', 'enabled'], true)) {
+        return true;
+    }
+    if (in_array($normalized, ['0', 'false', 'no', 'off', 'disabled'], true)) {
+        return false;
+    }
+
+    return $default;
+}
+
+function job_card_print_settings(int $companyId, int $garageId): array
+{
+    $defaults = job_card_print_default_settings();
+    $rawValue = system_setting_get_value($companyId, $garageId, 'job_card_print_settings_json', null);
+    if ($rawValue === null || trim($rawValue) === '') {
+        return $defaults;
+    }
+
+    $decoded = json_decode($rawValue, true);
+    if (!is_array($decoded)) {
+        return $defaults;
+    }
+
+    $resolved = $defaults;
+    foreach ($defaults as $settingKey => $defaultValue) {
+        $resolved[$settingKey] = job_card_setting_to_bool($decoded[$settingKey] ?? null, (bool) $defaultValue);
+    }
+
+    return $resolved;
+}
+
 function job_assignment_candidates(int $companyId, int $garageId): array
 {
     $stmt = db()->prepare(
@@ -1143,7 +1212,7 @@ function service_reminder_supported_types(): array
 function service_reminder_type_label(string $serviceType): string
 {
     return match (service_reminder_normalize_type($serviceType)) {
-        'SERVICE' => 'Service',
+        'SERVICE' => 'Labour',
         'PART' => 'Part',
         default => 'Item',
     };
@@ -2966,7 +3035,7 @@ function service_reminder_apply_job_creation_actions(
             ]);
             $service = $serviceFetchStmt->fetch() ?: null;
             if (!$service) {
-                $result['warnings'][] = 'Suggested service is no longer active: ' . ($itemName !== '' ? $itemName : ('Service #' . $itemId));
+                $result['warnings'][] = 'Suggested service is no longer active: ' . ($itemName !== '' ? $itemName : ('Labour #' . $itemId));
                 continue;
             }
 
@@ -2978,7 +3047,7 @@ function service_reminder_apply_job_creation_actions(
                 $insertLaborStmt->execute([
                     'job_card_id' => $jobId,
                     'service_id' => $itemId,
-                    'description' => (string) ($service['service_name'] ?? ($itemName !== '' ? $itemName : 'Service')),
+                    'description' => (string) ($service['service_name'] ?? ($itemName !== '' ? $itemName : 'Labour')),
                     'quantity' => $quantity,
                     'unit_price' => $unitPrice,
                     'gst_rate' => $gstRate,
@@ -2986,7 +3055,7 @@ function service_reminder_apply_job_creation_actions(
                 ]);
                 $lineAdded = true;
             } catch (Throwable $exception) {
-                $result['warnings'][] = 'Unable to add service line for ' . (string) ($service['service_name'] ?? ('Service #' . $itemId)) . '.';
+                $result['warnings'][] = 'Unable to add service line for ' . (string) ($service['service_name'] ?? ('Labour #' . $itemId)) . '.';
             }
         } elseif ($itemType === 'PART') {
             $partFetchStmt->execute([
@@ -3622,3 +3691,4 @@ function job_condition_photo_purge_older_than(int $companyId, int $garageId, int
         'message' => 'Condition photo cleanup completed.',
     ];
 }
+

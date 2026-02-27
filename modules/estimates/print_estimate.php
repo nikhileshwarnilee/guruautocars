@@ -245,7 +245,7 @@ $companyLogoUrl = company_logo_url((int) ($estimate['company_id'] ?? $companyId)
             <div class="col-7"></div>
             <div class="col-5">
               <table class="table table-sm table-bordered">
-                <tr><th>Service Total</th><td class="text-end"><?= e(number_format($serviceTotal, 2)); ?></td></tr>
+                <tr><th>Labour Total</th><td class="text-end"><?= e(number_format($serviceTotal, 2)); ?></td></tr>
                 <tr><th>Part Total</th><td class="text-end"><?= e(number_format($partsTotal, 2)); ?></td></tr>
                 <tr><th>Grand Total</th><td class="text-end"><strong><?= e(number_format($grandTotal, 2)); ?></strong></td></tr>
               </table>
@@ -258,3 +258,4 @@ $companyLogoUrl = company_logo_url((int) ($estimate['company_id'] ?? $companyId)
     </div>
   </body>
 </html>
+

@@ -378,7 +378,7 @@ if ($exportKey !== '') {
                 ],
                 $fastMovingStockRows
             );
-            reports_csv_download('inventory_fast_moving_' . $timestamp . '.csv', ['Part', 'SKU', 'Movement Count', 'OUT Qty'], $rows);
+            reports_csv_download('inventory_fast_moving_' . $timestamp . '.csv', ['Part', 'SKU/Part No', 'Movement Count', 'OUT Qty'], $rows);
 
         case 'dead_stock':
             $rows = array_map(
@@ -390,7 +390,7 @@ if ($exportKey !== '') {
                 ],
                 $deadStockRows
             );
-            reports_csv_download('inventory_dead_stock_' . $timestamp . '.csv', ['Part', 'SKU', 'Stock Qty', 'Stock Value'], $rows);
+            reports_csv_download('inventory_dead_stock_' . $timestamp . '.csv', ['Part', 'SKU/Part No', 'Stock Qty', 'Stock Value'], $rows);
 
         case 'parts_usage':
             $rows = array_map(
@@ -403,7 +403,7 @@ if ($exportKey !== '') {
                 ],
                 $partsUsageRows
             );
-            reports_csv_download('inventory_parts_usage_' . $timestamp . '.csv', ['Part', 'SKU', 'Jobs', 'Qty', 'Usage Value'], $rows);
+            reports_csv_download('inventory_parts_usage_' . $timestamp . '.csv', ['Part', 'SKU/Part No', 'Jobs', 'Qty', 'Usage Value'], $rows);
 
         default:
             flash_set('report_error', 'Unknown export requested.', 'warning');
@@ -821,3 +821,4 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 </script>
 
 <?php require_once __DIR__ . '/../../includes/footer.php'; ?>
+

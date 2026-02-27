@@ -64,7 +64,7 @@ function vehicle_master_render_rows(array $vehicles, bool $canManage): string
           </td>
           <td>
             <?= (int) ($vehicle['history_count'] ?? 0); ?><br>
-            <small class="text-muted">Last Service: <?= e(vehicle_master_format_datetime((string) ($vehicle['last_service_at'] ?? ''))); ?></small>
+            <small class="text-muted">Last Labour: <?= e(vehicle_master_format_datetime((string) ($vehicle['last_service_at'] ?? ''))); ?></small>
           </td>
           <td><span class="badge text-bg-<?= e(status_badge_class($statusCode)); ?>"><?= e(record_status_label($statusCode)); ?></span></td>
           <td class="d-flex gap-1">
@@ -297,3 +297,4 @@ try {
         'message' => 'Unable to load vehicle insights right now.',
     ], JSON_UNESCAPED_UNICODE);
 }
+

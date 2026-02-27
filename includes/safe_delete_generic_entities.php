@@ -301,7 +301,7 @@ function safe_delete_generic_entity_configs(): array
     ];
 
     $configs['service_category_master'] = [
-        'label' => 'Service Category',
+        'label' => 'Labour Category',
         'operation' => 'delete',
         'sql' => 'SELECT sc.id, sc.company_id, sc.category_code, sc.category_name, sc.status_code,
                          (SELECT COUNT(*) FROM services s WHERE s.company_id = sc.company_id AND s.category_id = sc.id AND s.status_code = "ACTIVE") AS active_service_count
@@ -311,17 +311,17 @@ function safe_delete_generic_entity_configs(): array
         'garage_scope_column' => null,
         'reference_columns' => ['category_code', 'category_name'],
         'reference_fallback_prefix' => 'SCAT',
-        'label_prefix' => 'Service Category ',
+        'label_prefix' => 'Labour Category ',
         'status_columns' => ['status_code'],
         'note' => static fn (array $row): ?string => trim((string) ($row['category_name'] ?? '')) !== '' ? (string) $row['category_name'] : null,
         'status_block_values' => ['DELETED'],
-        'status_block_message' => 'Service category is already deleted.',
+        'status_block_message' => 'Labour category is already deleted.',
         'recommended_action' => 'SOFT_DELETE',
         'execution_mode' => 'soft_delete',
         'postprocess' => static function (PDO $pdo, array $row, int $recordId, array $scope, array &$summary): void {
             $count = max(0, (int) ($row['active_service_count'] ?? 0));
-            $summary['groups'][] = safe_delete_make_group('services', 'Active Services', $count, [
-                safe_delete_make_item('Linked Active Services', null, null, $count > 0 ? 'LINKED' : 'NONE')
+            $summary['groups'][] = safe_delete_make_group('services', 'Active Labour', $count, [
+                safe_delete_make_item('Linked Active Labour', null, null, $count > 0 ? 'LINKED' : 'NONE')
             ], 0.0);
             if ($count > 0) {
                 $summary['warnings'][] = 'Deleting this category will uncategorize linked services as per existing workflow.';
@@ -330,7 +330,7 @@ function safe_delete_generic_entity_configs(): array
     ];
 
     $configs['service_master'] = [
-        'label' => 'Service',
+        'label' => 'Labour',
         'operation' => 'delete',
         'sql' => 'SELECT s.id, s.company_id, s.category_id, s.service_code, s.service_name, s.status_code, s.default_rate, sc.category_name,
                          (SELECT COUNT(*) FROM vis_service_part_map m WHERE m.service_id = s.id AND m.status_code = "ACTIVE") AS mapped_parts
@@ -341,7 +341,7 @@ function safe_delete_generic_entity_configs(): array
         'garage_scope_column' => null,
         'reference_columns' => ['service_code', 'service_name'],
         'reference_fallback_prefix' => 'SRV',
-        'label_prefix' => 'Service ',
+        'label_prefix' => 'Labour ',
         'status_columns' => ['status_code'],
         'amount_columns' => ['default_rate'],
         'note' => static function (array $row): ?string {
@@ -355,16 +355,16 @@ function safe_delete_generic_entity_configs(): array
             return $parts !== [] ? implode(' | ', $parts) : null;
         },
         'status_block_values' => ['DELETED'],
-        'status_block_message' => 'Service is already deleted.',
+        'status_block_message' => 'Labour is already deleted.',
         'recommended_action' => 'SOFT_DELETE',
         'execution_mode' => 'soft_delete',
         'postprocess' => static function (PDO $pdo, array $row, int $recordId, array $scope, array &$summary): void {
             $count = max(0, (int) ($row['mapped_parts'] ?? 0));
             if ($count > 0) {
-                $summary['groups'][] = safe_delete_make_group('service_part_map', 'VIS Service-Part Maps', $count, [
-                    safe_delete_make_item('Active Service-Part Links', null, null, 'LINKED')
+                $summary['groups'][] = safe_delete_make_group('service_part_map', 'VIS Labour-Part Maps', $count, [
+                    safe_delete_make_item('Active Labour-Part Links', null, null, 'LINKED')
                 ], 0.0);
-                $summary['warnings'][] = 'Service has active VIS service-part mappings.';
+                $summary['warnings'][] = 'Labour has active VIS service-part mappings.';
             }
         },
     ];
@@ -504,7 +504,7 @@ function safe_delete_generic_entity_configs(): array
     ];
 
     $configs['vis_service_part_map'] = [
-        'label' => 'VIS Service-Part Map',
+        'label' => 'VIS Labour-Part Map',
         'operation' => 'delete',
         'sql' => 'SELECT sm.id, sm.company_id, sm.status_code, sm.is_required, s.service_name, s.service_code, p.part_name, p.part_sku
                   FROM vis_service_part_map sm
@@ -515,12 +515,12 @@ function safe_delete_generic_entity_configs(): array
         'garage_scope_column' => null,
         'reference_columns' => ['service_code', 'service_name'],
         'reference_fallback_prefix' => 'VSMP',
-        'label_prefix' => 'Service-Part Map ',
+        'label_prefix' => 'Labour-Part Map ',
         'status_columns' => ['status_code'],
         'note' => static function (array $row): ?string {
             $parts = [];
             if (trim((string) ($row['service_name'] ?? '')) !== '') {
-                $parts[] = 'Service: ' . (string) $row['service_name'];
+                $parts[] = 'Labour: ' . (string) $row['service_name'];
             }
             if (trim((string) ($row['part_name'] ?? '')) !== '') {
                 $parts[] = 'Part: ' . (string) $row['part_name'];
@@ -529,7 +529,7 @@ function safe_delete_generic_entity_configs(): array
             return implode(' | ', $parts);
         },
         'status_block_values' => ['DELETED'],
-        'status_block_message' => 'Service-part mapping is already deleted.',
+        'status_block_message' => 'Labour-part mapping is already deleted.',
         'recommended_action' => 'SOFT_DELETE',
         'execution_mode' => 'soft_delete',
     ];
@@ -682,7 +682,7 @@ function safe_delete_generic_entity_configs(): array
     ];
 
     $configs['estimate_service_line'] = [
-        'label' => 'Estimate Service Line',
+        'label' => 'Estimate Labour Line',
         'operation' => 'delete',
         'sql' => 'SELECT es.id, es.estimate_id, es.description, es.total_amount, es.quantity, es.unit_price, es.gst_rate,
                          e.company_id, e.garage_id, e.estimate_number, e.estimate_status, s.service_name
@@ -694,7 +694,7 @@ function safe_delete_generic_entity_configs(): array
         'garage_scope_column' => 'e.garage_id',
         'reference_columns' => ['service_name', 'description'],
         'reference_fallback_prefix' => 'ESVC',
-        'label_prefix' => 'Estimate Service ',
+        'label_prefix' => 'Estimate Labour ',
         'amount_columns' => ['total_amount'],
         'status_builder' => static fn (array $row): string => (string) (($row['estimate_status'] ?? '') ?: 'LINE'),
         'note' => static function (array $row): ?string {
@@ -896,3 +896,4 @@ function safe_delete_analyze_generic_entity(PDO $pdo, string $entity, int $recor
 
     return safe_delete_summary_finalize($summary);
 }
+

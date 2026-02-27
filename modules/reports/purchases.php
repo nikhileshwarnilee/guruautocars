@@ -281,7 +281,7 @@ if ($exportKey !== '') {
                 (float) ($row['total_qty'] ?? 0),
                 (float) ($row['total_amount'] ?? 0),
             ], $topPartsRows);
-            reports_csv_download('purchase_top_parts_' . $timestamp . '.csv', ['Part', 'SKU', 'Qty', 'Value'], $rows);
+            reports_csv_download('purchase_top_parts_' . $timestamp . '.csv', ['Part', 'SKU/Part No', 'Qty', 'Value'], $rows);
         case 'vendor_outstanding':
             if (!$purchasePaymentsReady || !$canViewVendorPayables) {
                 flash_set('report_error', 'Vendor outstanding export is not available.', 'warning');
@@ -402,7 +402,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             <div class="card-header"><h3 class="card-title mb-0">Top Purchased Parts</h3></div>
             <div class="card-body table-responsive p-0">
               <table class="table table-sm table-striped mb-0">
-                <thead><tr><th>Part</th><th>SKU</th><th>Qty</th><th>Value</th></tr></thead>
+                <thead><tr><th>Part</th><th>SKU/Part No</th><th>Qty</th><th>Value</th></tr></thead>
                 <tbody>
                   <?php if (empty($topPartsRows)): ?><tr><td colspan="4" class="text-center text-muted py-4">No part trends.</td></tr><?php else: ?>
                     <?php foreach ($topPartsRows as $part): ?><tr><td><?= e((string) ($part['part_name'] ?? '')); ?></td><td><code><?= e((string) ($part['part_sku'] ?? '')); ?></code></td><td><?= e(number_format((float) ($part['total_qty'] ?? 0), 2)); ?></td><td><strong><?= e(format_currency((float) ($part['total_amount'] ?? 0))); ?></strong></td></tr><?php endforeach; ?>
@@ -449,3 +449,4 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 </main>
 
 <?php require_once __DIR__ . '/../../includes/footer.php'; ?>
+

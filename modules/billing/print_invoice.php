@@ -641,7 +641,7 @@ if ($companyLogoUrl === null) {
 
         <div class="summary-grid">
           <div class="summary-card">
-            <div class="panel-heading">Service And Parts Breakdown</div>
+            <div class="panel-heading">Labour And Parts Breakdown</div>
             <?php if ($invoiceHasGst): ?>
               <table class="summary-table">
                 <thead>
@@ -654,7 +654,7 @@ if ($companyLogoUrl === null) {
                 </thead>
                 <tbody>
                   <tr>
-                    <td>Services</td>
+                    <td>Labour</td>
                     <td class="text-end"><?= e(number_format($serviceSubtotal, 2)); ?></td>
                     <td class="text-end"><?= e(number_format($serviceTaxAmount, 2)); ?></td>
                     <td class="text-end"><?= e(number_format($serviceTotalWithTax, 2)); ?></td>
@@ -699,7 +699,7 @@ if ($companyLogoUrl === null) {
                 </thead>
                 <tbody>
                   <tr>
-                    <td>Services</td>
+                    <td>Labour</td>
                     <td class="text-end"><?= e(number_format($serviceSubtotal, 2)); ?></td>
                   </tr>
                   <tr>
@@ -787,33 +787,55 @@ if ($companyLogoUrl === null) {
         <?php endif; ?>
 
         <?php if ($showNextServiceReminders): ?>
+          <?php
+            $manualServiceReminders = [];
+            $nextServiceTitles = [];
+            foreach ($nextServiceReminders as $reminder) {
+                $serviceTitle = trim((string) ($reminder['service_label'] ?? service_reminder_type_label((string) ($reminder['service_type'] ?? ''))));
+                $sourceType = strtoupper(trim((string) ($reminder['source_type'] ?? 'AUTO')));
+                $isManualReminder = $sourceType !== '' && strpos($sourceType, 'MANUAL') !== false;
+                if ($isManualReminder) {
+                    $manualServiceReminders[] = $reminder;
+                    continue;
+                }
+                if ($serviceTitle !== '') {
+                    $nextServiceTitles[] = $serviceTitle;
+                }
+            }
+            $nextServiceTitles = array_values(array_unique($nextServiceTitles));
+          ?>
           <div class="section-title">Next Recommended Service</div>
-          <table class="line-table">
-            <thead>
-              <tr>
-                <th style="width:30%;">Service</th>
-                <th style="width:18%;" class="text-end">Due KM</th>
-                <th style="width:18%;">Due Date</th>
-                <th style="width:20%;">Predicted Visit</th>
-                <th style="width:14%;">Status</th>
-              </tr>
-            </thead>
-            <tbody>
-              <?php if (empty($nextServiceReminders)): ?>
-                <tr><td colspan="5" class="text-center">No active service reminders.</td></tr>
-              <?php else: ?>
-                <?php foreach ($nextServiceReminders as $reminder): ?>
+          <?php if (empty($nextServiceReminders)): ?>
+            <div class="invoice-footnote">No active service reminders.</div>
+          <?php else: ?>
+            <?php if (!empty($nextServiceTitles)): ?>
+              <div style="margin-bottom:8px;"><?= e(implode(', ', $nextServiceTitles)); ?></div>
+            <?php endif; ?>
+            <?php if (!empty($manualServiceReminders)): ?>
+              <table class="line-table">
+                <thead>
                   <tr>
-                    <td><?= e((string) ($reminder['service_label'] ?? service_reminder_type_label((string) ($reminder['service_type'] ?? '')))); ?></td>
-                    <td class="text-end"><?= isset($reminder['next_due_km']) && $reminder['next_due_km'] !== null ? e(number_format((float) $reminder['next_due_km'], 0)) : '-'; ?></td>
-                    <td><?= e((string) (($reminder['next_due_date'] ?? '') !== '' ? $reminder['next_due_date'] : '-')); ?></td>
-                    <td><?= e((string) (($reminder['predicted_next_visit_date'] ?? '') !== '' ? $reminder['predicted_next_visit_date'] : '-')); ?></td>
-                    <td><?= e((string) ($reminder['due_state'] ?? 'UNSCHEDULED')); ?></td>
+                    <th style="width:30%;">Service</th>
+                    <th style="width:18%;" class="text-end">Due KM</th>
+                    <th style="width:18%;">Due Date</th>
+                    <th style="width:20%;">Predicted Visit</th>
+                    <th style="width:14%;">Status</th>
                   </tr>
-                <?php endforeach; ?>
-              <?php endif; ?>
-            </tbody>
-          </table>
+                </thead>
+                <tbody>
+                  <?php foreach ($manualServiceReminders as $reminder): ?>
+                    <tr>
+                      <td><?= e((string) ($reminder['service_label'] ?? service_reminder_type_label((string) ($reminder['service_type'] ?? '')))); ?></td>
+                      <td class="text-end"><?= isset($reminder['next_due_km']) && $reminder['next_due_km'] !== null ? e(number_format((float) $reminder['next_due_km'], 0)) : '-'; ?></td>
+                      <td><?= e((string) (($reminder['next_due_date'] ?? '') !== '' ? $reminder['next_due_date'] : '-')); ?></td>
+                      <td><?= e((string) (($reminder['predicted_next_visit_date'] ?? '') !== '' ? $reminder['predicted_next_visit_date'] : '-')); ?></td>
+                      <td><?= e((string) ($reminder['due_state'] ?? 'UNSCHEDULED')); ?></td>
+                    </tr>
+                  <?php endforeach; ?>
+                </tbody>
+              </table>
+            <?php endif; ?>
+          <?php endif; ?>
         <?php endif; ?>
 
         <?php if ($invoiceStatus === 'CANCELLED'): ?>
@@ -827,3 +849,4 @@ if ($companyLogoUrl === null) {
     </div>
   </body>
 </html>
+

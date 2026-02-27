@@ -117,7 +117,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             <table class="table table-sm table-bordered align-middle mb-0" data-gac-table-skip="1">
               <thead>
                 <tr>
-                  <th>Service/Part Name</th>
+                  <th>Labour/Part Name</th>
                   <th style="width:90px;">Type</th>
                   <th style="width:130px;">Interval KM</th>
                   <th style="width:130px;">Interval Days</th>
@@ -863,3 +863,4 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 </script>
 
 <?php require_once __DIR__ . '/../../includes/footer.php'; ?>
+

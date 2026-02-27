@@ -1292,7 +1292,7 @@ if ($outsourcedReady) {
                 );
                 ow_csv_download(
                     'outsourced_pending_payables_' . $timestamp . '.csv',
-                    ['Job Number', 'Vendor/Partner', 'Service', 'Expected Return', 'Status', 'Agreed Cost', 'Paid', 'Outstanding'],
+                    ['Job Number', 'Vendor/Partner', 'Labour', 'Expected Return', 'Status', 'Agreed Cost', 'Paid', 'Outstanding'],
                     $rows,
                     $filterSummary
                 );
@@ -1495,7 +1495,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
               </div>
               <div class="col-md-2">
                 <label class="form-label">Search</label>
-                <input type="text" name="q" class="form-control" value="<?= e($searchQuery); ?>" placeholder="Job/Vendor/Service" />
+                <input type="text" name="q" class="form-control" value="<?= e($searchQuery); ?>" placeholder="Job/Vendor/Labour" />
               </div>
               <div class="col-md-2 d-flex gap-2">
                 <button type="submit" class="btn btn-primary">Apply</button>
@@ -1543,7 +1543,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                   <input type="text" name="partner_name" class="form-control" maxlength="150" value="<?= e((string) ($editWork['partner_name'] ?? '')); ?>" required />
                 </div>
                 <div class="col-md-3">
-                  <label class="form-label">Service Description</label>
+                  <label class="form-label">Labour Description</label>
                   <input type="text" name="service_description" class="form-control" maxlength="255" value="<?= e((string) ($editWork['service_description'] ?? '')); ?>" required />
                 </div>
                 <div class="col-md-3">
@@ -1668,7 +1668,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                   <th>#</th>
                   <th>Job</th>
                   <th>Vendor / Partner</th>
-                  <th>Service</th>
+                  <th>Labour</th>
                   <th>Status</th>
                   <th>Expected Return</th>
                   <th>Agreed</th>
@@ -1888,3 +1888,4 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 </main>
 
 <?php require_once __DIR__ . '/../../includes/footer.php'; ?>
+

@@ -262,7 +262,7 @@ if ($exportKey !== '') {
                 ],
                 $servicedModels
             );
-            reports_csv_download('vehicle_serviced_models_' . $timestamp . '.csv', ['Brand', 'Model', 'Closed Services'], $rows);
+            reports_csv_download('vehicle_serviced_models_' . $timestamp . '.csv', ['Brand', 'Model', 'Closed Labour'], $rows);
 
         case 'service_frequency':
             $rows = array_map(
@@ -275,7 +275,7 @@ if ($exportKey !== '') {
                 ],
                 $serviceFrequencyRows
             );
-            reports_csv_download('vehicle_service_frequency_' . $timestamp . '.csv', ['Registration', 'Services', 'Avg Days Between', 'Latest Odometer KM', 'Avg KM Between'], $rows);
+            reports_csv_download('vehicle_service_frequency_' . $timestamp . '.csv', ['Registration', 'Labour', 'Avg Days Between', 'Latest Odometer KM', 'Avg KM Between'], $rows);
 
         case 'vehicle_revenue':
             $rows = array_map(
@@ -484,7 +484,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         </div>
         <div class="col-lg-6">
           <div class="card h-100">
-            <div class="card-header"><h3 class="card-title mb-0">Service Frequency Trend</h3></div>
+            <div class="card-header"><h3 class="card-title mb-0">Labour Frequency Trend</h3></div>
             <div class="card-body">
               <div class="gac-chart-wrap"><canvas id="vehicles-chart-frequency-trend"></canvas></div>
             </div>
@@ -509,7 +509,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             </div>
             <div class="card-body p-0 table-responsive">
               <table class="table table-sm table-striped mb-0">
-                <thead><tr><th>Brand</th><th>Model</th><th>Closed Services</th></tr></thead>
+                <thead><tr><th>Brand</th><th>Model</th><th>Closed Labour</th></tr></thead>
                 <tbody>
                   <?php if (empty($servicedModels)): ?>
                     <tr><td colspan="3" class="text-center text-muted py-4">No serviced model data.</td></tr>
@@ -525,12 +525,12 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         <div class="col-lg-6">
           <div class="card h-100">
             <div class="card-header d-flex justify-content-between align-items-center">
-              <h3 class="card-title mb-0">Vehicle Service Frequency</h3>
+              <h3 class="card-title mb-0">Vehicle Labour Frequency</h3>
               <a href="<?= e(reports_export_url('modules/reports/vehicles.php', $baseParams, 'service_frequency')); ?>" class="btn btn-sm btn-outline-info">CSV</a>
             </div>
             <div class="card-body p-0 table-responsive">
               <table class="table table-sm table-striped mb-0">
-                <thead><tr><th>Vehicle</th><th>Services</th><th>Avg Days</th><th>Latest Odometer</th><th>Avg KM</th></tr></thead>
+                <thead><tr><th>Vehicle</th><th>Labour</th><th>Avg Days</th><th>Latest Odometer</th><th>Avg KM</th></tr></thead>
                 <tbody>
                   <?php if (empty($serviceFrequencyRows)): ?>
                     <tr><td colspan="5" class="text-center text-muted py-4">No service-frequency rows.</td></tr>
@@ -600,7 +600,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         data: {
           labels: chartData.serviced_models ? chartData.serviced_models.labels : [],
           datasets: [{
-            label: 'Closed Services',
+            label: 'Closed Labour',
             data: chartData.serviced_models ? chartData.serviced_models.values : [],
             backgroundColor: window.GacCharts.pickColors(10)
           }]
@@ -618,7 +618,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         data: {
           labels: chartData.service_trend ? chartData.service_trend.labels : [],
           datasets: [{
-            label: 'Closed Services',
+            label: 'Closed Labour',
             data: chartData.service_trend ? chartData.service_trend.values : [],
             borderColor: window.GacCharts.palette.blue,
             backgroundColor: window.GacCharts.palette.blue + '33',
@@ -657,3 +657,4 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 </script>
 
 <?php require_once __DIR__ . '/../../includes/footer.php'; ?>
+

@@ -5,7 +5,7 @@ require_once __DIR__ . '/../../includes/app.php';
 require_login();
 require_permission('service.view');
 
-$page_title = 'Service Category Master';
+$page_title = 'Labour Category Master';
 $active_menu = 'services.categories';
 $canManage = has_permission('service.manage');
 $companyId = active_company_id();
@@ -60,7 +60,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 ],
             ]);
 
-            flash_set('service_category_success', 'Service category created.', 'success');
+            flash_set('service_category_success', 'Labour category created.', 'success');
         } catch (Throwable $exception) {
             flash_set('service_category_error', 'Unable to create category. Code/name must be unique.', 'danger');
         }
@@ -135,7 +135,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             ],
         ]);
 
-        flash_set('service_category_success', 'Service category updated.', 'success');
+        flash_set('service_category_success', 'Labour category updated.', 'success');
         redirect('modules/services/categories.php');
     }
 
@@ -196,7 +196,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             ]);
         }
 
-        flash_set('service_category_success', 'Service category status updated.', 'success');
+        flash_set('service_category_success', 'Labour category status updated.', 'success');
         redirect('modules/services/categories.php');
     }
 }
@@ -231,11 +231,11 @@ require_once __DIR__ . '/../../includes/sidebar.php';
   <div class="app-content-header">
     <div class="container-fluid">
       <div class="row">
-        <div class="col-sm-6"><h3 class="mb-0">Service Category Master</h3></div>
+        <div class="col-sm-6"><h3 class="mb-0">Labour Category Master</h3></div>
         <div class="col-sm-6">
           <ol class="breadcrumb float-sm-end">
             <li class="breadcrumb-item"><a href="<?= e(url('dashboard.php')); ?>">Home</a></li>
-            <li class="breadcrumb-item active">Service Categories</li>
+            <li class="breadcrumb-item active">Labour Categories</li>
           </ol>
         </div>
       </div>
@@ -246,7 +246,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
     <div class="container-fluid">
       <?php if ($canManage): ?>
         <div class="card card-primary">
-          <div class="card-header"><h3 class="card-title"><?= $editCategory ? 'Edit Service Category' : 'Add Service Category'; ?></h3></div>
+          <div class="card-header"><h3 class="card-title"><?= $editCategory ? 'Edit Labour Category' : 'Add Labour Category'; ?></h3></div>
           <form method="post">
             <div class="card-body row g-3">
               <?= csrf_field(); ?>
@@ -293,7 +293,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                 <th>Code</th>
                 <th>Name</th>
                 <th>Description</th>
-                <th>Services</th>
+                <th>Labour</th>
                 <th>Status</th>
                 <th>Actions</th>
               </tr>
@@ -348,3 +348,4 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 </main>
 
 <?php require_once __DIR__ . '/../../includes/footer.php'; ?>
+

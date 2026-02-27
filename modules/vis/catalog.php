@@ -728,7 +728,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         <div class="alert alert-light border mt-3 mb-0">
           VIS fixed interval rules are retired.
           Use <a href="<?= e(url('modules/jobs/maintenance_setup.php')); ?>" class="alert-link">Vehicle Maintenance Setup</a>
-          for vehicle-specific service/part reminder rules.
+          for vehicle-specific Service/Part reminder rules.
         </div>
       <?php endif; ?>
 
@@ -950,3 +950,4 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 </script>
 
 <?php require_once __DIR__ . '/../../includes/footer.php'; ?>
+

@@ -25,7 +25,8 @@ $isReportsOpen = is_menu_group_open('reports', $activeMenu);
 $isUsersPermissionsOpen = is_menu_group_open('people.', $activeMenu);
 $isAdministrationOpen = is_menu_group_open('organization.', $activeMenu)
     || is_menu_group_open('system.', $activeMenu)
-    || is_menu_group_open('billing.', $activeMenu);
+    || is_menu_group_open('billing.', $activeMenu)
+    || $activeMenu === 'jobs.settings';
 $servicesMenuActive = ($activeMenu === 'services.master' || $activeMenu === 'services.categories') ? 'active' : '';
 $partsMenuActive = ($activeMenu === 'inventory.parts_master' || $activeMenu === 'inventory.categories' || $activeMenu === 'inventory.units') ? 'active' : '';
 $canViewReports = has_permission('reports.view') || has_permission('report.view');
@@ -295,7 +296,7 @@ $sidebarBrandLinkClass = 'brand-link gac-sidebar-brand-link gac-sidebar-brand-li
                 <li class="nav-item">
                   <a href="<?= e(url('modules/services/index.php')); ?>" class="nav-link <?= e($servicesMenuActive); ?>">
                     <i class="nav-icon bi bi-tools"></i>
-                    <p>Services</p>
+                    <p>Labour</p>
                   </a>
                 </li>
               <?php endif; ?>
@@ -548,6 +549,14 @@ $sidebarBrandLinkClass = 'brand-link gac-sidebar-brand-link gac-sidebar-brand-li
                   </a>
                 </li>
               <?php endif; ?>
+              <?php if ((has_permission('job.view') || has_permission('job.manage') || has_permission('job.print') || has_permission('settings.manage')) && (has_permission('job.manage') || has_permission('settings.manage'))): ?>
+                <li class="nav-item">
+                  <a href="<?= e(url('modules/jobs/print_settings.php')); ?>" class="nav-link <?= e(is_active_menu('jobs.settings', $activeMenu)); ?>">
+                    <i class="nav-icon bi bi-card-checklist"></i>
+                    <p>Job Card Print Settings</p>
+                  </a>
+                </li>
+              <?php endif; ?>
               <?php if (has_permission('audit.view')): ?>
                 <li class="nav-item">
                   <a href="<?= e(url('modules/system/audit_logs.php')); ?>" class="nav-link <?= e(is_active_menu('system.audit', $activeMenu)); ?>">
@@ -579,3 +588,4 @@ $sidebarBrandLinkClass = 'brand-link gac-sidebar-brand-link gac-sidebar-brand-li
     </nav>
   </div>
 </aside>
+

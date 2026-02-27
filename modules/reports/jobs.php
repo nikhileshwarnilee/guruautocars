@@ -297,7 +297,7 @@ if ($exportKey !== '') {
             );
             reports_csv_download(
                 'job_service_mix_' . $timestamp . '.csv',
-                ['Service', 'Lines', 'Billed Value'],
+                ['Labour', 'Lines', 'Billed Value'],
                 $rows
             );
 
@@ -561,12 +561,12 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 
       <div class="card mb-3">
         <div class="card-header d-flex justify-content-between align-items-center">
-          <h3 class="card-title mb-0">Closed Job Service Mix</h3>
+          <h3 class="card-title mb-0">Closed Job Labour Mix</h3>
           <a href="<?= e(reports_export_url('modules/reports/jobs.php', $reportParams, 'service_mix')); ?>" class="btn btn-sm btn-outline-primary">CSV</a>
         </div>
         <div class="card-body p-0 table-responsive">
           <table class="table table-sm table-striped mb-0">
-            <thead><tr><th>Service</th><th>Lines</th><th>Billed Value</th></tr></thead>
+            <thead><tr><th>Labour</th><th>Lines</th><th>Billed Value</th></tr></thead>
             <tbody>
               <?php if (empty($serviceMixRows)): ?>
                 <tr><td colspan="3" class="text-center text-muted py-4">No service line data in selected range.</td></tr>
@@ -679,3 +679,4 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 </script>
 
 <?php require_once __DIR__ . '/../../includes/footer.php'; ?>
+

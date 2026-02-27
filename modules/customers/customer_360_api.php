@@ -265,7 +265,7 @@ function customer360_render_maintenance(array $rows, bool $featureReady): string
         <thead>
           <tr>
             <th>Vehicle</th>
-            <th>Service/Part</th>
+            <th>Labour/Part</th>
             <th class="text-end">Last KM</th>
             <th class="text-end">Next Due KM</th>
             <th>Next Due Date</th>
@@ -538,3 +538,4 @@ echo json_encode([
         'payments' => customer360_render_payments($payments, $canViewInvoices),
     ],
 ], JSON_UNESCAPED_UNICODE);
+

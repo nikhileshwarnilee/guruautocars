@@ -537,10 +537,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         ]);
 
         estimate_recalculate_total($estimateId);
-        estimate_append_history($estimateId, 'SERVICE_ADD', null, null, 'Service line added');
+        estimate_append_history($estimateId, 'SERVICE_ADD', null, null, 'Labour line added');
         log_audit('estimates', 'add_service', $estimateId, 'Added service line to estimate');
 
-        flash_set('estimate_success', 'Service line added.', 'success');
+        flash_set('estimate_success', 'Labour line added.', 'success');
         redirect('modules/estimates/view.php?id=' . $estimateId);
     }
 
@@ -573,7 +573,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'garage_id' => $garageId,
         ]);
         if (!$lineStmt->fetch()) {
-            flash_set('estimate_error', 'Service line not found.', 'danger');
+            flash_set('estimate_error', 'Labour line not found.', 'danger');
             redirect('modules/estimates/view.php?id=' . $estimateId);
         }
 
@@ -601,10 +601,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         ]);
 
         estimate_recalculate_total($estimateId);
-        estimate_append_history($estimateId, 'SERVICE_EDIT', null, null, 'Service line updated');
+        estimate_append_history($estimateId, 'SERVICE_EDIT', null, null, 'Labour line updated');
         log_audit('estimates', 'update_service', $estimateId, 'Updated service line #' . $lineId);
 
-        flash_set('estimate_success', 'Service line updated.', 'success');
+        flash_set('estimate_success', 'Labour line updated.', 'success');
         redirect('modules/estimates/view.php?id=' . $estimateId);
     }
 
@@ -636,7 +636,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         ]);
 
         estimate_recalculate_total($estimateId);
-        estimate_append_history($estimateId, 'SERVICE_REMOVE', null, null, 'Service line removed');
+        estimate_append_history($estimateId, 'SERVICE_REMOVE', null, null, 'Labour line removed');
         log_audit('estimates', 'delete_service', $estimateId, 'Deleted service line #' . $lineId);
         safe_delete_log_cascade('estimate_service_line', 'delete', $lineId, $safeDeleteValidation, [
             'metadata' => [
@@ -646,7 +646,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             ],
         ]);
 
-        flash_set('estimate_success', 'Service line removed.', 'success');
+        flash_set('estimate_success', 'Labour line removed.', 'success');
         redirect('modules/estimates/view.php?id=' . $estimateId);
     }
 
@@ -994,7 +994,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 
       <div class="row g-3 mb-3">
         <div class="col-md-3"><div class="small-box text-bg-<?= e(estimate_status_badge_class($estimateStatus)); ?>"><div class="inner"><h4><?= e($estimateStatus); ?></h4><p>Current Status</p></div><span class="small-box-icon"><i class="bi bi-file-earmark-text"></i></span></div></div>
-        <div class="col-md-3"><div class="small-box text-bg-success"><div class="inner"><h4><?= e(format_currency($serviceTotal)); ?></h4><p>Services</p></div><span class="small-box-icon"><i class="bi bi-tools"></i></span></div></div>
+        <div class="col-md-3"><div class="small-box text-bg-success"><div class="inner"><h4><?= e(format_currency($serviceTotal)); ?></h4><p>Labour</p></div><span class="small-box-icon"><i class="bi bi-tools"></i></span></div></div>
         <div class="col-md-3"><div class="small-box text-bg-warning"><div class="inner"><h4><?= e(format_currency($partsTotal)); ?></h4><p>Parts</p></div><span class="small-box-icon"><i class="bi bi-box-seam"></i></span></div></div>
         <div class="col-md-3"><div class="small-box text-bg-primary"><div class="inner"><h4><?= e(format_currency($grandTotal)); ?></h4><p>Estimate Total</p></div><span class="small-box-icon"><i class="bi bi-currency-rupee"></i></span></div></div>
       </div>
@@ -1278,16 +1278,16 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       </div>
 
       <div class="card card-success mb-3">
-        <div class="card-header"><h3 class="card-title">Service Lines</h3></div>
+        <div class="card-header"><h3 class="card-title">Labour Lines</h3></div>
         <?php if ($canEdit && $editable): ?>
           <form method="post">
             <div class="card-body border-bottom row g-2">
               <?= csrf_field(); ?>
               <input type="hidden" name="_action" value="add_service" />
               <div class="col-md-5">
-                <label class="form-label">Service</label>
+                <label class="form-label">Labour</label>
                 <select id="estimate-add-service" name="service_id" class="form-select" required>
-                  <option value="">Select Service</option>
+                  <option value="">Select Labour</option>
                   <?php foreach ($serviceMaster as $service): ?>
                     <option value="<?= (int) $service['id']; ?>" data-name="<?= e((string) $service['service_name']); ?>" data-rate="<?= e((string) $service['default_rate']); ?>" data-gst="<?= e((string) $service['gst_rate']); ?>">
                       <?= e((string) ($service['category_name'] ?? 'Uncategorized')); ?> :: <?= e((string) $service['service_name']); ?>
@@ -1306,13 +1306,13 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 
         <div class="card-body table-responsive p-0">
           <table class="table table-sm table-striped mb-0">
-            <thead><tr><th>Service</th><th>Description</th><th>Qty</th><th>Rate</th><th>GST%</th><th>Total</th><th>Actions</th></tr></thead>
+            <thead><tr><th>Labour</th><th>Description</th><th>Qty</th><th>Rate</th><th>GST%</th><th>Total</th><th>Actions</th></tr></thead>
             <tbody>
               <?php if (empty($serviceLines)): ?>
                 <tr><td colspan="7" class="text-center text-muted py-4">No service lines added.</td></tr>
               <?php else: foreach ($serviceLines as $line): ?>
                 <tr>
-                  <td><?= e((string) (($line['service_name'] ?? '') !== '' ? $line['service_name'] : 'Manual Service')); ?></td>
+                  <td><?= e((string) (($line['service_name'] ?? '') !== '' ? $line['service_name'] : 'Manual Labour')); ?></td>
                   <td><?= e((string) $line['description']); ?></td>
                   <td><?= e(number_format((float) $line['quantity'], 2)); ?></td>
                   <td><?= e(format_currency((float) $line['unit_price'])); ?></td>
@@ -1584,3 +1584,4 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 </script>
 
 <?php require_once __DIR__ . '/../../includes/footer.php'; ?>
+
