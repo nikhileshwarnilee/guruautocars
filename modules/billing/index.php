@@ -117,6 +117,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             );
             $advanceId = (int) ($result['advance_id'] ?? 0);
 
+            if ($advanceId > 0 && function_exists('ledger_post_advance_received')) {
+                $advanceReceiptRow = billing_fetch_advance_receipt_row($pdo, $advanceId, $companyId, $garageId);
+                if ($advanceReceiptRow) {
+                    ledger_post_advance_received($pdo, $advanceReceiptRow, $userId > 0 ? $userId : null);
+                }
+            }
+
             log_audit('billing', 'advance_collect', $advanceId, 'Collected advance for job card #' . $jobCardId, [
                 'entity' => 'job_advance',
                 'source' => 'UI',
@@ -594,6 +601,29 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 );
             }
 
+            if (function_exists('ledger_post_invoice_finalized')) {
+                ledger_post_invoice_finalized($pdo, $invoice, $userId > 0 ? $userId : null);
+
+                if ($financialExtensionsReady && table_columns('advance_adjustments') !== []) {
+                    $advanceAdjustmentStmt = $pdo->prepare(
+                        'SELECT *
+                         FROM advance_adjustments
+                         WHERE company_id = :company_id
+                           AND garage_id = :garage_id
+                           AND invoice_id = :invoice_id
+                         ORDER BY id ASC'
+                    );
+                    $advanceAdjustmentStmt->execute([
+                        'company_id' => $companyId,
+                        'garage_id' => $garageId,
+                        'invoice_id' => $invoiceId,
+                    ]);
+                    foreach ($advanceAdjustmentStmt->fetchAll() as $adjustmentRow) {
+                        ledger_post_advance_adjustment($pdo, $adjustmentRow, $invoice, $userId > 0 ? $userId : null);
+                    }
+                }
+            }
+
             log_audit('billing', 'finalize', $invoiceId, 'Finalized invoice ' . (string) $invoice['invoice_number'], [
                 'entity' => 'invoice',
                 'source' => 'UI',
@@ -673,6 +703,38 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
             $releasedAdvanceTotal = round((float) ($releasedAdvance['released_total'] ?? 0), 2);
             $releasedAdvanceCount = (int) ($releasedAdvance['released_count'] ?? 0);
+            if (function_exists('ledger_reverse_reference')) {
+                ledger_reverse_reference(
+                    $pdo,
+                    $companyId,
+                    'INVOICE_FINALIZE',
+                    $invoiceId,
+                    'INVOICE_CANCEL_REVERSAL',
+                    $invoiceId,
+                    date('Y-m-d'),
+                    'Invoice cancellation reversal #' . $invoiceId,
+                    $userId > 0 ? $userId : null,
+                    true
+                );
+                foreach ((array) ($releasedAdvance['rows'] ?? []) as $releasedAdjustmentRow) {
+                    $releasedAdjustmentId = (int) ($releasedAdjustmentRow['adjustment_id'] ?? 0);
+                    if ($releasedAdjustmentId <= 0) {
+                        continue;
+                    }
+                    ledger_reverse_reference(
+                        $pdo,
+                        $companyId,
+                        'ADVANCE_ADJUSTMENT',
+                        $releasedAdjustmentId,
+                        'ADVANCE_ADJUSTMENT_RELEASE',
+                        $releasedAdjustmentId,
+                        date('Y-m-d'),
+                        'Advance adjustment release on invoice cancel #' . $invoiceId,
+                        $userId > 0 ? $userId : null,
+                        true
+                    );
+                }
+            }
             $paymentSummary = (array) ($dependencyReport['payment_summary'] ?? []);
             $paidAmount = round((float) ($paymentSummary['net_paid_amount'] ?? 0), 2);
             $cancelStmt = $pdo->prepare(
@@ -874,6 +936,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             );
             $paymentInsert->execute($paymentInsertParams);
             $paymentId = (int) $pdo->lastInsertId();
+
+            if (function_exists('ledger_post_customer_payment')) {
+                ledger_post_customer_payment($pdo, [
+                    'id' => $invoiceId,
+                    'company_id' => $companyId,
+                    'garage_id' => $garageId,
+                    'invoice_number' => (string) ($invoice['invoice_number'] ?? ''),
+                    'customer_id' => (int) ($invoice['customer_id'] ?? 0),
+                ], [
+                    'id' => $paymentId,
+                    'invoice_id' => $invoiceId,
+                    'amount' => billing_round($amount),
+                    'paid_on' => $paidOn,
+                    'payment_mode' => $paymentMode,
+                ], $userId > 0 ? $userId : null);
+            }
 
             $newPaid = billing_round($alreadyPaid + $amount);
             $netSettled = billing_round($newPaid + $advanceAdjusted);
@@ -1125,6 +1203,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $reversalInsertStmt->execute($reversalInsertParams);
             $reversalId = (int) $pdo->lastInsertId();
 
+            if (function_exists('ledger_reverse_reference')) {
+                ledger_reverse_reference(
+                    $pdo,
+                    $companyId,
+                    'INVOICE_PAYMENT',
+                    $paymentId,
+                    'INVOICE_PAYMENT_REVERSAL',
+                    $reversalId,
+                    $reversalDate,
+                    'Invoice payment reversal #' . $paymentId,
+                    $userId > 0 ? $userId : null,
+                    true
+                );
+            }
+
             $paymentUpdateSets = [];
             $paymentUpdateParams = ['payment_id' => $paymentId];
             if ($paymentHasIsReversed) {
@@ -1352,6 +1445,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                  WHERE id = :id'
             );
             $deleteStmt->execute($deleteParams);
+
+            if (function_exists('ledger_reverse_reference')) {
+                ledger_reverse_reference(
+                    $pdo,
+                    $companyId,
+                    'ADVANCE_RECEIVED',
+                    $advanceId,
+                    'ADVANCE_DELETE_REVERSAL',
+                    $advanceId,
+                    date('Y-m-d'),
+                    'Advance receipt delete reversal #' . $advanceId,
+                    $userId > 0 ? $userId : null,
+                    true
+                );
+            }
 
             log_audit(
                 'billing',

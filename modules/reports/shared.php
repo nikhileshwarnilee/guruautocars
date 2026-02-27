@@ -287,6 +287,41 @@ function reports_module_links(): array
             'label' => 'Profit & Loss',
             'icon' => 'bi bi-graph-up-arrow',
             'path' => 'modules/reports/profit_loss.php',
+        ], [
+            'menu_key' => 'reports.ledger_trial_balance',
+            'label' => 'Trial Balance (GL)',
+            'icon' => 'bi bi-list-check',
+            'path' => 'modules/reports/trial_balance_ledger.php',
+        ], [
+            'menu_key' => 'reports.ledger_profit_loss',
+            'label' => 'P&L (GL)',
+            'icon' => 'bi bi-bar-chart-line',
+            'path' => 'modules/reports/profit_loss_ledger.php',
+        ], [
+            'menu_key' => 'reports.ledger_balance_sheet',
+            'label' => 'Balance Sheet (GL)',
+            'icon' => 'bi bi-columns-gap',
+            'path' => 'modules/reports/balance_sheet_ledger.php',
+        ], [
+            'menu_key' => 'reports.ledger_cash_flow',
+            'label' => 'Cash Flow (GL)',
+            'icon' => 'bi bi-water',
+            'path' => 'modules/reports/cash_flow_ledger.php',
+        ], [
+            'menu_key' => 'reports.ledger_general_ledger',
+            'label' => 'General Ledger',
+            'icon' => 'bi bi-journal-bookmark',
+            'path' => 'modules/reports/general_ledger.php',
+        ], [
+            'menu_key' => 'reports.ledger_customer_ledger',
+            'label' => 'Customer Ledger',
+            'icon' => 'bi bi-person-lines-fill',
+            'path' => 'modules/reports/customer_ledger.php',
+        ], [
+            'menu_key' => 'reports.ledger_vendor_ledger',
+            'label' => 'Vendor Ledger',
+            'icon' => 'bi bi-building',
+            'path' => 'modules/reports/vendor_ledger.php',
         ]]);
     }
 

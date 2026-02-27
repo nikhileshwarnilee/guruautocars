@@ -1492,6 +1492,10 @@ function returns_approve_rma(PDO $pdo, int $returnId, int $companyId, int $garag
             'garage_id' => $garageId,
         ]);
 
+        if (function_exists('ledger_post_customer_return_approved')) {
+            ledger_post_customer_return_approved($pdo, $returnRow, $actorUserId > 0 ? $actorUserId : null);
+        }
+
         $pdo->commit();
 
         return [
@@ -2036,6 +2040,23 @@ function returns_delete_rma(PDO $pdo, int $returnId, int $companyId, int $garage
         $deleteStmt->execute($deleteParams);
         if ($deleteStmt->rowCount() <= 0) {
             throw new RuntimeException('Return entry could not be deleted.');
+        }
+
+        if (function_exists('ledger_reverse_reference')
+            && strtoupper(trim((string) ($returnRow['return_type'] ?? ''))) === 'CUSTOMER_RETURN'
+            && in_array(strtoupper(trim((string) ($returnRow['approval_status'] ?? 'PENDING'))), ['APPROVED', 'CLOSED'], true)) {
+            ledger_reverse_reference(
+                $pdo,
+                $companyId,
+                'CUSTOMER_RETURN_APPROVAL',
+                $returnId,
+                'CUSTOMER_RETURN_DELETE_REVERSAL',
+                $returnId,
+                date('Y-m-d'),
+                'Customer return delete reversal #' . $returnId,
+                $actorUserId > 0 ? $actorUserId : null,
+                true
+            );
         }
 
         $pdo->commit();

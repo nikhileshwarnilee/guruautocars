@@ -1,1 +1,5 @@
 /.env
+node_modules/
+playwright-report/
+test-results/
+database/regression_outputs/

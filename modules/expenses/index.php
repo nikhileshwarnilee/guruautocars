@@ -343,19 +343,24 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             redirect('modules/expenses/index.php');
         }
 
-        $expenseId = finance_record_expense([
-            'company_id' => $companyId,
-            'garage_id' => $garageId,
-            'category_name' => (string) $catRow['category_name'],
-            'expense_date' => $expenseDate,
-            'amount' => $amount,
-            'payment_mode' => $paymentMode,
-            'paid_to' => $paidTo,
-            'notes' => $notes,
-            'source_type' => 'MANUAL_EXPENSE',
-            'entry_type' => 'EXPENSE',
-            'created_by' => $_SESSION['user_id'] ?? null,
-        ]);
+        try {
+            $expenseId = finance_record_expense([
+                'company_id' => $companyId,
+                'garage_id' => $garageId,
+                'category_name' => (string) $catRow['category_name'],
+                'expense_date' => $expenseDate,
+                'amount' => $amount,
+                'payment_mode' => $paymentMode,
+                'paid_to' => $paidTo,
+                'notes' => $notes,
+                'source_type' => 'MANUAL_EXPENSE',
+                'entry_type' => 'EXPENSE',
+                'created_by' => $_SESSION['user_id'] ?? null,
+            ]);
+        } catch (Throwable $exception) {
+            flash_set('expense_error', $exception->getMessage(), 'danger');
+            redirect('modules/expenses/index.php');
+        }
         if ($expenseId) {
             log_audit('expenses', 'expense_create', (int) $expenseId, 'Recorded manual expense', [
                 'entity' => 'expense',
@@ -423,7 +428,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'company_id' => $companyId,
                 'garage_id' => $garageId,
             ]);
-            if (!$catStmt->fetch()) {
+            $catRow = $catStmt->fetch();
+            if (!$catRow) {
                 throw new RuntimeException('Category not found.');
             }
 
@@ -446,6 +452,45 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'notes' => $notes !== '' ? $notes : null,
                 'id' => $expenseId,
             ]);
+
+            if (function_exists('ledger_reverse_all_reference_types') && function_exists('ledger_post_finance_expense_entry')) {
+                ledger_reverse_all_reference_types(
+                    $pdo,
+                    $companyId,
+                    [
+                        ['reference_type' => 'EXPENSE', 'reference_id' => $expenseId],
+                        ['reference_type' => 'EXPENSE_UPDATE', 'reference_id' => $expenseId],
+                    ],
+                    'EXPENSE_UPDATE_RESTATE',
+                    $expenseId,
+                    $expenseDate,
+                    'Expense update restatement for expense #' . $expenseId,
+                    $_SESSION['user_id'] ?? null
+                );
+
+                ledger_post_finance_expense_entry(
+                    $pdo,
+                    [
+                        'id' => $expenseId,
+                        'company_id' => $companyId,
+                        'garage_id' => $garageId,
+                        'category_id' => $categoryId,
+                        'expense_date' => $expenseDate,
+                        'amount' => $amount,
+                        'paid_to' => $paidTo !== '' ? $paidTo : null,
+                        'payment_mode' => $paymentMode,
+                        'notes' => $notes !== '' ? $notes : null,
+                        'source_type' => (string) ($expense['source_type'] ?? 'MANUAL_EXPENSE'),
+                        'source_id' => isset($expense['source_id']) ? (int) $expense['source_id'] : null,
+                        'entry_type' => 'EXPENSE',
+                        'reversed_expense_id' => null,
+                        'created_by' => $_SESSION['user_id'] ?? null,
+                    ],
+                    (string) ($catRow['category_name'] ?? 'General Expense'),
+                    $_SESSION['user_id'] ?? null,
+                    'EXPENSE_UPDATE'
+                );
+            }
 
             log_audit('expenses', 'expense_update', $expenseId, 'Updated expense', [
                 'entity' => 'expense',
@@ -540,12 +585,29 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'reversed_expense_id' => $expenseId,
                 'created_by' => $_SESSION['user_id'] ?? null,
             ]);
+            $reversalId = (int) $pdo->lastInsertId();
+
+            if (function_exists('ledger_reverse_all_reference_types')) {
+                ledger_reverse_all_reference_types(
+                    $pdo,
+                    $companyId,
+                    [
+                        ['reference_type' => 'EXPENSE', 'reference_id' => $expenseId],
+                        ['reference_type' => 'EXPENSE_UPDATE', 'reference_id' => $expenseId],
+                    ],
+                    'EXPENSE_MANUAL_REVERSAL',
+                    $reversalId,
+                    $today,
+                    'Manual expense reversal for expense #' . $expenseId,
+                    $_SESSION['user_id'] ?? null
+                );
+            }
 
             log_audit('expenses', 'reverse', $expenseId, 'Expense reversed', [
                 'entity' => 'expense',
                 'source' => 'MANUAL',
                 'after' => [
-                    'reversal_id' => (int) $pdo->lastInsertId(),
+                    'reversal_id' => $reversalId,
                     'reverse_reason' => $reverseReason,
                 ],
             ]);

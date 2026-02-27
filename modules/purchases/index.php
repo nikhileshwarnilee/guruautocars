@@ -476,6 +476,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'finalized_at' => $targetStatus === 'FINALIZED' ? date('Y-m-d H:i:s') : null,
             ]);
             $purchaseId = (int) $pdo->lastInsertId();
+            $autoPaymentId = 0;
 
             $itemInsert = $pdo->prepare(
                 'INSERT INTO purchase_items
@@ -546,7 +547,37 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                   'notes' => 'Payment captured at purchase entry.',
                   'created_by' => $userId,
                 ]);
+                $autoPaymentId = (int) $pdo->lastInsertId();
               }
+
+            if ($targetStatus === 'FINALIZED' && function_exists('ledger_post_purchase_finalized')) {
+                ledger_post_purchase_finalized($pdo, [
+                    'id' => $purchaseId,
+                    'company_id' => $companyId,
+                    'garage_id' => $activeGarageId,
+                    'vendor_id' => $vendorId,
+                    'invoice_number' => $invoiceNumber !== '' ? $invoiceNumber : null,
+                    'purchase_date' => $purchaseDate,
+                    'taxable_amount' => $totals['taxable'],
+                    'gst_amount' => $totals['gst'],
+                    'grand_total' => $totals['grand'],
+                ], $userId > 0 ? $userId : null);
+            }
+            if ($targetStatus === 'FINALIZED' && $autoPaymentId > 0 && function_exists('ledger_post_vendor_payment')) {
+                ledger_post_vendor_payment($pdo, [
+                    'id' => $purchaseId,
+                    'company_id' => $companyId,
+                    'garage_id' => $activeGarageId,
+                    'vendor_id' => $vendorId,
+                    'invoice_number' => $invoiceNumber !== '' ? $invoiceNumber : null,
+                ], [
+                    'id' => $autoPaymentId,
+                    'purchase_id' => $purchaseId,
+                    'payment_date' => $purchaseDate,
+                    'amount' => (float) $totals['grand'],
+                    'payment_mode' => 'ADJUSTMENT',
+                ], $userId > 0 ? $userId : null);
+            }
 
             $pdo->commit();
             log_audit(
@@ -844,6 +875,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'id' => $purchaseId,
             ]);
 
+            $autoPaymentId = 0;
             if ($purchasePaymentsReady && $paymentStatus === 'PAID') {
               $grandTotal = round((float) ($updatedTotals['grand'] ?? 0), 2);
               if ($grandTotal > 0) {
@@ -863,7 +895,37 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                   'notes' => 'Payment captured during assignment.',
                   'created_by' => $userId,
                 ]);
+                $autoPaymentId = (int) $pdo->lastInsertId();
               }
+            }
+
+            if ($nextStatus === 'FINALIZED' && function_exists('ledger_post_purchase_finalized')) {
+                ledger_post_purchase_finalized($pdo, [
+                    'id' => $purchaseId,
+                    'company_id' => $companyId,
+                    'garage_id' => $activeGarageId,
+                    'vendor_id' => $vendorId,
+                    'invoice_number' => $invoiceNumber,
+                    'purchase_date' => $purchaseDate,
+                    'taxable_amount' => (float) $updatedTotals['taxable'],
+                    'gst_amount' => (float) $updatedTotals['gst'],
+                    'grand_total' => (float) $updatedTotals['grand'],
+                ], $userId > 0 ? $userId : null);
+            }
+            if ($nextStatus === 'FINALIZED' && $autoPaymentId > 0 && function_exists('ledger_post_vendor_payment')) {
+                ledger_post_vendor_payment($pdo, [
+                    'id' => $purchaseId,
+                    'company_id' => $companyId,
+                    'garage_id' => $activeGarageId,
+                    'vendor_id' => $vendorId,
+                    'invoice_number' => $invoiceNumber,
+                ], [
+                    'id' => $autoPaymentId,
+                    'purchase_id' => $purchaseId,
+                    'payment_date' => $purchaseDate,
+                    'amount' => (float) $updatedTotals['grand'],
+                    'payment_mode' => 'ADJUSTMENT',
+                ], $userId > 0 ? $userId : null);
             }
 
             $pdo->commit();
@@ -970,6 +1032,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'finalized_at' => date('Y-m-d H:i:s'),
                 'id' => $purchaseId,
             ]);
+
+            if (function_exists('ledger_post_purchase_finalized')) {
+                $purchaseForLedger = pur_fetch_purchase_for_update($pdo, $purchaseId, $companyId, $activeGarageId);
+                if ($purchaseForLedger) {
+                    ledger_post_purchase_finalized($pdo, $purchaseForLedger, $userId > 0 ? $userId : null);
+                }
+            }
 
             $pdo->commit();
             log_audit('purchases', 'finalize', $purchaseId, 'Finalized purchase #' . $purchaseId, [
@@ -1465,6 +1534,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             );
             $deleteStmt->execute($deleteParams);
 
+            if (function_exists('ledger_reverse_reference') && strtoupper((string) ($purchase['purchase_status'] ?? '')) === 'FINALIZED') {
+                ledger_reverse_reference(
+                    $pdo,
+                    $companyId,
+                    'PURCHASE_FINALIZE',
+                    $purchaseId,
+                    'PURCHASE_DELETE_REVERSAL',
+                    $purchaseId,
+                    date('Y-m-d'),
+                    'Purchase delete reversal #' . $purchaseId,
+                    $userId > 0 ? $userId : null,
+                    true
+                );
+            }
+
             $pdo->commit();
             safe_delete_log_cascade('purchase', 'delete', $purchaseId, (array) $safeDeleteValidation, [
                 'reversal_references' => array_slice($stockReversalMovementUids, 0, 20),
@@ -1571,6 +1655,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'created_by' => $userId > 0 ? $userId : null,
           ]);
           $paymentId = (int) $pdo->lastInsertId();
+
+          if (function_exists('ledger_post_vendor_payment')) {
+            ledger_post_vendor_payment($pdo, $purchase, [
+              'id' => $paymentId,
+              'purchase_id' => $purchaseId,
+              'payment_date' => $paymentDate,
+              'amount' => $amount,
+              'payment_mode' => $paymentMode,
+            ], $userId > 0 ? $userId : null);
+          }
 
           $newPaid = round($paidAmount + $amount, 2);
           $nextStatus = pur_payment_status_from_amounts($grandTotal, $newPaid);
@@ -1707,6 +1801,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'created_by' => $userId > 0 ? $userId : null,
           ]);
           $reversalId = (int) $pdo->lastInsertId();
+
+          if (function_exists('ledger_reverse_reference')) {
+            ledger_reverse_reference(
+              $pdo,
+              $companyId,
+              'PURCHASE_PAYMENT',
+              $paymentId,
+              'PURCHASE_PAYMENT_REVERSAL',
+              $reversalId,
+              $reversalDate,
+              'Purchase payment reversal #' . $paymentId,
+              $userId > 0 ? $userId : null,
+              true
+            );
+          }
 
           $purchase = pur_fetch_purchase_for_update($pdo, $purchaseId, $companyId, $activeGarageId);
           if (!$purchase) {

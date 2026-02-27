@@ -88,63 +88,107 @@ function finance_record_expense(array $payload): ?int
     }
 
     $pdo = db();
-    if ($sourceType !== '' && $sourceId > 0) {
-        $existingStmt = $pdo->prepare(
-            'SELECT id FROM expenses WHERE company_id = :company_id AND source_type = :source_type AND source_id = :source_id AND entry_type = :entry_type LIMIT 1'
-        );
-        $existingStmt->execute([
-            'company_id' => $companyId,
-            'source_type' => $sourceType,
-            'source_id' => $sourceId,
-            'entry_type' => $entryType,
-        ]);
-        $existing = $existingStmt->fetch();
-        if ($existing) {
-            return (int) $existing['id'];
+    $ownsTx = !$pdo->inTransaction();
+    if ($ownsTx) {
+        $pdo->beginTransaction();
+    }
+
+    try {
+        if ($sourceType !== '' && $sourceId > 0) {
+            $existingStmt = $pdo->prepare(
+                'SELECT id FROM expenses WHERE company_id = :company_id AND source_type = :source_type AND source_id = :source_id AND entry_type = :entry_type LIMIT 1'
+            );
+            $existingStmt->execute([
+                'company_id' => $companyId,
+                'source_type' => $sourceType,
+                'source_id' => $sourceId,
+                'entry_type' => $entryType,
+            ]);
+            $existing = $existingStmt->fetch();
+            if ($existing) {
+                if ($ownsTx) {
+                    $pdo->commit();
+                }
+                return (int) $existing['id'];
+            }
         }
-    }
 
-    $categoryId = finance_ensure_category($companyId, $garageId, $categoryName, $createdBy);
-    if (!$categoryId && $garageId !== 0) {
-        $categoryId = finance_ensure_category($companyId, 0, $categoryName, $createdBy);
-    }
+        $categoryId = finance_ensure_category($companyId, $garageId, $categoryName, $createdBy);
+        if (!$categoryId && $garageId !== 0) {
+            $categoryId = finance_ensure_category($companyId, 0, $categoryName, $createdBy);
+        }
 
-    $insertStmt = $pdo->prepare(
-        'INSERT INTO expenses
-          (company_id, garage_id, category_id, expense_date, amount, paid_to, payment_mode, notes, source_type, source_id, entry_type, reversed_expense_id, created_by)
-         VALUES
-          (:company_id, :garage_id, :category_id, :expense_date, :amount, :paid_to, :payment_mode, :notes, :source_type, :source_id, :entry_type, :reversed_expense_id, :created_by)'
-    );
-    $insertStmt->execute([
-        'company_id' => $companyId,
-        'garage_id' => $garageId,
-        'category_id' => $categoryId,
-        'expense_date' => $expenseDate,
-        'amount' => $amount,
-        'paid_to' => $paidTo !== '' ? $paidTo : null,
-        'payment_mode' => $paymentMode,
-        'notes' => $notes !== '' ? $notes : null,
-        'source_type' => $sourceType !== '' ? $sourceType : null,
-        'source_id' => $sourceId > 0 ? $sourceId : null,
-        'entry_type' => $entryType,
-        'reversed_expense_id' => $reversedExpenseId > 0 ? $reversedExpenseId : null,
-        'created_by' => $createdBy > 0 ? $createdBy : null,
-    ]);
-
-    $expenseId = (int) $pdo->lastInsertId();
-    log_audit('expenses', strtolower($entryType), $expenseId, 'Expense entry created', [
-        'entity' => 'expense',
-        'source' => $sourceType !== '' ? $sourceType : 'MANUAL',
-        'after' => [
+        $insertStmt = $pdo->prepare(
+            'INSERT INTO expenses
+              (company_id, garage_id, category_id, expense_date, amount, paid_to, payment_mode, notes, source_type, source_id, entry_type, reversed_expense_id, created_by)
+             VALUES
+              (:company_id, :garage_id, :category_id, :expense_date, :amount, :paid_to, :payment_mode, :notes, :source_type, :source_id, :entry_type, :reversed_expense_id, :created_by)'
+        );
+        $insertStmt->execute([
             'company_id' => $companyId,
             'garage_id' => $garageId,
-            'category_name' => $categoryName,
+            'category_id' => $categoryId,
+            'expense_date' => $expenseDate,
             'amount' => $amount,
+            'paid_to' => $paidTo !== '' ? $paidTo : null,
+            'payment_mode' => $paymentMode,
+            'notes' => $notes !== '' ? $notes : null,
+            'source_type' => $sourceType !== '' ? $sourceType : null,
+            'source_id' => $sourceId > 0 ? $sourceId : null,
             'entry_type' => $entryType,
-        ],
-    ]);
+            'reversed_expense_id' => $reversedExpenseId > 0 ? $reversedExpenseId : null,
+            'created_by' => $createdBy > 0 ? $createdBy : null,
+        ]);
 
-    return $expenseId;
+        $expenseId = (int) $pdo->lastInsertId();
+
+        if (function_exists('ledger_post_finance_expense_entry')) {
+            ledger_post_finance_expense_entry(
+                $pdo,
+                [
+                    'id' => $expenseId,
+                    'company_id' => $companyId,
+                    'garage_id' => $garageId,
+                    'category_id' => $categoryId,
+                    'expense_date' => $expenseDate,
+                    'amount' => $amount,
+                    'paid_to' => $paidTo !== '' ? $paidTo : null,
+                    'payment_mode' => $paymentMode,
+                    'notes' => $notes !== '' ? $notes : null,
+                    'source_type' => $sourceType !== '' ? $sourceType : null,
+                    'source_id' => $sourceId > 0 ? $sourceId : null,
+                    'entry_type' => $entryType,
+                    'reversed_expense_id' => $reversedExpenseId > 0 ? $reversedExpenseId : null,
+                    'created_by' => $createdBy > 0 ? $createdBy : null,
+                ],
+                $categoryName,
+                $createdBy > 0 ? $createdBy : null
+            );
+        }
+
+        log_audit('expenses', strtolower($entryType), $expenseId, 'Expense entry created', [
+            'entity' => 'expense',
+            'source' => $sourceType !== '' ? $sourceType : 'MANUAL',
+            'after' => [
+                'company_id' => $companyId,
+                'garage_id' => $garageId,
+                'category_name' => $categoryName,
+                'amount' => $amount,
+                'entry_type' => $entryType,
+            ],
+        ]);
+
+        if ($ownsTx) {
+            $pdo->commit();
+        }
+
+        return $expenseId;
+    } catch (Throwable $exception) {
+        if ($ownsTx && $pdo->inTransaction()) {
+            $pdo->rollBack();
+        }
+        throw $exception;
+    }
 }
 
 function finance_record_expense_for_purchase_payment(int $paymentId, int $purchaseId, int $companyId, int $garageId, float $amount, string $paymentDate, string $paymentMode, string $notes, bool $isReversal, ?int $createdBy): ?int
