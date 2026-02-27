@@ -1362,17 +1362,30 @@ $partsStockStmt = db()->prepare(
     'SELECT p.id, p.part_name, p.part_sku, p.hsn_code, p.unit, p.selling_price, p.gst_rate, p.min_stock, p.status_code,
             pc.category_name,
             v.vendor_name,
-            COALESCE(gi.quantity, 0) AS stock_qty,
+            COALESCE(gi.quantity, 0) AS actual_stock_qty,
+            COALESCE(rsv.reserved_qty, 0) AS reserved_stock_qty,
+            (COALESCE(gi.quantity, 0) - COALESCE(rsv.reserved_qty, 0)) AS current_stock_qty,
+            (COALESCE(gi.quantity, 0) - COALESCE(rsv.reserved_qty, 0)) AS stock_qty,
             lm.last_movement_at,
             CASE
-                WHEN COALESCE(gi.quantity, 0) <= 0 THEN "OUT"
-                WHEN COALESCE(gi.quantity, 0) <= p.min_stock THEN "LOW"
+                WHEN (COALESCE(gi.quantity, 0) - COALESCE(rsv.reserved_qty, 0)) <= 0 THEN "OUT"
+                WHEN (COALESCE(gi.quantity, 0) - COALESCE(rsv.reserved_qty, 0)) <= p.min_stock THEN "LOW"
                 ELSE "OK"
             END AS stock_state
      FROM parts p
      LEFT JOIN part_categories pc ON pc.id = p.category_id
      LEFT JOIN vendors v ON v.id = p.vendor_id
      LEFT JOIN garage_inventory gi ON gi.part_id = p.id AND gi.garage_id = :inventory_garage_id
+     LEFT JOIN (
+        SELECT jp.part_id, SUM(jp.quantity) AS reserved_qty
+        FROM job_parts jp
+        INNER JOIN job_cards jc ON jc.id = jp.job_card_id
+        WHERE jc.company_id = :company_id
+          AND jc.garage_id = :inventory_garage_id
+          AND jc.status_code = "ACTIVE"
+          AND UPPER(COALESCE(jc.status, "OPEN")) NOT IN ("CLOSED", "CANCELLED")
+        GROUP BY jp.part_id
+     ) rsv ON rsv.part_id = p.id
      LEFT JOIN (
         SELECT part_id, garage_id, MAX(created_at) AS last_movement_at
         FROM inventory_movements
@@ -1610,7 +1623,10 @@ try {
         if ($visVariantId > 0) {
             $compatStmt = db()->prepare(
                 'SELECT p.id, p.part_name, p.part_sku, p.unit, p.min_stock,
-                        COALESCE(gi.quantity, 0) AS stock_qty,
+                        COALESCE(gi.quantity, 0) AS actual_stock_qty,
+                        COALESCE(rsv.reserved_qty, 0) AS reserved_stock_qty,
+                        (COALESCE(gi.quantity, 0) - COALESCE(rsv.reserved_qty, 0)) AS current_stock_qty,
+                        (COALESCE(gi.quantity, 0) - COALESCE(rsv.reserved_qty, 0)) AS stock_qty,
                         vpc.compatibility_note
                  FROM vis_part_compatibility vpc
                  INNER JOIN parts p
@@ -1620,6 +1636,16 @@ try {
                  LEFT JOIN garage_inventory gi
                     ON gi.part_id = p.id
                    AND gi.garage_id = :garage_id
+                 LEFT JOIN (
+                    SELECT jp.part_id, SUM(jp.quantity) AS reserved_qty
+                    FROM job_parts jp
+                    INNER JOIN job_cards jc ON jc.id = jp.job_card_id
+                    WHERE jc.company_id = :company_id
+                      AND jc.garage_id = :garage_id
+                      AND jc.status_code = "ACTIVE"
+                      AND UPPER(COALESCE(jc.status, "OPEN")) NOT IN ("CLOSED", "CANCELLED")
+                    GROUP BY jp.part_id
+                 ) rsv ON rsv.part_id = p.id
                  WHERE vpc.company_id = :company_id
                    AND vpc.variant_id = :variant_id
                    AND vpc.status_code = "ACTIVE"
@@ -1786,7 +1812,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                             $partAllowsDecimal = part_unit_allows_decimal($companyId, $partUnitCode);
                           ?>
                           <option value="<?= (int) $part['id']; ?>" data-unit="<?= e($partUnitCode); ?>" data-allow-decimal="<?= $partAllowsDecimal ? '1' : '0'; ?>">
-                            <?= e((string) $part['part_name']); ?> (<?= e((string) $part['part_sku']); ?>) | Stock <?= e(number_format((float) $part['stock_qty'], 2)); ?> <?= e((string) $part['unit']); ?>
+                            <?= e((string) $part['part_name']); ?> (<?= e((string) $part['part_sku']); ?>) | Current <?= e(number_format((float) ($part['current_stock_qty'] ?? $part['stock_qty'] ?? 0), 2)); ?> <?= e((string) $part['unit']); ?> | Actual <?= e(number_format((float) ($part['actual_stock_qty'] ?? $part['stock_qty'] ?? 0), 2)); ?> <?= e((string) $part['unit']); ?>
                           </option>
                         <?php endforeach; ?>
                       </select>
@@ -1850,7 +1876,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                             $partAllowsDecimal = part_unit_allows_decimal($companyId, $partUnitCode);
                           ?>
                           <option value="<?= (int) $part['id']; ?>" data-unit="<?= e($partUnitCode); ?>" data-allow-decimal="<?= $partAllowsDecimal ? '1' : '0'; ?>">
-                            <?= e((string) $part['part_name']); ?> (<?= e((string) $part['part_sku']); ?>) | Source stock <?= e(number_format((float) $part['stock_qty'], 2)); ?> <?= e($partUnitCode); ?>
+                            <?= e((string) $part['part_name']); ?> (<?= e((string) $part['part_sku']); ?>) | Current <?= e(number_format((float) ($part['current_stock_qty'] ?? $part['stock_qty'] ?? 0), 2)); ?> <?= e($partUnitCode); ?> | Actual <?= e(number_format((float) ($part['actual_stock_qty'] ?? $part['stock_qty'] ?? 0), 2)); ?> <?= e($partUnitCode); ?>
                           </option>
                         <?php endforeach; ?>
                       </select>
@@ -2334,14 +2360,15 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                 <th>Sell Price</th>
                 <th>GST%</th>
                 <th>Min Stock</th>
+                <th>Actual Stock</th>
                 <th>Current Stock</th>
                 <th>Alert</th>
                 <th>Last Movement</th>
               </tr>
             </thead>
-            <tbody data-master-table-body="1" data-table-colspan="12">
+            <tbody data-master-table-body="1" data-table-colspan="13">
               <?php if (empty($partsTablePreview)): ?>
-                <tr><td colspan="12" class="text-center text-muted py-4">No parts configured.</td></tr>
+                <tr><td colspan="13" class="text-center text-muted py-4">No parts configured.</td></tr>
               <?php else: ?>
                 <?php foreach ($partsTablePreview as $part): ?>
                   <?php
@@ -2359,7 +2386,8 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                     <td><?= e(format_currency((float) $part['selling_price'])); ?></td>
                     <td><?= e(number_format((float) $part['gst_rate'], 2)); ?></td>
                     <td><?= e(number_format((float) $part['min_stock'], 2)); ?> <?= e((string) $part['unit']); ?></td>
-                    <td><?= e(number_format((float) $part['stock_qty'], 2)); ?> <?= e((string) $part['unit']); ?></td>
+                    <td><?= e(number_format((float) ($part['actual_stock_qty'] ?? $part['stock_qty'] ?? 0), 2)); ?> <?= e((string) $part['unit']); ?></td>
+                    <td><?= e(number_format((float) ($part['current_stock_qty'] ?? $part['stock_qty'] ?? 0), 2)); ?> <?= e((string) $part['unit']); ?></td>
                     <td><span class="badge text-bg-<?= e($badgeClass); ?>"><?= e($label); ?></span></td>
                     <td><?= e(inv_format_datetime((string) ($part['last_movement_at'] ?? ''))); ?></td>
                   </tr>
@@ -2495,7 +2523,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                   <thead>
                     <tr>
                       <th>Part</th>
-                      <th>Stock</th>
+                      <th>Stock (Current / Actual)</th>
                       <th>Min Stock</th>
                       <th>Compatibility Note</th>
                     </tr>
@@ -2505,10 +2533,10 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                       <tr><td colspan="4" class="text-center text-muted">No VIS compatible parts for selected variant.</td></tr>
                     <?php else: ?>
                       <?php foreach ($visCompatibleParts as $compat): ?>
-                        <?php $isLow = ((float) $compat['stock_qty'] <= (float) $compat['min_stock']); ?>
+                        <?php $isLow = ((float) ($compat['current_stock_qty'] ?? $compat['stock_qty'] ?? 0) <= (float) $compat['min_stock']); ?>
                         <tr>
                           <td><?= e((string) $compat['part_name']); ?> (<?= e((string) $compat['part_sku']); ?>)</td>
-                          <td class="<?= $isLow ? 'text-danger' : 'text-success'; ?>"><?= e(number_format((float) $compat['stock_qty'], 2)); ?> <?= e((string) $compat['unit']); ?></td>
+                          <td class="<?= $isLow ? 'text-danger' : 'text-success'; ?>"><?= e(number_format((float) ($compat['current_stock_qty'] ?? $compat['stock_qty'] ?? 0), 2)); ?> / <?= e(number_format((float) ($compat['actual_stock_qty'] ?? $compat['stock_qty'] ?? 0), 2)); ?> <?= e((string) $compat['unit']); ?></td>
                           <td><?= e(number_format((float) $compat['min_stock'], 2)); ?></td>
                           <td><?= e((string) ($compat['compatibility_note'] ?? '-')); ?></td>
                         </tr>

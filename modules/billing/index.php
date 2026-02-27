@@ -75,9 +75,54 @@ function billing_sort_timestamp(?string $dateTime, ?string $fallbackDate = null)
     return $timestamp === false ? 0 : (int) $timestamp;
 }
 
+function billing_store_customer_state_resolution_context(int $companyId, int $garageId, array $payload): void
+{
+    $_SESSION['billing_customer_state_resolution'] = [
+        'company_id' => $companyId,
+        'garage_id' => $garageId,
+        'job_card_id' => (int) ($payload['job_card_id'] ?? 0),
+        'job_number' => mb_substr(trim((string) ($payload['job_number'] ?? '')), 0, 40),
+        'customer_id' => (int) ($payload['customer_id'] ?? 0),
+        'customer_name' => mb_substr(trim((string) ($payload['customer_name'] ?? '')), 0, 150),
+        'customer_phone' => mb_substr(trim((string) ($payload['customer_phone'] ?? '')), 0, 20),
+        'customer_gstin' => mb_substr(strtoupper(trim((string) ($payload['customer_gstin'] ?? ''))), 0, 15),
+        'customer_address_line1' => mb_substr(trim((string) ($payload['customer_address_line1'] ?? '')), 0, 200),
+        'customer_address_line2' => mb_substr(trim((string) ($payload['customer_address_line2'] ?? '')), 0, 200),
+        'customer_city' => mb_substr(trim((string) ($payload['customer_city'] ?? '')), 0, 80),
+        'customer_state' => mb_substr(trim((string) ($payload['customer_state'] ?? '')), 0, 80),
+        'customer_pincode' => mb_substr(trim((string) ($payload['customer_pincode'] ?? '')), 0, 10),
+        'due_date' => billing_parse_date((string) ($payload['due_date'] ?? '')) ?? '',
+        'discount_type' => billing_normalize_discount_type((string) ($payload['discount_type'] ?? 'AMOUNT')),
+        'discount_value' => max(0.0, billing_round((float) ($payload['discount_value'] ?? 0))),
+        'notes' => mb_substr(trim((string) ($payload['notes'] ?? '')), 0, 1000),
+    ];
+}
+
+function billing_pull_customer_state_resolution_context(int $companyId, int $garageId): ?array
+{
+    $context = $_SESSION['billing_customer_state_resolution'] ?? null;
+    unset($_SESSION['billing_customer_state_resolution']);
+
+    if (!is_array($context)) {
+        return null;
+    }
+
+    if ((int) ($context['company_id'] ?? 0) !== $companyId || (int) ($context['garage_id'] ?? 0) !== $garageId) {
+        return null;
+    }
+
+    if ((int) ($context['job_card_id'] ?? 0) <= 0 || (int) ($context['customer_id'] ?? 0) <= 0) {
+        return null;
+    }
+
+    return $context;
+}
+
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     require_csrf();
     $action = (string) ($_POST['_action'] ?? '');
+    $gstStateRequiredMessage = 'Garage and customer state are required to determine GST regime.';
+    $customerUpdatedForDraftInvoice = false;
 
     if ($action === 'collect_advance' && $canPay) {
         if (!$financialExtensionsReady) {
@@ -147,6 +192,162 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         redirect('modules/billing/index.php');
     }
 
+    if ($action === 'resolve_customer_state_and_create_invoice' && $canCreate) {
+        if (!has_permission('job.view')) {
+            flash_set('billing_error', 'You do not have permission to bill against job cards.', 'danger');
+            redirect('modules/billing/index.php');
+        }
+
+        $jobCardId = post_int('job_card_id');
+        $jobNumber = post_string('job_number', 40);
+        $customerId = post_int('customer_id');
+        $customerName = post_string('customer_name', 150);
+        $customerPhone = post_string('customer_phone', 20);
+        $customerGstin = strtoupper(post_string('customer_gstin', 15));
+        $customerAddressLine1 = post_string('customer_address_line1', 200);
+        $customerAddressLine2 = post_string('customer_address_line2', 200);
+        $customerCity = post_string('customer_city', 80);
+        $customerState = post_string('customer_state', 80);
+        $customerPincode = post_string('customer_pincode', 10);
+
+        $dueDate = billing_parse_date((string) ($_POST['due_date'] ?? ''));
+        $discountType = billing_normalize_discount_type((string) ($_POST['discount_type'] ?? 'AMOUNT'));
+        $discountValue = max(0.0, billing_round((float) ($_POST['discount_value'] ?? 0)));
+        $notes = post_string('notes', 1000);
+
+        $contextPayload = [
+            'job_card_id' => $jobCardId,
+            'job_number' => $jobNumber,
+            'customer_id' => $customerId,
+            'customer_name' => $customerName,
+            'customer_phone' => $customerPhone,
+            'customer_gstin' => $customerGstin,
+            'customer_address_line1' => $customerAddressLine1,
+            'customer_address_line2' => $customerAddressLine2,
+            'customer_city' => $customerCity,
+            'customer_state' => $customerState,
+            'customer_pincode' => $customerPincode,
+            'due_date' => $dueDate ?? '',
+            'discount_type' => $discountType,
+            'discount_value' => $discountValue,
+            'notes' => $notes,
+        ];
+
+        if ($jobCardId <= 0 || $customerId <= 0) {
+            flash_set('billing_error', 'Invalid closed job card selected for customer update.', 'danger');
+            redirect('modules/billing/index.php');
+        }
+
+        if (billing_normalize_state($customerState) === '') {
+            billing_store_customer_state_resolution_context($companyId, $garageId, $contextPayload);
+            flash_set('billing_error', 'Customer state is required to create draft invoice.', 'danger');
+            redirect('modules/billing/index.php');
+        }
+
+        $pdo = db();
+        $pdo->beginTransaction();
+
+        try {
+            $jobStmt = $pdo->prepare(
+                'SELECT jc.id, jc.job_number, jc.customer_id
+                 FROM job_cards jc
+                 WHERE jc.id = :job_id
+                   AND jc.company_id = :company_id
+                   AND jc.garage_id = :garage_id
+                   AND jc.status = "CLOSED"
+                   AND jc.status_code = "ACTIVE"
+                 LIMIT 1
+                 FOR UPDATE'
+            );
+            $jobStmt->execute([
+                'job_id' => $jobCardId,
+                'company_id' => $companyId,
+                'garage_id' => $garageId,
+            ]);
+            $jobRow = $jobStmt->fetch();
+            if (!$jobRow) {
+                throw new RuntimeException('Closed job card not found for customer update.');
+            }
+
+            if ((int) ($jobRow['customer_id'] ?? 0) !== $customerId) {
+                throw new RuntimeException('Selected customer does not match the closed job card.');
+            }
+
+            $customerLockStmt = $pdo->prepare(
+                'SELECT id
+                 FROM customers
+                 WHERE id = :customer_id
+                   AND company_id = :company_id
+                   AND (status_code IS NULL OR status_code <> "DELETED")
+                 LIMIT 1
+                 FOR UPDATE'
+            );
+            $customerLockStmt->execute([
+                'customer_id' => $customerId,
+                'company_id' => $companyId,
+            ]);
+            if (!$customerLockStmt->fetch()) {
+                throw new RuntimeException('Customer not found for update.');
+            }
+
+            $updateCustomerStmt = $pdo->prepare(
+                'UPDATE customers
+                 SET gstin = :gstin,
+                     address_line1 = :address_line1,
+                     address_line2 = :address_line2,
+                     city = :city,
+                     state = :state,
+                     pincode = :pincode
+                 WHERE id = :customer_id
+                   AND company_id = :company_id'
+            );
+            $updateCustomerStmt->execute([
+                'gstin' => $customerGstin !== '' ? $customerGstin : null,
+                'address_line1' => $customerAddressLine1 !== '' ? $customerAddressLine1 : null,
+                'address_line2' => $customerAddressLine2 !== '' ? $customerAddressLine2 : null,
+                'city' => $customerCity !== '' ? $customerCity : null,
+                'state' => $customerState,
+                'pincode' => $customerPincode !== '' ? $customerPincode : null,
+                'customer_id' => $customerId,
+                'company_id' => $companyId,
+            ]);
+
+            if (function_exists('add_customer_history')) {
+                add_customer_history($customerId, 'UPDATE', 'Customer details updated from billing draft invoice flow', [
+                    'job_card_id' => $jobCardId,
+                    'city' => $customerCity,
+                    'state' => $customerState,
+                    'pincode' => $customerPincode,
+                ]);
+            }
+
+            log_audit('billing', 'customer_update_for_draft_invoice', $customerId, 'Updated customer details while creating draft invoice.', [
+                'entity' => 'customer',
+                'source' => 'UI',
+                'metadata' => [
+                    'job_card_id' => $jobCardId,
+                    'customer_id' => $customerId,
+                    'state' => $customerState,
+                ],
+            ]);
+
+            $pdo->commit();
+            $customerUpdatedForDraftInvoice = true;
+
+            $_POST['job_card_id'] = (string) $jobCardId;
+            $_POST['due_date'] = $dueDate ?? '';
+            $_POST['discount_type'] = $discountType;
+            $_POST['discount_value'] = number_format($discountValue, 2, '.', '');
+            $_POST['notes'] = $notes;
+            $action = 'create_invoice';
+        } catch (Throwable $exception) {
+            $pdo->rollBack();
+            billing_store_customer_state_resolution_context($companyId, $garageId, $contextPayload);
+            flash_set('billing_error', $exception->getMessage(), 'danger');
+            redirect('modules/billing/index.php');
+        }
+    }
+
     if ($action === 'create_invoice' && $canCreate) {
         if (!has_permission('job.view')) {
             flash_set('billing_error', 'You do not have permission to bill against job cards.', 'danger');
@@ -167,6 +368,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $pdo = db();
         $pdo->beginTransaction();
 
+        $job = null;
         try {
             $jobStmt = $pdo->prepare(
                 'SELECT jc.id, jc.job_number, jc.customer_id, jc.vehicle_id, jc.status, jc.status_code, jc.closed_at,
@@ -612,13 +814,46 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $successMessage = $cancelledInvoice
                 ? 'Draft invoice regenerated from cancelled invoice: ' . $invoiceNumber
                 : 'Draft invoice created: ' . $invoiceNumber;
+            if ($customerUpdatedForDraftInvoice) {
+                $successMessage = 'Customer details saved. ' . $successMessage;
+            }
             if ((float) ($autoAdjustedAdvance['adjusted_total'] ?? 0) > 0.009) {
                 $successMessage .= ' | Advance auto-adjusted: ' . number_format((float) $autoAdjustedAdvance['adjusted_total'], 2);
             }
             flash_set('billing_success', $successMessage, 'success');
         } catch (Throwable $exception) {
             $pdo->rollBack();
-            flash_set('billing_error', $exception->getMessage(), 'danger');
+            $errorMessage = $exception->getMessage();
+            $jobRow = is_array($job) ? $job : null;
+            $garageStateMissing = $jobRow !== null
+                && billing_normalize_state((string) ($jobRow['garage_state'] ?? '')) === '';
+            $customerStateMissing = $jobRow !== null
+                && billing_normalize_state((string) ($jobRow['customer_state'] ?? '')) === '';
+
+            if ($errorMessage === $gstStateRequiredMessage && $jobRow !== null && !$garageStateMissing && $customerStateMissing) {
+                billing_store_customer_state_resolution_context($companyId, $garageId, [
+                    'job_card_id' => (int) ($jobRow['id'] ?? 0),
+                    'job_number' => (string) ($jobRow['job_number'] ?? ''),
+                    'customer_id' => (int) ($jobRow['customer_id'] ?? 0),
+                    'customer_name' => (string) ($jobRow['customer_name'] ?? ''),
+                    'customer_phone' => (string) ($jobRow['customer_phone'] ?? ''),
+                    'customer_gstin' => (string) ($jobRow['customer_gstin'] ?? ''),
+                    'customer_address_line1' => (string) ($jobRow['customer_address_line1'] ?? ''),
+                    'customer_address_line2' => (string) ($jobRow['customer_address_line2'] ?? ''),
+                    'customer_city' => (string) ($jobRow['customer_city'] ?? ''),
+                    'customer_state' => (string) ($jobRow['customer_state'] ?? ''),
+                    'customer_pincode' => (string) ($jobRow['customer_pincode'] ?? ''),
+                    'due_date' => $dueDate ?? '',
+                    'discount_type' => $discountType,
+                    'discount_value' => $discountValue,
+                    'notes' => $notes,
+                ]);
+                flash_set('billing_warning', 'Customer state is missing for this job card. Update customer details to continue billing.', 'warning');
+            } elseif ($errorMessage === $gstStateRequiredMessage && $garageStateMissing) {
+                flash_set('billing_error', 'Garage state is missing. Update garage profile before creating draft invoice.', 'danger');
+            } else {
+                flash_set('billing_error', $errorMessage, 'danger');
+            }
         }
 
         redirect('modules/billing/index.php');
@@ -1984,6 +2219,7 @@ $draftFormNotes = $isDraftFormEditMode ? (string) ($editDraftInvoice['notes'] ??
 $draftFormInvoiceDate = $isDraftFormEditMode
     ? (string) ($editDraftInvoice['invoice_date'] ?? date('Y-m-d'))
     : date('Y-m-d');
+$customerStateResolutionContext = billing_pull_customer_state_resolution_context($companyId, $garageId);
 
 $paymentRecentSelect = 'p.*, i.invoice_number, u.name AS received_by_name';
 $paymentRecentJoin = '';
@@ -2836,6 +3072,77 @@ require_once __DIR__ . '/../../includes/sidebar.php';
   </div>
 </main>
 
+<?php if ($customerStateResolutionContext !== null): ?>
+<div class="modal fade" id="customerStateResolutionModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-lg">
+    <div class="modal-content">
+      <form method="post">
+        <div class="modal-header bg-warning-subtle">
+          <h5 class="modal-title">Update Customer Details to Continue Billing</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+        </div>
+        <div class="modal-body">
+          <?= csrf_field(); ?>
+          <input type="hidden" name="_action" value="resolve_customer_state_and_create_invoice" />
+          <input type="hidden" name="job_card_id" value="<?= (int) ($customerStateResolutionContext['job_card_id'] ?? 0); ?>" />
+          <input type="hidden" name="job_number" value="<?= e((string) ($customerStateResolutionContext['job_number'] ?? '')); ?>" />
+          <input type="hidden" name="customer_id" value="<?= (int) ($customerStateResolutionContext['customer_id'] ?? 0); ?>" />
+          <input type="hidden" name="customer_name" value="<?= e((string) ($customerStateResolutionContext['customer_name'] ?? '')); ?>" />
+          <input type="hidden" name="customer_phone" value="<?= e((string) ($customerStateResolutionContext['customer_phone'] ?? '')); ?>" />
+          <input type="hidden" name="due_date" value="<?= e((string) ($customerStateResolutionContext['due_date'] ?? '')); ?>" />
+          <input type="hidden" name="discount_type" value="<?= e((string) ($customerStateResolutionContext['discount_type'] ?? 'AMOUNT')); ?>" />
+          <input type="hidden" name="discount_value" value="<?= e(number_format((float) ($customerStateResolutionContext['discount_value'] ?? 0), 2, '.', '')); ?>" />
+          <input type="hidden" name="notes" value="<?= e((string) ($customerStateResolutionContext['notes'] ?? '')); ?>" />
+
+          <div class="alert alert-warning">
+            Job <?= e((string) ($customerStateResolutionContext['job_number'] ?? '-')); ?> cannot be billed because customer state is missing for GST regime.
+          </div>
+
+          <div class="row g-3">
+            <div class="col-md-6">
+              <label class="form-label">Customer</label>
+              <input type="text" class="form-control" value="<?= e((string) ($customerStateResolutionContext['customer_name'] ?? '-')); ?>" readonly />
+            </div>
+            <div class="col-md-6">
+              <label class="form-label">Phone</label>
+              <input type="text" class="form-control" value="<?= e((string) ($customerStateResolutionContext['customer_phone'] ?? '-')); ?>" readonly />
+            </div>
+            <div class="col-md-4">
+              <label class="form-label">GSTIN</label>
+              <input type="text" name="customer_gstin" class="form-control" maxlength="15" value="<?= e((string) ($customerStateResolutionContext['customer_gstin'] ?? '')); ?>" />
+            </div>
+            <div class="col-md-4">
+              <label class="form-label">City</label>
+              <input type="text" name="customer_city" class="form-control" maxlength="80" value="<?= e((string) ($customerStateResolutionContext['customer_city'] ?? '')); ?>" />
+            </div>
+            <div class="col-md-4">
+              <label class="form-label">State <span class="text-danger">*</span></label>
+              <input type="text" name="customer_state" class="form-control" maxlength="80" required value="<?= e((string) ($customerStateResolutionContext['customer_state'] ?? '')); ?>" />
+            </div>
+            <div class="col-md-6">
+              <label class="form-label">Address Line 1</label>
+              <input type="text" name="customer_address_line1" class="form-control" maxlength="200" value="<?= e((string) ($customerStateResolutionContext['customer_address_line1'] ?? '')); ?>" />
+            </div>
+            <div class="col-md-4">
+              <label class="form-label">Address Line 2</label>
+              <input type="text" name="customer_address_line2" class="form-control" maxlength="200" value="<?= e((string) ($customerStateResolutionContext['customer_address_line2'] ?? '')); ?>" />
+            </div>
+            <div class="col-md-2">
+              <label class="form-label">Pincode</label>
+              <input type="text" name="customer_pincode" class="form-control" maxlength="10" value="<?= e((string) ($customerStateResolutionContext['customer_pincode'] ?? '')); ?>" />
+            </div>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Close</button>
+          <button type="submit" class="btn btn-primary">Save and Create Draft Invoice</button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+<?php endif; ?>
+
 <div class="modal fade" id="cancelInvoiceModal" tabindex="-1" aria-hidden="true">
   <div class="modal-dialog">
     <div class="modal-content">
@@ -2964,6 +3271,16 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         setValue('delete-advance-reason', '');
       }
     });
+
+    var customerStateModalElement = document.getElementById('customerStateResolutionModal');
+    if (customerStateModalElement) {
+      if (window.bootstrap && window.bootstrap.Modal) {
+        window.bootstrap.Modal.getOrCreateInstance(customerStateModalElement).show();
+      } else {
+        customerStateModalElement.classList.add('show');
+        customerStateModalElement.style.display = 'block';
+      }
+    }
   })();
 </script>
 

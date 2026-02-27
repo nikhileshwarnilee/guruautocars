@@ -1782,18 +1782,23 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 
     function syncIntakeFileInput() {
       if (!intakeImagesInput) {
-        return;
+        return false;
       }
       if (typeof DataTransfer === 'undefined') {
-        return;
+        return false;
       }
-      var transfer = new DataTransfer();
-      intakeImageRows.forEach(function (entry) {
-        if (entry && entry.file) {
-          transfer.items.add(entry.file);
-        }
-      });
-      intakeImagesInput.files = transfer.files;
+      try {
+        var transfer = new DataTransfer();
+        intakeImageRows.forEach(function (entry) {
+          if (entry && entry.file) {
+            transfer.items.add(entry.file);
+          }
+        });
+        intakeImagesInput.files = transfer.files;
+        return true;
+      } catch (error) {
+        return false;
+      }
     }
 
     function renderIntakeImagePreview() {
@@ -1871,8 +1876,9 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         });
       });
 
-      syncIntakeFileInput();
+      var synced = syncIntakeFileInput();
       renderIntakeImagePreview();
+      return synced;
     }
 
     function addCustomIntakeRow() {
@@ -1903,10 +1909,6 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         return false;
       }
       if (!jobForm) {
-        return false;
-      }
-      if (!jobForm.checkValidity()) {
-        jobForm.reportValidity();
         return false;
       }
       return true;
@@ -2194,8 +2196,10 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       }
       if (intakeImagesInput) {
         intakeImagesInput.addEventListener('change', function () {
-          addIntakeFiles(Array.prototype.slice.call(intakeImagesInput.files || []));
-          intakeImagesInput.value = '';
+          var synced = addIntakeFiles(Array.prototype.slice.call(intakeImagesInput.files || []));
+          if (synced) {
+            intakeImagesInput.value = '';
+          }
         });
       }
       if (intakeDropZone) {
@@ -2252,13 +2256,13 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         });
       }
 
-      if (confirmIntakeCreateBtn && submitCreateHidden) {
+      if (confirmIntakeCreateBtn) {
         confirmIntakeCreateBtn.addEventListener('click', function () {
           if (!validateIntakeBeforeSubmit()) {
             return;
           }
-          submitCreateHidden.classList.remove('d-none');
-          submitCreateHidden.click();
+          syncIntakeFileInput();
+          jobForm.submit();
         });
       }
     }

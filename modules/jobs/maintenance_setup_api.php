@@ -15,7 +15,7 @@ function maintenance_setup_can_manage(): bool
 
 function maintenance_setup_parse_vehicle_ids(mixed $value): array
 {
-    $vehicleIds = [];
+    $ids = [];
     if (is_array($value)) {
         $source = $value;
     } else {
@@ -27,13 +27,18 @@ function maintenance_setup_parse_vehicle_ids(mixed $value): array
     }
 
     foreach ($source as $rawId) {
-        $vehicleId = (int) $rawId;
-        if ($vehicleId > 0) {
-            $vehicleIds[$vehicleId] = true;
+        $id = (int) $rawId;
+        if ($id > 0) {
+            $ids[$id] = true;
         }
     }
 
-    return array_map('intval', array_keys($vehicleIds));
+    return array_map('intval', array_keys($ids));
+}
+
+function maintenance_setup_parse_variant_ids(mixed $value): array
+{
+    return maintenance_setup_parse_vehicle_ids($value);
 }
 
 function maintenance_setup_vis_catalog_ready(): bool
@@ -54,6 +59,51 @@ function maintenance_setup_parse_vehicle_csv(string $csv): array
     }
 
     return array_map('intval', array_keys($items));
+}
+
+function maintenance_setup_vehicle_ids_for_variants(int $companyId, array $variantIds): array
+{
+    if ($companyId <= 0 || !maintenance_setup_vis_catalog_ready()) {
+        return [];
+    }
+
+    $variantIds = array_values(array_unique(array_filter(array_map('intval', $variantIds), static fn (int $id): bool => $id > 0)));
+    if ($variantIds === []) {
+        return [];
+    }
+
+    $vehicleColumns = table_columns('vehicles');
+    $hasVariantId = in_array('variant_id', $vehicleColumns, true);
+    $hasVisVariantId = in_array('vis_variant_id', $vehicleColumns, true);
+    $hasVehicleVariants = $hasVariantId && table_columns('vehicle_variants') !== [];
+    if (!$hasVisVariantId && !$hasVehicleVariants) {
+        return [];
+    }
+
+    $variantLinkSql = $hasVisVariantId
+        ? ($hasVehicleVariants ? 'COALESCE(v.vis_variant_id, mvv.vis_variant_id)' : 'v.vis_variant_id')
+        : 'mvv.vis_variant_id';
+    $joinSql = $hasVehicleVariants
+        ? 'LEFT JOIN vehicle_variants mvv ON mvv.id = v.variant_id'
+        : '';
+    $placeholders = implode(',', array_fill(0, count($variantIds), '?'));
+
+    try {
+        $stmt = db()->prepare(
+            'SELECT v.id
+             FROM vehicles v
+             ' . $joinSql . '
+             WHERE v.company_id = ?
+               AND v.status_code <> "DELETED"
+               AND ' . $variantLinkSql . ' IN (' . $placeholders . ')'
+        );
+        $stmt->execute(array_merge([$companyId], $variantIds));
+        $rows = $stmt->fetchAll() ?: [];
+        $vehicleIds = array_map(static fn (array $row): int => (int) ($row['id'] ?? 0), $rows);
+        return array_values(array_unique(array_filter($vehicleIds, static fn (int $id): bool => $id > 0)));
+    } catch (Throwable $exception) {
+        return [];
+    }
 }
 
 function maintenance_setup_fetch_variant_rows(
@@ -85,18 +135,11 @@ function maintenance_setup_fetch_variant_rows(
     $safeQuery = mb_substr(trim($query), 0, 120);
 
     $where = [
-        'v.company_id = :company_id',
-        'v.status_code = "ACTIVE"',
         '(vv.status_code IS NULL OR TRIM(vv.status_code) = "" OR UPPER(TRIM(vv.status_code)) <> "DELETED")',
         '(vm.status_code IS NULL OR TRIM(vm.status_code) = "" OR UPPER(TRIM(vm.status_code)) <> "DELETED")',
         '(vb.status_code IS NULL OR TRIM(vb.status_code) = "" OR UPPER(TRIM(vb.status_code)) <> "DELETED")',
     ];
     $params = ['company_id' => $companyId];
-
-    if ($excludeVehicleId > 0) {
-        $where[] = 'v.id <> :exclude_vehicle_id';
-        $params['exclude_vehicle_id'] = $excludeVehicleId;
-    }
 
     if ($brandId > 0) {
         $where[] = 'vb.id = :brand_id';
@@ -116,9 +159,23 @@ function maintenance_setup_fetch_variant_rows(
         $params['query'] = '%' . $safeQuery . '%';
     }
 
-    $joinSql = $hasVehicleVariants
+    $vehicleVariantJoinSql = $hasVehicleVariants
         ? 'LEFT JOIN vehicle_variants mvv ON mvv.id = v.variant_id'
         : '';
+    $vehicleWhereSql = [
+        'v.company_id = :company_id',
+        'v.status_code = "ACTIVE"',
+    ];
+    if ($excludeVehicleId > 0) {
+        $vehicleWhereSql[] = 'v.id <> :exclude_vehicle_id';
+        $params['exclude_vehicle_id'] = $excludeVehicleId;
+    }
+
+    $vehicleMapSql =
+        'SELECT v.id AS vehicle_id, ' . $variantLinkSql . ' AS vis_variant_id
+         FROM vehicles v
+         ' . $vehicleVariantJoinSql . '
+         WHERE ' . implode(' AND ', $vehicleWhereSql);
 
     $stmt = db()->prepare(
         'SELECT vv.id AS vis_variant_id,
@@ -127,14 +184,13 @@ function maintenance_setup_fetch_variant_rows(
                 vb.brand_name,
                 vm.model_name,
                 vv.variant_name,
-                MIN(v.id) AS primary_vehicle_id,
-                COUNT(*) AS vehicle_count,
-                GROUP_CONCAT(v.id ORDER BY v.id ASC) AS vehicle_ids_csv
-         FROM vehicles v
-         ' . $joinSql . '
-         INNER JOIN vis_variants vv ON vv.id = ' . $variantLinkSql . '
+                MIN(vmap.vehicle_id) AS primary_vehicle_id,
+                COUNT(vmap.vehicle_id) AS vehicle_count,
+                GROUP_CONCAT(vmap.vehicle_id ORDER BY vmap.vehicle_id ASC) AS vehicle_ids_csv
+         FROM vis_variants vv
          INNER JOIN vis_models vm ON vm.id = vv.model_id
          INNER JOIN vis_brands vb ON vb.id = vm.brand_id
+         LEFT JOIN (' . $vehicleMapSql . ') vmap ON vmap.vis_variant_id = vv.id
          WHERE ' . implode(' AND ', $where) . '
          GROUP BY vv.id, vm.id, vb.id, vb.brand_name, vm.model_name, vv.variant_name
          ORDER BY vb.brand_name ASC, vm.model_name ASC, vv.variant_name ASC
@@ -153,15 +209,9 @@ function maintenance_setup_fetch_variant_rows(
         }
 
         $vehicleIds = maintenance_setup_parse_vehicle_csv((string) ($row['vehicle_ids_csv'] ?? ''));
-        if ($vehicleIds === []) {
-            continue;
-        }
         $primaryVehicleId = (int) ($row['primary_vehicle_id'] ?? 0);
-        if ($primaryVehicleId <= 0) {
+        if ($primaryVehicleId <= 0 && $vehicleIds !== []) {
             $primaryVehicleId = (int) ($vehicleIds[0] ?? 0);
-        }
-        if ($primaryVehicleId <= 0) {
-            continue;
         }
 
         $brandName = trim((string) ($row['brand_name'] ?? ''));
@@ -187,7 +237,7 @@ function maintenance_setup_fetch_variant_rows(
             'variant' => $variantName,
             'variant_label' => $variantLabel,
             'label' => $label,
-            'vehicle_count' => max(1, (int) ($row['vehicle_count'] ?? count($vehicleIds))),
+            'vehicle_count' => max(0, (int) ($row['vehicle_count'] ?? count($vehicleIds))),
             'primary_vehicle_id' => $primaryVehicleId,
             'vehicle_ids' => $vehicleIds,
         ];
@@ -575,7 +625,12 @@ if ($method === 'GET') {
 
     if ($action === 'rules') {
         $vehicleId = get_int('vehicle_id');
-        if ($vehicleId <= 0) {
+        $variantId = get_int('variant_id');
+        if ($variantId <= 0 && $vehicleId > 0) {
+            $variantId = service_reminder_vehicle_vis_variant_id($companyId, $vehicleId);
+        }
+
+        if ($variantId <= 0 && $vehicleId <= 0) {
             http_response_code(422);
             echo json_encode([
                 'ok' => false,
@@ -585,15 +640,19 @@ if ($method === 'GET') {
         }
 
         try {
-            $rules = service_reminder_fetch_rule_grid($companyId, $vehicleId);
-            $existingRows = service_reminder_vehicle_rule_rows($companyId, $vehicleId, true);
-            $vehicleMeta = maintenance_setup_vehicle_meta($companyId, $vehicleId);
+            $rules = $vehicleId > 0
+                ? service_reminder_fetch_rule_grid($companyId, $vehicleId)
+                : service_reminder_fetch_rule_grid_for_variant($companyId, $variantId);
+            $vehicleRows = $vehicleId > 0 ? service_reminder_vehicle_rule_rows($companyId, $vehicleId, true) : [];
+            $variantRows = $variantId > 0 ? service_reminder_variant_rule_rows($companyId, $variantId, true) : [];
+            $vehicleMeta = $vehicleId > 0 ? maintenance_setup_vehicle_meta($companyId, $vehicleId) : null;
 
             echo json_encode([
                 'ok' => true,
                 'vehicle_id' => $vehicleId,
+                'variant_id' => $variantId,
                 'vehicle' => $vehicleMeta,
-                'has_existing_rules' => !empty($existingRows),
+                'has_existing_rules' => !empty($vehicleRows) || !empty($variantRows),
                 'rules' => $rules,
             ], JSON_UNESCAPED_UNICODE);
             exit;
@@ -601,7 +660,7 @@ if ($method === 'GET') {
             http_response_code(500);
             echo json_encode([
                 'ok' => false,
-                'message' => 'Unable to load vehicle maintenance rules.',
+                'message' => 'Unable to load maintenance rules.',
             ], JSON_UNESCAPED_UNICODE);
             exit;
         }
@@ -631,27 +690,142 @@ if ($method === 'POST') {
 
     if ($action === 'save_rules') {
         $vehicleIds = maintenance_setup_parse_vehicle_ids($_POST['vehicle_ids'] ?? []);
+        $variantIds = maintenance_setup_parse_variant_ids($_POST['variant_ids'] ?? []);
         $ruleRowsJson = trim((string) ($_POST['rule_rows_json'] ?? ''));
         $ruleRows = json_decode($ruleRowsJson, true);
         if (!is_array($ruleRows)) {
             $ruleRows = [];
         }
 
-        $result = service_reminder_save_rules_for_vehicles($companyId, $vehicleIds, $ruleRows, $actorUserId);
+        if ($vehicleIds === [] && $variantIds === []) {
+            http_response_code(422);
+            echo json_encode([
+                'ok' => false,
+                'message' => 'Select at least one variant first.',
+            ], JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+
+        $mappedVehicleIds = maintenance_setup_vehicle_ids_for_variants($companyId, $variantIds);
+        $targetVehicleIds = array_values(array_unique(array_merge($vehicleIds, $mappedVehicleIds)));
+
+        $variantResult = [
+            'ok' => true,
+            'variant_count' => 0,
+            'rule_count' => 0,
+            'saved_count' => 0,
+            'warnings' => [],
+        ];
+        if ($variantIds !== []) {
+            $variantResult = service_reminder_save_rules_for_variants($companyId, $variantIds, $ruleRows, $actorUserId);
+        }
+
+        $vehicleResult = [
+            'ok' => true,
+            'vehicle_count' => 0,
+            'rule_count' => 0,
+            'saved_count' => 0,
+            'warnings' => [],
+        ];
+        if ($targetVehicleIds !== []) {
+            $vehicleResult = service_reminder_save_rules_for_vehicles($companyId, $targetVehicleIds, $ruleRows, $actorUserId);
+        }
+
+        $warnings = array_merge(
+            (array) ($variantResult['warnings'] ?? []),
+            (array) ($vehicleResult['warnings'] ?? [])
+        );
+        $warnings = array_values(array_filter(array_map(static fn (mixed $warning): string => trim((string) $warning), $warnings), static fn (string $warning): bool => $warning !== ''));
+
+        $ok = ($variantIds === [] || (bool) ($variantResult['ok'] ?? false))
+            && ($targetVehicleIds === [] || (bool) ($vehicleResult['ok'] ?? false));
+
+        $result = [
+            'ok' => $ok,
+            'variant_result' => $variantResult,
+            'vehicle_result' => $vehicleResult,
+            'warnings' => $warnings,
+        ];
         echo json_encode([
             'ok' => (bool) ($result['ok'] ?? false),
             'result' => $result,
             'message' => (bool) ($result['ok'] ?? false)
-                ? 'Rules saved for selected vehicles.'
+                ? 'Rules saved for selected variants.'
                 : (string) ((array) ($result['warnings'] ?? []) !== [] ? implode(' ', (array) $result['warnings']) : 'Unable to save rules.'),
         ], JSON_UNESCAPED_UNICODE);
         exit;
     }
 
     if ($action === 'copy_rules') {
-        $sourceVehicleId = post_int('source_vehicle_id');
-        $targetVehicleIds = maintenance_setup_parse_vehicle_ids($_POST['target_vehicle_ids'] ?? []);
-        $result = service_reminder_copy_rules_between_vehicles($companyId, $sourceVehicleId, $targetVehicleIds, $actorUserId);
+        $legacySourceVehicleId = post_int('source_vehicle_id');
+        $sourceVariantId = post_int('source_variant_id');
+        if ($sourceVariantId <= 0) {
+            if ($legacySourceVehicleId > 0) {
+                $sourceVariantId = service_reminder_vehicle_vis_variant_id($companyId, $legacySourceVehicleId);
+            }
+        }
+        $targetVariantIds = maintenance_setup_parse_variant_ids($_POST['target_variant_ids'] ?? []);
+        $targetVehicleIdsInput = maintenance_setup_parse_vehicle_ids($_POST['target_vehicle_ids'] ?? []);
+
+        if ($targetVariantIds === [] && $legacySourceVehicleId > 0 && $targetVehicleIdsInput !== []) {
+            $legacyResult = service_reminder_copy_rules_between_vehicles($companyId, $legacySourceVehicleId, $targetVehicleIdsInput, $actorUserId);
+            echo json_encode([
+                'ok' => (bool) ($legacyResult['ok'] ?? false),
+                'result' => $legacyResult,
+                'message' => (bool) ($legacyResult['ok'] ?? false)
+                    ? 'Rules copied successfully.'
+                    : (string) ((array) ($legacyResult['warnings'] ?? []) !== [] ? implode(' ', (array) $legacyResult['warnings']) : 'Unable to copy rules.'),
+            ], JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+
+        $variantCopyResult = service_reminder_copy_rules_between_variants($companyId, $sourceVariantId, $targetVariantIds, $actorUserId);
+        $mappedVehicleIds = maintenance_setup_vehicle_ids_for_variants($companyId, $targetVariantIds);
+        $targetVehicleIds = array_values(array_unique(array_merge($targetVehicleIdsInput, $mappedVehicleIds)));
+
+        $vehicleSyncResult = [
+            'ok' => true,
+            'vehicle_count' => 0,
+            'rule_count' => 0,
+            'saved_count' => 0,
+            'warnings' => [],
+        ];
+        if ((bool) ($variantCopyResult['ok'] ?? false) && $targetVehicleIds !== []) {
+            $sourceRows = service_reminder_variant_rule_rows($companyId, $sourceVariantId, true);
+            $ruleRows = [];
+            foreach ($sourceRows as $row) {
+                $itemType = service_reminder_normalize_type((string) ($row['item_type'] ?? ''));
+                $itemId = (int) ($row['item_id'] ?? 0);
+                if ($itemType === '' || $itemId <= 0) {
+                    continue;
+                }
+                $ruleRows[] = [
+                    'item_type' => $itemType,
+                    'item_id' => $itemId,
+                    'interval_km' => service_reminder_parse_positive_int($row['interval_km'] ?? null),
+                    'interval_days' => service_reminder_parse_positive_int($row['interval_days'] ?? null),
+                    'is_active' => (int) ($row['is_active'] ?? 0) === 1 && (string) ($row['status_code'] ?? 'ACTIVE') === 'ACTIVE',
+                ];
+            }
+            if ($ruleRows !== []) {
+                $vehicleSyncResult = service_reminder_save_rules_for_vehicles($companyId, $targetVehicleIds, $ruleRows, $actorUserId);
+            }
+        }
+
+        $warnings = array_merge(
+            (array) ($variantCopyResult['warnings'] ?? []),
+            (array) ($vehicleSyncResult['warnings'] ?? [])
+        );
+        $warnings = array_values(array_filter(array_map(static fn (mixed $warning): string => trim((string) $warning), $warnings), static fn (string $warning): bool => $warning !== ''));
+
+        $ok = (bool) ($variantCopyResult['ok'] ?? false)
+            && ($targetVehicleIds === [] || (bool) ($vehicleSyncResult['ok'] ?? false));
+        $result = [
+            'ok' => $ok,
+            'variant_result' => $variantCopyResult,
+            'vehicle_result' => $vehicleSyncResult,
+            'warnings' => $warnings,
+        ];
         echo json_encode([
             'ok' => (bool) ($result['ok'] ?? false),
             'result' => $result,
@@ -664,14 +838,60 @@ if ($method === 'POST') {
 
     if ($action === 'delete_rule') {
         $vehicleIds = maintenance_setup_parse_vehicle_ids($_POST['vehicle_ids'] ?? []);
+        $variantIds = maintenance_setup_parse_variant_ids($_POST['variant_ids'] ?? []);
         $itemType = strtoupper(trim((string) ($_POST['item_type'] ?? '')));
         $itemId = post_int('item_id');
-        $result = service_reminder_delete_rules_for_vehicles($companyId, $vehicleIds, $itemType, $itemId, $actorUserId);
+        if ($vehicleIds === [] && $variantIds === []) {
+            http_response_code(422);
+            echo json_encode([
+                'ok' => false,
+                'message' => 'Select target variants.',
+            ], JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+
+        $mappedVehicleIds = maintenance_setup_vehicle_ids_for_variants($companyId, $variantIds);
+        $targetVehicleIds = array_values(array_unique(array_merge($vehicleIds, $mappedVehicleIds)));
+
+        $variantResult = [
+            'ok' => true,
+            'deleted_count' => 0,
+            'warnings' => [],
+        ];
+        if ($variantIds !== []) {
+            $variantResult = service_reminder_delete_rules_for_variants($companyId, $variantIds, $itemType, $itemId, $actorUserId);
+        }
+
+        $vehicleResult = [
+            'ok' => true,
+            'deleted_count' => 0,
+            'warnings' => [],
+        ];
+        if ($targetVehicleIds !== []) {
+            $vehicleResult = service_reminder_delete_rules_for_vehicles($companyId, $targetVehicleIds, $itemType, $itemId, $actorUserId);
+        }
+
+        $warnings = array_merge(
+            (array) ($variantResult['warnings'] ?? []),
+            (array) ($vehicleResult['warnings'] ?? [])
+        );
+        $warnings = array_values(array_filter(array_map(static fn (mixed $warning): string => trim((string) $warning), $warnings), static fn (string $warning): bool => $warning !== ''));
+
+        $ok = ($variantIds === [] || (bool) ($variantResult['ok'] ?? false))
+            && ($targetVehicleIds === [] || (bool) ($vehicleResult['ok'] ?? false));
+
+        $result = [
+            'ok' => $ok,
+            'deleted_count' => (int) ($variantResult['deleted_count'] ?? 0) + (int) ($vehicleResult['deleted_count'] ?? 0),
+            'variant_result' => $variantResult,
+            'vehicle_result' => $vehicleResult,
+            'warnings' => $warnings,
+        ];
         echo json_encode([
             'ok' => (bool) ($result['ok'] ?? false),
             'result' => $result,
             'message' => (bool) ($result['ok'] ?? false)
-                ? 'Rule deleted for selected vehicles.'
+                ? 'Rule deleted for selected variants.'
                 : (string) ((array) ($result['warnings'] ?? []) !== [] ? implode(' ', (array) $result['warnings']) : 'Unable to delete rule.'),
         ], JSON_UNESCAPED_UNICODE);
         exit;

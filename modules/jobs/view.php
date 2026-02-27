@@ -457,18 +457,33 @@ function fetch_job_labor(int $jobId): array
     return $stmt->fetchAll();
 }
 
-function fetch_job_parts(int $jobId, int $garageId): array
+function fetch_job_parts(int $jobId, int $companyId, int $garageId): array
 {
     $stmt = db()->prepare(
-        'SELECT jp.*, p.part_name, p.part_sku, p.unit AS part_unit, COALESCE(gi.quantity, 0) AS stock_qty
+        'SELECT jp.*, p.part_name, p.part_sku, p.unit AS part_unit,
+                COALESCE(gi.quantity, 0) AS actual_stock_qty,
+                COALESCE(rsv.reserved_qty, 0) AS reserved_stock_qty,
+                (COALESCE(gi.quantity, 0) - COALESCE(rsv.reserved_qty, 0)) AS current_stock_qty,
+                (COALESCE(gi.quantity, 0) - COALESCE(rsv.reserved_qty, 0)) AS stock_qty
          FROM job_parts jp
          INNER JOIN parts p ON p.id = jp.part_id
          LEFT JOIN garage_inventory gi ON gi.part_id = jp.part_id AND gi.garage_id = :garage_id
+         LEFT JOIN (
+            SELECT jp2.part_id, SUM(jp2.quantity) AS reserved_qty
+            FROM job_parts jp2
+            INNER JOIN job_cards jc2 ON jc2.id = jp2.job_card_id
+            WHERE jc2.company_id = :company_id
+              AND jc2.garage_id = :garage_id
+              AND jc2.status_code = "ACTIVE"
+              AND UPPER(COALESCE(jc2.status, "OPEN")) NOT IN ("CLOSED", "CANCELLED")
+            GROUP BY jp2.part_id
+         ) rsv ON rsv.part_id = jp.part_id
          WHERE jp.job_card_id = :job_id
          ORDER BY jp.id DESC'
     );
     $stmt->execute([
         'job_id' => $jobId,
+        'company_id' => $companyId,
         'garage_id' => $garageId,
     ]);
     return $stmt->fetchAll();
@@ -514,9 +529,22 @@ function fetch_parts_master(int $companyId, int $garageId): array
 {
     $stmt = db()->prepare(
         'SELECT p.id, p.part_name, p.part_sku, p.unit, p.selling_price, p.gst_rate,
-                COALESCE(gi.quantity, 0) AS stock_qty
+                COALESCE(gi.quantity, 0) AS actual_stock_qty,
+                COALESCE(rsv.reserved_qty, 0) AS reserved_stock_qty,
+                (COALESCE(gi.quantity, 0) - COALESCE(rsv.reserved_qty, 0)) AS current_stock_qty,
+                (COALESCE(gi.quantity, 0) - COALESCE(rsv.reserved_qty, 0)) AS stock_qty
          FROM parts p
          LEFT JOIN garage_inventory gi ON gi.part_id = p.id AND gi.garage_id = :garage_id
+         LEFT JOIN (
+            SELECT jp.part_id, SUM(jp.quantity) AS reserved_qty
+            FROM job_parts jp
+            INNER JOIN job_cards jc ON jc.id = jp.job_card_id
+            WHERE jc.company_id = :company_id
+              AND jc.garage_id = :garage_id
+              AND jc.status_code = "ACTIVE"
+              AND UPPER(COALESCE(jc.status, "OPEN")) NOT IN ("CLOSED", "CANCELLED")
+            GROUP BY jp.part_id
+         ) rsv ON rsv.part_id = p.id
          WHERE p.company_id = :company_id
            AND p.status_code = "ACTIVE"
          ORDER BY p.part_name ASC'
@@ -1436,6 +1464,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if ($activeInvoice) {
                     throw new RuntimeException('Cancel the active invoice ' . (string) ($activeInvoice['invoice_number'] ?? ('#' . (int) ($activeInvoice['id'] ?? 0))) . ' before reopening this job.');
                 }
+
+                $reopenResult = job_reverse_inventory_on_reopen($jobId, $companyId, $garageId, $userId);
             } catch (Throwable $exception) {
                 flash_set('job_error', 'Unable to reopen job: ' . $exception->getMessage(), 'danger');
                 redirect('modules/jobs/view.php?id=' . $jobId);
@@ -1553,6 +1583,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $preview .= ' | +' . (count($inventoryWarnings) - 3) . ' more';
             }
             flash_set('job_warning', 'Job closed with stock warnings: ' . $preview, 'warning');
+        }
+        if ($isReopenFromClosed && !empty($reopenResult['warnings'])) {
+            $reopenWarnings = (array) $reopenResult['warnings'];
+            $preview = implode(' | ', array_slice($reopenWarnings, 0, 3));
+            if (count($reopenWarnings) > 3) {
+                $preview .= ' | +' . (count($reopenWarnings) - 3) . ' more';
+            }
+            flash_set('job_warning', 'Job reopened with stock reversal warnings: ' . $preview, 'warning');
         }
         if (!empty($reminderResult['warnings'])) {
             $preview = implode(' | ', array_slice((array) $reminderResult['warnings'], 0, 2));
@@ -2356,9 +2394,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         $partStmt = db()->prepare(
             'SELECT p.id, p.part_name, p.part_sku, p.unit, p.selling_price, p.gst_rate,
-                    COALESCE(gi.quantity, 0) AS stock_qty
+                    COALESCE(gi.quantity, 0) AS actual_stock_qty,
+                    COALESCE(rsv.reserved_qty, 0) AS reserved_stock_qty,
+                    (COALESCE(gi.quantity, 0) - COALESCE(rsv.reserved_qty, 0)) AS current_stock_qty,
+                    (COALESCE(gi.quantity, 0) - COALESCE(rsv.reserved_qty, 0)) AS stock_qty
              FROM parts p
              LEFT JOIN garage_inventory gi ON gi.part_id = p.id AND gi.garage_id = :garage_id
+             LEFT JOIN (
+                SELECT jp.part_id, SUM(jp.quantity) AS reserved_qty
+                FROM job_parts jp
+                INNER JOIN job_cards jc ON jc.id = jp.job_card_id
+                WHERE jc.company_id = :company_id
+                  AND jc.garage_id = :garage_id
+                  AND jc.status_code = "ACTIVE"
+                  AND UPPER(COALESCE(jc.status, "OPEN")) NOT IN ("CLOSED", "CANCELLED")
+                GROUP BY jp.part_id
+             ) rsv ON rsv.part_id = p.id
              WHERE p.id = :part_id
                AND p.company_id = :company_id
                AND p.status_code = "ACTIVE"
@@ -2395,7 +2446,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         $gstRate = max(0, min(100, $gstRate));
         $totalAmount = round($quantity * $unitPrice, 2);
-        $availableQty = (float) $part['stock_qty'];
+        $availableQty = (float) ($part['current_stock_qty'] ?? $part['stock_qty'] ?? 0);
 
         $insertStmt = db()->prepare(
             'INSERT INTO job_parts
@@ -2434,7 +2485,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         if ($availableQty < $quantity) {
             flash_set(
                 'job_warning',
-                'Stock warning: ' . (string) $part['part_name'] . ' requires ' . number_format($quantity, 2) . ' ' . $partUnit . ', available ' . number_format($availableQty, 2) . ' ' . $partUnit . '. Closing will still post stock.',
+                'Stock warning: ' . (string) $part['part_name'] . ' requires ' . number_format($quantity, 2) . ' ' . $partUnit . ', current available ' . number_format($availableQty, 2) . ' ' . $partUnit . '. Closing will still post stock.',
                 'warning'
             );
         }
@@ -2454,11 +2505,25 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
 
         $lineStmt = db()->prepare(
-            'SELECT jp.id, jp.part_id, p.part_name, p.unit AS part_unit, COALESCE(gi.quantity, 0) AS stock_qty
+            'SELECT jp.id, jp.part_id, jp.quantity, p.part_name, p.unit AS part_unit,
+                    COALESCE(gi.quantity, 0) AS actual_stock_qty,
+                    COALESCE(rsv.reserved_qty, 0) AS reserved_stock_qty,
+                    (COALESCE(gi.quantity, 0) - COALESCE(rsv.reserved_qty, 0)) AS current_stock_qty,
+                    (COALESCE(gi.quantity, 0) - COALESCE(rsv.reserved_qty, 0)) AS stock_qty
              FROM job_parts jp
              INNER JOIN job_cards jc ON jc.id = jp.job_card_id
              INNER JOIN parts p ON p.id = jp.part_id
              LEFT JOIN garage_inventory gi ON gi.part_id = jp.part_id AND gi.garage_id = :garage_id
+             LEFT JOIN (
+                SELECT jp2.part_id, SUM(jp2.quantity) AS reserved_qty
+                FROM job_parts jp2
+                INNER JOIN job_cards jc2 ON jc2.id = jp2.job_card_id
+                WHERE jc2.company_id = :company_id
+                  AND jc2.garage_id = :garage_id
+                  AND jc2.status_code = "ACTIVE"
+                  AND UPPER(COALESCE(jc2.status, "OPEN")) NOT IN ("CLOSED", "CANCELLED")
+                GROUP BY jp2.part_id
+             ) rsv ON rsv.part_id = jp.part_id
              WHERE jp.id = :line_id
                AND jp.job_card_id = :job_id
                AND jc.company_id = :company_id
@@ -2489,7 +2554,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         $gstRate = max(0, min(100, $gstRate));
         $totalAmount = round($quantity * $unitPrice, 2);
-        $availableQty = (float) $line['stock_qty'];
+        $currentAvailableQty = (float) ($line['current_stock_qty'] ?? $line['stock_qty'] ?? 0);
+        $existingLineQty = (float) ($line['quantity'] ?? 0);
+        $availableQty = $currentAvailableQty + $existingLineQty;
 
         $updateStmt = db()->prepare(
             'UPDATE job_parts
@@ -2531,7 +2598,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         if ($availableQty < $quantity) {
             flash_set(
                 'job_warning',
-                'Stock warning: ' . (string) $line['part_name'] . ' requires ' . number_format($quantity, 2) . ' ' . $partUnit . ', available ' . number_format($availableQty, 2) . ' ' . $partUnit . '. Closing will still post stock.',
+                'Stock warning: ' . (string) $line['part_name'] . ' requires ' . number_format($quantity, 2) . ' ' . $partUnit . ', current available ' . number_format($availableQty, 2) . ' ' . $partUnit . '. Closing will still post stock.',
                 'warning'
             );
         }
@@ -2634,7 +2701,7 @@ foreach ($servicesMaster as $serviceMasterRow) {
 }
 $partsMaster = fetch_parts_master($companyId, $garageId);
 $laborEntries = fetch_job_labor($jobId);
-$partEntries = fetch_job_parts($jobId, $garageId);
+$partEntries = fetch_job_parts($jobId, $companyId, $garageId);
 $historyEntries = fetch_job_history_timeline($jobId);
 $outsourceLineCount = 0;
 $outsourceCostTotal = 0.0;
@@ -3589,15 +3656,19 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                   <p class="text-muted small mb-0">No part suggestions.</p>
                 <?php else: ?>
                   <ul class="list-group mb-0">
-                    <?php foreach ($visPartSuggestions as $suggestion): ?>
-                      <?php $stockQty = (float) ($suggestion['stock_qty'] ?? 0); ?>
+                      <?php foreach ($visPartSuggestions as $suggestion): ?>
+                      <?php
+                        $currentStockQty = (float) ($suggestion['current_stock_qty'] ?? $suggestion['stock_qty'] ?? 0);
+                        $actualStockQty = (float) ($suggestion['actual_stock_qty'] ?? $currentStockQty);
+                      ?>
                       <li class="list-group-item d-flex justify-content-between align-items-center">
                         <div>
                           <div class="fw-semibold"><?= e((string) $suggestion['part_name']); ?> (<?= e((string) $suggestion['part_sku']); ?>)</div>
                           <small class="text-muted">
                             Price: <?= e(format_currency((float) $suggestion['selling_price'])); ?> |
                             GST: <?= e((string) $suggestion['gst_rate']); ?>% |
-                            Stock: <span class="<?= $stockQty > 0 ? 'text-success' : 'text-danger'; ?>"><?= e(number_format($stockQty, 2)); ?></span>
+                            Current: <span class="<?= $currentStockQty > 0 ? 'text-success' : 'text-danger'; ?>"><?= e(number_format($currentStockQty, 2)); ?></span> |
+                            Actual: <?= e(number_format($actualStockQty, 2)); ?>
                           </small>
                         </div>
                         <?php if ($canEdit && !$jobLocked): ?>
@@ -3956,7 +4027,8 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                       <?php foreach ($partsMaster as $part): ?>
                         <?php
                           $partId = (int) ($part['id'] ?? 0);
-                          $partStockQty = (float) ($part['stock_qty'] ?? 0);
+                          $partCurrentStockQty = (float) ($part['current_stock_qty'] ?? $part['stock_qty'] ?? 0);
+                          $partActualStockQty = (float) ($part['actual_stock_qty'] ?? $partCurrentStockQty);
                           $partNameText = (string) ($part['part_name'] ?? '');
                           $partSkuText = (string) ($part['part_sku'] ?? '');
                           $partUnitCode = part_unit_normalize_code((string) ($part['unit'] ?? ''));
@@ -3971,16 +4043,18 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                           value="<?= $partId; ?>"
                           data-price="<?= e((string) $part['selling_price']); ?>"
                           data-gst="<?= e((string) $part['gst_rate']); ?>"
-                          data-stock="<?= e((string) $partStockQty); ?>"
+                          data-stock="<?= e((string) $partCurrentStockQty); ?>"
+                          data-current-stock="<?= e((string) $partCurrentStockQty); ?>"
+                          data-actual-stock="<?= e((string) $partActualStockQty); ?>"
                           data-unit="<?= e($partUnitCode); ?>"
                           data-unit-label="<?= e($partUnitLabel); ?>"
                           data-allow-decimal="<?= $partAllowsDecimal ? '1' : '0'; ?>"
                           data-name="<?= e($partNameText); ?>"
                           data-sku="<?= e($partSkuText); ?>"
                           data-vis-compatible="<?= $partVisCompatible ? '1' : '0'; ?>"
-                          data-in-stock="<?= $partStockQty > 0 ? '1' : '0'; ?>"
+                          data-in-stock="<?= $partCurrentStockQty > 0 ? '1' : '0'; ?>"
                         >
-                          <?= e($partNameText); ?> (<?= e($partSkuText); ?>) | Stock <?= e(number_format($partStockQty, 2)); ?> <?= e($partUnitCode); ?><?= $partVisCompatible ? ' | VIS' : ''; ?>
+                          <?= e($partNameText); ?> (<?= e($partSkuText); ?>) | Current <?= e(number_format($partCurrentStockQty, 2)); ?> <?= e($partUnitCode); ?> | Actual <?= e(number_format($partActualStockQty, 2)); ?> <?= e($partUnitCode); ?><?= $partVisCompatible ? ' | VIS' : ''; ?>
                         </option>
                       <?php endforeach; ?>
                     </select>
@@ -4015,7 +4089,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                     <th>Rate</th>
                     <th>GST%</th>
                     <th>Total</th>
-                    <th>Garage Stock</th>
+                    <th>Stock (Current / Actual)</th>
                     <th>Actions</th>
                   </tr>
                 </thead>
@@ -4026,13 +4100,14 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                     <?php foreach ($partEntries as $line): ?>
                       <?php
                         $lineQty = (float) $line['quantity'];
-                        $lineStock = (float) $line['stock_qty'];
+                        $lineCurrentStock = (float) ($line['current_stock_qty'] ?? $line['stock_qty'] ?? 0);
+                        $lineActualStock = (float) ($line['actual_stock_qty'] ?? $lineCurrentStock);
                         $lineUnitCode = part_unit_normalize_code((string) ($line['part_unit'] ?? ''));
                         if ($lineUnitCode === '') {
                             $lineUnitCode = 'PCS';
                         }
                         $lineAllowsDecimal = part_unit_allows_decimal($companyId, $lineUnitCode);
-                        $stockClass = $lineStock >= $lineQty ? 'text-success' : 'text-danger';
+                        $stockClass = $lineCurrentStock > 0 ? 'text-success' : 'text-danger';
                       ?>
                       <tr>
                         <td><?= e((string) $line['part_name']); ?> (<?= e((string) $line['part_sku']); ?>)</td>
@@ -4041,7 +4116,8 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                         <td><?= e(number_format((float) $line['gst_rate'], 2)); ?></td>
                         <td><?= e(format_currency((float) $line['total_amount'])); ?></td>
                         <td>
-                          <span class="<?= e($stockClass); ?>"><?= e(number_format($lineStock, 2)); ?> <?= e($lineUnitCode); ?></span>
+                          <span class="<?= e($stockClass); ?>"><?= e(number_format($lineCurrentStock, 2)); ?></span>
+                          <span class="text-muted"> / <?= e(number_format($lineActualStock, 2)); ?> <?= e($lineUnitCode); ?></span>
                         </td>
                         <td>
                           <?php if ($canEdit && !$jobLocked): ?>
@@ -4723,7 +4799,8 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 
       partPrice.value = selected.getAttribute('data-price') || partPrice.value;
       partGst.value = selected.getAttribute('data-gst') || partGst.value;
-      var stock = selected.getAttribute('data-stock') || '0';
+      var currentStock = selected.getAttribute('data-current-stock') || selected.getAttribute('data-stock') || '0';
+      var actualStock = selected.getAttribute('data-actual-stock') || currentStock;
       var unitCode = selected.getAttribute('data-unit') || 'PCS';
       var unitLabel = selected.getAttribute('data-unit-label') || unitCode;
       var allowDecimal = (selected.getAttribute('data-allow-decimal') || '1') === '1';
@@ -4741,7 +4818,9 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       }
       var visCompatible = (selected.getAttribute('data-vis-compatible') || '0') === '1';
       var unitRule = allowDecimal ? 'decimal quantity allowed' : 'whole quantity only';
-      partStockHint.textContent = 'Garage stock: ' + stock + ' ' + unitCode + ' (' + unitLabel + ') | ' + unitRule + ' | ' + (visCompatible ? 'VIS compatible' : 'Manual override part');
+      var reservedStock = readNumber(actualStock) - readNumber(currentStock);
+      var reservedText = reservedStock > 0.0001 ? (' | Reserved: ' + reservedStock.toFixed(2) + ' ' + unitCode) : '';
+      partStockHint.textContent = 'Available (Current): ' + currentStock + ' ' + unitCode + ' | Actual: ' + actualStock + ' ' + unitCode + ' (' + unitLabel + ')' + reservedText + ' | ' + unitRule + ' | ' + (visCompatible ? 'VIS compatible' : 'Manual override part');
     }
 
     function setPartMode(mode, focusSearch) {

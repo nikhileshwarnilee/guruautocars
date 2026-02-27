@@ -126,7 +126,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                 </tr>
               </thead>
               <tbody id="maintenance-rule-rows">
-                <tr><td colspan="6" class="text-center text-muted py-4">Select vehicles and load rules.</td></tr>
+                <tr><td colspan="6" class="text-center text-muted py-4">Select variants and load rules.</td></tr>
               </tbody>
             </table>
           </div>
@@ -173,6 +173,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       selectedVariantKeys: [],
       variantsByKey: {},
       primaryVehicleId: 0,
+      primaryVariantId: 0,
       primaryVariantKey: '',
       rules: []
     };
@@ -340,6 +341,24 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       return state.selectedVariantKeys.slice();
     }
 
+    function selectedVariantIds() {
+      var ids = [];
+      var seen = {};
+      selectedVariantKeys().forEach(function (variantKey) {
+        var row = state.variantsByKey[variantKey];
+        if (!row) {
+          return;
+        }
+        var visVariantId = Number(row.vis_variant_id || 0);
+        if (visVariantId <= 0 || seen[visVariantId]) {
+          return;
+        }
+        seen[visVariantId] = true;
+        ids.push(visVariantId);
+      });
+      return ids;
+    }
+
     function selectedVehicleIds() {
       var ids = [];
       var seen = {};
@@ -363,6 +382,19 @@ require_once __DIR__ . '/../../includes/sidebar.php';
     function selectedPrimaryVariantKey() {
       var keys = selectedVariantKeys();
       return keys.length > 0 ? keys[0] : '';
+    }
+
+    function selectedPrimaryVariantId() {
+      var variantKey = selectedPrimaryVariantKey();
+      if (variantKey === '') {
+        return 0;
+      }
+      var row = state.variantsByKey[variantKey];
+      if (!row) {
+        return 0;
+      }
+      var variantId = Number(row.vis_variant_id || 0);
+      return variantId > 0 ? variantId : 0;
     }
 
     function selectedPrimaryVehicleId() {
@@ -467,9 +499,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         if (primaryVehicleId <= 0 && vehicleIds.length > 0) {
           primaryVehicleId = Number(vehicleIds[0] || 0);
         }
-        if (vehicleIds.length === 0 || primaryVehicleId <= 0) {
-          return;
-        }
+        var hasVehicleMapping = vehicleIds.length > 0 && primaryVehicleId > 0;
 
         var brandName = String(item.brand || '').trim();
         var modelName = String(item.model || '').trim();
@@ -491,14 +521,19 @@ require_once __DIR__ . '/../../includes/sidebar.php';
           model: modelName,
           variant: variantName,
           label: variantLabel,
+          has_vehicle_mapping: hasVehicleMapping,
           primary_vehicle_id: primaryVehicleId,
           vehicle_ids: vehicleIds
         };
 
         var checked = selectedMap[variantKey] ? ' checked' : '';
+        var mappedNote = hasVehicleMapping
+          ? ''
+          : '<div class="small text-muted">No active vehicle mapped to this variant yet. You can still set rules.</div>';
         html += '<tr>';
         html += '<td><input type="checkbox" data-variant-key="' + escapeHtml(variantKey) + '"' + checked + '></td>';
         html += '<td><strong>' + escapeHtml(variantLabel) + '</strong>';
+        html += mappedNote;
         html += '</td>';
         html += '</tr>';
       });
@@ -569,23 +604,35 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       ruleRows.innerHTML = html !== '' ? html : '<tr><td colspan="6" class="text-center text-muted py-4">No reminder-enabled items available.</td></tr>';
     }
 
-    function loadRulesForSelection() {
+    function loadRulesForSelection(options) {
+      var opts = options && typeof options === 'object' ? options : {};
+      var preserveAlert = !!opts.preserveAlert;
       var primaryVariantKey = selectedPrimaryVariantKey();
+      var primaryVariantId = selectedPrimaryVariantId();
       var primaryVehicleId = selectedPrimaryVehicleId();
-      if (primaryVehicleId <= 0) {
+      if (primaryVariantId <= 0) {
         showAlert('warning', 'Select at least one vehicle variant first.');
-        return;
+        return Promise.resolve(false);
       }
 
-      showAlert('', '');
-      var query = encodeQuery({ action: 'rules', vehicle_id: primaryVehicleId });
-      getJson(apiUrl + '?' + query)
+      if (!preserveAlert) {
+        showAlert('', '');
+      }
+      var query = encodeQuery({
+        action: 'rules',
+        variant_id: primaryVariantId,
+        vehicle_id: primaryVehicleId > 0 ? primaryVehicleId : ''
+      });
+      return getJson(apiUrl + '?' + query)
         .then(function (response) {
           if (!response || !response.ok) {
-            showAlert('danger', response && response.message ? response.message : 'Unable to load rules.');
-            return;
+            if (!preserveAlert) {
+              showAlert('danger', response && response.message ? response.message : 'Unable to load rules.');
+            }
+            return false;
           }
-          state.primaryVehicleId = primaryVehicleId;
+          state.primaryVehicleId = Number(response.vehicle_id || primaryVehicleId || 0);
+          state.primaryVariantId = Number(response.variant_id || primaryVariantId || 0);
           state.primaryVariantKey = primaryVariantKey;
           if (workspace) {
             workspace.classList.remove('d-none');
@@ -605,10 +652,49 @@ require_once __DIR__ . '/../../includes/sidebar.php';
               loadCopySourceCandidates('');
             }
           }
+          return true;
         })
         .catch(function () {
-          showAlert('danger', 'Unable to load rules.');
+          if (!preserveAlert) {
+            showAlert('danger', 'Unable to load rules.');
+          }
+          return false;
         });
+    }
+
+    function saveSummaryMessage(response) {
+      var result = response && response.result ? response.result : null;
+      if (!result || typeof result !== 'object') {
+        return (response && response.message) ? String(response.message) : 'Rules saved.';
+      }
+
+      var details = [];
+      var variantResult = result.variant_result && typeof result.variant_result === 'object'
+        ? result.variant_result
+        : null;
+      var vehicleResult = result.vehicle_result && typeof result.vehicle_result === 'object'
+        ? result.vehicle_result
+        : null;
+
+      if (variantResult) {
+        var variantCount = Number(variantResult.variant_count || 0);
+        var variantSaved = Number(variantResult.saved_count || 0);
+        if (variantCount > 0 || variantSaved > 0) {
+          details.push('Variants: ' + variantCount + ', entries: ' + variantSaved);
+        }
+      }
+      if (vehicleResult) {
+        var vehicleCount = Number(vehicleResult.vehicle_count || 0);
+        var vehicleSaved = Number(vehicleResult.saved_count || 0);
+        if (vehicleCount > 0 || vehicleSaved > 0) {
+          details.push('Vehicles synced: ' + vehicleCount + ', entries: ' + vehicleSaved);
+        }
+      }
+
+      if (details.length > 0) {
+        return 'Rules saved. ' + details.join(' | ');
+      }
+      return (response && response.message) ? String(response.message) : 'Rules saved.';
     }
 
     function collectRuleRows() {
@@ -645,8 +731,9 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         showAlert('warning', 'You have view-only access.');
         return;
       }
+      var variantIds = selectedVariantIds();
       var vehicleIds = selectedVehicleIds();
-      if (vehicleIds.length === 0) {
+      if (variantIds.length === 0) {
         showAlert('warning', 'Select at least one vehicle variant.');
         return;
       }
@@ -657,6 +744,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       }
       postForm({
         action: 'save_rules',
+        variant_ids: variantIds,
         vehicle_ids: vehicleIds,
         rule_rows_json: JSON.stringify(rows)
       })
@@ -665,8 +753,9 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             showAlert('danger', response && response.message ? response.message : 'Unable to save rules.');
             return;
           }
-          showAlert('success', response.message || 'Rules saved.');
-          loadRulesForSelection();
+          var summary = saveSummaryMessage(response);
+          showAlert('success', summary);
+          loadRulesForSelection({ preserveAlert: true });
         })
         .catch(function () {
           showAlert('danger', 'Unable to save rules.');
@@ -677,6 +766,21 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       if (!copySource) {
         return;
       }
+      function applyCopySourceOptions(items) {
+        var options = ['<option value="">Select source variant</option>'];
+        (items || []).forEach(function (item) {
+          var id = Number(item.vis_variant_id || item.id || item.primary_vehicle_id || 0);
+          if (id <= 0 || (state.primaryVariantId > 0 && id === state.primaryVariantId)) {
+            return;
+          }
+          options.push('<option value="' + id + '">' + escapeHtml(item.label || ('Variant #' + id)) + '</option>');
+        });
+        copySource.innerHTML = options.join('');
+        if (typeof gacRefreshSearchableSelect === 'function') {
+          gacRefreshSearchableSelect(copySource);
+        }
+      }
+
       var query = encodeQuery({
         action: 'source_candidates',
         q: searchText || '',
@@ -685,21 +789,31 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       });
       getJson(apiUrl + '?' + query)
         .then(function (response) {
-          if (!response || !response.ok) {
-            return;
-          }
-          var options = ['<option value="">Select source variant</option>'];
-          (response.items || []).forEach(function (item) {
-            var id = Number(item.primary_vehicle_id || 0);
-            if (id <= 0) {
+          if (response && response.ok) {
+            var items = Array.isArray(response.items) ? response.items : [];
+            if (items.length > 0 || (searchText || '') !== '') {
+              applyCopySourceOptions(items);
               return;
             }
-            options.push('<option value="' + id + '">' + escapeHtml(item.label || ('Variant #' + id)) + '</option>');
+          }
+          var fallbackQuery = encodeQuery({
+            action: 'vehicles',
+            q: searchText || '',
+            limit: 120
           });
-          copySource.innerHTML = options.join('');
+          return getJson(apiUrl + '?' + fallbackQuery).then(function (fallbackResponse) {
+            if (!fallbackResponse || !fallbackResponse.ok) {
+              applyCopySourceOptions([]);
+              return;
+            }
+            applyCopySourceOptions(Array.isArray(fallbackResponse.items) ? fallbackResponse.items : []);
+          });
         })
         .catch(function () {
           copySource.innerHTML = '<option value="">Select source variant</option>';
+          if (typeof gacRefreshSearchableSelect === 'function') {
+            gacRefreshSearchableSelect(copySource);
+          }
         });
     }
 
@@ -708,20 +822,22 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         showAlert('warning', 'You have view-only access.');
         return;
       }
-      var sourceVehicleId = Number(copySource ? copySource.value : 0);
+      var sourceVariantId = Number(copySource ? copySource.value : 0);
+      var targetVariantIds = selectedVariantIds();
       var targetVehicleIds = selectedVehicleIds();
-      if (sourceVehicleId <= 0) {
+      if (sourceVariantId <= 0) {
         showAlert('warning', 'Select source variant to copy rules.');
         return;
       }
-      if (targetVehicleIds.length === 0) {
+      if (targetVariantIds.length === 0) {
         showAlert('warning', 'Select target variants.');
         return;
       }
 
       postForm({
         action: 'copy_rules',
-        source_vehicle_id: sourceVehicleId,
+        source_variant_id: sourceVariantId,
+        target_variant_ids: targetVariantIds,
         target_vehicle_ids: targetVehicleIds
       })
         .then(function (response) {
@@ -742,13 +858,15 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         showAlert('warning', 'You have view-only access.');
         return;
       }
+      var targetVariantIds = selectedVariantIds();
       var targetVehicleIds = selectedVehicleIds();
-      if (targetVehicleIds.length === 0) {
+      if (targetVariantIds.length === 0) {
         showAlert('warning', 'Select target variants.');
         return;
       }
       postForm({
         action: 'delete_rule',
+        variant_ids: targetVariantIds,
         vehicle_ids: targetVehicleIds,
         item_type: itemType,
         item_id: itemId

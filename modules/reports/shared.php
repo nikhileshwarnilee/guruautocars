@@ -121,19 +121,34 @@ function reports_build_scope_context(bool $includeVehicleFilters = false): array
     $fyLabel = (string) ($selectedFy['fy_label'] ?? '-');
     $fyStart = (string) ($selectedFy['start_date'] ?? date('Y-04-01'));
     $fyEnd = (string) ($selectedFy['end_date'] ?? date('Y-03-31', strtotime('+1 year')));
+    if (!date_filter_is_valid_iso($fyStart)) {
+        $fyStart = date('Y-04-01');
+    }
+    if (!date_filter_is_valid_iso($fyEnd)) {
+        $fyEnd = date('Y-03-31', strtotime('+1 year'));
+    }
+    if ($fyEnd < $fyStart) {
+        $fyEnd = $fyStart;
+    }
+
     $today = date('Y-m-d');
     $defaultToDate = $today <= $fyEnd ? $today : $fyEnd;
     if ($defaultToDate < $fyStart) {
         $defaultToDate = $fyStart;
     }
 
+    // Treat bare report URLs as a true reset of date-mode/session memory.
+    $hasExplicitDateRequest = isset($_GET['date_mode']) || isset($_GET['from']) || isset($_GET['to']);
+
     $dateFilter = date_filter_resolve_request([
         'company_id' => $companyId,
         'garage_id' => $selectedGarageId,
         'range_start' => $fyStart,
-        'range_end' => $defaultToDate,
+        'range_end' => $fyEnd,
         'yearly_start' => $fyStart,
         'session_namespace' => 'reports',
+        'ignore_session' => !$hasExplicitDateRequest,
+        'custom_default_to' => $defaultToDate,
         'request_mode' => $_GET['date_mode'] ?? null,
         'request_from' => $_GET['from'] ?? null,
         'request_to' => $_GET['to'] ?? null,
@@ -193,7 +208,7 @@ function reports_build_scope_context(bool $includeVehicleFilters = false): array
         'fy_start' => $fyStart,
         'fy_end' => $fyEnd,
         'date_range_start' => $fyStart,
-        'date_range_end' => $defaultToDate,
+        'date_range_end' => $fyEnd,
         'date_mode' => $dateMode,
         'default_date_mode' => $defaultDateMode,
         'date_mode_options' => date_filter_modes(),

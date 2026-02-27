@@ -883,7 +883,10 @@ function job_fetch_vis_suggestions(int $companyId, int $garageId, int $vehicleId
 
         $partsStmt = db()->prepare(
             'SELECT p.id AS part_id, p.part_name, p.part_sku, p.selling_price, p.gst_rate,
-                    COALESCE(gi.quantity, 0) AS stock_qty,
+                    COALESCE(gi.quantity, 0) AS actual_stock_qty,
+                    COALESCE(rsv.reserved_qty, 0) AS reserved_stock_qty,
+                    (COALESCE(gi.quantity, 0) - COALESCE(rsv.reserved_qty, 0)) AS current_stock_qty,
+                    (COALESCE(gi.quantity, 0) - COALESCE(rsv.reserved_qty, 0)) AS stock_qty,
                     vpc.compatibility_note
              FROM vis_part_compatibility vpc
              INNER JOIN parts p
@@ -893,6 +896,16 @@ function job_fetch_vis_suggestions(int $companyId, int $garageId, int $vehicleId
              LEFT JOIN garage_inventory gi
                ON gi.part_id = p.id
               AND gi.garage_id = :garage_id
+             LEFT JOIN (
+                SELECT jp.part_id, SUM(jp.quantity) AS reserved_qty
+                FROM job_parts jp
+                INNER JOIN job_cards jc ON jc.id = jp.job_card_id
+                WHERE jc.company_id = :company_id
+                  AND jc.garage_id = :garage_id
+                  AND jc.status_code = "ACTIVE"
+                  AND UPPER(COALESCE(jc.status, "OPEN")) NOT IN ("CLOSED", "CANCELLED")
+                GROUP BY jp.part_id
+             ) rsv ON rsv.part_id = p.id
              WHERE vpc.company_id = :company_id
                AND vpc.variant_id = :variant_id
                AND vpc.status_code = "ACTIVE"
@@ -946,7 +959,10 @@ function job_fetch_vis_parts_for_service(int $companyId, int $garageId, int $veh
 
         $partsStmt = db()->prepare(
             'SELECT DISTINCT p.id AS part_id, p.part_name, p.part_sku, p.selling_price, p.gst_rate,
-                    COALESCE(gi.quantity, 0) AS stock_qty,
+                    COALESCE(gi.quantity, 0) AS actual_stock_qty,
+                    COALESCE(rsv.reserved_qty, 0) AS reserved_stock_qty,
+                    (COALESCE(gi.quantity, 0) - COALESCE(rsv.reserved_qty, 0)) AS current_stock_qty,
+                    (COALESCE(gi.quantity, 0) - COALESCE(rsv.reserved_qty, 0)) AS stock_qty,
                     sm.is_required,
                     vpc.compatibility_note
              FROM vis_service_part_map sm
@@ -962,6 +978,16 @@ function job_fetch_vis_parts_for_service(int $companyId, int $garageId, int $veh
              LEFT JOIN garage_inventory gi
                ON gi.part_id = p.id
               AND gi.garage_id = :garage_id
+             LEFT JOIN (
+                SELECT jp.part_id, SUM(jp.quantity) AS reserved_qty
+                FROM job_parts jp
+                INNER JOIN job_cards jc ON jc.id = jp.job_card_id
+                WHERE jc.company_id = :company_id
+                  AND jc.garage_id = :garage_id
+                  AND jc.status_code = "ACTIVE"
+                  AND UPPER(COALESCE(jc.status, "OPEN")) NOT IN ("CLOSED", "CANCELLED")
+                GROUP BY jp.part_id
+             ) rsv ON rsv.part_id = p.id
              WHERE sm.company_id = :company_id
                AND sm.service_id = :service_id
                AND sm.status_code = "ACTIVE"
@@ -1103,6 +1129,28 @@ function service_reminder_feature_ready(bool $refresh = false): bool
         );
 
         db()->exec(
+            'CREATE TABLE IF NOT EXISTS vis_variant_maintenance_rules (
+                id INT UNSIGNED NOT NULL AUTO_INCREMENT,
+                company_id INT UNSIGNED NOT NULL,
+                vis_variant_id INT UNSIGNED NOT NULL,
+                item_type VARCHAR(20) NOT NULL,
+                item_id INT UNSIGNED NOT NULL,
+                interval_km INT UNSIGNED DEFAULT NULL,
+                interval_days INT UNSIGNED DEFAULT NULL,
+                is_active TINYINT(1) NOT NULL DEFAULT 1,
+                status_code VARCHAR(20) NOT NULL DEFAULT "ACTIVE",
+                created_by INT UNSIGNED DEFAULT NULL,
+                updated_by INT UNSIGNED DEFAULT NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP NULL DEFAULT NULL ON UPDATE CURRENT_TIMESTAMP,
+                PRIMARY KEY (id),
+                UNIQUE KEY uniq_variant_item_rule (company_id, vis_variant_id, item_type, item_id),
+                KEY idx_variant_maintenance_rule_scope (company_id, vis_variant_id, is_active, status_code),
+                KEY idx_variant_maintenance_rule_item (company_id, item_type, item_id, status_code)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci'
+        );
+
+        db()->exec(
             'CREATE TABLE IF NOT EXISTS vehicle_maintenance_reminders (
                 id INT UNSIGNED NOT NULL AUTO_INCREMENT,
                 company_id INT UNSIGNED NOT NULL,
@@ -1157,6 +1205,22 @@ function service_reminder_feature_ready(bool $refresh = false): bool
              WHERE (r.item_type = "SERVICE" AND s.id IS NULL)
                 OR (r.item_type = "PART" AND p.id IS NULL)'
         );
+        if (table_columns('vis_variants') !== []) {
+            db()->exec(
+                'DELETE r
+                 FROM vis_variant_maintenance_rules r
+                 LEFT JOIN vis_variants vv ON vv.id = r.vis_variant_id
+                 WHERE vv.id IS NULL OR (vv.status_code IS NOT NULL AND UPPER(TRIM(vv.status_code)) = "DELETED")'
+            );
+        }
+        db()->exec(
+            'DELETE r
+             FROM vis_variant_maintenance_rules r
+             LEFT JOIN services s ON r.item_type = "SERVICE" AND s.id = r.item_id AND s.company_id = r.company_id
+             LEFT JOIN parts p ON r.item_type = "PART" AND p.id = r.item_id AND p.company_id = r.company_id
+             WHERE (r.item_type = "SERVICE" AND s.id IS NULL)
+                OR (r.item_type = "PART" AND p.id IS NULL)'
+        );
         db()->exec(
             'DELETE mr
              FROM vehicle_maintenance_reminders mr
@@ -1197,6 +1261,7 @@ function service_reminder_feature_ready(bool $refresh = false): bool
     }
 
     $ready = service_reminder_table_exists('vehicle_maintenance_rules', true)
+        && service_reminder_table_exists('vis_variant_maintenance_rules', true)
         && service_reminder_table_exists('vehicle_maintenance_reminders', true)
         && in_array('enable_reminder', table_columns('services'), true)
         && in_array('enable_reminder', table_columns('parts'), true);
@@ -1356,6 +1421,101 @@ function service_reminder_item_lookup_map(int $companyId, bool $onlyReminderEnab
     return $lookup;
 }
 
+function service_reminder_vehicle_vis_variant_id(int $companyId, int $vehicleId): int
+{
+    if ($companyId <= 0 || $vehicleId <= 0 || !service_reminder_feature_ready()) {
+        return 0;
+    }
+
+    $vehicleColumns = table_columns('vehicles');
+    $hasVariantId = in_array('variant_id', $vehicleColumns, true);
+    $hasVisVariantId = in_array('vis_variant_id', $vehicleColumns, true);
+    $hasVehicleVariants = $hasVariantId && table_columns('vehicle_variants') !== [];
+    if (!$hasVisVariantId && !$hasVehicleVariants) {
+        return 0;
+    }
+
+    $variantLinkSql = $hasVisVariantId
+        ? ($hasVehicleVariants ? 'COALESCE(v.vis_variant_id, mvv.vis_variant_id)' : 'v.vis_variant_id')
+        : 'mvv.vis_variant_id';
+    $joinSql = $hasVehicleVariants
+        ? 'LEFT JOIN vehicle_variants mvv ON mvv.id = v.variant_id'
+        : '';
+
+    try {
+        $stmt = db()->prepare(
+            'SELECT ' . $variantLinkSql . ' AS vis_variant_id
+             FROM vehicles v
+             ' . $joinSql . '
+             WHERE v.company_id = :company_id
+               AND v.id = :vehicle_id
+               AND v.status_code <> "DELETED"
+             LIMIT 1'
+        );
+        $stmt->execute([
+            'company_id' => $companyId,
+            'vehicle_id' => $vehicleId,
+        ]);
+        return (int) ($stmt->fetchColumn() ?: 0);
+    } catch (Throwable $exception) {
+        return 0;
+    }
+}
+
+function service_reminder_variant_rule_rows(int $companyId, int $visVariantId, bool $includeInactive = false): array
+{
+    if ($companyId <= 0 || $visVariantId <= 0 || !service_reminder_feature_ready()) {
+        return [];
+    }
+
+    $statusFilterSql = $includeInactive
+        ? ' AND r.status_code <> "DELETED" '
+        : ' AND r.is_active = 1 AND r.status_code = "ACTIVE" ';
+
+    $stmt = db()->prepare(
+        'SELECT r.*,
+                CASE
+                  WHEN r.item_type = "SERVICE" THEN s.service_name
+                  WHEN r.item_type = "PART" THEN p.part_name
+                  ELSE NULL
+                END AS item_name,
+                CASE
+                  WHEN r.item_type = "SERVICE" THEN s.service_code
+                  WHEN r.item_type = "PART" THEN p.part_sku
+                  ELSE NULL
+                END AS item_code
+         FROM vis_variant_maintenance_rules r
+         LEFT JOIN services s ON r.item_type = "SERVICE" AND s.id = r.item_id AND s.company_id = r.company_id
+         LEFT JOIN parts p ON r.item_type = "PART" AND p.id = r.item_id AND p.company_id = r.company_id
+         WHERE r.company_id = :company_id
+           AND r.vis_variant_id = :vis_variant_id
+           ' . $statusFilterSql . '
+         ORDER BY r.item_type ASC, r.id ASC'
+    );
+    $stmt->execute([
+        'company_id' => $companyId,
+        'vis_variant_id' => $visVariantId,
+    ]);
+
+    return $stmt->fetchAll();
+}
+
+function service_reminder_rule_map_for_variant(int $companyId, int $visVariantId, bool $onlyActive = true): array
+{
+    $rows = service_reminder_variant_rule_rows($companyId, $visVariantId, !$onlyActive);
+    $map = [];
+    foreach ($rows as $row) {
+        $itemType = service_reminder_normalize_type((string) ($row['item_type'] ?? ''));
+        $itemId = (int) ($row['item_id'] ?? 0);
+        if ($itemType === '' || $itemId <= 0) {
+            continue;
+        }
+        $map[$itemType . ':' . $itemId] = $row;
+    }
+
+    return $map;
+}
+
 function service_reminder_vehicle_rule_rows(int $companyId, int $vehicleId, bool $includeInactive = false): array
 {
     if ($companyId <= 0 || $vehicleId <= 0 || !service_reminder_feature_ready()) {
@@ -1396,8 +1556,13 @@ function service_reminder_vehicle_rule_rows(int $companyId, int $vehicleId, bool
 
 function service_reminder_rule_map_for_vehicle(int $companyId, int $vehicleId, bool $onlyActive = true): array
 {
-    $rows = service_reminder_vehicle_rule_rows($companyId, $vehicleId, !$onlyActive);
     $map = [];
+    $visVariantId = service_reminder_vehicle_vis_variant_id($companyId, $vehicleId);
+    if ($visVariantId > 0) {
+        $map = service_reminder_rule_map_for_variant($companyId, $visVariantId, $onlyActive);
+    }
+
+    $rows = service_reminder_vehicle_rule_rows($companyId, $vehicleId, !$onlyActive);
     foreach ($rows as $row) {
         $itemType = service_reminder_normalize_type((string) ($row['item_type'] ?? ''));
         $itemId = (int) ($row['item_id'] ?? 0);
@@ -2482,6 +2647,84 @@ function service_reminder_fetch_rule_grid(int $companyId, int $vehicleId): array
     return $rows;
 }
 
+function service_reminder_fetch_rule_grid_for_variant(int $companyId, int $visVariantId): array
+{
+    if ($companyId <= 0 || $visVariantId <= 0 || !service_reminder_feature_ready()) {
+        return [];
+    }
+
+    $items = service_reminder_master_items($companyId, true);
+    $ruleMap = service_reminder_rule_map_for_variant($companyId, $visVariantId, false);
+    $rows = [];
+
+    foreach ($items as $item) {
+        $itemType = service_reminder_normalize_type((string) ($item['item_type'] ?? ''));
+        $itemId = (int) ($item['item_id'] ?? 0);
+        if ($itemType === '' || $itemId <= 0) {
+            continue;
+        }
+
+        $key = $itemType . ':' . $itemId;
+        $rule = is_array($ruleMap[$key] ?? null) ? (array) $ruleMap[$key] : null;
+        $rows[] = [
+            'rule_id' => (int) ($rule['id'] ?? 0),
+            'item_type' => $itemType,
+            'item_id' => $itemId,
+            'item_name' => (string) ($item['item_name'] ?? ''),
+            'item_code' => (string) ($item['item_code'] ?? ''),
+            'interval_km' => service_reminder_parse_positive_int($rule['interval_km'] ?? null),
+            'interval_days' => service_reminder_parse_positive_int($rule['interval_days'] ?? null),
+            'is_active' => $rule !== null ? ((int) ($rule['is_active'] ?? 0) === 1 && (string) ($rule['status_code'] ?? 'ACTIVE') === 'ACTIVE') : false,
+            'status_code' => (string) ($rule['status_code'] ?? 'ACTIVE'),
+        ];
+    }
+
+    return $rows;
+}
+
+function service_reminder_normalize_rule_rows(int $companyId, array $ruleRows): array
+{
+    if ($companyId <= 0 || !service_reminder_feature_ready()) {
+        return [];
+    }
+
+    $lookup = service_reminder_item_lookup_map($companyId, true);
+    $normalizedRules = [];
+    foreach ($ruleRows as $ruleRow) {
+        if (!is_array($ruleRow)) {
+            continue;
+        }
+
+        $itemType = service_reminder_normalize_type((string) ($ruleRow['item_type'] ?? ''));
+        $itemId = (int) ($ruleRow['item_id'] ?? 0);
+        if ($itemType === '' || $itemId <= 0) {
+            continue;
+        }
+
+        $ruleKey = $itemType . ':' . $itemId;
+        if (!isset($lookup[$ruleKey])) {
+            continue;
+        }
+
+        $intervalKm = service_reminder_parse_positive_int($ruleRow['interval_km'] ?? null);
+        $intervalDays = service_reminder_parse_positive_int($ruleRow['interval_days'] ?? null);
+        $isActive = !empty($ruleRow['is_active']);
+        if ($isActive && $intervalKm === null && $intervalDays === null) {
+            $isActive = false;
+        }
+
+        $normalizedRules[$ruleKey] = [
+            'item_type' => $itemType,
+            'item_id' => $itemId,
+            'interval_km' => $intervalKm,
+            'interval_days' => $intervalDays,
+            'is_active' => $isActive,
+        ];
+    }
+
+    return $normalizedRules;
+}
+
 function service_reminder_save_rules_for_vehicles(int $companyId, array $vehicleIds, array $ruleRows, int $actorUserId): array
 {
     $result = [
@@ -2526,39 +2769,7 @@ function service_reminder_save_rules_for_vehicles(int $companyId, array $vehicle
         return $result;
     }
 
-    $lookup = service_reminder_item_lookup_map($companyId, true);
-    $normalizedRules = [];
-    foreach ($ruleRows as $ruleRow) {
-        if (!is_array($ruleRow)) {
-            continue;
-        }
-
-        $itemType = service_reminder_normalize_type((string) ($ruleRow['item_type'] ?? ''));
-        $itemId = (int) ($ruleRow['item_id'] ?? 0);
-        if ($itemType === '' || $itemId <= 0) {
-            continue;
-        }
-
-        $ruleKey = $itemType . ':' . $itemId;
-        if (!isset($lookup[$ruleKey])) {
-            continue;
-        }
-
-        $intervalKm = service_reminder_parse_positive_int($ruleRow['interval_km'] ?? null);
-        $intervalDays = service_reminder_parse_positive_int($ruleRow['interval_days'] ?? null);
-        $isActive = !empty($ruleRow['is_active']);
-        if ($isActive && $intervalKm === null && $intervalDays === null) {
-            $isActive = false;
-        }
-
-        $normalizedRules[$ruleKey] = [
-            'item_type' => $itemType,
-            'item_id' => $itemId,
-            'interval_km' => $intervalKm,
-            'interval_days' => $intervalDays,
-            'is_active' => $isActive,
-        ];
-    }
+    $normalizedRules = service_reminder_normalize_rule_rows($companyId, $ruleRows);
 
     if ($normalizedRules === []) {
         $result['warnings'][] = 'No valid reminder rows provided.';
@@ -2610,6 +2821,110 @@ function service_reminder_save_rules_for_vehicles(int $companyId, array $vehicle
 
     $result['ok'] = true;
     $result['vehicle_count'] = count($validVehicleIds);
+    $result['rule_count'] = count($normalizedRules);
+    return $result;
+}
+
+function service_reminder_validate_variant_ids(int $companyId, array $variantIds): array
+{
+    if ($companyId <= 0 || !service_reminder_feature_ready()) {
+        return [];
+    }
+
+    $variantIds = array_values(array_unique(array_filter(array_map('intval', $variantIds), static fn (int $id): bool => $id > 0)));
+    if ($variantIds === []) {
+        return [];
+    }
+
+    try {
+        $placeholders = implode(',', array_fill(0, count($variantIds), '?'));
+        $stmt = db()->prepare(
+            'SELECT id
+             FROM vis_variants
+             WHERE id IN (' . $placeholders . ')
+               AND (status_code IS NULL OR TRIM(status_code) = "" OR UPPER(TRIM(status_code)) <> "DELETED")'
+        );
+        $stmt->execute($variantIds);
+        $rows = $stmt->fetchAll() ?: [];
+        $validIds = array_map(static fn (array $row): int => (int) ($row['id'] ?? 0), $rows);
+        return array_values(array_unique(array_filter($validIds, static fn (int $id): bool => $id > 0)));
+    } catch (Throwable $exception) {
+        return [];
+    }
+}
+
+function service_reminder_save_rules_for_variants(int $companyId, array $variantIds, array $ruleRows, int $actorUserId): array
+{
+    $result = [
+        'ok' => false,
+        'variant_count' => 0,
+        'rule_count' => 0,
+        'saved_count' => 0,
+        'warnings' => [],
+    ];
+
+    if ($companyId <= 0 || !service_reminder_feature_ready()) {
+        $result['warnings'][] = 'Reminder storage is not ready.';
+        return $result;
+    }
+
+    $validVariantIds = service_reminder_validate_variant_ids($companyId, $variantIds);
+    if ($validVariantIds === []) {
+        $result['warnings'][] = 'Select at least one valid variant.';
+        return $result;
+    }
+
+    $normalizedRules = service_reminder_normalize_rule_rows($companyId, $ruleRows);
+    if ($normalizedRules === []) {
+        $result['warnings'][] = 'No valid reminder rows provided.';
+        return $result;
+    }
+
+    $pdo = db();
+    $upsertStmt = $pdo->prepare(
+        'INSERT INTO vis_variant_maintenance_rules
+          (company_id, vis_variant_id, item_type, item_id, interval_km, interval_days, is_active, status_code, created_by, updated_by)
+         VALUES
+          (:company_id, :vis_variant_id, :item_type, :item_id, :interval_km, :interval_days, :is_active, :status_code, :created_by, :updated_by)
+         ON DUPLICATE KEY UPDATE
+          interval_km = VALUES(interval_km),
+          interval_days = VALUES(interval_days),
+          is_active = VALUES(is_active),
+          status_code = VALUES(status_code),
+          updated_by = VALUES(updated_by),
+          updated_at = NOW()'
+    );
+
+    $pdo->beginTransaction();
+    try {
+        foreach ($validVariantIds as $visVariantId) {
+            foreach ($normalizedRules as $rule) {
+                $upsertStmt->execute([
+                    'company_id' => $companyId,
+                    'vis_variant_id' => $visVariantId,
+                    'item_type' => (string) $rule['item_type'],
+                    'item_id' => (int) $rule['item_id'],
+                    'interval_km' => $rule['interval_km'],
+                    'interval_days' => $rule['interval_days'],
+                    'is_active' => !empty($rule['is_active']) ? 1 : 0,
+                    'status_code' => !empty($rule['is_active']) ? 'ACTIVE' : 'INACTIVE',
+                    'created_by' => $actorUserId > 0 ? $actorUserId : null,
+                    'updated_by' => $actorUserId > 0 ? $actorUserId : null,
+                ]);
+                $result['saved_count']++;
+            }
+        }
+        $pdo->commit();
+    } catch (Throwable $exception) {
+        if ($pdo->inTransaction()) {
+            $pdo->rollBack();
+        }
+        $result['warnings'][] = 'Unable to save variant rules: ' . $exception->getMessage();
+        return $result;
+    }
+
+    $result['ok'] = true;
+    $result['variant_count'] = count($validVariantIds);
     $result['rule_count'] = count($normalizedRules);
     return $result;
 }
@@ -2724,6 +3039,123 @@ function service_reminder_copy_rules_between_vehicles(
     return $result;
 }
 
+function service_reminder_delete_rules_for_variants(
+    int $companyId,
+    array $variantIds,
+    string $itemType,
+    int $itemId,
+    int $actorUserId
+): array {
+    $result = [
+        'ok' => false,
+        'deleted_count' => 0,
+        'warnings' => [],
+    ];
+
+    if ($companyId <= 0 || !service_reminder_feature_ready()) {
+        $result['warnings'][] = 'Reminder storage is not ready.';
+        return $result;
+    }
+
+    $normalizedType = service_reminder_normalize_type($itemType);
+    if ($normalizedType === '' || $itemId <= 0) {
+        $result['warnings'][] = 'Invalid item selected for delete.';
+        return $result;
+    }
+
+    $validVariantIds = service_reminder_validate_variant_ids($companyId, $variantIds);
+    if ($validVariantIds === []) {
+        $result['warnings'][] = 'No target variants selected.';
+        return $result;
+    }
+
+    try {
+        $placeholders = implode(',', array_fill(0, count($validVariantIds), '?'));
+        $sql =
+            'UPDATE vis_variant_maintenance_rules
+             SET is_active = 0,
+                 status_code = "DELETED",
+                 updated_by = ?
+             WHERE company_id = ?
+               AND item_type = ?
+               AND item_id = ?
+               AND vis_variant_id IN (' . $placeholders . ')';
+        $stmt = db()->prepare($sql);
+        $stmt->execute(
+            array_merge(
+                [$actorUserId > 0 ? $actorUserId : null, $companyId, $normalizedType, $itemId],
+                $validVariantIds
+            )
+        );
+        $result['ok'] = true;
+        $result['deleted_count'] = $stmt->rowCount();
+    } catch (Throwable $exception) {
+        $result['warnings'][] = 'Unable to delete variant rules: ' . $exception->getMessage();
+    }
+
+    return $result;
+}
+
+function service_reminder_copy_rules_between_variants(
+    int $companyId,
+    int $sourceVariantId,
+    array $targetVariantIds,
+    int $actorUserId
+): array {
+    $result = [
+        'ok' => false,
+        'copied_count' => 0,
+        'warnings' => [],
+    ];
+
+    if ($companyId <= 0 || $sourceVariantId <= 0 || !service_reminder_feature_ready()) {
+        $result['warnings'][] = 'Invalid copy request.';
+        return $result;
+    }
+
+    $validSourceIds = service_reminder_validate_variant_ids($companyId, [$sourceVariantId]);
+    if ($validSourceIds === []) {
+        $result['warnings'][] = 'Selected source variant is invalid.';
+        return $result;
+    }
+    $sourceVariantId = (int) $validSourceIds[0];
+
+    $targetVariantIds = service_reminder_validate_variant_ids($companyId, $targetVariantIds);
+    $targetVariantIds = array_values(array_filter($targetVariantIds, static fn (int $id): bool => $id !== $sourceVariantId));
+    if ($targetVariantIds === []) {
+        $result['warnings'][] = 'Select at least one target variant.';
+        return $result;
+    }
+
+    $sourceRows = service_reminder_variant_rule_rows($companyId, $sourceVariantId, true);
+    $ruleRows = [];
+    foreach ($sourceRows as $row) {
+        $itemType = service_reminder_normalize_type((string) ($row['item_type'] ?? ''));
+        $itemId = (int) ($row['item_id'] ?? 0);
+        if ($itemType === '' || $itemId <= 0) {
+            continue;
+        }
+        $ruleRows[] = [
+            'item_type' => $itemType,
+            'item_id' => $itemId,
+            'interval_km' => service_reminder_parse_positive_int($row['interval_km'] ?? null),
+            'interval_days' => service_reminder_parse_positive_int($row['interval_days'] ?? null),
+            'is_active' => (int) ($row['is_active'] ?? 0) === 1 && (string) ($row['status_code'] ?? 'ACTIVE') === 'ACTIVE',
+        ];
+    }
+
+    if ($ruleRows === []) {
+        $result['warnings'][] = 'Selected source variant has no rules to copy.';
+        return $result;
+    }
+
+    $saveResult = service_reminder_save_rules_for_variants($companyId, $targetVariantIds, $ruleRows, $actorUserId);
+    $result['ok'] = (bool) ($saveResult['ok'] ?? false);
+    $result['copied_count'] = (int) ($saveResult['saved_count'] ?? 0);
+    $result['warnings'] = (array) ($saveResult['warnings'] ?? []);
+    return $result;
+}
+
 function service_reminder_due_recommendations_for_vehicle(int $companyId, int $garageId, int $vehicleId, int $limit = 12): array
 {
     $rows = service_reminder_fetch_active_by_vehicle($companyId, $vehicleId, $garageId, max(1, min(50, $limit * 3)));
@@ -2770,14 +3202,28 @@ function service_reminder_due_recommendations_for_vehicle(int $companyId, int $g
             $partIdList = array_keys($partIds);
             $placeholders = implode(',', array_fill(0, count($partIdList), '?'));
             $stmt = db()->prepare(
-                'SELECT p.id, p.part_name, p.unit AS part_unit, p.selling_price, p.gst_rate, COALESCE(gi.quantity, 0) AS stock_qty
+                'SELECT p.id, p.part_name, p.unit AS part_unit, p.selling_price, p.gst_rate,
+                        COALESCE(gi.quantity, 0) AS actual_stock_qty,
+                        COALESCE(rsv.reserved_qty, 0) AS reserved_stock_qty,
+                        (COALESCE(gi.quantity, 0) - COALESCE(rsv.reserved_qty, 0)) AS current_stock_qty,
+                        (COALESCE(gi.quantity, 0) - COALESCE(rsv.reserved_qty, 0)) AS stock_qty
                  FROM parts p
                  LEFT JOIN garage_inventory gi ON gi.part_id = p.id AND gi.garage_id = ?
+                 LEFT JOIN (
+                    SELECT jp.part_id, SUM(jp.quantity) AS reserved_qty
+                    FROM job_parts jp
+                    INNER JOIN job_cards jc ON jc.id = jp.job_card_id
+                    WHERE jc.company_id = ?
+                      AND jc.garage_id = ?
+                      AND jc.status_code = "ACTIVE"
+                      AND UPPER(COALESCE(jc.status, "OPEN")) NOT IN ("CLOSED", "CANCELLED")
+                    GROUP BY jp.part_id
+                 ) rsv ON rsv.part_id = p.id
                  WHERE p.company_id = ?
                    AND p.status_code = "ACTIVE"
                    AND p.id IN (' . $placeholders . ')'
             );
-            $stmt->execute(array_merge([$garageId, $companyId], $partIdList));
+            $stmt->execute(array_merge([$garageId, $companyId, $garageId, $companyId], $partIdList));
             foreach ($stmt->fetchAll() as $row) {
                 $partMeta[(int) ($row['id'] ?? 0)] = $row;
             }
@@ -2802,6 +3248,8 @@ function service_reminder_due_recommendations_for_vehicle(int $companyId, int $g
         $unitPrice = 0.0;
         $gstRate = 0.0;
         $stockQty = null;
+        $actualStockQty = null;
+        $currentStockQty = null;
         $partUnit = null;
         if ($itemType === 'SERVICE' && isset($serviceMeta[$itemId])) {
             $unitPrice = (float) ($serviceMeta[$itemId]['default_rate'] ?? 0);
@@ -2810,6 +3258,8 @@ function service_reminder_due_recommendations_for_vehicle(int $companyId, int $g
             $unitPrice = (float) ($partMeta[$itemId]['selling_price'] ?? 0);
             $gstRate = (float) ($partMeta[$itemId]['gst_rate'] ?? 0);
             $stockQty = (float) ($partMeta[$itemId]['stock_qty'] ?? 0);
+            $actualStockQty = (float) ($partMeta[$itemId]['actual_stock_qty'] ?? $stockQty);
+            $currentStockQty = (float) ($partMeta[$itemId]['current_stock_qty'] ?? $stockQty);
             $partUnit = part_unit_normalize_code((string) ($partMeta[$itemId]['part_unit'] ?? ''));
         }
 
@@ -2829,6 +3279,8 @@ function service_reminder_due_recommendations_for_vehicle(int $companyId, int $g
             'unit_price' => round($unitPrice, 2),
             'gst_rate' => round($gstRate, 2),
             'stock_qty' => $stockQty,
+            'actual_stock_qty' => $itemType === 'PART' ? $actualStockQty : null,
+            'current_stock_qty' => $itemType === 'PART' ? $currentStockQty : null,
             'part_unit' => $partUnit,
             'action_default' => in_array($dueState, ['OVERDUE', 'DUE'], true) ? 'add' : 'postpone',
         ];
@@ -2932,9 +3384,23 @@ function service_reminder_apply_job_creation_actions(
          LIMIT 1'
     );
     $partFetchStmt = $pdo->prepare(
-        'SELECT p.id, p.part_name, p.unit AS part_unit, p.selling_price, p.gst_rate, COALESCE(gi.quantity, 0) AS stock_qty
+        'SELECT p.id, p.part_name, p.unit AS part_unit, p.selling_price, p.gst_rate,
+                COALESCE(gi.quantity, 0) AS actual_stock_qty,
+                COALESCE(rsv.reserved_qty, 0) AS reserved_stock_qty,
+                (COALESCE(gi.quantity, 0) - COALESCE(rsv.reserved_qty, 0)) AS current_stock_qty,
+                (COALESCE(gi.quantity, 0) - COALESCE(rsv.reserved_qty, 0)) AS stock_qty
          FROM parts p
          LEFT JOIN garage_inventory gi ON gi.part_id = p.id AND gi.garage_id = :garage_id
+         LEFT JOIN (
+            SELECT jp.part_id, SUM(jp.quantity) AS reserved_qty
+            FROM job_parts jp
+            INNER JOIN job_cards jc ON jc.id = jp.job_card_id
+            WHERE jc.company_id = :company_id
+              AND jc.garage_id = :garage_id
+              AND jc.status_code = "ACTIVE"
+              AND UPPER(COALESCE(jc.status, "OPEN")) NOT IN ("CLOSED", "CANCELLED")
+            GROUP BY jp.part_id
+         ) rsv ON rsv.part_id = p.id
          WHERE p.id = :id
            AND p.company_id = :company_id
            AND p.status_code = "ACTIVE"

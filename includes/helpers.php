@@ -900,11 +900,17 @@ function date_filter_resolve_request(array $config): array
     $sessionKey = 'gac_date_filter_mode_' . $companyId . '_' . strtolower($sessionNamespace);
     $sessionFromKey = $sessionKey . '_from';
     $sessionToKey = $sessionKey . '_to';
+    $ignoreSession = !empty($config['ignore_session']);
+    if ($ignoreSession) {
+        unset($_SESSION[$sessionKey], $_SESSION[$sessionFromKey], $_SESSION[$sessionToKey]);
+    }
 
     $requestedModeRaw = isset($config['request_mode']) ? trim((string) $config['request_mode']) : '';
     $hasRequestedMode = $requestedModeRaw !== '';
     $requestedMode = date_filter_normalize_mode($requestedModeRaw, $systemDefaultMode);
-    $sessionMode = isset($_SESSION[$sessionKey]) ? date_filter_normalize_mode((string) $_SESSION[$sessionKey], $systemDefaultMode) : '';
+    $sessionMode = !$ignoreSession && isset($_SESSION[$sessionKey])
+        ? date_filter_normalize_mode((string) $_SESSION[$sessionKey], $systemDefaultMode)
+        : '';
     $resolvedMode = $hasRequestedMode
         ? $requestedMode
         : ($sessionMode !== '' ? $sessionMode : $systemDefaultMode);
@@ -922,10 +928,10 @@ function date_filter_resolve_request(array $config): array
     $requestedToRaw = isset($config['request_to']) ? trim((string) $config['request_to']) : '';
     $hasRequestedFrom = date_filter_is_valid_iso($requestedFromRaw);
     $hasRequestedTo = date_filter_is_valid_iso($requestedToRaw);
-    $sessionFrom = isset($_SESSION[$sessionFromKey]) && date_filter_is_valid_iso((string) $_SESSION[$sessionFromKey])
+    $sessionFrom = !$ignoreSession && isset($_SESSION[$sessionFromKey]) && date_filter_is_valid_iso((string) $_SESSION[$sessionFromKey])
         ? (string) $_SESSION[$sessionFromKey]
         : '';
-    $sessionTo = isset($_SESSION[$sessionToKey]) && date_filter_is_valid_iso((string) $_SESSION[$sessionToKey])
+    $sessionTo = !$ignoreSession && isset($_SESSION[$sessionToKey]) && date_filter_is_valid_iso((string) $_SESSION[$sessionToKey])
         ? (string) $_SESSION[$sessionToKey]
         : '';
     $useSessionCustomRange = $resolvedMode === 'custom' && !$hasRequestedFrom && !$hasRequestedTo && $sessionFrom !== '' && $sessionTo !== '';

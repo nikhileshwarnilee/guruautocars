@@ -56,7 +56,7 @@ function inv_parts_api_render_rows(array $parts, string $garageLabel): string
 
     if ($parts === []) {
         ?>
-        <tr><td colspan="12" class="text-center text-muted py-4">No parts found for selected filters.</td></tr>
+        <tr><td colspan="13" class="text-center text-muted py-4">No parts found for selected filters.</td></tr>
         <?php
         return (string) ob_get_clean();
     }
@@ -76,7 +76,8 @@ function inv_parts_api_render_rows(array $parts, string $garageLabel): string
           <td><?= e(format_currency((float) ($part['selling_price'] ?? 0))); ?></td>
           <td><?= e(number_format((float) ($part['gst_rate'] ?? 0), 2)); ?></td>
           <td><?= e(number_format((float) ($part['min_stock'] ?? 0), 2)); ?> <?= e((string) ($part['unit'] ?? '')); ?></td>
-          <td><?= e(number_format((float) ($part['stock_qty'] ?? 0), 2)); ?> <?= e((string) ($part['unit'] ?? '')); ?></td>
+          <td><?= e(number_format((float) ($part['actual_stock_qty'] ?? $part['stock_qty'] ?? 0), 2)); ?> <?= e((string) ($part['unit'] ?? '')); ?></td>
+          <td><?= e(number_format((float) ($part['current_stock_qty'] ?? $part['stock_qty'] ?? 0), 2)); ?> <?= e((string) ($part['unit'] ?? '')); ?></td>
           <td><span class="badge text-bg-<?= e($badgeClass); ?>"><?= e($label); ?></span></td>
           <td><?= e(inv_parts_api_format_datetime((string) ($part['last_movement_at'] ?? ''))); ?></td>
         </tr>
@@ -177,9 +178,13 @@ $whereParts = [
 $params = [
     'company_id' => $companyId,
     'inventory_garage_id' => $garageId,
+    'reserved_company_id' => $companyId,
+    'reserved_garage_id' => $garageId,
     'movement_company_id' => $companyId,
     'movement_garage_id' => $garageId,
 ];
+
+$currentStockExpr = '(COALESCE(gi.quantity, 0) - COALESCE(rsv.reserved_qty, 0))';
 
 if ($partName !== '') {
     $whereParts[] = '(
@@ -205,11 +210,11 @@ if ($vendorId > 0) {
 }
 
 if ($stockLevel === 'ZERO') {
-    $whereParts[] = 'COALESCE(gi.quantity, 0) <= 0';
+    $whereParts[] = $currentStockExpr . ' <= 0';
 } elseif ($stockLevel === 'LOW') {
-    $whereParts[] = 'COALESCE(gi.quantity, 0) > 0 AND COALESCE(gi.quantity, 0) <= p.min_stock';
+    $whereParts[] = $currentStockExpr . ' > 0 AND ' . $currentStockExpr . ' <= p.min_stock';
 } elseif ($stockLevel === 'AVAILABLE') {
-    $whereParts[] = 'COALESCE(gi.quantity, 0) > p.min_stock';
+    $whereParts[] = $currentStockExpr . ' > p.min_stock';
 }
 
 if ($lastMovementFrom !== '') {
@@ -224,8 +229,8 @@ if ($lastMovementTo !== '') {
 try {
     $stockStateExpr =
         'CASE
-            WHEN COALESCE(gi.quantity, 0) <= 0 THEN "OUT"
-            WHEN COALESCE(gi.quantity, 0) <= p.min_stock THEN "LOW"
+            WHEN ' . $currentStockExpr . ' <= 0 THEN "OUT"
+            WHEN ' . $currentStockExpr . ' <= p.min_stock THEN "LOW"
             ELSE "OK"
          END';
     $partsFromSql =
@@ -234,7 +239,17 @@ try {
          LEFT JOIN vendors v ON v.id = p.vendor_id
          LEFT JOIN garage_inventory gi
            ON gi.part_id = p.id
-          AND gi.garage_id = :inventory_garage_id
+           AND gi.garage_id = :inventory_garage_id
+         LEFT JOIN (
+            SELECT jp.part_id, SUM(jp.quantity) AS reserved_qty
+            FROM job_parts jp
+            INNER JOIN job_cards jc ON jc.id = jp.job_card_id
+            WHERE jc.company_id = :reserved_company_id
+              AND jc.garage_id = :reserved_garage_id
+              AND jc.status_code = "ACTIVE"
+              AND UPPER(COALESCE(jc.status, "OPEN")) NOT IN ("CLOSED", "CANCELLED")
+            GROUP BY jp.part_id
+         ) rsv ON rsv.part_id = p.id
          LEFT JOIN (
             SELECT part_id, garage_id, MAX(created_at) AS last_movement_at
             FROM inventory_movements
@@ -246,8 +261,8 @@ try {
 
     $statsSql =
         'SELECT COUNT(*) AS tracked_parts,
-                SUM(CASE WHEN COALESCE(gi.quantity, 0) <= 0 THEN 1 ELSE 0 END) AS out_of_stock_parts,
-                SUM(CASE WHEN COALESCE(gi.quantity, 0) > 0 AND COALESCE(gi.quantity, 0) <= p.min_stock THEN 1 ELSE 0 END) AS low_stock_parts
+                SUM(CASE WHEN ' . $currentStockExpr . ' <= 0 THEN 1 ELSE 0 END) AS out_of_stock_parts,
+                SUM(CASE WHEN ' . $currentStockExpr . ' > 0 AND ' . $currentStockExpr . ' <= p.min_stock THEN 1 ELSE 0 END) AS low_stock_parts
          ' . $partsFromSql;
     $statsStmt = db()->prepare($statsSql);
     $statsStmt->execute($params);
@@ -263,7 +278,10 @@ try {
         'SELECT p.id, p.part_name, p.part_sku, p.hsn_code, p.unit, p.selling_price, p.gst_rate, p.min_stock,
                 pc.category_name,
                 v.vendor_name,
-                COALESCE(gi.quantity, 0) AS stock_qty,
+                COALESCE(gi.quantity, 0) AS actual_stock_qty,
+                COALESCE(rsv.reserved_qty, 0) AS reserved_stock_qty,
+                ' . $currentStockExpr . ' AS current_stock_qty,
+                ' . $currentStockExpr . ' AS stock_qty,
                 lm.last_movement_at,
                 ' . $stockStateExpr . ' AS stock_state
          ' . $partsFromSql . '
