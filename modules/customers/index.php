@@ -11,6 +11,38 @@ $canManage = has_permission('customer.manage');
 $canVehicleManage = has_permission('vehicle.view') && has_permission('vehicle.manage');
 $companyId = active_company_id();
 
+function customer_master_valid_date(?string $value): bool
+{
+    $date = trim((string) $value);
+    if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $date)) {
+        return false;
+    }
+
+    [$year, $month, $day] = array_map('intval', explode('-', $date));
+    return checkdate($month, $day, $year);
+}
+
+function customer_master_fetch_row(int $companyId, int $customerId): ?array
+{
+    if ($companyId <= 0 || $customerId <= 0) {
+        return null;
+    }
+
+    $stmt = db()->prepare(
+        'SELECT *
+         FROM customers
+         WHERE id = :id
+           AND company_id = :company_id
+         LIMIT 1'
+    );
+    $stmt->execute([
+        'id' => $customerId,
+        'company_id' => $companyId,
+    ]);
+
+    return $stmt->fetch() ?: null;
+}
+
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     require_csrf();
 
@@ -229,6 +261,158 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         redirect('modules/customers/index.php');
     }
+
+    if ($action === 'set_opening_balance') {
+        $customerId = post_int('customer_id');
+        $openingType = strtoupper(trim((string) ($_POST['opening_type'] ?? 'RECEIVABLE')));
+        $openingAmount = ledger_round(max(0.0, (float) ($_POST['opening_amount'] ?? 0)));
+        $openingDate = trim((string) ($_POST['opening_date'] ?? date('Y-m-d')));
+        $openingNotes = post_string('opening_notes', 255);
+        $redirectUrl = 'modules/customers/index.php?financial_customer_id=' . $customerId . '&financial_action=opening#customer-financial-actions';
+
+        if ($customerId <= 0 || !in_array($openingType, ['RECEIVABLE', 'ADVANCE'], true) || !customer_master_valid_date($openingDate)) {
+            flash_set('customer_error', 'Invalid opening balance payload.', 'danger');
+            redirect($redirectUrl);
+        }
+
+        $customer = customer_master_fetch_row($companyId, $customerId);
+        if (!$customer) {
+            flash_set('customer_error', 'Customer not found for opening balance update.', 'danger');
+            redirect('modules/customers/index.php');
+        }
+        if (strtoupper(trim((string) ($customer['status_code'] ?? 'ACTIVE'))) === 'DELETED') {
+            flash_set('customer_error', 'Opening balance cannot be changed for deleted customers.', 'danger');
+            redirect('modules/customers/index.php');
+        }
+
+        $userId = (int) ($_SESSION['user_id'] ?? 0);
+        $pdo = db();
+        $pdo->beginTransaction();
+        try {
+            ledger_set_customer_opening_balance(
+                $pdo,
+                $companyId,
+                $customerId,
+                $openingAmount,
+                $openingType,
+                $openingDate,
+                active_garage_id(),
+                $userId > 0 ? $userId : null,
+                $openingNotes !== '' ? $openingNotes : null
+            );
+
+            add_customer_history($customerId, 'OPENING_BALANCE', 'Customer opening balance updated', [
+                'opening_type' => $openingType,
+                'opening_amount' => $openingAmount,
+                'opening_date' => $openingDate,
+            ]);
+            log_audit('customers', 'opening_balance', $customerId, 'Updated opening balance for customer ' . (string) ($customer['full_name'] ?? ('#' . $customerId)), [
+                'entity' => 'customer_opening_balance',
+                'source' => 'UI',
+                'metadata' => [
+                    'customer_id' => $customerId,
+                    'opening_type' => $openingType,
+                    'opening_amount' => $openingAmount,
+                    'opening_date' => $openingDate,
+                ],
+            ]);
+
+            $pdo->commit();
+            flash_set('customer_success', $openingAmount > 0.009 ? 'Opening balance saved successfully.' : 'Opening balance cleared successfully.', 'success');
+        } catch (Throwable $exception) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+            flash_set('customer_error', $exception->getMessage(), 'danger');
+        }
+
+        redirect($redirectUrl);
+    }
+
+    if ($action === 'record_balance_settlement') {
+        $customerId = post_int('customer_id');
+        $settlementDirection = strtoupper(trim((string) ($_POST['settlement_direction'] ?? 'COLLECT')));
+        $settlementAmount = ledger_round(max(0.0, (float) ($_POST['settlement_amount'] ?? 0)));
+        $settlementDate = trim((string) ($_POST['settlement_date'] ?? date('Y-m-d')));
+        $paymentMode = finance_normalize_payment_mode((string) ($_POST['payment_mode'] ?? 'CASH'));
+        $settlementNotes = post_string('settlement_notes', 255);
+        $redirectAction = strtolower($settlementDirection) === 'PAY' ? 'pay' : 'collect';
+        $redirectUrl = 'modules/customers/index.php?financial_customer_id=' . $customerId . '&financial_action=' . $redirectAction . '#customer-financial-actions';
+
+        if ($customerId <= 0 || !in_array($settlementDirection, ['COLLECT', 'PAY'], true) || !customer_master_valid_date($settlementDate) || $settlementAmount <= 0.0) {
+            flash_set('customer_error', 'Invalid settlement payload.', 'danger');
+            redirect($redirectUrl);
+        }
+
+        $customer = customer_master_fetch_row($companyId, $customerId);
+        if (!$customer) {
+            flash_set('customer_error', 'Customer not found for settlement.', 'danger');
+            redirect('modules/customers/index.php');
+        }
+        if (strtoupper(trim((string) ($customer['status_code'] ?? 'ACTIVE'))) === 'DELETED') {
+            flash_set('customer_error', 'Settlement cannot be recorded for deleted customers.', 'danger');
+            redirect('modules/customers/index.php');
+        }
+
+        $userId = (int) ($_SESSION['user_id'] ?? 0);
+        $pdo = db();
+        $pdo->beginTransaction();
+        try {
+            $currentBalance = ledger_customer_net_balance($pdo, $companyId, $customerId);
+            if ($settlementDirection === 'COLLECT' && $currentBalance <= 0.009) {
+                throw new RuntimeException('No receivable balance available to collect.');
+            }
+            if ($settlementDirection === 'PAY' && $currentBalance >= -0.009) {
+                throw new RuntimeException('No advance/payable balance available to pay.');
+            }
+
+            $maxSettlable = abs($currentBalance);
+            if ($settlementAmount > $maxSettlable + 0.01) {
+                throw new RuntimeException('Settlement amount exceeds available balance: ' . number_format($maxSettlable, 2));
+            }
+
+            ledger_post_customer_balance_settlement(
+                $pdo,
+                $companyId,
+                $customerId,
+                $settlementAmount,
+                $settlementDirection,
+                $settlementDate,
+                $paymentMode,
+                active_garage_id(),
+                $userId > 0 ? $userId : null,
+                $settlementNotes !== '' ? $settlementNotes : null
+            );
+
+            add_customer_history($customerId, 'BALANCE_SETTLEMENT', 'Customer balance settlement recorded', [
+                'direction' => $settlementDirection,
+                'amount' => $settlementAmount,
+                'payment_mode' => $paymentMode,
+                'settlement_date' => $settlementDate,
+            ]);
+            log_audit('customers', 'balance_settlement', $customerId, 'Recorded customer balance settlement for ' . (string) ($customer['full_name'] ?? ('#' . $customerId)), [
+                'entity' => 'customer_balance_settlement',
+                'source' => 'UI',
+                'metadata' => [
+                    'customer_id' => $customerId,
+                    'direction' => $settlementDirection,
+                    'amount' => $settlementAmount,
+                    'payment_mode' => $paymentMode,
+                    'settlement_date' => $settlementDate,
+                ],
+            ]);
+
+            $pdo->commit();
+            flash_set('customer_success', 'Customer balance settlement recorded.', 'success');
+        } catch (Throwable $exception) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+            flash_set('customer_error', $exception->getMessage(), 'danger');
+        }
+
+        redirect($redirectUrl);
+    }
 }
 
 $editId = get_int('edit_id');
@@ -289,6 +473,66 @@ if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $toDateFilter)) {
     $toDateFilter = '';
 }
 
+$ledgerReady = table_columns('ledger_entries') !== []
+    && table_columns('ledger_journals') !== []
+    && table_columns('chart_of_accounts') !== [];
+$customerLedgerBalanceExpr = $ledgerReady
+    ? '(SELECT COALESCE(SUM(le.debit_amount), 0) - COALESCE(SUM(le.credit_amount), 0)
+        FROM ledger_entries le
+        INNER JOIN ledger_journals lj ON lj.id = le.journal_id
+        INNER JOIN chart_of_accounts coa ON coa.id = le.account_id
+        WHERE lj.company_id = c.company_id
+          AND le.party_type = "CUSTOMER"
+          AND le.party_id = c.id
+          AND coa.code IN ("1200", "2300"))'
+    : '0';
+$financialCustomerId = get_int('financial_customer_id');
+$financialAction = strtolower(trim((string) ($_GET['financial_action'] ?? 'opening')));
+if (!in_array($financialAction, ['opening', 'collect', 'pay'], true)) {
+    $financialAction = 'opening';
+}
+$financialCustomer = $financialCustomerId > 0 ? customer_master_fetch_row($companyId, $financialCustomerId) : null;
+if (!$financialCustomer) {
+    $financialCustomerId = 0;
+}
+
+$selectedCustomerBalance = 0.0;
+$selectedCustomerLedgers = [];
+if ($ledgerReady && $financialCustomerId > 0) {
+    $selectedCustomerBalance = ledger_customer_net_balance(db(), $companyId, $financialCustomerId);
+    $ledgerStmt = db()->prepare(
+        'SELECT lj.id AS journal_id,
+                lj.journal_date,
+                lj.reference_type,
+                lj.reference_id,
+                lj.narration,
+                COALESCE(SUM(CASE
+                    WHEN coa.code IN ("1200", "2300")
+                     AND le.party_type = "CUSTOMER"
+                     AND le.party_id = :customer_id
+                    THEN le.debit_amount - le.credit_amount
+                    ELSE 0
+                END), 0) AS net_delta
+         FROM ledger_journals lj
+         INNER JOIN ledger_entries le ON le.journal_id = lj.id
+         INNER JOIN chart_of_accounts coa ON coa.id = le.account_id
+         WHERE lj.company_id = :company_id
+           AND (
+                (le.party_type = "CUSTOMER" AND le.party_id = :customer_id AND lj.reference_type IN ("CUSTOMER_OPENING_BALANCE", "CUSTOMER_OPENING_BALANCE_REV"))
+                OR
+                (le.party_type = "CUSTOMER" AND le.party_id = :customer_id AND lj.reference_type = "CUSTOMER_BALANCE_SETTLEMENT")
+           )
+         GROUP BY lj.id, lj.journal_date, lj.reference_type, lj.reference_id, lj.narration
+         ORDER BY lj.id DESC
+         LIMIT 12'
+    );
+    $ledgerStmt->execute([
+        'company_id' => $companyId,
+        'customer_id' => $financialCustomerId,
+    ]);
+    $selectedCustomerLedgers = $ledgerStmt->fetchAll();
+}
+
 $whereParts = ['c.company_id = :company_id'];
 $params = ['company_id' => $companyId];
 
@@ -307,7 +551,8 @@ if ($statusFilter === '') {
 $listSql =
     'SELECT c.*,
             (SELECT COUNT(*) FROM vehicles v WHERE v.customer_id = c.id AND v.status_code <> "DELETED") AS vehicle_count,
-            (SELECT COUNT(*) FROM customer_history h WHERE h.customer_id = c.id) AS history_count
+            (SELECT COUNT(*) FROM customer_history h WHERE h.customer_id = c.id) AS history_count,
+            ' . $customerLedgerBalanceExpr . ' AS ledger_balance
      FROM customers c
      WHERE ' . implode(' AND ', $whereParts) . '
      ORDER BY c.id DESC
@@ -530,19 +775,26 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                 <th>GSTIN</th>
                 <th>Vehicles</th>
                 <th>History</th>
+                <th>Ledger Balance</th>
                 <th>Status</th>
                 <th>Actions</th>
               </tr>
             </thead>
-            <tbody data-master-table-body="1" data-table-colspan="8">
+            <tbody data-master-table-body="1" data-table-colspan="9">
               <?php if (empty($customers)): ?>
-                <tr><td colspan="8" class="text-center text-muted py-4">No customers found.</td></tr>
+                <tr><td colspan="9" class="text-center text-muted py-4">No customers found.</td></tr>
               <?php else: ?>
                 <?php foreach ($customers as $customer): ?>
+                  <?php
+                    $customerId = (int) ($customer['id'] ?? 0);
+                    $customerLedgerBalance = ledger_round((float) ($customer['ledger_balance'] ?? 0));
+                    $isCustomerReceivable = $customerLedgerBalance > 0.009;
+                    $isCustomerAdvance = $customerLedgerBalance < -0.009;
+                  ?>
                   <tr>
-                    <td><?= (int) $customer['id']; ?></td>
+                    <td><?= $customerId; ?></td>
                     <td>
-                      <a href="<?= e(url('modules/customers/view.php?id=' . (int) $customer['id'])); ?>" class="fw-semibold text-decoration-none">
+                      <a href="<?= e(url('modules/customers/view.php?id=' . $customerId)); ?>" class="fw-semibold text-decoration-none">
                         <?= e((string) $customer['full_name']); ?>
                       </a><br>
                       <small class="text-muted"><?= e((string) (($customer['city'] ?? '-') . ', ' . ($customer['state'] ?? '-'))); ?></small>
@@ -551,20 +803,39 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                     <td><?= e((string) ($customer['gstin'] ?? '-')); ?></td>
                     <td><?= (int) $customer['vehicle_count']; ?></td>
                     <td><?= (int) $customer['history_count']; ?></td>
+                    <td>
+                      <div class="fw-semibold <?= $isCustomerReceivable ? 'text-danger' : ($isCustomerAdvance ? 'text-success' : 'text-muted'); ?>">
+                        <?= e(format_currency(abs($customerLedgerBalance))); ?>
+                      </div>
+                      <small class="text-muted">
+                        <?= $isCustomerReceivable ? 'Receivable' : ($isCustomerAdvance ? 'Advance' : 'Nil'); ?>
+                      </small>
+                    </td>
                     <td><span class="badge text-bg-<?= e(status_badge_class((string) $customer['status_code'])); ?>"><?= e(record_status_label((string) $customer['status_code'])); ?></span></td>
                     <td class="d-flex gap-1">
-                      <a class="btn btn-sm btn-outline-success" href="<?= e(url('modules/customers/view.php?id=' . (int) $customer['id'])); ?>">View</a>
-                      <a class="btn btn-sm btn-outline-info" href="<?= e(url('modules/customers/index.php?history_id=' . (int) $customer['id'])); ?>">History</a>
+                      <a class="btn btn-sm btn-outline-success" href="<?= e(url('modules/customers/view.php?id=' . $customerId)); ?>">View</a>
+                      <a class="btn btn-sm btn-outline-info" href="<?= e(url('modules/customers/index.php?history_id=' . $customerId)); ?>">History</a>
+                      <?php if ($canManage && $ledgerReady): ?>
+                        <a class="btn btn-sm btn-outline-secondary" href="<?= e(url('modules/reports/customer_ledger.php?customer_id=' . $customerId)); ?>">Ledger</a>
+                        <?php if ((string) ($customer['status_code'] ?? '') !== 'DELETED'): ?>
+                          <a class="btn btn-sm btn-outline-primary" href="<?= e(url('modules/customers/index.php?financial_customer_id=' . $customerId . '&financial_action=opening#customer-financial-actions')); ?>">Opening</a>
+                          <?php if ($isCustomerReceivable): ?>
+                            <a class="btn btn-sm btn-outline-success" href="<?= e(url('modules/customers/index.php?financial_customer_id=' . $customerId . '&financial_action=collect#customer-financial-actions')); ?>">Collect</a>
+                          <?php elseif ($isCustomerAdvance): ?>
+                            <a class="btn btn-sm btn-outline-warning" href="<?= e(url('modules/customers/index.php?financial_customer_id=' . $customerId . '&financial_action=pay#customer-financial-actions')); ?>">Pay</a>
+                          <?php endif; ?>
+                        <?php endif; ?>
+                      <?php endif; ?>
                       <?php if ($canVehicleManage && (string) $customer['status_code'] !== 'DELETED'): ?>
-                        <a class="btn btn-sm btn-outline-dark" href="<?= e(url('modules/vehicles/index.php?prefill_customer_id=' . (int) $customer['id'])); ?>">Add Vehicle</a>
+                        <a class="btn btn-sm btn-outline-dark" href="<?= e(url('modules/vehicles/index.php?prefill_customer_id=' . $customerId)); ?>">Add Vehicle</a>
                       <?php endif; ?>
                       <?php if ($canManage): ?>
-                        <a class="btn btn-sm btn-outline-primary" href="<?= e(url('modules/customers/index.php?edit_id=' . (int) $customer['id'])); ?>">Edit</a>
+                        <a class="btn btn-sm btn-outline-primary" href="<?= e(url('modules/customers/index.php?edit_id=' . $customerId)); ?>">Edit</a>
                         <?php if ((string) $customer['status_code'] !== 'DELETED'): ?>
                           <form method="post" class="d-inline" data-confirm="Change customer status?">
                             <?= csrf_field(); ?>
                             <input type="hidden" name="_action" value="change_status" />
-                            <input type="hidden" name="customer_id" value="<?= (int) $customer['id']; ?>" />
+                            <input type="hidden" name="customer_id" value="<?= $customerId; ?>" />
                             <input type="hidden" name="next_status" value="<?= e(((string) $customer['status_code'] === 'ACTIVE') ? 'INACTIVE' : 'ACTIVE'); ?>" />
                             <button type="submit" class="btn btn-sm btn-outline-secondary"><?= ((string) $customer['status_code'] === 'ACTIVE') ? 'Inactivate' : 'Activate'; ?></button>
                           </form>
@@ -573,10 +844,10 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                                 data-safe-delete-entity="customer"
                                 data-safe-delete-record-field="customer_id"
                                 data-safe-delete-operation="delete"
-                                data-safe-delete-reason-field="deletion_reason">
+                                    data-safe-delete-reason-field="deletion_reason">
                             <?= csrf_field(); ?>
                             <input type="hidden" name="_action" value="change_status" />
-                            <input type="hidden" name="customer_id" value="<?= (int) $customer['id']; ?>" />
+                            <input type="hidden" name="customer_id" value="<?= $customerId; ?>" />
                             <input type="hidden" name="next_status" value="DELETED" />
                             <button type="submit" class="btn btn-sm btn-outline-danger">Soft Delete</button>
                           </form>
@@ -590,6 +861,157 @@ require_once __DIR__ . '/../../includes/sidebar.php';
           </table>
         </div>
       </div>
+
+      <?php if ($canManage): ?>
+        <div class="card mt-3" id="customer-financial-actions">
+          <div class="card-header d-flex justify-content-between align-items-center">
+            <h3 class="card-title mb-0">Customer Opening Balance & Settlement</h3>
+            <?php if ($financialCustomerId > 0): ?>
+              <a class="btn btn-sm btn-outline-secondary" href="<?= e(url('modules/reports/customer_ledger.php?customer_id=' . $financialCustomerId)); ?>">Open Customer Ledger Report</a>
+            <?php endif; ?>
+          </div>
+          <div class="card-body">
+            <?php if (!$ledgerReady): ?>
+              <div class="alert alert-warning mb-0">Ledger tables are not ready. Opening balance and settlement actions are unavailable.</div>
+            <?php elseif ($financialCustomerId <= 0 || !$financialCustomer): ?>
+              <div class="alert alert-info mb-0">Select any customer row and click <strong>Opening</strong>, <strong>Collect</strong>, or <strong>Pay</strong> to manage opening balance and settlements.</div>
+            <?php else: ?>
+              <?php
+                $selectedCustomerName = (string) ($financialCustomer['full_name'] ?? ('Customer #' . $financialCustomerId));
+                $selectedBalanceAbs = abs($selectedCustomerBalance);
+                $selectedIsReceivable = $selectedCustomerBalance > 0.009;
+                $selectedIsAdvance = $selectedCustomerBalance < -0.009;
+                $openingTypeDefault = $selectedIsAdvance ? 'ADVANCE' : 'RECEIVABLE';
+                $settlementDirectionDefault = $financialAction === 'pay'
+                    ? 'PAY'
+                    : ($financialAction === 'collect' ? 'COLLECT' : ($selectedIsAdvance ? 'PAY' : 'COLLECT'));
+                $settlementBtnDisabled = $selectedBalanceAbs <= 0.009 ? 'disabled' : '';
+              ?>
+              <div class="row g-3 mb-3">
+                <div class="col-md-4">
+                  <div class="border rounded p-3 h-100">
+                    <div class="text-muted small mb-1">Customer</div>
+                    <div class="fw-semibold"><?= e($selectedCustomerName); ?> (#<?= (int) $financialCustomerId; ?>)</div>
+                    <div class="text-muted small mt-2">Current Net Balance</div>
+                    <div class="<?= $selectedIsReceivable ? 'text-danger' : ($selectedIsAdvance ? 'text-success' : 'text-muted'); ?>">
+                      <?= e(format_currency($selectedBalanceAbs)); ?>
+                      <small>(<?= $selectedIsReceivable ? 'Receivable' : ($selectedIsAdvance ? 'Advance' : 'Nil'); ?>)</small>
+                    </div>
+                  </div>
+                </div>
+                <div class="col-md-8">
+                  <div class="row g-3">
+                    <div class="col-lg-6">
+                      <form method="post" class="border rounded p-3 h-100">
+                        <?= csrf_field(); ?>
+                        <input type="hidden" name="_action" value="set_opening_balance" />
+                        <input type="hidden" name="customer_id" value="<?= (int) $financialCustomerId; ?>" />
+                        <h6 class="mb-3">Set Opening Balance</h6>
+                        <div class="row g-2">
+                          <div class="col-6">
+                            <label class="form-label">Type</label>
+                            <select name="opening_type" class="form-select" required>
+                              <option value="RECEIVABLE" <?= $openingTypeDefault === 'RECEIVABLE' ? 'selected' : ''; ?>>Receivable</option>
+                              <option value="ADVANCE" <?= $openingTypeDefault === 'ADVANCE' ? 'selected' : ''; ?>>Advance</option>
+                            </select>
+                          </div>
+                          <div class="col-6">
+                            <label class="form-label">Amount</label>
+                            <input type="number" name="opening_amount" class="form-control" min="0" step="0.01" value="<?= e(number_format($selectedBalanceAbs, 2, '.', '')); ?>" required>
+                          </div>
+                          <div class="col-6">
+                            <label class="form-label">Date</label>
+                            <input type="date" name="opening_date" class="form-control" value="<?= e(date('Y-m-d')); ?>" required>
+                          </div>
+                          <div class="col-6">
+                            <label class="form-label">Notes</label>
+                            <input type="text" name="opening_notes" class="form-control" maxlength="255" placeholder="Optional note">
+                          </div>
+                        </div>
+                        <div class="mt-3 d-flex gap-2">
+                          <button type="submit" class="btn btn-primary btn-sm">Save Opening</button>
+                        </div>
+                      </form>
+                    </div>
+                    <div class="col-lg-6">
+                      <form method="post" class="border rounded p-3 h-100">
+                        <?= csrf_field(); ?>
+                        <input type="hidden" name="_action" value="record_balance_settlement" />
+                        <input type="hidden" name="customer_id" value="<?= (int) $financialCustomerId; ?>" />
+                        <h6 class="mb-3">Settle Balance (Pay / Collect)</h6>
+                        <div class="row g-2">
+                          <div class="col-6">
+                            <label class="form-label">Direction</label>
+                            <select name="settlement_direction" class="form-select" required>
+                              <option value="COLLECT" <?= $settlementDirectionDefault === 'COLLECT' ? 'selected' : ''; ?>>Collect</option>
+                              <option value="PAY" <?= $settlementDirectionDefault === 'PAY' ? 'selected' : ''; ?>>Pay</option>
+                            </select>
+                          </div>
+                          <div class="col-6">
+                            <label class="form-label">Amount</label>
+                            <input type="number" name="settlement_amount" class="form-control" min="0.01" step="0.01" value="<?= e(number_format($selectedBalanceAbs, 2, '.', '')); ?>" required>
+                          </div>
+                          <div class="col-6">
+                            <label class="form-label">Date</label>
+                            <input type="date" name="settlement_date" class="form-control" value="<?= e(date('Y-m-d')); ?>" required>
+                          </div>
+                          <div class="col-6">
+                            <label class="form-label">Mode</label>
+                            <select name="payment_mode" class="form-select" required>
+                              <?php foreach (finance_payment_modes() as $mode): ?>
+                                <option value="<?= e($mode); ?>" <?= $mode === 'CASH' ? 'selected' : ''; ?>><?= e($mode); ?></option>
+                              <?php endforeach; ?>
+                            </select>
+                          </div>
+                          <div class="col-12">
+                            <label class="form-label">Notes</label>
+                            <input type="text" name="settlement_notes" class="form-control" maxlength="255" placeholder="Optional note">
+                          </div>
+                        </div>
+                        <div class="mt-3">
+                          <button type="submit" class="btn btn-success btn-sm" <?= $settlementBtnDisabled; ?>>Record Settlement</button>
+                        </div>
+                      </form>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="table-responsive">
+                <table class="table table-sm table-striped mb-0">
+                  <thead>
+                    <tr>
+                      <th>Journal #</th>
+                      <th>Date</th>
+                      <th>Reference Type</th>
+                      <th>Narration</th>
+                      <th class="text-end">Net Delta</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <?php if (empty($selectedCustomerLedgers)): ?>
+                      <tr><td colspan="5" class="text-center text-muted py-3">No opening/settlement ledger entries for this customer yet.</td></tr>
+                    <?php else: ?>
+                      <?php foreach ($selectedCustomerLedgers as $ledgerRow): ?>
+                        <?php $netDelta = ledger_round((float) ($ledgerRow['net_delta'] ?? 0)); ?>
+                        <tr>
+                          <td>#<?= (int) ($ledgerRow['journal_id'] ?? 0); ?></td>
+                          <td><?= e((string) ($ledgerRow['journal_date'] ?? '-')); ?></td>
+                          <td><?= e((string) ($ledgerRow['reference_type'] ?? '-')); ?></td>
+                          <td><?= e((string) ($ledgerRow['narration'] ?? '-')); ?></td>
+                          <td class="text-end <?= $netDelta > 0.009 ? 'text-danger' : ($netDelta < -0.009 ? 'text-success' : 'text-muted'); ?>">
+                            <?= e(number_format($netDelta, 2)); ?>
+                          </td>
+                        </tr>
+                      <?php endforeach; ?>
+                    <?php endif; ?>
+                  </tbody>
+                </table>
+              </div>
+            <?php endif; ?>
+          </div>
+        </div>
+      <?php endif; ?>
 
       <?php if ($historyCustomerId > 0): ?>
         <div class="card mt-3">

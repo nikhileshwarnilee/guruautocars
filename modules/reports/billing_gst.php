@@ -57,6 +57,7 @@ $salesSummary = [
     'avg_invoice_value' => 0.0,
     'collection_rate' => 0.0,
 ];
+$customerOpeningBalanceNet = 0.0;
 
 function sales_report_discount_meta_from_snapshot(array $snapshot): array
 {
@@ -174,6 +175,27 @@ if ($canViewFinancial) {
     }
     if ($salesSummary['revenue_total'] > 0.009) {
         $salesSummary['collection_rate'] = round(($salesSummary['collected_total'] / $salesSummary['revenue_total']) * 100, 2);
+    }
+
+    if (table_columns('ledger_entries') !== [] && table_columns('ledger_journals') !== [] && table_columns('chart_of_accounts') !== []) {
+        $openingParams = ['company_id' => $companyId, 'to_date' => $toDate];
+        $openingScopeSql = analytics_garage_scope_sql('le.garage_id', $selectedGarageId, $garageIds, $openingParams, 'sales_opening_scope');
+        $openingStmt = db()->prepare(
+            'SELECT COALESCE(SUM(le.debit_amount), 0) AS debit_total,
+                    COALESCE(SUM(le.credit_amount), 0) AS credit_total
+             FROM ledger_entries le
+             INNER JOIN ledger_journals lj ON lj.id = le.journal_id
+             INNER JOIN chart_of_accounts coa ON coa.id = le.account_id
+             WHERE lj.company_id = :company_id
+               AND le.party_type = "CUSTOMER"
+               AND coa.code IN ("1200", "2300")
+               AND lj.reference_type IN ("CUSTOMER_OPENING_BALANCE", "CUSTOMER_OPENING_BALANCE_REV", "CUSTOMER_BALANCE_SETTLEMENT")
+               AND lj.journal_date <= :to_date
+               ' . $openingScopeSql
+        );
+        $openingStmt->execute($openingParams);
+        $openingRow = $openingStmt->fetch() ?: ['debit_total' => 0, 'credit_total' => 0];
+        $customerOpeningBalanceNet = ledger_round((float) ($openingRow['debit_total'] ?? 0) - (float) ($openingRow['credit_total'] ?? 0));
     }
 
     $collectionMonthlyParams = ['company_id' => $companyId, 'from_date' => $fromDate, 'to_date' => $toDate];
@@ -648,6 +670,15 @@ require_once __DIR__ . '/../../includes/sidebar.php';
               <div class="info-box-content">
                 <span class="info-box-text">Payment Entries</span>
                 <span class="info-box-number"><?= number_format($totalPaymentEntries); ?></span>
+              </div>
+            </div>
+          </div>
+          <div class="col-md-3">
+            <div class="info-box">
+              <span class="info-box-icon text-bg-<?= $customerOpeningBalanceNet > 0.009 ? 'danger' : ($customerOpeningBalanceNet < -0.009 ? 'success' : 'secondary'); ?>"><i class="bi bi-journal-text"></i></span>
+              <div class="info-box-content">
+                <span class="info-box-text">Opening Net (Customer)</span>
+                <span class="info-box-number"><?= e(format_currency($customerOpeningBalanceNet)); ?></span>
               </div>
             </div>
           </div>

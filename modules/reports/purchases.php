@@ -177,6 +177,7 @@ $agingSummary = [
     'bucket_90_plus' => 0,
     'outstanding_total' => 0,
 ];
+$vendorOpeningBalanceNet = 0.0;
 if ($purchasePaymentsReady && $canViewVendorPayables) {
     $payableParams = ['company_id' => $companyId, 'from_date' => $fromDate, 'to_date' => $toDate];
     $payableScopeSql = analytics_garage_scope_sql('p.garage_id', $selectedGarageId, $garageIds, $payableParams, 'purchase_payable_scope');
@@ -240,6 +241,25 @@ if ($purchasePaymentsReady && $canViewVendorPayables) {
     );
     $agingStmt->execute($payableParams);
     $agingSummary = $agingStmt->fetch() ?: $agingSummary;
+
+    if (table_columns('ledger_entries') !== [] && table_columns('ledger_journals') !== [] && table_columns('chart_of_accounts') !== []) {
+        $openingParams = ['company_id' => $companyId, 'to_date' => $toDate];
+        $openingScopeSql = analytics_garage_scope_sql('le.garage_id', $selectedGarageId, $garageIds, $openingParams, 'purchase_opening_scope');
+        $openingStmt = db()->prepare(
+            'SELECT COALESCE(SUM(le.credit_amount), 0) - COALESCE(SUM(le.debit_amount), 0) AS net_total
+             FROM ledger_entries le
+             INNER JOIN ledger_journals lj ON lj.id = le.journal_id
+             INNER JOIN chart_of_accounts coa ON coa.id = le.account_id
+             WHERE lj.company_id = :company_id
+               AND le.party_type = "VENDOR"
+               AND coa.code = "2100"
+               AND lj.reference_type IN ("VENDOR_OPENING_BALANCE", "VENDOR_OPENING_BALANCE_REV", "VENDOR_BALANCE_SETTLEMENT")
+               AND lj.journal_date <= :to_date
+               ' . $openingScopeSql
+        );
+        $openingStmt->execute($openingParams);
+        $vendorOpeningBalanceNet = ledger_round((float) ($openingStmt->fetchColumn() ?? 0));
+    }
 }
 
 $exportKey = trim((string) ($_GET['export'] ?? ''));
@@ -415,6 +435,10 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       </div>
 
       <?php if ($purchasePaymentsReady && $canViewVendorPayables): ?>
+        <div class="alert alert-light border mb-3">
+          <strong>Vendor Opening Net (as of <?= e($toDate); ?>):</strong>
+          <?= e(format_currency($vendorOpeningBalanceNet)); ?>
+        </div>
         <div class="card mb-3">
           <div class="card-header d-flex justify-content-between align-items-center"><h3 class="card-title mb-0">Vendor Outstanding Summary</h3><?php if ($canExportData): ?><a href="<?= e(reports_export_url('modules/reports/purchases.php', $pageParams, 'vendor_outstanding')); ?>" class="btn btn-sm btn-outline-secondary">CSV</a><?php endif; ?></div>
           <div class="card-body table-responsive p-0">

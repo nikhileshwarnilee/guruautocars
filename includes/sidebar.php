@@ -16,6 +16,7 @@ $isSalesOpen = $activeMenu === 'billing'
     || $activeMenu === 'vehicles';
 $isFinanceOpen = is_menu_group_open('finance.', $activeMenu);
 $isVehicleIntelligenceOpen = $activeMenu === 'jobs.maintenance_setup'
+    || $activeMenu === 'jobs.checklist_master'
     || $activeMenu === 'inventory.parts_master'
     || $activeMenu === 'inventory.categories'
     || $activeMenu === 'inventory.units'
@@ -24,9 +25,7 @@ $isVehicleIntelligenceOpen = $activeMenu === 'jobs.maintenance_setup'
 $isReportsOpen = is_menu_group_open('reports', $activeMenu);
 $isUsersPermissionsOpen = is_menu_group_open('people.', $activeMenu);
 $isAdministrationOpen = is_menu_group_open('organization.', $activeMenu)
-    || is_menu_group_open('system.', $activeMenu)
-    || is_menu_group_open('billing.', $activeMenu)
-    || $activeMenu === 'jobs.settings';
+    || is_menu_group_open('system.', $activeMenu);
 $servicesMenuActive = ($activeMenu === 'services.master' || $activeMenu === 'services.categories') ? 'active' : '';
 $partsMenuActive = ($activeMenu === 'inventory.parts_master' || $activeMenu === 'inventory.categories' || $activeMenu === 'inventory.units') ? 'active' : '';
 $canViewReports = has_permission('reports.view') || has_permission('report.view');
@@ -40,7 +39,6 @@ $canViewAdministration = has_permission('company.manage')
     || has_permission('financial_year.view')
     || has_permission('settings.view')
     || has_permission('settings.manage')
-    || has_permission('invoice.manage')
     || has_permission('audit.view')
     || has_permission('export.data')
     || has_permission('backup.manage');
@@ -315,6 +313,14 @@ $sidebarBrandLinkClass = 'brand-link gac-sidebar-brand-link gac-sidebar-brand-li
                     <p>Vehicle Maintenance Setup</p>
                   </a>
                 </li>
+                <?php if (has_permission('job.manage') || has_permission('settings.manage')): ?>
+                  <li class="nav-item">
+                    <a href="<?= e(url('modules/jobs/checklist_master.php')); ?>" class="nav-link <?= e(is_active_menu('jobs.checklist_master', $activeMenu)); ?>">
+                      <i class="nav-icon bi bi-list-check"></i>
+                      <p>Intake Checklist Master</p>
+                    </a>
+                  </li>
+                <?php endif; ?>
               <?php endif; ?>
             </ul>
           </li>
@@ -406,6 +412,12 @@ $sidebarBrandLinkClass = 'brand-link gac-sidebar-brand-link gac-sidebar-brand-li
                 </a>
               </li>
               <?php if (has_permission('job.view') || has_permission('job.manage') || has_permission('reports.financial')): ?>
+                <li class="nav-item">
+                  <a href="<?= e(url('modules/reports/vehicle_intake_audit.php')); ?>" class="nav-link <?= e(is_active_menu('reports.vehicle_intake_audit', $activeMenu)); ?>">
+                    <i class="nav-icon bi bi-clipboard2-check"></i>
+                    <p>Vehicle Intake Audit</p>
+                  </a>
+                </li>
                 <li class="nav-item">
                   <a href="<?= e(url('modules/reports/insurance_claims.php')); ?>" class="nav-link <?= e(is_active_menu('reports.insurance_claims', $activeMenu)); ?>">
                     <i class="nav-icon bi bi-shield-check"></i>
@@ -538,22 +550,6 @@ $sidebarBrandLinkClass = 'brand-link gac-sidebar-brand-link gac-sidebar-brand-li
                   <a href="<?= e(url('modules/system/settings.php')); ?>" class="nav-link <?= e(is_active_menu('system.settings', $activeMenu)); ?>">
                     <i class="nav-icon bi bi-sliders"></i>
                     <p>Settings</p>
-                  </a>
-                </li>
-              <?php endif; ?>
-              <?php if ((has_permission('billing.view') || has_permission('invoice.view')) && (has_permission('invoice.manage') || has_permission('settings.manage'))): ?>
-                <li class="nav-item">
-                  <a href="<?= e(url('modules/billing/invoice_settings.php')); ?>" class="nav-link <?= e(is_active_menu('billing.settings', $activeMenu)); ?>">
-                    <i class="nav-icon bi bi-receipt"></i>
-                    <p>Invoice Settings</p>
-                  </a>
-                </li>
-              <?php endif; ?>
-              <?php if ((has_permission('job.view') || has_permission('job.manage') || has_permission('job.print') || has_permission('settings.manage')) && (has_permission('job.manage') || has_permission('settings.manage'))): ?>
-                <li class="nav-item">
-                  <a href="<?= e(url('modules/jobs/print_settings.php')); ?>" class="nav-link <?= e(is_active_menu('jobs.settings', $activeMenu)); ?>">
-                    <i class="nav-icon bi bi-card-checklist"></i>
-                    <p>Job Card Print Settings</p>
                   </a>
                 </li>
               <?php endif; ?>

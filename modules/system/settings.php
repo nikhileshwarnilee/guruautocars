@@ -8,7 +8,18 @@ require_permission('settings.view');
 $page_title = 'System Settings';
 $active_menu = 'system.settings';
 $canManage = has_permission('settings.manage');
+$canManageInvoicePrintSettings = has_permission('invoice.manage') || has_permission('settings.manage');
+$canManageJobCardPrintSettings = has_permission('job.manage') || has_permission('settings.manage');
+$canViewInvoicePrintSettings = has_permission('billing.view')
+    || has_permission('invoice.view')
+    || has_permission('invoice.manage')
+    || has_permission('settings.manage');
+$canViewJobCardPrintSettings = has_permission('job.view')
+    || has_permission('job.print')
+    || has_permission('job.manage')
+    || has_permission('settings.manage');
 $companyId = active_company_id();
+$garageId = active_garage_id();
 $actorUserId = (int) ($_SESSION['user_id'] ?? 0);
 $dateModeOptions = date_filter_modes();
 
@@ -67,6 +78,109 @@ function job_type_name_exists(array $jobTypesById, string $name, ?int $excludeId
     return false;
 }
 
+function system_settings_to_bool(mixed $value, bool $default = false): bool
+{
+    if (is_bool($value)) {
+        return $value;
+    }
+    if (is_int($value) || is_float($value)) {
+        return ((float) $value) > 0;
+    }
+    if (!is_string($value)) {
+        return $default;
+    }
+
+    $normalized = strtolower(trim($value));
+    if ($normalized === '') {
+        return $default;
+    }
+
+    if (in_array($normalized, ['1', 'true', 'yes', 'on', 'enabled'], true)) {
+        return true;
+    }
+    if (in_array($normalized, ['0', 'false', 'no', 'off', 'disabled'], true)) {
+        return false;
+    }
+
+    return $default;
+}
+
+function settings_invoice_print_default_settings(): array
+{
+    return [
+        'show_company_logo' => true,
+        'show_company_gstin' => true,
+        'show_customer_gstin' => true,
+        'show_recommendation_note' => true,
+        'show_next_service_reminders' => true,
+        'show_paid_outstanding' => true,
+        'show_advance_adjustment_history' => true,
+    ];
+}
+
+function settings_invoice_print_settings(int $companyId, int $garageId): array
+{
+    $defaults = settings_invoice_print_default_settings();
+    $rawValue = system_setting_get_value($companyId, $garageId, 'invoice_print_settings_json', null);
+    if ($rawValue === null || trim($rawValue) === '') {
+        return $defaults;
+    }
+
+    $decoded = json_decode($rawValue, true);
+    if (!is_array($decoded)) {
+        return $defaults;
+    }
+
+    $resolved = $defaults;
+    foreach ($defaults as $settingKey => $defaultValue) {
+        $resolved[$settingKey] = system_settings_to_bool($decoded[$settingKey] ?? null, (bool) $defaultValue);
+    }
+
+    return $resolved;
+}
+
+function settings_job_card_print_default_settings(): array
+{
+    return [
+        'show_company_logo' => true,
+        'show_company_gstin' => true,
+        'show_customer_gstin' => true,
+        'show_assigned_staff' => true,
+        'show_job_meta' => true,
+        'show_complaint' => true,
+        'show_diagnosis' => true,
+        'show_recommendation_note' => true,
+        'show_insurance_section' => true,
+        'show_labor_lines' => true,
+        'show_parts_lines' => true,
+        'show_next_service_reminders' => true,
+        'show_totals' => true,
+        'show_cancel_note' => true,
+        'show_costs_in_job_card_print' => true,
+    ];
+}
+
+function settings_job_card_print_settings(int $companyId, int $garageId): array
+{
+    $defaults = settings_job_card_print_default_settings();
+    $rawValue = system_setting_get_value($companyId, $garageId, 'job_card_print_settings_json', null);
+    if ($rawValue === null || trim($rawValue) === '') {
+        return $defaults;
+    }
+
+    $decoded = json_decode($rawValue, true);
+    if (!is_array($decoded)) {
+        return $defaults;
+    }
+
+    $resolved = $defaults;
+    foreach ($defaults as $settingKey => $defaultValue) {
+        $resolved[$settingKey] = system_settings_to_bool($decoded[$settingKey] ?? null, (bool) $defaultValue);
+    }
+
+    return $resolved;
+}
+
 $jobTypeCatalog = job_type_catalog($companyId);
 $jobTypesById = [];
 foreach ($jobTypeCatalog as $jobTypeRow) {
@@ -79,13 +193,100 @@ foreach ($jobTypeCatalog as $jobTypeRow) {
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     require_csrf();
+    $action = (string) ($_POST['_action'] ?? '');
+
+    if ($action === 'save_invoice_print_settings') {
+        if (!$canManageInvoicePrintSettings) {
+            flash_set('settings_error', 'You do not have permission to update invoice print settings.', 'danger');
+            redirect('modules/system/settings.php?tab=invoice_print');
+        }
+
+        $defaults = settings_invoice_print_default_settings();
+        $payload = [];
+        foreach (array_keys($defaults) as $settingKey) {
+            $payload[$settingKey] = isset($_POST[$settingKey]);
+        }
+
+        $encoded = json_encode($payload, JSON_UNESCAPED_UNICODE);
+        if (!is_string($encoded)) {
+            flash_set('settings_error', 'Unable to serialize invoice print settings. Please retry.', 'danger');
+            redirect('modules/system/settings.php?tab=invoice_print');
+        }
+
+        $settingId = system_setting_upsert_value(
+            $companyId,
+            $garageId,
+            'BILLING',
+            'invoice_print_settings_json',
+            $encoded,
+            'JSON',
+            'ACTIVE',
+            $actorUserId > 0 ? $actorUserId : null
+        );
+        if ($settingId <= 0) {
+            flash_set('settings_error', 'Unable to save invoice print settings right now.', 'danger');
+            redirect('modules/system/settings.php?tab=invoice_print');
+        }
+
+        log_audit('billing', 'invoice_print_settings_update', $settingId, 'Updated invoice print visibility settings from system settings.', [
+            'entity' => 'invoice_print_settings',
+            'source' => 'UI',
+            'company_id' => $companyId,
+            'garage_id' => $garageId,
+            'metadata' => $payload,
+        ]);
+        flash_set('settings_success', 'Invoice print settings saved.', 'success');
+        redirect('modules/system/settings.php?tab=invoice_print');
+    }
+
+    if ($action === 'save_job_card_print_settings') {
+        if (!$canManageJobCardPrintSettings) {
+            flash_set('settings_error', 'You do not have permission to update job card print settings.', 'danger');
+            redirect('modules/system/settings.php?tab=job_card_print');
+        }
+
+        $defaults = settings_job_card_print_default_settings();
+        $payload = [];
+        foreach (array_keys($defaults) as $settingKey) {
+            $payload[$settingKey] = isset($_POST[$settingKey]);
+        }
+
+        $encoded = json_encode($payload, JSON_UNESCAPED_UNICODE);
+        if (!is_string($encoded)) {
+            flash_set('settings_error', 'Unable to serialize job card print settings. Please retry.', 'danger');
+            redirect('modules/system/settings.php?tab=job_card_print');
+        }
+
+        $settingId = system_setting_upsert_value(
+            $companyId,
+            $garageId,
+            'JOBS',
+            'job_card_print_settings_json',
+            $encoded,
+            'JSON',
+            'ACTIVE',
+            $actorUserId > 0 ? $actorUserId : null
+        );
+        if ($settingId <= 0) {
+            flash_set('settings_error', 'Unable to save job card print settings right now.', 'danger');
+            redirect('modules/system/settings.php?tab=job_card_print');
+        }
+
+        log_audit('jobs', 'job_card_print_settings_update', $settingId, 'Updated job card print visibility settings from system settings.', [
+            'entity' => 'job_card_print_settings',
+            'source' => 'UI',
+            'company_id' => $companyId,
+            'garage_id' => $garageId,
+            'metadata' => $payload,
+        ]);
+        flash_set('settings_success', 'Job card print settings saved.', 'success');
+        redirect('modules/system/settings.php?tab=job_card_print');
+    }
 
     if (!$canManage) {
         flash_set('settings_error', 'You do not have permission to modify settings.', 'danger');
-        redirect('modules/system/settings.php');
+        redirect('modules/system/settings.php?tab=general');
     }
-
-    $action = (string) ($_POST['_action'] ?? '');
 
     if ($action === 'update_default_date_filter_mode') {
         $selectedMode = date_filter_normalize_mode((string) ($_POST['default_date_filter_mode'] ?? 'monthly'), 'monthly');
@@ -114,7 +315,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             flash_set('settings_error', 'Unable to update default date filter mode right now.', 'danger');
         }
 
-        redirect('modules/system/settings.php');
+        redirect('modules/system/settings.php?tab=general');
     }
 
     if ($action === 'create_job_type') {
@@ -124,17 +325,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         if ($statusCode === 'DELETED') {
             flash_set('settings_error', 'Use delete action to mark a job type as deleted.', 'danger');
-            redirect('modules/system/settings.php');
+            redirect('modules/system/settings.php?tab=job_types');
         }
 
         if ($jobTypeName === '') {
             flash_set('settings_error', 'Job type name is required.', 'danger');
-            redirect('modules/system/settings.php');
+            redirect('modules/system/settings.php?tab=job_types');
         }
 
         if (job_type_name_exists($jobTypesById, $jobTypeName, null)) {
             flash_set('settings_error', 'Job type name already exists. Use edit to modify it.', 'danger');
-            redirect('modules/system/settings.php');
+            redirect('modules/system/settings.php?tab=job_types');
         }
 
         $nextId = $jobTypesById !== [] ? (max(array_map('intval', array_keys($jobTypesById))) + 1) : 1;
@@ -148,7 +349,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $settingId = job_type_save_catalog($companyId, array_values($jobTypesById), $actorUserId > 0 ? $actorUserId : null);
         if ($settingId <= 0) {
             flash_set('settings_error', 'Unable to save job type right now.', 'danger');
-            redirect('modules/system/settings.php');
+            redirect('modules/system/settings.php?tab=job_types');
         }
 
         log_audit('system_settings', 'job_type_create', $settingId, 'Created job type ' . $jobTypeName, [
@@ -163,7 +364,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             ],
         ]);
         flash_set('settings_success', 'Job type created successfully.', 'success');
-        redirect('modules/system/settings.php');
+        redirect('modules/system/settings.php?tab=job_types');
     }
 
     if ($action === 'update_job_type') {
@@ -174,22 +375,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         if ($statusCode === 'DELETED') {
             flash_set('settings_error', 'Use delete action to mark a job type as deleted.', 'danger');
-            redirect('modules/system/settings.php');
+            redirect('modules/system/settings.php?tab=job_types');
         }
 
         if ($jobTypeId <= 0 || !isset($jobTypesById[$jobTypeId])) {
             flash_set('settings_error', 'Job type not found for update.', 'danger');
-            redirect('modules/system/settings.php');
+            redirect('modules/system/settings.php?tab=job_types');
         }
 
         if ($jobTypeName === '') {
             flash_set('settings_error', 'Job type name is required.', 'danger');
-            redirect('modules/system/settings.php?edit_job_type_id=' . $jobTypeId);
+            redirect('modules/system/settings.php?tab=job_types&edit_job_type_id=' . $jobTypeId);
         }
 
         if (job_type_name_exists($jobTypesById, $jobTypeName, $jobTypeId)) {
             flash_set('settings_error', 'Job type name already exists. Choose a different name.', 'danger');
-            redirect('modules/system/settings.php?edit_job_type_id=' . $jobTypeId);
+            redirect('modules/system/settings.php?tab=job_types&edit_job_type_id=' . $jobTypeId);
         }
 
         $before = $jobTypesById[$jobTypeId];
@@ -203,7 +404,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $settingId = job_type_save_catalog($companyId, array_values($jobTypesById), $actorUserId > 0 ? $actorUserId : null);
         if ($settingId <= 0) {
             flash_set('settings_error', 'Unable to update job type right now.', 'danger');
-            redirect('modules/system/settings.php?edit_job_type_id=' . $jobTypeId);
+            redirect('modules/system/settings.php?tab=job_types&edit_job_type_id=' . $jobTypeId);
         }
 
         log_audit('system_settings', 'job_type_update', $settingId, 'Updated job type ' . $jobTypeName, [
@@ -216,7 +417,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             ],
         ]);
         flash_set('settings_success', 'Job type updated successfully.', 'success');
-        redirect('modules/system/settings.php');
+        redirect('modules/system/settings.php?tab=job_types');
     }
 
     if ($action === 'change_job_type_status') {
@@ -225,7 +426,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         if ($jobTypeId <= 0 || !isset($jobTypesById[$jobTypeId])) {
             flash_set('settings_error', 'Job type not found for status update.', 'danger');
-            redirect('modules/system/settings.php');
+            redirect('modules/system/settings.php?tab=job_types');
         }
 
         $before = $jobTypesById[$jobTypeId];
@@ -234,7 +435,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $settingId = job_type_save_catalog($companyId, array_values($jobTypesById), $actorUserId > 0 ? $actorUserId : null);
         if ($settingId <= 0) {
             flash_set('settings_error', 'Unable to update job type status right now.', 'danger');
-            redirect('modules/system/settings.php');
+            redirect('modules/system/settings.php?tab=job_types');
         }
 
         log_audit('system_settings', 'job_type_status', $settingId, 'Changed job type status to ' . $nextStatus, [
@@ -247,7 +448,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             ],
         ]);
         flash_set('settings_success', 'Job type status updated.', 'success');
-        redirect('modules/system/settings.php');
+        redirect('modules/system/settings.php?tab=job_types');
     }
 
     if ($action === 'create') {
@@ -260,7 +461,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         if ($settingGroup === '' || $settingKey === '') {
             flash_set('settings_error', 'Setting group and key are required.', 'danger');
-            redirect('modules/system/settings.php');
+            redirect('modules/system/settings.php?tab=general');
         }
 
         $allowedTypes = ['STRING', 'NUMBER', 'BOOLEAN', 'JSON'];
@@ -284,7 +485,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         if ($stmt->fetch()) {
             flash_set('settings_error', 'Setting key already exists for selected scope.', 'danger');
-            redirect('modules/system/settings.php');
+            redirect('modules/system/settings.php?tab=general');
         }
 
         $insertStmt = db()->prepare(
@@ -308,7 +509,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $settingId = (int) db()->lastInsertId();
         log_audit('system_settings', 'create', $settingId, 'Created key ' . $settingKey);
         flash_set('settings_success', 'Setting created successfully.', 'success');
-        redirect('modules/system/settings.php');
+        redirect('modules/system/settings.php?tab=general');
     }
 
     if ($action === 'update') {
@@ -350,7 +551,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         log_audit('system_settings', 'update', $settingId, 'Updated key ' . $settingKey);
         flash_set('settings_success', 'Setting updated successfully.', 'success');
-        redirect('modules/system/settings.php');
+        redirect('modules/system/settings.php?tab=general');
     }
 
     if ($action === 'change_status') {
@@ -388,7 +589,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             ]);
         }
         flash_set('settings_success', 'Setting status updated.', 'success');
-        redirect('modules/system/settings.php');
+        redirect('modules/system/settings.php?tab=general');
     }
 }
 
@@ -425,6 +626,47 @@ $settingsStmt = db()->prepare(
 $settingsStmt->execute(['company_id' => $companyId]);
 $settings = $settingsStmt->fetchAll();
 $defaultDateFilterMode = date_filter_normalize_mode(system_setting_get_value($companyId, 0, 'default_date_filter_mode', 'monthly'), 'monthly');
+$invoicePrintSettings = settings_invoice_print_settings($companyId, $garageId);
+$jobCardPrintSettings = settings_job_card_print_settings($companyId, $garageId);
+
+$activeGarageName = 'Garage #' . $garageId;
+foreach ($garages as $garage) {
+    if ((int) ($garage['id'] ?? 0) === $garageId) {
+        $activeGarageName = (string) ($garage['name'] ?? $activeGarageName);
+        break;
+    }
+}
+
+$settingsTabs = [
+    'general' => [
+        'label' => 'General',
+        'visible' => true,
+    ],
+    'job_types' => [
+        'label' => 'Job Types',
+        'visible' => true,
+    ],
+    'invoice_print' => [
+        'label' => 'Invoice Print',
+        'visible' => $canViewInvoicePrintSettings,
+    ],
+    'job_card_print' => [
+        'label' => 'Job Card Print',
+        'visible' => $canViewJobCardPrintSettings,
+    ],
+];
+
+$requestedTab = strtolower(trim((string) ($_GET['tab'] ?? '')));
+if ($requestedTab === '' && $editJobTypeId > 0) {
+    $requestedTab = 'job_types';
+}
+if ($requestedTab === '') {
+    $requestedTab = 'general';
+}
+if (!isset($settingsTabs[$requestedTab]) || !$settingsTabs[$requestedTab]['visible']) {
+    $requestedTab = 'general';
+}
+$activeSettingsTab = $requestedTab;
 
 require_once __DIR__ . '/../../includes/header.php';
 require_once __DIR__ . '/../../includes/sidebar.php';
@@ -447,7 +689,20 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 
   <div class="app-content">
     <div class="container-fluid">
+      <div class="d-flex flex-wrap gap-2 mb-3">
+        <?php foreach ($settingsTabs as $tabKey => $tabMeta): ?>
+          <?php if (empty($tabMeta['visible'])): ?>
+            <?php continue; ?>
+          <?php endif; ?>
+          <a
+            href="<?= e(url('modules/system/settings.php?tab=' . urlencode((string) $tabKey))); ?>"
+            class="btn btn-sm <?= $activeSettingsTab === $tabKey ? 'btn-primary' : 'btn-outline-primary'; ?>">
+            <?= e((string) ($tabMeta['label'] ?? 'Tab')); ?>
+          </a>
+        <?php endforeach; ?>
+      </div>
       <?php if ($canManage): ?>
+        <?php if ($activeSettingsTab === 'general'): ?>
         <div class="card card-outline card-info">
           <div class="card-header"><h3 class="card-title">Global Date Filter Default</h3></div>
           <form method="post">
@@ -475,7 +730,9 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             </div>
           </form>
         </div>
+        <?php endif; ?>
 
+        <?php if ($activeSettingsTab === 'job_types'): ?>
         <div class="card card-primary">
           <div class="card-header"><h3 class="card-title"><?= $editJobType ? 'Edit Job Type Option' : 'Add Job Type Option'; ?></h3></div>
           <form method="post">
@@ -532,12 +789,14 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             <div class="card-footer d-flex gap-2">
               <button type="submit" class="btn btn-primary"><?= $editJobType ? 'Update Job Type' : 'Create Job Type'; ?></button>
               <?php if ($editJobType): ?>
-                <a href="<?= e(url('modules/system/settings.php')); ?>" class="btn btn-outline-secondary">Cancel Edit</a>
+                <a href="<?= e(url('modules/system/settings.php?tab=job_types')); ?>" class="btn btn-outline-secondary">Cancel Edit</a>
               <?php endif; ?>
             </div>
           </form>
         </div>
+        <?php endif; ?>
 
+        <?php if ($activeSettingsTab === 'general'): ?>
         <div class="card card-primary">
           <div class="card-header"><h3 class="card-title"><?= $editSetting ? 'Edit Setting' : 'Add Setting'; ?></h3></div>
           <form method="post">
@@ -591,13 +850,15 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             <div class="card-footer d-flex gap-2">
               <button type="submit" class="btn btn-primary"><?= $editSetting ? 'Update Setting' : 'Create Setting'; ?></button>
               <?php if ($editSetting): ?>
-                <a href="<?= e(url('modules/system/settings.php')); ?>" class="btn btn-outline-secondary">Cancel Edit</a>
+                <a href="<?= e(url('modules/system/settings.php?tab=general')); ?>" class="btn btn-outline-secondary">Cancel Edit</a>
               <?php endif; ?>
             </div>
           </form>
         </div>
+        <?php endif; ?>
       <?php endif; ?>
 
+      <?php if ($activeSettingsTab === 'job_types'): ?>
       <div class="card">
         <div class="card-header"><h3 class="card-title mb-0">Job Type Options</h3></div>
         <div class="card-body table-responsive p-0">
@@ -633,7 +894,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                     </td>
                     <td class="d-flex gap-1">
                       <?php if ($canManage): ?>
-                        <a class="btn btn-sm btn-outline-primary" href="<?= e(url('modules/system/settings.php?edit_job_type_id=' . $jobTypeId)); ?>">Edit</a>
+                        <a class="btn btn-sm btn-outline-primary" href="<?= e(url('modules/system/settings.php?tab=job_types&edit_job_type_id=' . $jobTypeId)); ?>">Edit</a>
                         <?php if ($jobTypeStatus !== 'DELETED'): ?>
                           <form method="post" class="d-inline" data-confirm="Change job type status?">
                             <?= csrf_field(); ?>
@@ -661,7 +922,9 @@ require_once __DIR__ . '/../../includes/sidebar.php';
           </table>
         </div>
       </div>
+      <?php endif; ?>
 
+      <?php if ($activeSettingsTab === 'general'): ?>
       <div class="card">
         <div class="card-header"><h3 class="card-title">Settings List</h3></div>
         <div class="card-body table-responsive p-0">
@@ -693,7 +956,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                     <td><span class="badge text-bg-<?= e(status_badge_class((string) $setting['status_code'])); ?>"><?= e((string) $setting['status_code']); ?></span></td>
                     <td class="d-flex gap-1">
                       <?php if ($canManage): ?>
-                        <a class="btn btn-sm btn-outline-primary" href="<?= e(url('modules/system/settings.php?edit_id=' . (int) $setting['id'])); ?>">Edit</a>
+                        <a class="btn btn-sm btn-outline-primary" href="<?= e(url('modules/system/settings.php?tab=general&edit_id=' . (int) $setting['id'])); ?>">Edit</a>
                         <form method="post" class="d-inline" data-confirm="Change setting status?">
                           <?= csrf_field(); ?>
                           <input type="hidden" name="_action" value="change_status" />
@@ -725,6 +988,109 @@ require_once __DIR__ . '/../../includes/sidebar.php';
           </table>
         </div>
       </div>
+      <?php endif; ?>
+
+      <?php if ($activeSettingsTab === 'invoice_print' && $canViewInvoicePrintSettings): ?>
+        <div class="card card-outline card-info">
+          <div class="card-header"><h3 class="card-title">Invoice Print Settings</h3></div>
+          <form method="post">
+            <div class="card-body row g-3">
+              <?= csrf_field(); ?>
+              <input type="hidden" name="_action" value="save_invoice_print_settings" />
+              <div class="col-md-6">
+                <div class="form-check">
+                  <input class="form-check-input" type="checkbox" id="inv_show_company_logo" name="show_company_logo" <?= !empty($invoicePrintSettings['show_company_logo']) ? 'checked' : ''; ?> <?= $canManageInvoicePrintSettings ? '' : 'disabled'; ?> />
+                  <label class="form-check-label" for="inv_show_company_logo">Show company/invoice logo in header</label>
+                </div>
+              </div>
+              <div class="col-md-6">
+                <div class="form-check">
+                  <input class="form-check-input" type="checkbox" id="inv_show_company_gstin" name="show_company_gstin" <?= !empty($invoicePrintSettings['show_company_gstin']) ? 'checked' : ''; ?> <?= $canManageInvoicePrintSettings ? '' : 'disabled'; ?> />
+                  <label class="form-check-label" for="inv_show_company_gstin">Show company GSTIN</label>
+                </div>
+              </div>
+              <div class="col-md-6">
+                <div class="form-check">
+                  <input class="form-check-input" type="checkbox" id="inv_show_customer_gstin" name="show_customer_gstin" <?= !empty($invoicePrintSettings['show_customer_gstin']) ? 'checked' : ''; ?> <?= $canManageInvoicePrintSettings ? '' : 'disabled'; ?> />
+                  <label class="form-check-label" for="inv_show_customer_gstin">Show customer GSTIN</label>
+                </div>
+              </div>
+              <div class="col-md-6">
+                <div class="form-check">
+                  <input class="form-check-input" type="checkbox" id="inv_show_recommendation_note" name="show_recommendation_note" <?= !empty($invoicePrintSettings['show_recommendation_note']) ? 'checked' : ''; ?> <?= $canManageInvoicePrintSettings ? '' : 'disabled'; ?> />
+                  <label class="form-check-label" for="inv_show_recommendation_note">Show recommendation note section</label>
+                </div>
+              </div>
+              <div class="col-md-6">
+                <div class="form-check">
+                  <input class="form-check-input" type="checkbox" id="inv_show_next_service_reminders" name="show_next_service_reminders" <?= !empty($invoicePrintSettings['show_next_service_reminders']) ? 'checked' : ''; ?> <?= $canManageInvoicePrintSettings ? '' : 'disabled'; ?> />
+                  <label class="form-check-label" for="inv_show_next_service_reminders">Show next recommended service section</label>
+                </div>
+              </div>
+              <div class="col-md-6">
+                <div class="form-check">
+                  <input class="form-check-input" type="checkbox" id="inv_show_paid_outstanding" name="show_paid_outstanding" <?= !empty($invoicePrintSettings['show_paid_outstanding']) ? 'checked' : ''; ?> <?= $canManageInvoicePrintSettings ? '' : 'disabled'; ?> />
+                  <label class="form-check-label" for="inv_show_paid_outstanding">Show paid and outstanding in final totals</label>
+                </div>
+              </div>
+              <div class="col-md-6">
+                <div class="form-check">
+                  <input class="form-check-input" type="checkbox" id="inv_show_advance_adjustment_history" name="show_advance_adjustment_history" <?= !empty($invoicePrintSettings['show_advance_adjustment_history']) ? 'checked' : ''; ?> <?= $canManageInvoicePrintSettings ? '' : 'disabled'; ?> />
+                  <label class="form-check-label" for="inv_show_advance_adjustment_history">Show advance adjustment history in print</label>
+                </div>
+              </div>
+              <div class="col-12">
+                <small class="text-muted">Applied to active garage: <?= e($activeGarageName); ?>.</small>
+              </div>
+            </div>
+            <?php if ($canManageInvoicePrintSettings): ?>
+              <div class="card-footer">
+                <button type="submit" class="btn btn-primary">Save Invoice Print Settings</button>
+              </div>
+            <?php else: ?>
+              <div class="card-footer text-muted">View only. Contact admin to update invoice settings.</div>
+            <?php endif; ?>
+          </form>
+        </div>
+      <?php endif; ?>
+
+      <?php if ($activeSettingsTab === 'job_card_print' && $canViewJobCardPrintSettings): ?>
+        <div class="card card-outline card-info">
+          <div class="card-header"><h3 class="card-title">Job Card Print Settings</h3></div>
+          <form method="post">
+            <div class="card-body row g-3">
+              <?= csrf_field(); ?>
+              <input type="hidden" name="_action" value="save_job_card_print_settings" />
+
+              <div class="col-md-6"><div class="form-check"><input class="form-check-input" type="checkbox" id="job_show_company_logo" name="show_company_logo" <?= !empty($jobCardPrintSettings['show_company_logo']) ? 'checked' : ''; ?> <?= $canManageJobCardPrintSettings ? '' : 'disabled'; ?> /><label class="form-check-label" for="job_show_company_logo">Show company logo in header</label></div></div>
+              <div class="col-md-6"><div class="form-check"><input class="form-check-input" type="checkbox" id="job_show_company_gstin" name="show_company_gstin" <?= !empty($jobCardPrintSettings['show_company_gstin']) ? 'checked' : ''; ?> <?= $canManageJobCardPrintSettings ? '' : 'disabled'; ?> /><label class="form-check-label" for="job_show_company_gstin">Show company GSTIN</label></div></div>
+              <div class="col-md-6"><div class="form-check"><input class="form-check-input" type="checkbox" id="job_show_customer_gstin" name="show_customer_gstin" <?= !empty($jobCardPrintSettings['show_customer_gstin']) ? 'checked' : ''; ?> <?= $canManageJobCardPrintSettings ? '' : 'disabled'; ?> /><label class="form-check-label" for="job_show_customer_gstin">Show customer GSTIN</label></div></div>
+              <div class="col-md-6"><div class="form-check"><input class="form-check-input" type="checkbox" id="job_show_assigned_staff" name="show_assigned_staff" <?= !empty($jobCardPrintSettings['show_assigned_staff']) ? 'checked' : ''; ?> <?= $canManageJobCardPrintSettings ? '' : 'disabled'; ?> /><label class="form-check-label" for="job_show_assigned_staff">Show assigned staff section</label></div></div>
+              <div class="col-md-6"><div class="form-check"><input class="form-check-input" type="checkbox" id="job_show_job_meta" name="show_job_meta" <?= !empty($jobCardPrintSettings['show_job_meta']) ? 'checked' : ''; ?> <?= $canManageJobCardPrintSettings ? '' : 'disabled'; ?> /><label class="form-check-label" for="job_show_job_meta">Show job meta (priority/advisor)</label></div></div>
+              <div class="col-md-6"><div class="form-check"><input class="form-check-input" type="checkbox" id="job_show_complaint" name="show_complaint" <?= !empty($jobCardPrintSettings['show_complaint']) ? 'checked' : ''; ?> <?= $canManageJobCardPrintSettings ? '' : 'disabled'; ?> /><label class="form-check-label" for="job_show_complaint">Show complaint section</label></div></div>
+              <div class="col-md-6"><div class="form-check"><input class="form-check-input" type="checkbox" id="job_show_diagnosis" name="show_diagnosis" <?= !empty($jobCardPrintSettings['show_diagnosis']) ? 'checked' : ''; ?> <?= $canManageJobCardPrintSettings ? '' : 'disabled'; ?> /><label class="form-check-label" for="job_show_diagnosis">Show notes/diagnosis section</label></div></div>
+              <div class="col-md-6"><div class="form-check"><input class="form-check-input" type="checkbox" id="job_show_recommendation_note" name="show_recommendation_note" <?= !empty($jobCardPrintSettings['show_recommendation_note']) ? 'checked' : ''; ?> <?= $canManageJobCardPrintSettings ? '' : 'disabled'; ?> /><label class="form-check-label" for="job_show_recommendation_note">Show recommendation note section</label></div></div>
+              <div class="col-md-6"><div class="form-check"><input class="form-check-input" type="checkbox" id="job_show_insurance_section" name="show_insurance_section" <?= !empty($jobCardPrintSettings['show_insurance_section']) ? 'checked' : ''; ?> <?= $canManageJobCardPrintSettings ? '' : 'disabled'; ?> /><label class="form-check-label" for="job_show_insurance_section">Show insurance section</label></div></div>
+              <div class="col-md-6"><div class="form-check"><input class="form-check-input" type="checkbox" id="job_show_labor_lines" name="show_labor_lines" <?= !empty($jobCardPrintSettings['show_labor_lines']) ? 'checked' : ''; ?> <?= $canManageJobCardPrintSettings ? '' : 'disabled'; ?> /><label class="form-check-label" for="job_show_labor_lines">Show labour line items</label></div></div>
+              <div class="col-md-6"><div class="form-check"><input class="form-check-input" type="checkbox" id="job_show_parts_lines" name="show_parts_lines" <?= !empty($jobCardPrintSettings['show_parts_lines']) ? 'checked' : ''; ?> <?= $canManageJobCardPrintSettings ? '' : 'disabled'; ?> /><label class="form-check-label" for="job_show_parts_lines">Show parts line items</label></div></div>
+              <div class="col-md-6"><div class="form-check"><input class="form-check-input" type="checkbox" id="job_show_next_service_reminders" name="show_next_service_reminders" <?= !empty($jobCardPrintSettings['show_next_service_reminders']) ? 'checked' : ''; ?> <?= $canManageJobCardPrintSettings ? '' : 'disabled'; ?> /><label class="form-check-label" for="job_show_next_service_reminders">Show next recommended service section</label></div></div>
+              <div class="col-md-6"><div class="form-check"><input class="form-check-input" type="checkbox" id="job_show_totals" name="show_totals" <?= !empty($jobCardPrintSettings['show_totals']) ? 'checked' : ''; ?> <?= $canManageJobCardPrintSettings ? '' : 'disabled'; ?> /><label class="form-check-label" for="job_show_totals">Show totals block</label></div></div>
+              <div class="col-md-6"><div class="form-check"><input class="form-check-input" type="checkbox" id="job_show_cancel_note" name="show_cancel_note" <?= !empty($jobCardPrintSettings['show_cancel_note']) ? 'checked' : ''; ?> <?= $canManageJobCardPrintSettings ? '' : 'disabled'; ?> /><label class="form-check-label" for="job_show_cancel_note">Show cancel note</label></div></div>
+              <div class="col-md-12"><div class="form-check"><input class="form-check-input" type="checkbox" id="job_show_costs" name="show_costs_in_job_card_print" <?= !empty($jobCardPrintSettings['show_costs_in_job_card_print']) ? 'checked' : ''; ?> <?= $canManageJobCardPrintSettings ? '' : 'disabled'; ?> /><label class="form-check-label" for="job_show_costs">Show costs (Rate, GST, totals and insurance claim amounts) in job card print</label></div></div>
+              <div class="col-12">
+                <small class="text-muted">Applied to active garage: <?= e($activeGarageName); ?>.</small>
+              </div>
+            </div>
+            <?php if ($canManageJobCardPrintSettings): ?>
+              <div class="card-footer">
+                <button type="submit" class="btn btn-primary">Save Job Card Print Settings</button>
+              </div>
+            <?php else: ?>
+              <div class="card-footer text-muted">View only. Contact admin to update job card print settings.</div>
+            <?php endif; ?>
+          </form>
+        </div>
+      <?php endif; ?>
     </div>
   </div>
 </main>

@@ -20,7 +20,7 @@ $canFinalize = billing_can_finalize();
 $canCancel = billing_can_cancel();
 $canPay = billing_can_pay();
 $canEditDraftDiscount = $canCreate || $canFinalize || billing_has_permission(['invoice.manage']);
-$canManageInvoiceSettings = billing_has_permission(['invoice.manage', 'settings.manage']);
+$canManageInvoiceSettings = has_permission('settings.view') && billing_has_permission(['invoice.manage', 'settings.manage']);
 $canViewJobs = has_permission('job.view');
 $financialExtensionsReady = billing_financial_extensions_ready();
 $paymentColumns = table_columns('payments');
@@ -2244,7 +2244,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
     <div class="container-fluid">
       <?php if ($canManageInvoiceSettings): ?>
         <div class="d-flex justify-content-end mb-2">
-          <a href="<?= e(url('modules/billing/invoice_settings.php')); ?>" class="btn btn-outline-secondary btn-sm">
+          <a href="<?= e(url('modules/system/settings.php?tab=invoice_print')); ?>" class="btn btn-outline-secondary btn-sm">
             <i class="bi bi-sliders me-1"></i>Invoice Settings
           </a>
         </div>

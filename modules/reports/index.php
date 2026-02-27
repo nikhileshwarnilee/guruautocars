@@ -293,6 +293,14 @@ $moduleCards = [
         'badge' => 'Overdue Reminders',
         'metric' => number_format((int) ($serviceReminderSummary['overdue'] ?? 0)),
     ],
+    [
+        'title' => 'Vehicle Intake Audit',
+        'description' => 'Track intake checklists, fuel levels, damages, and captured images for dispute-proof operations.',
+        'path' => 'modules/reports/vehicle_intake_audit.php',
+        'icon' => 'bi bi-clipboard2-check',
+        'badge' => 'Closed Jobs',
+        'metric' => number_format($closedJobs),
+    ],
 ];
 
 if ($canViewFinancial) {

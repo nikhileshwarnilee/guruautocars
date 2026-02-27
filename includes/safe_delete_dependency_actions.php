@@ -983,6 +983,17 @@ function safe_delete_dependency_delete_job_card(PDO $pdo, int $jobId, array $sco
             throw new RuntimeException('Job card delete was not applied.');
         }
 
+        $intakeDeletedCount = 0;
+        if (function_exists('job_vehicle_intake_soft_delete_by_job')) {
+            $intakeDeletedCount = (int) job_vehicle_intake_soft_delete_by_job(
+                $companyId,
+                $garageId,
+                $jobId,
+                $actorUserId > 0 ? $actorUserId : null,
+                $reason
+            );
+        }
+
         if (function_exists('job_append_history')) {
             job_append_history(
                 $jobId,
@@ -1010,6 +1021,7 @@ function safe_delete_dependency_delete_job_card(PDO $pdo, int $jobId, array $sco
                 'job_number' => (string) ($job['job_number'] ?? ''),
                 'cancellable_outsourced_count' => count($cancellableOutsourcedIds),
                 'inventory_movements' => (int) ($dependencyReport['inventory_movements'] ?? 0),
+                'intake_deleted_count' => $intakeDeletedCount,
             ],
         ]);
 
@@ -1021,6 +1033,7 @@ function safe_delete_dependency_delete_job_card(PDO $pdo, int $jobId, array $sco
                 'job_id' => $jobId,
                 'job_number' => (string) ($job['job_number'] ?? ''),
                 'cancellable_outsourced_count' => count($cancellableOutsourcedIds),
+                'intake_deleted_count' => $intakeDeletedCount,
             ],
         ];
     } catch (Throwable $exception) {

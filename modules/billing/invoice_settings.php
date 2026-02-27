@@ -11,7 +11,7 @@ if (!billing_can_view()) {
 }
 
 $page_title = 'Invoice Settings';
-$active_menu = 'billing.settings';
+$active_menu = 'system.settings';
 $companyId = active_company_id();
 $garageId = active_garage_id();
 $actorUserId = (int) ($_SESSION['user_id'] ?? 0);

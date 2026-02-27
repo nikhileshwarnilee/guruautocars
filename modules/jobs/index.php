@@ -17,14 +17,27 @@ $canCreate = has_permission('job.create') || has_permission('job.manage');
 $canEdit = has_permission('job.edit') || has_permission('job.update') || has_permission('job.manage');
 $canAssign = has_permission('job.assign') || has_permission('job.manage');
 $canJobTypeSettingsManage = has_permission('settings.manage');
-$canJobCardPrintSettingsManage = has_permission('job.manage') || has_permission('settings.manage');
+$canJobCardPrintSettingsManage = has_permission('settings.view') && (has_permission('job.manage') || has_permission('settings.manage'));
 $canInlineVehicleCreate = has_permission('vehicle.view') && has_permission('vehicle.manage');
 $canConditionPhotoManage = has_permission('job.manage') || has_permission('settings.manage');
+$canChecklistMasterManage = has_permission('job.manage') || has_permission('settings.manage');
 $jobCardColumns = table_columns('job_cards');
 $jobOdometerEnabled = in_array('odometer_km', $jobCardColumns, true);
 $jobRecommendationNoteEnabled = job_recommendation_note_feature_ready();
 $jobInsuranceEnabled = job_insurance_feature_ready();
 $jobTypeEnabled = job_type_feature_ready();
+$vehicleIntakeFeatureReady = job_vehicle_intake_feature_ready();
+$vehicleIntakeChecklistMaster = $vehicleIntakeFeatureReady ? job_vehicle_intake_master_items(true) : [];
+if ($vehicleIntakeFeatureReady && $vehicleIntakeChecklistMaster === []) {
+    foreach (job_vehicle_intake_default_checklist_items() as $itemName) {
+        $vehicleIntakeChecklistMaster[] = [
+            'id' => 0,
+            'item_name' => $itemName,
+            'is_default' => 1,
+            'active' => 1,
+        ];
+    }
+}
 $odometerEditableStatuses = ['OPEN', 'IN_PROGRESS'];
 $maintenanceReminderFeatureReady = service_reminder_feature_ready();
 $maintenanceRecommendationApiUrl = url('modules/jobs/maintenance_recommendations_api.php');
@@ -299,6 +312,60 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $jobTypeId = $jobTypeEnabled ? post_int('job_type_id') : 0;
         $promisedAt = post_string('promised_at', 25);
         $assignedUserIds = $canAssign ? parse_ids($_POST['assigned_user_ids'] ?? []) : [];
+        $intakeFuelLevel = job_vehicle_intake_normalize_fuel_level((string) ($_POST['intake_fuel_level'] ?? 'LOW'));
+        $intakeExteriorNotes = post_string('intake_exterior_condition_notes', 5000);
+        $intakeInteriorNotes = post_string('intake_interior_condition_notes', 5000);
+        $intakeMechanicalNotes = post_string('intake_mechanical_condition_notes', 5000);
+        $intakeRemarks = post_string('intake_remarks', 5000);
+        $intakeCustomerAcknowledged = !empty($_POST['intake_customer_acknowledged']);
+
+        $intakeChecklistRows = [];
+        $intakeDefaultNames = $_POST['intake_checklist_name'] ?? [];
+        $intakeDefaultStatuses = $_POST['intake_checklist_status'] ?? [];
+        $intakeDefaultRemarks = $_POST['intake_checklist_remarks'] ?? [];
+        if (is_array($intakeDefaultNames)) {
+            $defaultCount = count($intakeDefaultNames);
+            for ($index = 0; $index < $defaultCount; $index++) {
+                $name = mb_substr(trim((string) ($intakeDefaultNames[$index] ?? '')), 0, 120);
+                if ($name === '') {
+                    continue;
+                }
+                $intakeChecklistRows[] = [
+                    'item_name' => $name,
+                    'status' => job_vehicle_intake_normalize_item_status((string) ($intakeDefaultStatuses[$index] ?? 'NOT_PRESENT')),
+                    'remarks' => mb_substr(trim((string) ($intakeDefaultRemarks[$index] ?? '')), 0, 255),
+                ];
+            }
+        }
+
+        $intakeCustomNames = $_POST['intake_custom_item_name'] ?? [];
+        $intakeCustomStatuses = $_POST['intake_custom_item_status'] ?? [];
+        $intakeCustomRemarks = $_POST['intake_custom_item_remarks'] ?? [];
+        if (is_array($intakeCustomNames)) {
+            $customCount = count($intakeCustomNames);
+            for ($index = 0; $index < $customCount; $index++) {
+                $name = mb_substr(trim((string) ($intakeCustomNames[$index] ?? '')), 0, 120);
+                if ($name === '') {
+                    continue;
+                }
+                $intakeChecklistRows[] = [
+                    'item_name' => $name,
+                    'status' => job_vehicle_intake_normalize_item_status((string) ($intakeCustomStatuses[$index] ?? 'NOT_PRESENT')),
+                    'remarks' => mb_substr(trim((string) ($intakeCustomRemarks[$index] ?? '')), 0, 255),
+                ];
+            }
+        }
+
+        $intakeUploads = job_vehicle_intake_normalize_uploads($_FILES['intake_images'] ?? null);
+        $intakeImageTypes = $_POST['intake_image_types'] ?? [];
+        foreach ($intakeUploads as $uploadIndex => $uploadFile) {
+            if (!is_array($uploadFile)) {
+                continue;
+            }
+            $intakeUploads[$uploadIndex]['image_type'] = is_array($intakeImageTypes)
+                ? job_vehicle_intake_normalize_image_type((string) ($intakeImageTypes[$uploadIndex] ?? 'OTHER'))
+                : 'OTHER';
+        }
         $maintenanceActions = [];
         if ($maintenanceReminderFeatureReady) {
             $rawMaintenanceActions = $_POST['maintenance_action'] ?? [];
@@ -374,6 +441,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $allowParallelJobsForType = $jobTypeEnabled
             && $jobTypeId > 0
             && job_type_allows_multiple_active_jobs($companyId, $jobTypeId);
+        $intakeOdometerReading = $jobOdometerEnabled && $odometerKm !== null
+            ? $odometerKm
+            : max(0, post_int('intake_odometer_reading'));
 
         $pdo = db();
         $pdo->beginTransaction();
@@ -480,6 +550,44 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'ignored_count' => (int) ($maintenanceResult['ignored_count'] ?? 0),
                 ]);
             }
+
+            $intakeResult = [
+                'intake_id' => 0,
+                'checklist_count' => 0,
+                'image_count' => 0,
+                'fuel_level' => $intakeFuelLevel,
+                'odometer_reading' => $intakeOdometerReading,
+            ];
+            if ($vehicleIntakeFeatureReady) {
+                $intakePayload = [
+                    'fuel_level' => $intakeFuelLevel,
+                    'odometer_reading' => $intakeOdometerReading,
+                    'exterior_condition_notes' => $intakeExteriorNotes,
+                    'interior_condition_notes' => $intakeInteriorNotes,
+                    'mechanical_condition_notes' => $intakeMechanicalNotes,
+                    'remarks' => $intakeRemarks,
+                    'customer_acknowledged' => $intakeCustomerAcknowledged ? 1 : 0,
+                ];
+                $intakeResult = job_vehicle_intake_save_for_job(
+                    $companyId,
+                    $garageId,
+                    $jobId,
+                    $intakePayload,
+                    $intakeChecklistRows,
+                    $intakeUploads,
+                    $userId
+                );
+                if ((int) ($intakeResult['intake_id'] ?? 0) > 0) {
+                    job_append_history($jobId, 'VEHICLE_INTAKE', null, null, 'Vehicle intake captured', [
+                        'intake_id' => (int) ($intakeResult['intake_id'] ?? 0),
+                        'checklist_count' => (int) ($intakeResult['checklist_count'] ?? 0),
+                        'image_count' => (int) ($intakeResult['image_count'] ?? 0),
+                        'fuel_level' => (string) ($intakeResult['fuel_level'] ?? $intakeFuelLevel),
+                        'odometer_reading' => (int) ($intakeResult['odometer_reading'] ?? $intakeOdometerReading),
+                    ]);
+                }
+            }
+
             $createHistoryPayload = ['job_number' => $jobNumber];
             if ($jobOdometerEnabled && $odometerKm !== null) {
                 $createHistoryPayload['odometer_km'] = $odometerKm;
@@ -488,6 +596,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $createHistoryPayload['job_type_id'] = $jobTypeId > 0 ? $jobTypeId : null;
                 $createHistoryPayload['job_type_name'] = $jobTypeId > 0 ? ($jobTypeLabelsById[$jobTypeId] ?? ('Job Type #' . $jobTypeId)) : null;
             }
+            $createHistoryPayload['intake_id'] = (int) ($intakeResult['intake_id'] ?? 0);
             job_append_history($jobId, 'CREATE', null, 'OPEN', 'Job created', $createHistoryPayload);
             log_audit('job_cards', 'create', $jobId, 'Created job card ' . $jobNumber, [
                 'entity' => 'job_card',
@@ -515,10 +624,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'assigned_count' => isset($assigned) && is_array($assigned) ? count($assigned) : 0,
                     'maintenance_added' => (int) ($maintenanceResult['added_count'] ?? 0),
                     'maintenance_postponed' => (int) ($maintenanceResult['postponed_count'] ?? 0),
+                    'intake_id' => (int) ($intakeResult['intake_id'] ?? 0),
+                    'intake_checklist_count' => (int) ($intakeResult['checklist_count'] ?? 0),
+                    'intake_image_count' => (int) ($intakeResult['image_count'] ?? 0),
                 ],
             ]);
             $pdo->commit();
-            flash_set('job_success', 'Job card created successfully. Upload vehicle condition photos now.', 'success');
+            if ((int) ($intakeResult['intake_id'] ?? 0) > 0) {
+                flash_set('job_success', 'Job card created. Vehicle intake can be edited later from Job Card view.', 'success');
+            } else {
+                flash_set('job_success', 'Job card created successfully.', 'success');
+            }
             if ((int) ($maintenanceResult['added_count'] ?? 0) > 0
                 || (int) ($maintenanceResult['postponed_count'] ?? 0) > 0
                 || (int) ($maintenanceResult['ignored_count'] ?? 0) > 0) {
@@ -538,7 +654,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
                 flash_set('job_warning_maintenance_' . $index, $warningMessage, 'warning');
             }
-            redirect('modules/jobs/view.php?id=' . $jobId . '&prompt_condition_photos=1#condition-photos');
+            redirect('modules/jobs/view.php?id=' . $jobId . '#vehicle-intake');
         } catch (Throwable $exception) {
             $pdo->rollBack();
             $errorMessage = $exception instanceof RuntimeException
@@ -908,7 +1024,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
   <div class="app-content"><div class="container-fluid">
     <?php if ($canJobCardPrintSettingsManage): ?>
       <div class="d-flex justify-content-end mb-2">
-        <a href="<?= e(url('modules/jobs/print_settings.php')); ?>" class="btn btn-outline-secondary btn-sm">
+        <a href="<?= e(url('modules/system/settings.php?tab=job_card_print')); ?>" class="btn btn-outline-secondary btn-sm">
           <i class="bi bi-sliders me-1"></i>Job Card Print Settings
         </a>
       </div>
@@ -917,17 +1033,24 @@ require_once __DIR__ . '/../../includes/sidebar.php';
     <div class="card card-primary">
       <div class="card-header d-flex justify-content-between align-items-center">
         <h3 class="card-title mb-0"><?= $editJob ? 'Edit Job Card' : 'Create Job Card'; ?></h3>
-        <?php if (!$editJob && $jobTypeEnabled): ?>
-          <button
-            type="button"
-            class="btn btn-sm btn-outline-light"
-            data-bs-toggle="collapse"
-            data-bs-target="#job-type-settings-panel"
-            aria-expanded="<?= $openJobSettings ? 'true' : 'false'; ?>"
-            aria-controls="job-type-settings-panel">
-            Job Settings
-          </button>
-        <?php endif; ?>
+        <div class="d-flex gap-2">
+          <?php if (!$editJob && $canChecklistMasterManage): ?>
+            <a href="<?= e(url('modules/jobs/checklist_master.php')); ?>" class="btn btn-sm btn-outline-light">
+              Intake Checklist Master
+            </a>
+          <?php endif; ?>
+          <?php if (!$editJob && $jobTypeEnabled): ?>
+            <button
+              type="button"
+              class="btn btn-sm btn-outline-light"
+              data-bs-toggle="collapse"
+              data-bs-target="#job-type-settings-panel"
+              aria-expanded="<?= $openJobSettings ? 'true' : 'false'; ?>"
+              aria-controls="job-type-settings-panel">
+              Job Settings
+            </button>
+          <?php endif; ?>
+        </div>
       </div>
       <?php if (!$editJob && $jobTypeEnabled): ?>
         <div class="collapse<?= $openJobSettings ? ' show' : ''; ?>" id="job-type-settings-panel">
@@ -969,7 +1092,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
           </div>
         </div>
       <?php endif; ?>
-      <form method="post"><div class="card-body row g-3">
+      <form method="post" enctype="multipart/form-data" id="job-card-form"><div class="card-body row g-3">
         <?= csrf_field(); ?><input type="hidden" name="_action" value="<?= $editJob ? 'update' : 'create'; ?>"><input type="hidden" name="job_id" value="<?= (int) ($editJob['id'] ?? 0); ?>">
         <?php if (!$jobOdometerEnabled): ?>
           <div class="col-12">
@@ -1137,6 +1260,25 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         <?php if ($canAssign): ?><div class="col-md-12"><label class="form-label">Assigned Staff (Multiple)</label><select name="assigned_user_ids[]" class="form-select" multiple size="4"><?php foreach ($staffCandidates as $staff): ?><option value="<?= (int) $staff['id']; ?>" <?= in_array((int) $staff['id'], $editAssignments, true) ? 'selected' : ''; ?>><?= e((string) $staff['name']); ?> - <?= e((string) $staff['role_name']); ?></option><?php endforeach; ?></select></div><?php endif; ?>
         <?php if (!$editJob): ?>
           <div class="col-md-12">
+            <div class="card border-0 intake-section-card mb-0">
+              <div class="card-body d-flex justify-content-between align-items-center flex-wrap gap-2">
+                <div>
+                  <h6 class="mb-1">Vehicle Intake Inspection</h6>
+                  <div class="small text-muted">
+                    Capture intake now or fill/update it later from the Job Card view page.
+                  </div>
+                </div>
+                <?php if (!$vehicleIntakeFeatureReady): ?>
+                  <span class="badge text-bg-warning">Module Not Ready</span>
+                <?php else: ?>
+                  <span class="badge text-bg-primary">Ready</span>
+                <?php endif; ?>
+              </div>
+            </div>
+          </div>
+        <?php endif; ?>
+        <?php if (!$editJob): ?>
+          <div class="col-md-12">
             <div class="card card-outline card-success mb-0">
               <div class="card-header">
                 <h3 class="card-title mb-0">Recommended Services/Parts Due</h3>
@@ -1151,7 +1293,183 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             </div>
           </div>
         <?php endif; ?>
-      </div><div class="card-footer d-flex gap-2"><button class="btn btn-primary" type="submit"><?= $editJob ? 'Update' : 'Create'; ?></button><?php if ($editJob): ?><a class="btn btn-outline-secondary" href="<?= e(url('modules/jobs/index.php')); ?>">Cancel</a><?php endif; ?></div></form>
+      </div>
+      <div class="card-footer d-flex gap-2">
+        <?php if ($editJob): ?>
+          <button class="btn btn-primary" type="submit">Update</button>
+          <a class="btn btn-outline-secondary" href="<?= e(url('modules/jobs/index.php')); ?>">Cancel</a>
+        <?php else: ?>
+          <?php if ($vehicleIntakeFeatureReady): ?>
+            <button
+              class="btn btn-primary"
+              type="button"
+              id="open-intake-modal-btn"
+              data-bs-toggle="modal"
+              data-bs-target="#vehicle-intake-modal"
+            >
+              Create Job Card
+            </button>
+            <button class="btn btn-primary d-none" type="submit" id="submit-create-job-hidden">Create Job Card</button>
+          <?php else: ?>
+            <button class="btn btn-primary" type="submit">Create Job Card</button>
+            <span class="text-warning small align-self-center">Vehicle intake module is unavailable right now. You can update intake later.</span>
+          <?php endif; ?>
+        <?php endif; ?>
+      </div>
+
+      <?php if (!$editJob): ?>
+        <div class="modal fade" id="vehicle-intake-modal" tabindex="-1" aria-labelledby="vehicle-intake-modal-label" aria-hidden="true">
+          <div class="modal-dialog modal-xl modal-dialog-scrollable">
+            <div class="modal-content">
+              <div class="modal-header">
+                <h5 class="modal-title" id="vehicle-intake-modal-label">Vehicle Intake Inspection</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+              </div>
+              <div class="modal-body">
+                <?php if (!$vehicleIntakeFeatureReady): ?>
+                  <div class="alert alert-warning mb-0">
+                    Vehicle intake storage is not ready. Contact admin to run upgrade before creating job cards.
+                  </div>
+                <?php else: ?>
+                  <div class="card border-0 intake-section-card mb-3">
+                    <div class="card-body">
+                      <div class="row g-3 align-items-end">
+                        <div class="col-md-3">
+                          <label class="form-label">Odometer (KM)</label>
+                          <input type="number" class="form-control" id="intake-odometer-input" name="intake_odometer_reading" min="0">
+                          <div class="form-hint text-muted mt-1">Auto-linked from Job Card odometer.</div>
+                        </div>
+                        <div class="col-md-9">
+                          <label class="form-label">Fuel Level</label>
+                          <div class="btn-group flex-wrap intake-fuel-group" role="group" aria-label="Fuel level selector">
+                            <?php foreach (job_vehicle_intake_allowed_fuel_levels() as $fuelLevelOption): ?>
+                              <?php $fuelOptionId = 'intake-fuel-' . strtolower($fuelLevelOption); ?>
+                              <input
+                                class="btn-check intake-fuel-option"
+                                type="radio"
+                                name="intake_fuel_level"
+                                id="<?= e($fuelOptionId); ?>"
+                                value="<?= e($fuelLevelOption); ?>"
+                                <?= $fuelLevelOption === 'LOW' ? 'checked' : ''; ?>
+                              >
+                              <label class="btn btn-outline-primary btn-sm" for="<?= e($fuelOptionId); ?>"><?= e(str_replace('_', ' ', $fuelLevelOption)); ?></label>
+                            <?php endforeach; ?>
+                          </div>
+                          <div class="progress mt-2 intake-fuel-progress-wrap">
+                            <div id="intake-fuel-progress-bar" class="progress-bar bg-success" role="progressbar" style="width: 15%;" aria-valuemin="0" aria-valuemax="100">LOW</div>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div class="card border-0 intake-section-card mb-3">
+                    <div class="card-body">
+                      <div class="d-flex justify-content-between align-items-center mb-2">
+                        <h6 class="mb-0">Belongings Checklist</h6>
+                        <button type="button" class="btn btn-sm btn-outline-primary" id="add-custom-intake-item-btn">Add Custom Belonging</button>
+                      </div>
+                      <div class="table-responsive">
+                        <table class="table table-sm align-middle mb-0">
+                          <thead>
+                            <tr>
+                              <th>Item</th>
+                              <th style="width: 290px;">Status</th>
+                              <th>Remarks</th>
+                            </tr>
+                          </thead>
+                          <tbody id="intake-checklist-table-body">
+                            <?php $checklistIndex = 0; ?>
+                            <?php foreach ($vehicleIntakeChecklistMaster as $masterItem): ?>
+                              <?php $itemName = trim((string) ($masterItem['item_name'] ?? '')); ?>
+                              <?php if ($itemName === '') { continue; } ?>
+                              <?php $statusField = 'intake_checklist_status[' . $checklistIndex . ']'; ?>
+                              <?php $presentId = 'intake-checklist-' . $checklistIndex . '-present'; ?>
+                              <?php $missingId = 'intake-checklist-' . $checklistIndex . '-missing'; ?>
+                              <?php $damagedId = 'intake-checklist-' . $checklistIndex . '-damaged'; ?>
+                              <tr>
+                                <td>
+                                  <input type="hidden" name="intake_checklist_name[]" value="<?= e($itemName); ?>">
+                                  <span><?= e($itemName); ?></span>
+                                </td>
+                                <td>
+                                  <div class="btn-group btn-group-sm w-100" role="group">
+                                    <input class="btn-check" type="radio" id="<?= e($presentId); ?>" name="<?= e($statusField); ?>" value="PRESENT" checked>
+                                    <label class="btn btn-outline-success" for="<?= e($presentId); ?>">Present</label>
+                                    <input class="btn-check" type="radio" id="<?= e($missingId); ?>" name="<?= e($statusField); ?>" value="NOT_PRESENT">
+                                    <label class="btn btn-outline-secondary" for="<?= e($missingId); ?>">Not Present</label>
+                                    <input class="btn-check" type="radio" id="<?= e($damagedId); ?>" name="<?= e($statusField); ?>" value="DAMAGED">
+                                    <label class="btn btn-outline-danger" for="<?= e($damagedId); ?>">Damaged</label>
+                                  </div>
+                                </td>
+                                <td><input type="text" name="intake_checklist_remarks[]" class="form-control form-control-sm" maxlength="255" placeholder="Optional"></td>
+                              </tr>
+                              <?php $checklistIndex++; ?>
+                            <?php endforeach; ?>
+                          </tbody>
+                          <tbody id="intake-custom-items-body"></tbody>
+                        </table>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div class="card border-0 intake-section-card mb-3">
+                    <div class="card-body">
+                      <h6 class="mb-2">Damage and Condition Notes</h6>
+                      <div class="row g-2">
+                        <div class="col-md-4">
+                          <label class="form-label">Exterior</label>
+                          <textarea name="intake_exterior_condition_notes" class="form-control" rows="3" maxlength="5000" placeholder="Scratches, dents, panel issues"></textarea>
+                        </div>
+                        <div class="col-md-4">
+                          <label class="form-label">Interior</label>
+                          <textarea name="intake_interior_condition_notes" class="form-control" rows="3" maxlength="5000" placeholder="Seats, dashboard, cabin"></textarea>
+                        </div>
+                        <div class="col-md-4">
+                          <label class="form-label">Mechanical</label>
+                          <textarea name="intake_mechanical_condition_notes" class="form-control" rows="3" maxlength="5000" placeholder="Leaks, noise, warning lights"></textarea>
+                        </div>
+                        <div class="col-12">
+                          <label class="form-label">General Remarks</label>
+                          <textarea name="intake_remarks" class="form-control" rows="2" maxlength="5000" placeholder="Any extra intake remarks"></textarea>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div class="card border-0 intake-section-card mb-3">
+                    <div class="card-body">
+                      <div class="d-flex justify-content-between align-items-center mb-2">
+                        <h6 class="mb-0">Intake Images</h6>
+                        <span class="small text-muted">Drag-drop supported. Max <?= e(number_format(job_vehicle_intake_image_max_upload_bytes($companyId, $garageId) / 1048576, 2)); ?> MB each.</span>
+                      </div>
+                      <div id="intake-drop-zone" class="intake-drop-zone">
+                        <input type="file" id="intake-images-input" name="intake_images[]" accept=".jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp" multiple class="d-none">
+                        <div class="text-muted">Drop images here or <button type="button" class="btn btn-link p-0 align-baseline" id="intake-browse-files-btn">browse files</button></div>
+                      </div>
+                      <div id="intake-image-preview-grid" class="row g-2 mt-2"></div>
+                    </div>
+                  </div>
+
+                  <div class="form-check">
+                    <input class="form-check-input" type="checkbox" name="intake_customer_acknowledged" id="intake-customer-ack" value="1">
+                    <label class="form-check-label fw-semibold" for="intake-customer-ack">
+                      Vehicle condition confirmed in presence of customer
+                    </label>
+                  </div>
+                <?php endif; ?>
+              </div>
+              <div class="modal-footer">
+                <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Close</button>
+                <?php if ($vehicleIntakeFeatureReady): ?>
+                  <button type="button" class="btn btn-primary" id="confirm-intake-create-btn">Save Intake and Create Job Card</button>
+                <?php endif; ?>
+              </div>
+            </div>
+          </div>
+        </div>
+      <?php endif; ?>
+      </form>
     </div>
     <div class="card card-outline card-info mb-3 collapsed-card"><div class="card-header"><h3 class="card-title">VIS Suggestions (Optional)</h3><div class="card-tools"><button type="button" class="btn btn-tool" data-lte-toggle="card-collapse"><i class="bi bi-plus-lg"></i></button></div></div><div class="card-body" id="vis-suggestions-content">Select a vehicle to load optional VIS suggestions. Job creation never depends on VIS.</div></div>
     <?php endif; ?>
@@ -1292,6 +1610,37 @@ require_once __DIR__ . '/../../includes/sidebar.php';
   </div></div>
 </main>
 <?php if ($canCreate || ($canEdit && $editJob)): ?>
+<style>
+  .intake-section-card {
+    background: #edf4ff;
+    border: 1px solid #d4e2fb;
+  }
+
+  .intake-fuel-progress-wrap {
+    height: 14px;
+    background: #dbe8ff;
+  }
+
+  .intake-fuel-group .btn {
+    min-width: 90px;
+  }
+
+  .intake-drop-zone {
+    border: 2px dashed #9db7e8;
+    border-radius: 10px;
+    background: #f6f9ff;
+    padding: 18px;
+    text-align: center;
+    transition: border-color 0.2s ease, background-color 0.2s ease;
+  }
+
+  .intake-drop-zone.is-dragover {
+    border-color: #3d6fcb;
+    background: #e9f2ff;
+  }
+</style>
+<?php endif; ?>
+<?php if ($canCreate || ($canEdit && $editJob)): ?>
 <script>
   (function () {
     var vehicleSelect = document.getElementById('job-vehicle-select');
@@ -1305,6 +1654,22 @@ require_once __DIR__ . '/../../includes/sidebar.php';
     var maintenanceApiUrl = '<?= e($maintenanceRecommendationApiUrl); ?>';
     var isEditMode = <?= $editJob ? 'true' : 'false'; ?>;
     var odometerEnabled = <?= $jobOdometerEnabled ? 'true' : 'false'; ?>;
+    var jobForm = document.getElementById('job-card-form');
+    var intakeModal = document.getElementById('vehicle-intake-modal');
+    var intakeOdometerInput = document.getElementById('intake-odometer-input');
+    var intakeFuelOptions = document.querySelectorAll('.intake-fuel-option');
+    var intakeFuelProgressBar = document.getElementById('intake-fuel-progress-bar');
+    var addCustomIntakeItemBtn = document.getElementById('add-custom-intake-item-btn');
+    var intakeCustomItemsBody = document.getElementById('intake-custom-items-body');
+    var intakeDropZone = document.getElementById('intake-drop-zone');
+    var intakeImagesInput = document.getElementById('intake-images-input');
+    var intakeImagePreviewGrid = document.getElementById('intake-image-preview-grid');
+    var intakeBrowseFilesBtn = document.getElementById('intake-browse-files-btn');
+    var confirmIntakeCreateBtn = document.getElementById('confirm-intake-create-btn');
+    var submitCreateHidden = document.getElementById('submit-create-job-hidden');
+    var intakeCustomerAck = document.getElementById('intake-customer-ack');
+    var intakeFeatureReady = <?= (!$editJob && $vehicleIntakeFeatureReady) ? 'true' : 'false'; ?>;
+    var intakeImageRows = [];
     if (!vehicleSelect || !target) return;
 
     function selectedVehicleOption() {
@@ -1367,6 +1732,186 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       odometerHint.textContent = message || '';
     }
 
+    function syncIntakeOdometer() {
+      if (!intakeOdometerInput || !odometerInput) {
+        return;
+      }
+      var value = (odometerInput.value || '').trim();
+      intakeOdometerInput.value = value;
+    }
+
+    function fuelLevelPercent(level) {
+      switch (String(level || '').toUpperCase()) {
+        case 'EMPTY': return 0;
+        case 'LOW': return 15;
+        case 'QUARTER': return 25;
+        case 'HALF': return 50;
+        case 'THREE_QUARTER': return 75;
+        case 'FULL': return 100;
+        default: return 0;
+      }
+    }
+
+    function updateFuelMeter() {
+      if (!intakeFuelProgressBar) {
+        return;
+      }
+      var selected = document.querySelector('.intake-fuel-option:checked');
+      var level = selected ? String(selected.value || '').toUpperCase() : 'LOW';
+      var pct = fuelLevelPercent(level);
+      intakeFuelProgressBar.style.width = pct + '%';
+      intakeFuelProgressBar.setAttribute('aria-valuenow', String(pct));
+      intakeFuelProgressBar.textContent = level.replace(/_/g, ' ');
+      if (pct >= 60) {
+        intakeFuelProgressBar.className = 'progress-bar bg-success';
+      } else if (pct >= 30) {
+        intakeFuelProgressBar.className = 'progress-bar bg-info';
+      } else if (pct > 0) {
+        intakeFuelProgressBar.className = 'progress-bar bg-warning';
+      } else {
+        intakeFuelProgressBar.className = 'progress-bar bg-danger';
+      }
+    }
+
+    function fileIdentity(file) {
+      if (!file) {
+        return '';
+      }
+      return [file.name || '', file.size || 0, file.lastModified || 0].join('::');
+    }
+
+    function syncIntakeFileInput() {
+      if (!intakeImagesInput) {
+        return;
+      }
+      if (typeof DataTransfer === 'undefined') {
+        return;
+      }
+      var transfer = new DataTransfer();
+      intakeImageRows.forEach(function (entry) {
+        if (entry && entry.file) {
+          transfer.items.add(entry.file);
+        }
+      });
+      intakeImagesInput.files = transfer.files;
+    }
+
+    function renderIntakeImagePreview() {
+      if (!intakeImagePreviewGrid) {
+        return;
+      }
+      if (!Array.isArray(intakeImageRows) || intakeImageRows.length === 0) {
+        intakeImagePreviewGrid.innerHTML = '<div class="col-12"><div class="small text-muted">No intake images selected yet.</div></div>';
+        return;
+      }
+
+      var html = '';
+      for (var i = 0; i < intakeImageRows.length; i++) {
+        var row = intakeImageRows[i] || {};
+        var file = row.file;
+        if (!file) {
+          continue;
+        }
+        var previewUrl = URL.createObjectURL(file);
+        html += ''
+          + '<div class="col-md-3 col-sm-4 col-6">'
+          + '  <div class="border rounded p-2 h-100 d-flex flex-column">'
+          + '    <img src="' + escapeHtml(previewUrl) + '" class="img-fluid rounded mb-2" style="height:110px;object-fit:cover;" alt="Intake Preview">'
+          + '    <div class="small text-muted text-truncate mb-1">' + escapeHtml(file.name || 'Image') + '</div>'
+          + '    <select class="form-select form-select-sm mb-2 intake-image-type-select" data-index="' + i + '" name="intake_image_types[]">'
+          + '      <option value="FRONT"' + ((row.type || 'OTHER') === 'FRONT' ? ' selected' : '') + '>Front</option>'
+          + '      <option value="REAR"' + ((row.type || 'OTHER') === 'REAR' ? ' selected' : '') + '>Rear</option>'
+          + '      <option value="LEFT"' + ((row.type || 'OTHER') === 'LEFT' ? ' selected' : '') + '>Left</option>'
+          + '      <option value="RIGHT"' + ((row.type || 'OTHER') === 'RIGHT' ? ' selected' : '') + '>Right</option>'
+          + '      <option value="INTERIOR"' + ((row.type || 'OTHER') === 'INTERIOR' ? ' selected' : '') + '>Interior</option>'
+          + '      <option value="ENGINE"' + ((row.type || 'OTHER') === 'ENGINE' ? ' selected' : '') + '>Engine</option>'
+          + '      <option value="OTHER"' + ((row.type || 'OTHER') === 'OTHER' ? ' selected' : '') + '>Other</option>'
+          + '    </select>'
+          + '    <button type="button" class="btn btn-sm btn-outline-danger intake-remove-image-btn mt-auto" data-index="' + i + '">Remove</button>'
+          + '  </div>'
+          + '</div>';
+      }
+      intakeImagePreviewGrid.innerHTML = html;
+
+      var previewImages = intakeImagePreviewGrid.querySelectorAll('img');
+      previewImages.forEach(function (imageNode) {
+        imageNode.addEventListener('load', function () {
+          var src = imageNode.getAttribute('src') || '';
+          if (src.indexOf('blob:') === 0) {
+            URL.revokeObjectURL(src);
+          }
+        });
+      });
+    }
+
+    function addIntakeFiles(files) {
+      if (!Array.isArray(intakeImageRows)) {
+        intakeImageRows = [];
+      }
+      var existing = {};
+      intakeImageRows.forEach(function (entry) {
+        if (entry && entry.file) {
+          existing[fileIdentity(entry.file)] = true;
+        }
+      });
+
+      var fileList = Array.prototype.slice.call(files || []);
+      fileList.forEach(function (file) {
+        if (!file || !file.type || file.type.indexOf('image/') !== 0) {
+          return;
+        }
+        var key = fileIdentity(file);
+        if (key === '' || existing[key]) {
+          return;
+        }
+        existing[key] = true;
+        intakeImageRows.push({
+          file: file,
+          type: 'OTHER'
+        });
+      });
+
+      syncIntakeFileInput();
+      renderIntakeImagePreview();
+    }
+
+    function addCustomIntakeRow() {
+      if (!intakeCustomItemsBody) {
+        return;
+      }
+      var row = document.createElement('tr');
+      row.innerHTML = ''
+        + '<td><input type="text" name="intake_custom_item_name[]" class="form-control form-control-sm" maxlength="120" placeholder="Custom item name"></td>'
+        + '<td>'
+        + '  <select name="intake_custom_item_status[]" class="form-select form-select-sm">'
+        + '    <option value="PRESENT">Present</option>'
+        + '    <option value="NOT_PRESENT">Not Present</option>'
+        + '    <option value="DAMAGED">Damaged</option>'
+        + '  </select>'
+        + '</td>'
+        + '<td>'
+        + '  <div class="d-flex gap-2">'
+        + '    <input type="text" name="intake_custom_item_remarks[]" class="form-control form-control-sm" maxlength="255" placeholder="Optional">'
+        + '    <button type="button" class="btn btn-sm btn-outline-danger intake-remove-custom-item-btn">X</button>'
+        + '  </div>'
+        + '</td>';
+      intakeCustomItemsBody.appendChild(row);
+    }
+
+    function validateIntakeBeforeSubmit() {
+      if (!intakeFeatureReady) {
+        return false;
+      }
+      if (!jobForm) {
+        return false;
+      }
+      if (!jobForm.checkValidity()) {
+        jobForm.reportValidity();
+        return false;
+      }
+      return true;
+    }
+
     function syncOwnerFromVehicle() {
       if (!customerSelect || customerSelect.disabled || vehicleSelect.disabled) {
         return;
@@ -1390,9 +1935,11 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 
     function syncOdometerFromVehicle(forceOverwrite) {
       if (!odometerEnabled || !odometerInput || odometerInput.disabled) {
+        syncIntakeOdometer();
         return;
       }
       if (vehicleSelect.disabled) {
+        syncIntakeOdometer();
         return;
       }
 
@@ -1402,6 +1949,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
           odometerInput.value = '';
         }
         renderOdometerHint('Select vehicle to auto-fill the last recorded odometer.');
+        syncIntakeOdometer();
         return;
       }
 
@@ -1411,6 +1959,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
           odometerInput.value = '';
         }
         renderOdometerHint('No previous odometer found for this vehicle. Enter current reading.');
+        syncIntakeOdometer();
         return;
       }
 
@@ -1420,6 +1969,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 
       var sourceText = odometerMeta.source !== '' ? ' (' + odometerMeta.source + ')' : '';
       renderOdometerHint('Last recorded odometer: ' + formatKm(odometerMeta.value) + ' KM' + sourceText + '.');
+      syncIntakeOdometer();
     }
 
     function customerVehicleOptions(customerId) {
@@ -1607,6 +2157,112 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         .then(render)
         .catch(function () { target.innerHTML = 'VIS suggestions unavailable. Continue manually.'; });
     }
+
+    if (odometerInput) {
+      odometerInput.addEventListener('input', syncIntakeOdometer);
+    }
+
+    if (!isEditMode && intakeFeatureReady) {
+      if (intakeFuelOptions && intakeFuelOptions.length > 0) {
+        intakeFuelOptions.forEach(function (option) {
+          option.addEventListener('change', updateFuelMeter);
+        });
+      }
+      updateFuelMeter();
+      syncIntakeOdometer();
+
+      if (addCustomIntakeItemBtn) {
+        addCustomIntakeItemBtn.addEventListener('click', addCustomIntakeRow);
+      }
+      if (intakeCustomItemsBody) {
+        intakeCustomItemsBody.addEventListener('click', function (event) {
+          var targetBtn = event.target;
+          if (!targetBtn || !targetBtn.classList.contains('intake-remove-custom-item-btn')) {
+            return;
+          }
+          var row = targetBtn.closest('tr');
+          if (row && row.parentNode) {
+            row.parentNode.removeChild(row);
+          }
+        });
+      }
+
+      if (intakeBrowseFilesBtn && intakeImagesInput) {
+        intakeBrowseFilesBtn.addEventListener('click', function () {
+          intakeImagesInput.click();
+        });
+      }
+      if (intakeImagesInput) {
+        intakeImagesInput.addEventListener('change', function () {
+          addIntakeFiles(Array.prototype.slice.call(intakeImagesInput.files || []));
+          intakeImagesInput.value = '';
+        });
+      }
+      if (intakeDropZone) {
+        ['dragenter', 'dragover'].forEach(function (eventName) {
+          intakeDropZone.addEventListener(eventName, function (event) {
+            event.preventDefault();
+            event.stopPropagation();
+            intakeDropZone.classList.add('is-dragover');
+          });
+        });
+        ['dragleave', 'drop'].forEach(function (eventName) {
+          intakeDropZone.addEventListener(eventName, function (event) {
+            event.preventDefault();
+            event.stopPropagation();
+            intakeDropZone.classList.remove('is-dragover');
+          });
+        });
+        intakeDropZone.addEventListener('drop', function (event) {
+          var files = event.dataTransfer ? event.dataTransfer.files : null;
+          addIntakeFiles(Array.prototype.slice.call(files || []));
+        });
+      }
+      if (intakeImagePreviewGrid) {
+        intakeImagePreviewGrid.addEventListener('change', function (event) {
+          var select = event.target;
+          if (!select || !select.classList.contains('intake-image-type-select')) {
+            return;
+          }
+          var index = Number(select.getAttribute('data-index') || -1);
+          if (Number.isFinite(index) && index >= 0 && intakeImageRows[index]) {
+            intakeImageRows[index].type = String(select.value || 'OTHER').toUpperCase();
+          }
+        });
+        intakeImagePreviewGrid.addEventListener('click', function (event) {
+          var btn = event.target;
+          if (!btn || !btn.classList.contains('intake-remove-image-btn')) {
+            return;
+          }
+          var index = Number(btn.getAttribute('data-index') || -1);
+          if (!Number.isFinite(index) || index < 0) {
+            return;
+          }
+          intakeImageRows.splice(index, 1);
+          syncIntakeFileInput();
+          renderIntakeImagePreview();
+        });
+      }
+      renderIntakeImagePreview();
+
+      if (intakeModal) {
+        intakeModal.addEventListener('shown.bs.modal', function () {
+          syncIntakeOdometer();
+          updateFuelMeter();
+        });
+      }
+
+      if (confirmIntakeCreateBtn && submitCreateHidden) {
+        confirmIntakeCreateBtn.addEventListener('click', function () {
+          if (!validateIntakeBeforeSubmit()) {
+            return;
+          }
+          submitCreateHidden.classList.remove('d-none');
+          submitCreateHidden.click();
+        });
+      }
+    }
+
     vehicleSelect.addEventListener('change', function () {
       syncOwnerFromVehicle();
       syncOdometerFromVehicle(true);

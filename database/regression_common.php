@@ -512,6 +512,27 @@ final class RegressionHarness
             if ($this->tableExists('job_assignments') && $this->tableExists('job_cards')) {
                 $deleteJoin('job_assignments', 'ja', 'INNER JOIN job_cards j ON j.id = ja.job_card_id', 'j.company_id = :company_id', ['company_id' => $this->companyId]);
             }
+            if ($this->tableExists('job_vehicle_images') && $this->tableExists('job_vehicle_intake') && $this->tableExists('job_cards')) {
+                $deleteJoin(
+                    'job_vehicle_images',
+                    'jimg',
+                    'INNER JOIN job_vehicle_intake jvi ON jvi.id = jimg.job_intake_id INNER JOIN job_cards j ON j.id = jvi.job_card_id',
+                    'j.company_id = :company_id',
+                    ['company_id' => $this->companyId]
+                );
+            }
+            if ($this->tableExists('job_vehicle_checklist_items') && $this->tableExists('job_vehicle_intake') && $this->tableExists('job_cards')) {
+                $deleteJoin(
+                    'job_vehicle_checklist_items',
+                    'jci',
+                    'INNER JOIN job_vehicle_intake jvi ON jvi.id = jci.job_intake_id INNER JOIN job_cards j ON j.id = jvi.job_card_id',
+                    'j.company_id = :company_id',
+                    ['company_id' => $this->companyId]
+                );
+            }
+            if ($this->tableExists('job_vehicle_intake') && $this->tableExists('job_cards')) {
+                $deleteJoin('job_vehicle_intake', 'jvi', 'INNER JOIN job_cards j ON j.id = jvi.job_card_id', 'j.company_id = :company_id', ['company_id' => $this->companyId]);
+            }
             if ($this->tableExists('return_items') && $this->tableExists('returns_rma')) {
                 $deleteJoin('return_items', 'ri', 'INNER JOIN returns_rma r ON r.id = ri.return_id', 'r.company_id = :company_id', ['company_id' => $this->companyId]);
             }
@@ -536,6 +557,7 @@ final class RegressionHarness
                 'payroll_salary_payments',
                 'payroll_salary_sheets',
                 'inventory_movements',
+                'job_vehicle_intake',
                 'job_cards',
                 'vehicle_history',
                 'customer_history',

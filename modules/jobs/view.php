@@ -713,6 +713,184 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         redirect('modules/jobs/view.php?id=' . $jobId);
     }
 
+    if ($action === 'save_vehicle_intake') {
+        if (!($canEdit || $canCreate)) {
+            flash_set('job_error', 'You do not have permission to update vehicle intake.', 'danger');
+            redirect('modules/jobs/view.php?id=' . $jobId . '#vehicle-intake');
+        }
+        if (!job_vehicle_intake_feature_ready()) {
+            flash_set('job_error', 'Vehicle intake storage is not ready.', 'danger');
+            redirect('modules/jobs/view.php?id=' . $jobId . '#vehicle-intake');
+        }
+        if (normalize_status_code((string) ($jobForWrite['status_code'] ?? 'ACTIVE')) === 'DELETED') {
+            flash_set('job_error', 'Deleted job cards cannot be modified.', 'danger');
+            redirect('modules/jobs/view.php?id=' . $jobId . '#vehicle-intake');
+        }
+        if (job_normalize_status((string) ($jobForWrite['status'] ?? 'OPEN')) === 'CLOSED') {
+            flash_set('job_error', 'Vehicle intake is read-only after job closure.', 'danger');
+            redirect('modules/jobs/view.php?id=' . $jobId . '#vehicle-intake');
+        }
+
+        $intakeOdometerRaw = trim((string) ($_POST['intake_odometer_reading'] ?? ''));
+        $intakeOdometer = $intakeOdometerRaw !== ''
+            ? max(0, (int) $intakeOdometerRaw)
+            : max(0, (int) ($jobForWrite['odometer_km'] ?? 0));
+        $intakeFuelLevel = job_vehicle_intake_normalize_fuel_level((string) ($_POST['intake_fuel_level'] ?? 'LOW'));
+        $intakeExteriorNotes = post_string('intake_exterior_condition_notes', 5000);
+        $intakeInteriorNotes = post_string('intake_interior_condition_notes', 5000);
+        $intakeMechanicalNotes = post_string('intake_mechanical_condition_notes', 5000);
+        $intakeRemarks = post_string('intake_remarks', 5000);
+        $intakeCustomerAcknowledged = !empty($_POST['intake_customer_acknowledged']);
+
+        $intakeChecklistRows = [];
+        $intakeDefaultNames = $_POST['intake_checklist_name'] ?? [];
+        $intakeDefaultStatuses = $_POST['intake_checklist_status'] ?? [];
+        $intakeDefaultRemarks = $_POST['intake_checklist_remarks'] ?? [];
+        if (is_array($intakeDefaultNames)) {
+            $defaultCount = count($intakeDefaultNames);
+            for ($index = 0; $index < $defaultCount; $index++) {
+                $name = mb_substr(trim((string) ($intakeDefaultNames[$index] ?? '')), 0, 120);
+                if ($name === '') {
+                    continue;
+                }
+                $intakeChecklistRows[] = [
+                    'item_name' => $name,
+                    'status' => job_vehicle_intake_normalize_item_status((string) ($intakeDefaultStatuses[$index] ?? 'NOT_PRESENT')),
+                    'remarks' => mb_substr(trim((string) ($intakeDefaultRemarks[$index] ?? '')), 0, 255),
+                ];
+            }
+        }
+
+        $intakeCustomNames = $_POST['intake_custom_item_name'] ?? [];
+        $intakeCustomStatuses = $_POST['intake_custom_item_status'] ?? [];
+        $intakeCustomRemarks = $_POST['intake_custom_item_remarks'] ?? [];
+        if (is_array($intakeCustomNames)) {
+            $customCount = count($intakeCustomNames);
+            for ($index = 0; $index < $customCount; $index++) {
+                $name = mb_substr(trim((string) ($intakeCustomNames[$index] ?? '')), 0, 120);
+                if ($name === '') {
+                    continue;
+                }
+                $intakeChecklistRows[] = [
+                    'item_name' => $name,
+                    'status' => job_vehicle_intake_normalize_item_status((string) ($intakeCustomStatuses[$index] ?? 'NOT_PRESENT')),
+                    'remarks' => mb_substr(trim((string) ($intakeCustomRemarks[$index] ?? '')), 0, 255),
+                ];
+            }
+        }
+
+        $intakeUploads = job_vehicle_intake_normalize_uploads($_FILES['intake_images'] ?? null);
+        $intakeImageTypes = $_POST['intake_image_types'] ?? [];
+        $defaultUploadType = is_array($intakeImageTypes)
+            ? job_vehicle_intake_normalize_image_type((string) ($intakeImageTypes[0] ?? 'OTHER'))
+            : 'OTHER';
+        foreach ($intakeUploads as $uploadIndex => $uploadFile) {
+            if (!is_array($uploadFile)) {
+                continue;
+            }
+            $intakeUploads[$uploadIndex]['image_type'] = is_array($intakeImageTypes)
+                ? job_vehicle_intake_normalize_image_type((string) ($intakeImageTypes[$uploadIndex] ?? $defaultUploadType))
+                : $defaultUploadType;
+        }
+
+        try {
+            $saveResult = job_vehicle_intake_save_for_job(
+                $companyId,
+                $garageId,
+                $jobId,
+                [
+                    'fuel_level' => $intakeFuelLevel,
+                    'odometer_reading' => $intakeOdometer,
+                    'exterior_condition_notes' => $intakeExteriorNotes,
+                    'interior_condition_notes' => $intakeInteriorNotes,
+                    'mechanical_condition_notes' => $intakeMechanicalNotes,
+                    'remarks' => $intakeRemarks,
+                    'customer_acknowledged' => $intakeCustomerAcknowledged ? 1 : 0,
+                ],
+                $intakeChecklistRows,
+                $intakeUploads,
+                $userId,
+                true
+            );
+            job_append_history($jobId, 'VEHICLE_INTAKE_UPDATE', null, null, 'Vehicle intake updated', [
+                'intake_id' => (int) ($saveResult['intake_id'] ?? 0),
+                'checklist_count' => (int) ($saveResult['checklist_count'] ?? 0),
+                'image_count' => (int) ($saveResult['image_count'] ?? 0),
+            ]);
+            flash_set('job_success', 'Vehicle intake saved successfully.', 'success');
+        } catch (Throwable $exception) {
+            $message = trim((string) $exception->getMessage());
+            flash_set('job_error', $message !== '' ? $message : 'Unable to save vehicle intake.', 'danger');
+        }
+
+        redirect('modules/jobs/view.php?id=' . $jobId . '#vehicle-intake');
+    }
+
+    if ($action === 'delete_vehicle_intake_image') {
+        if (!($canEdit || $canCreate)) {
+            flash_set('job_error', 'You do not have permission to delete intake images.', 'danger');
+            redirect('modules/jobs/view.php?id=' . $jobId . '#vehicle-intake');
+        }
+        if (!job_vehicle_intake_feature_ready()) {
+            flash_set('job_error', 'Vehicle intake storage is not ready.', 'danger');
+            redirect('modules/jobs/view.php?id=' . $jobId . '#vehicle-intake');
+        }
+        if (job_normalize_status((string) ($jobForWrite['status'] ?? 'OPEN')) === 'CLOSED') {
+            flash_set('job_error', 'Vehicle intake is read-only after job closure.', 'danger');
+            redirect('modules/jobs/view.php?id=' . $jobId . '#vehicle-intake');
+        }
+
+        $imageId = post_int('image_id');
+        if ($imageId <= 0) {
+            flash_set('job_error', 'Invalid intake image selected.', 'danger');
+            redirect('modules/jobs/view.php?id=' . $jobId . '#vehicle-intake');
+        }
+
+        $imageStmt = db()->prepare(
+            'SELECT jimg.id, jimg.image_path, jimg.job_intake_id
+             FROM job_vehicle_images jimg
+             INNER JOIN job_vehicle_intake jvi ON jvi.id = jimg.job_intake_id
+             WHERE jimg.id = :image_id
+               AND jimg.status_code = "ACTIVE"
+               AND jvi.company_id = :company_id
+               AND jvi.garage_id = :garage_id
+               AND jvi.job_card_id = :job_id
+               AND jvi.status_code = "ACTIVE"
+             LIMIT 1'
+        );
+        $imageStmt->execute([
+            'image_id' => $imageId,
+            'company_id' => $companyId,
+            'garage_id' => $garageId,
+            'job_id' => $jobId,
+        ]);
+        $imageRow = $imageStmt->fetch() ?: null;
+        if (!$imageRow) {
+            flash_set('job_error', 'Intake image not found.', 'danger');
+            redirect('modules/jobs/view.php?id=' . $jobId . '#vehicle-intake');
+        }
+
+        $updateStmt = db()->prepare(
+            'UPDATE job_vehicle_images
+             SET status_code = "DELETED",
+                 deleted_at = NOW()
+             WHERE id = :id
+               AND status_code = "ACTIVE"'
+        );
+        $updateStmt->execute(['id' => $imageId]);
+        if ($updateStmt->rowCount() > 0) {
+            job_vehicle_intake_image_delete_file((string) ($imageRow['image_path'] ?? ''));
+            job_append_history($jobId, 'VEHICLE_INTAKE_IMAGE_DELETE', null, null, 'Deleted intake image', [
+                'image_id' => $imageId,
+            ]);
+            flash_set('job_success', 'Intake image deleted.', 'success');
+        } else {
+            flash_set('job_error', 'Unable to delete intake image.', 'danger');
+        }
+
+        redirect('modules/jobs/view.php?id=' . $jobId . '#vehicle-intake');
+    }
+
     if ($action === 'update_recommendation_note') {
         if (!$jobRecommendationNoteEnabled) {
             flash_set('job_error', 'Recommendation note storage is not ready.', 'danger');
@@ -1483,6 +1661,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             );
             $deleteStmt->execute($deleteParams);
 
+            $intakeDeletedCount = job_vehicle_intake_soft_delete_by_job(
+                $companyId,
+                $garageId,
+                $jobId,
+                $userId > 0 ? $userId : null,
+                $deleteNote
+            );
+
             job_append_history(
                 $jobId,
                 'SOFT_DELETE',
@@ -1504,6 +1690,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'metadata' => [
                     'cancellable_outsourced_count' => count($cancellableOutsourcedIds),
                     'inventory_movements' => (int) ($dependencyReport['inventory_movements'] ?? 0),
+                    'intake_deleted_count' => $intakeDeletedCount,
                 ],
             ]);
 
@@ -1513,6 +1700,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'job_number' => (string) ($jobForWrite['job_number'] ?? ''),
                     'inventory_movements' => (int) ($dependencyReport['inventory_movements'] ?? 0),
                     'cancellable_outsourced_count' => count($cancellableOutsourcedIds),
+                    'intake_deleted_count' => $intakeDeletedCount,
                 ],
             ]);
             flash_set('job_success', 'Job card soft deleted with safe dependency checks.', 'success');
@@ -2544,6 +2732,51 @@ $canPrintJob = has_permission('job.print') || has_permission('job.manage') || ha
 $jobPrintRestricted = $jobStatus === 'CANCELLED' || normalize_status_code((string) ($job['status_code'] ?? 'ACTIVE')) === 'DELETED';
 $canPrintRestricted = has_permission('job.print.cancelled') || has_permission('job.manage');
 $canRenderPrintButton = $canPrintJob && (!$jobPrintRestricted || $canPrintRestricted);
+$vehicleIntakeFeatureReady = job_vehicle_intake_feature_ready();
+$vehicleIntakeData = $vehicleIntakeFeatureReady
+    ? job_vehicle_intake_fetch_by_job($companyId, $garageId, $jobId)
+    : null;
+$vehicleIntake = is_array($vehicleIntakeData) && is_array($vehicleIntakeData['intake'] ?? null)
+    ? (array) $vehicleIntakeData['intake']
+    : null;
+$vehicleIntakeChecklistItems = is_array($vehicleIntakeData)
+    ? (array) ($vehicleIntakeData['checklist_items'] ?? [])
+    : [];
+$vehicleIntakeImages = is_array($vehicleIntakeData)
+    ? (array) ($vehicleIntakeData['images'] ?? [])
+    : [];
+$vehicleIntakeChecklistSummary = is_array($vehicleIntakeData)
+    ? (array) ($vehicleIntakeData['checklist_summary'] ?? ['present' => 0, 'not_present' => 0, 'damaged' => 0])
+    : ['present' => 0, 'not_present' => 0, 'damaged' => 0];
+$vehicleIntakeImageCount = count($vehicleIntakeImages);
+$vehicleIntakeEditable = $vehicleIntakeFeatureReady
+    && ($canEdit || $canCreate)
+    && $jobStatus !== 'CLOSED'
+    && normalize_status_code((string) ($job['status_code'] ?? 'ACTIVE')) !== 'DELETED';
+$vehicleIntakeMasterItems = $vehicleIntakeFeatureReady ? job_vehicle_intake_master_items(true) : [];
+if ($vehicleIntakeFeatureReady && $vehicleIntakeMasterItems === []) {
+    foreach (job_vehicle_intake_default_checklist_items() as $itemName) {
+        $vehicleIntakeMasterItems[] = [
+            'item_name' => $itemName,
+        ];
+    }
+}
+$vehicleIntakeFormChecklistItems = [];
+if ($vehicleIntakeChecklistItems !== []) {
+    $vehicleIntakeFormChecklistItems = $vehicleIntakeChecklistItems;
+} else {
+    foreach ($vehicleIntakeMasterItems as $masterItem) {
+        $name = trim((string) ($masterItem['item_name'] ?? ''));
+        if ($name === '') {
+            continue;
+        }
+        $vehicleIntakeFormChecklistItems[] = [
+            'item_name' => $name,
+            'status' => 'NOT_PRESENT',
+            'remarks' => '',
+        ];
+    }
+}
 $conditionPhotoFeatureReady = job_condition_photo_feature_ready();
 $conditionPhotos = $conditionPhotoFeatureReady
     ? job_condition_photo_fetch_by_job($companyId, $garageId, $jobId, 200)
@@ -2650,6 +2883,11 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                 <a href="<?= e(url('modules/jobs/print_job_card.php?id=' . $jobId)); ?>" class="btn btn-outline-dark btn-sm" target="_blank">
                   Print Job Card
                 </a>
+                <?php if ($vehicleIntake !== null): ?>
+                  <a href="<?= e(url('modules/jobs/print_vehicle_intake.php?id=' . $jobId)); ?>" class="btn btn-outline-primary btn-sm" target="_blank">
+                    Print Vehicle Intake
+                  </a>
+                <?php endif; ?>
               <?php elseif ($jobPrintRestricted): ?>
                 <span class="btn btn-outline-dark btn-sm disabled">Print blocked for <?= e($jobStatus); ?></span>
               <?php endif; ?>
@@ -2826,6 +3064,226 @@ require_once __DIR__ . '/../../includes/sidebar.php';
               <?php endif; ?>
               <?php if (!empty($job['cancel_note'])): ?>
                 <div class="alert alert-light border mt-3 mb-0"><strong>Audit Note:</strong> <?= e((string) $job['cancel_note']); ?></div>
+              <?php endif; ?>
+            </div>
+          </div>
+
+          <div class="card card-outline card-primary" id="vehicle-intake">
+            <div class="card-header d-flex justify-content-between align-items-center">
+              <h3 class="card-title mb-0">Vehicle Intake</h3>
+              <span class="badge text-bg-<?= $vehicleIntake !== null ? 'success' : 'warning'; ?>">
+                <?= $vehicleIntake !== null ? 'Captured' : 'Pending'; ?>
+              </span>
+            </div>
+            <div class="card-body">
+              <?php if (!$vehicleIntakeFeatureReady): ?>
+                <div class="alert alert-warning mb-0">
+                  Vehicle intake storage is not ready. Run DB upgrade to enable this section.
+                </div>
+              <?php else: ?>
+                <?php if ($jobStatus === 'CLOSED'): ?>
+                  <div class="alert alert-light border">Vehicle intake is read-only because this job is CLOSED.</div>
+                <?php elseif ($vehicleIntakeEditable): ?>
+                  <div class="alert alert-info py-2">
+                    Vehicle intake is optional during creation. You can add or modify intake details here before job closure.
+                  </div>
+                <?php endif; ?>
+
+                <?php if ($vehicleIntakeEditable): ?>
+                  <form method="post" enctype="multipart/form-data" class="row g-2 mb-3">
+                    <?= csrf_field(); ?>
+                    <input type="hidden" name="_action" value="save_vehicle_intake">
+                    <div class="col-md-3">
+                      <label class="form-label">Odometer (KM)</label>
+                      <input type="number" name="intake_odometer_reading" class="form-control" min="0" value="<?= e((string) (int) ($vehicleIntake['odometer_reading'] ?? ($job['odometer_km'] ?? 0))); ?>">
+                    </div>
+                    <div class="col-md-3">
+                      <label class="form-label">Fuel Level</label>
+                      <?php $selectedIntakeFuel = job_vehicle_intake_normalize_fuel_level((string) ($vehicleIntake['fuel_level'] ?? 'LOW')); ?>
+                      <select name="intake_fuel_level" class="form-select">
+                        <?php foreach (job_vehicle_intake_allowed_fuel_levels() as $fuelOption): ?>
+                          <option value="<?= e($fuelOption); ?>" <?= $selectedIntakeFuel === $fuelOption ? 'selected' : ''; ?>><?= e(str_replace('_', ' ', $fuelOption)); ?></option>
+                        <?php endforeach; ?>
+                      </select>
+                    </div>
+                    <div class="col-md-6 d-flex align-items-end">
+                      <div class="form-check mb-2">
+                        <input class="form-check-input" type="checkbox" name="intake_customer_acknowledged" id="view-intake-customer-ack" value="1" <?= (int) ($vehicleIntake['customer_acknowledged'] ?? 0) === 1 ? 'checked' : ''; ?>>
+                        <label class="form-check-label" for="view-intake-customer-ack">Vehicle condition confirmed in presence of customer</label>
+                      </div>
+                    </div>
+                    <div class="col-md-3">
+                      <label class="form-label">Exterior Notes</label>
+                      <textarea name="intake_exterior_condition_notes" class="form-control" rows="2" maxlength="5000"><?= e((string) ($vehicleIntake['exterior_condition_notes'] ?? '')); ?></textarea>
+                    </div>
+                    <div class="col-md-3">
+                      <label class="form-label">Interior Notes</label>
+                      <textarea name="intake_interior_condition_notes" class="form-control" rows="2" maxlength="5000"><?= e((string) ($vehicleIntake['interior_condition_notes'] ?? '')); ?></textarea>
+                    </div>
+                    <div class="col-md-3">
+                      <label class="form-label">Mechanical Notes</label>
+                      <textarea name="intake_mechanical_condition_notes" class="form-control" rows="2" maxlength="5000"><?= e((string) ($vehicleIntake['mechanical_condition_notes'] ?? '')); ?></textarea>
+                    </div>
+                    <div class="col-md-3">
+                      <label class="form-label">Remarks</label>
+                      <textarea name="intake_remarks" class="form-control" rows="2" maxlength="5000"><?= e((string) ($vehicleIntake['remarks'] ?? '')); ?></textarea>
+                    </div>
+
+                    <div class="col-12">
+                      <div class="d-flex justify-content-between align-items-center mb-1">
+                        <label class="form-label mb-0">Checklist Items</label>
+                        <button type="button" class="btn btn-sm btn-outline-primary" id="view-add-intake-custom-item-btn">Add Custom Item</button>
+                      </div>
+                      <div class="table-responsive">
+                        <table class="table table-sm table-bordered mb-0">
+                          <thead>
+                            <tr>
+                              <th>Item</th>
+                              <th style="width: 160px;">Status</th>
+                              <th>Remarks</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            <?php foreach ($vehicleIntakeFormChecklistItems as $checklistItem): ?>
+                              <?php $itemName = trim((string) ($checklistItem['item_name'] ?? '')); ?>
+                              <?php if ($itemName === '') { continue; } ?>
+                              <?php $itemStatus = job_vehicle_intake_normalize_item_status((string) ($checklistItem['status'] ?? 'NOT_PRESENT')); ?>
+                              <tr>
+                                <td>
+                                  <input type="hidden" name="intake_checklist_name[]" value="<?= e($itemName); ?>">
+                                  <?= e($itemName); ?>
+                                </td>
+                                <td>
+                                  <select name="intake_checklist_status[]" class="form-select form-select-sm">
+                                    <option value="PRESENT" <?= $itemStatus === 'PRESENT' ? 'selected' : ''; ?>>Present</option>
+                                    <option value="NOT_PRESENT" <?= $itemStatus === 'NOT_PRESENT' ? 'selected' : ''; ?>>Not Present</option>
+                                    <option value="DAMAGED" <?= $itemStatus === 'DAMAGED' ? 'selected' : ''; ?>>Damaged</option>
+                                  </select>
+                                </td>
+                                <td><input type="text" name="intake_checklist_remarks[]" class="form-control form-control-sm" maxlength="255" value="<?= e((string) ($checklistItem['remarks'] ?? '')); ?>" placeholder="Optional"></td>
+                              </tr>
+                            <?php endforeach; ?>
+                          </tbody>
+                          <tbody id="view-intake-custom-items-body"></tbody>
+                        </table>
+                      </div>
+                    </div>
+
+                    <div class="col-md-8">
+                      <label class="form-label">Upload Intake Images</label>
+                      <input type="file" name="intake_images[]" class="form-control" accept=".jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp" multiple>
+                    </div>
+                    <div class="col-md-4">
+                      <label class="form-label">Image Type</label>
+                      <select name="intake_image_types[]" class="form-select">
+                        <?php foreach (job_vehicle_intake_allowed_image_types() as $imageTypeOption): ?>
+                          <option value="<?= e($imageTypeOption); ?>"><?= e(str_replace('_', ' ', $imageTypeOption)); ?></option>
+                        <?php endforeach; ?>
+                      </select>
+                    </div>
+                    <div class="col-12 d-flex justify-content-end">
+                      <button type="submit" class="btn btn-outline-primary">Save Vehicle Intake</button>
+                    </div>
+                  </form>
+                <?php endif; ?>
+
+                <?php if ($vehicleIntake === null): ?>
+                  <div class="text-muted">No vehicle intake record found for this job card.</div>
+                <?php else: ?>
+                  <div class="row g-2 mb-3">
+                    <div class="col-md-6">
+                      <div class="small text-muted">Odometer</div>
+                      <div class="fw-semibold"><?= e(number_format((float) ($vehicleIntake['odometer_reading'] ?? 0), 0)); ?> KM</div>
+                    </div>
+                    <div class="col-md-6">
+                      <div class="small text-muted">Fuel Level</div>
+                      <?php
+                        $intakeFuelLevel = job_vehicle_intake_normalize_fuel_level((string) ($vehicleIntake['fuel_level'] ?? 'LOW'));
+                        $fuelPercent = job_vehicle_intake_fuel_level_percent($intakeFuelLevel);
+                        $fuelBarClass = $fuelPercent >= 60 ? 'bg-success' : ($fuelPercent >= 30 ? 'bg-info' : ($fuelPercent > 0 ? 'bg-warning' : 'bg-danger'));
+                      ?>
+                      <div class="progress" style="height: 14px;">
+                        <div class="progress-bar <?= e($fuelBarClass); ?>" role="progressbar" style="width: <?= (int) $fuelPercent; ?>%;"><?= e(str_replace('_', ' ', $intakeFuelLevel)); ?></div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div class="row g-2 mb-3">
+                    <div class="col-md-4"><span class="badge text-bg-success">Present: <?= (int) ($vehicleIntakeChecklistSummary['present'] ?? 0); ?></span></div>
+                    <div class="col-md-4"><span class="badge text-bg-secondary">Not Present: <?= (int) ($vehicleIntakeChecklistSummary['not_present'] ?? 0); ?></span></div>
+                    <div class="col-md-4"><span class="badge text-bg-danger">Damaged: <?= (int) ($vehicleIntakeChecklistSummary['damaged'] ?? 0); ?></span></div>
+                  </div>
+
+                  <div class="table-responsive mb-3">
+                    <table class="table table-sm table-bordered mb-0">
+                      <thead>
+                        <tr>
+                          <th>Item</th>
+                          <th style="width: 130px;">Status</th>
+                          <th>Remarks</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        <?php if ($vehicleIntakeChecklistItems === []): ?>
+                          <tr><td colspan="3" class="text-center text-muted">No checklist rows captured.</td></tr>
+                        <?php else: ?>
+                          <?php foreach ($vehicleIntakeChecklistItems as $checklistItem): ?>
+                            <?php $rowStatus = job_vehicle_intake_normalize_item_status((string) ($checklistItem['status'] ?? 'NOT_PRESENT')); ?>
+                            <?php $rowBadge = $rowStatus === 'PRESENT' ? 'success' : ($rowStatus === 'DAMAGED' ? 'danger' : 'secondary'); ?>
+                            <tr>
+                              <td><?= e((string) ($checklistItem['item_name'] ?? '')); ?></td>
+                              <td><span class="badge text-bg-<?= e($rowBadge); ?>"><?= e($rowStatus); ?></span></td>
+                              <td><?= e((string) (($checklistItem['remarks'] ?? '') !== '' ? $checklistItem['remarks'] : '-')); ?></td>
+                            </tr>
+                          <?php endforeach; ?>
+                        <?php endif; ?>
+                      </tbody>
+                    </table>
+                  </div>
+
+                  <div class="mb-3">
+                    <div><strong>Exterior:</strong> <?= nl2br(e((string) (($vehicleIntake['exterior_condition_notes'] ?? '') !== '' ? $vehicleIntake['exterior_condition_notes'] : '-'))); ?></div>
+                    <div><strong>Interior:</strong> <?= nl2br(e((string) (($vehicleIntake['interior_condition_notes'] ?? '') !== '' ? $vehicleIntake['interior_condition_notes'] : '-'))); ?></div>
+                    <div><strong>Mechanical:</strong> <?= nl2br(e((string) (($vehicleIntake['mechanical_condition_notes'] ?? '') !== '' ? $vehicleIntake['mechanical_condition_notes'] : '-'))); ?></div>
+                    <div><strong>Remarks:</strong> <?= nl2br(e((string) (($vehicleIntake['remarks'] ?? '') !== '' ? $vehicleIntake['remarks'] : '-'))); ?></div>
+                  </div>
+                <?php endif; ?>
+
+                <div>
+                  <h6 class="mb-2">Intake Images (<?= (int) $vehicleIntakeImageCount; ?>)</h6>
+                  <div class="row g-2">
+                    <?php if ($vehicleIntakeImages === []): ?>
+                      <div class="col-12"><div class="text-muted">No intake images found.</div></div>
+                    <?php else: ?>
+                      <?php foreach ($vehicleIntakeImages as $intakeImage): ?>
+                        <?php $intakeImageUrl = job_vehicle_intake_image_url((string) ($intakeImage['image_path'] ?? '')); ?>
+                        <div class="col-md-3 col-sm-4 col-6">
+                          <div class="border rounded p-2 h-100">
+                            <?php if ($intakeImageUrl !== null): ?>
+                              <a href="<?= e($intakeImageUrl); ?>" target="_blank" class="d-block mb-2">
+                                <img src="<?= e($intakeImageUrl); ?>" alt="Intake Image" class="img-fluid rounded" style="height:110px; width:100%; object-fit:cover;">
+                              </a>
+                            <?php else: ?>
+                              <div class="bg-light border rounded d-flex align-items-center justify-content-center mb-2" style="height:110px;">
+                                <span class="text-muted small">File Missing</span>
+                              </div>
+                            <?php endif; ?>
+                            <div class="small text-muted"><?= e((string) ($intakeImage['uploaded_at'] ?? '')); ?></div>
+                            <div class="small"><?= e(job_vehicle_intake_normalize_image_type((string) ($intakeImage['image_type'] ?? 'OTHER'))); ?></div>
+                            <?php if ($vehicleIntakeEditable): ?>
+                              <form method="post" class="mt-2">
+                                <?= csrf_field(); ?>
+                                <input type="hidden" name="_action" value="delete_vehicle_intake_image">
+                                <input type="hidden" name="image_id" value="<?= (int) ($intakeImage['id'] ?? 0); ?>">
+                                <button type="submit" class="btn btn-sm btn-outline-danger w-100">Delete</button>
+                              </form>
+                            <?php endif; ?>
+                          </div>
+                        </div>
+                      <?php endforeach; ?>
+                    <?php endif; ?>
+                  </div>
+                </div>
               <?php endif; ?>
             </div>
           </div>
@@ -3877,6 +4335,47 @@ require_once __DIR__ . '/../../includes/sidebar.php';
     var laborCostInput = document.getElementById('add-labor-cost');
     var laborExpectedReturnInput = document.getElementById('add-labor-expected-return');
     var laborOutsourceHint = document.getElementById('add-labor-outsourced-hint');
+    var viewAddIntakeCustomItemBtn = document.getElementById('view-add-intake-custom-item-btn');
+    var viewIntakeCustomItemsBody = document.getElementById('view-intake-custom-items-body');
+
+    function addViewIntakeCustomRow() {
+      if (!viewIntakeCustomItemsBody) {
+        return;
+      }
+      var row = document.createElement('tr');
+      row.innerHTML = ''
+        + '<td><input type="text" name="intake_custom_item_name[]" class="form-control form-control-sm" maxlength="120" placeholder="Custom item"></td>'
+        + '<td>'
+        + '  <select name="intake_custom_item_status[]" class="form-select form-select-sm">'
+        + '    <option value="PRESENT">Present</option>'
+        + '    <option value="NOT_PRESENT">Not Present</option>'
+        + '    <option value="DAMAGED">Damaged</option>'
+        + '  </select>'
+        + '</td>'
+        + '<td>'
+        + '  <div class="d-flex gap-2">'
+        + '    <input type="text" name="intake_custom_item_remarks[]" class="form-control form-control-sm" maxlength="255" placeholder="Optional">'
+        + '    <button type="button" class="btn btn-sm btn-outline-danger view-remove-intake-custom-item-btn">X</button>'
+        + '  </div>'
+        + '</td>';
+      viewIntakeCustomItemsBody.appendChild(row);
+    }
+
+    if (viewAddIntakeCustomItemBtn) {
+      viewAddIntakeCustomItemBtn.addEventListener('click', addViewIntakeCustomRow);
+    }
+    if (viewIntakeCustomItemsBody) {
+      viewIntakeCustomItemsBody.addEventListener('click', function (event) {
+        var btn = event.target;
+        if (!btn || !btn.classList.contains('view-remove-intake-custom-item-btn')) {
+          return;
+        }
+        var row = btn.closest('tr');
+        if (row && row.parentNode) {
+          row.parentNode.removeChild(row);
+        }
+      });
+    }
 
     function getSelectedVendorName(select) {
       if (!select) {

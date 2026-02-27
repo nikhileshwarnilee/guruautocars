@@ -1035,6 +1035,428 @@ function ledger_post_vendor_payment(PDO $pdo, array $purchase, array $payment, ?
     ]);
 }
 
+function ledger_generate_reference_id(): int
+{
+    try {
+        $base = (int) floor(microtime(true) * 1000000);
+        $salt = random_int(10, 99);
+    } catch (Throwable $exception) {
+        $base = (int) floor(microtime(true) * 1000000);
+        $salt = mt_rand(10, 99);
+    }
+
+    $referenceId = (int) ($base * 100 + $salt);
+    if ($referenceId <= 0) {
+        $referenceId = max(1, (int) time());
+    }
+
+    return $referenceId;
+}
+
+function ledger_customer_net_balance(PDO $pdo, int $companyId, int $customerId, ?int $garageId = null): float
+{
+    if ($companyId <= 0 || $customerId <= 0) {
+        return 0.0;
+    }
+
+    $params = [
+        'company_id' => $companyId,
+        'customer_id' => $customerId,
+    ];
+    $garageSql = '';
+    if ($garageId !== null && $garageId > 0) {
+        $garageSql = ' AND le.garage_id = :garage_id';
+        $params['garage_id'] = $garageId;
+    }
+
+    $stmt = $pdo->prepare(
+        'SELECT COALESCE(SUM(le.debit_amount), 0) AS debit_total,
+                COALESCE(SUM(le.credit_amount), 0) AS credit_total
+         FROM ledger_entries le
+         INNER JOIN ledger_journals lj ON lj.id = le.journal_id
+         INNER JOIN chart_of_accounts coa ON coa.id = le.account_id
+         WHERE lj.company_id = :company_id
+           AND le.party_type = "CUSTOMER"
+           AND le.party_id = :customer_id
+           AND coa.code IN ("1200", "2300")
+           ' . $garageSql
+    );
+    $stmt->execute($params);
+    $row = $stmt->fetch() ?: ['debit_total' => 0, 'credit_total' => 0];
+
+    return ledger_round((float) ($row['debit_total'] ?? 0) - (float) ($row['credit_total'] ?? 0));
+}
+
+function ledger_vendor_net_balance(PDO $pdo, int $companyId, int $vendorId, ?int $garageId = null): float
+{
+    if ($companyId <= 0 || $vendorId <= 0) {
+        return 0.0;
+    }
+
+    $params = [
+        'company_id' => $companyId,
+        'vendor_id' => $vendorId,
+    ];
+    $garageSql = '';
+    if ($garageId !== null && $garageId > 0) {
+        $garageSql = ' AND le.garage_id = :garage_id';
+        $params['garage_id'] = $garageId;
+    }
+
+    $stmt = $pdo->prepare(
+        'SELECT COALESCE(SUM(le.debit_amount), 0) AS debit_total,
+                COALESCE(SUM(le.credit_amount), 0) AS credit_total
+         FROM ledger_entries le
+         INNER JOIN ledger_journals lj ON lj.id = le.journal_id
+         INNER JOIN chart_of_accounts coa ON coa.id = le.account_id
+         WHERE lj.company_id = :company_id
+           AND le.party_type = "VENDOR"
+           AND le.party_id = :vendor_id
+           AND coa.code = "2100"
+           ' . $garageSql
+    );
+    $stmt->execute($params);
+    $row = $stmt->fetch() ?: ['debit_total' => 0, 'credit_total' => 0];
+
+    return ledger_round((float) ($row['credit_total'] ?? 0) - (float) ($row['debit_total'] ?? 0));
+}
+
+function ledger_set_customer_opening_balance(
+    PDO $pdo,
+    int $companyId,
+    int $customerId,
+    float $amount,
+    string $openingType,
+    ?string $openingDate = null,
+    ?int $garageId = null,
+    ?int $createdBy = null,
+    ?string $narration = null
+): ?int {
+    $normalizedType = strtoupper(trim($openingType));
+    if (!in_array($normalizedType, ['RECEIVABLE', 'ADVANCE'], true)) {
+        throw new RuntimeException('Invalid customer opening balance type.');
+    }
+    if ($companyId <= 0 || $customerId <= 0) {
+        return null;
+    }
+
+    $normalizedAmount = ledger_round(max(0.0, $amount));
+    $dateValue = ledger_is_valid_date($openingDate) ? (string) $openingDate : date('Y-m-d');
+    $effectiveGarageId = $garageId !== null && $garageId > 0 ? $garageId : null;
+
+    ledger_reverse_reference(
+        $pdo,
+        $companyId,
+        'CUSTOMER_OPENING_BALANCE',
+        $customerId,
+        'CUSTOMER_OPENING_BALANCE_REV',
+        $customerId,
+        $dateValue,
+        'Customer opening balance updated #' . $customerId,
+        $createdBy,
+        true
+    );
+
+    if ($normalizedAmount <= 0.009) {
+        return null;
+    }
+
+    $lines = [];
+    if ($normalizedType === 'RECEIVABLE') {
+        $lines[] = [
+            'account_code' => '1200',
+            'debit_amount' => $normalizedAmount,
+            'credit_amount' => 0.0,
+            'garage_id' => $effectiveGarageId,
+            'party_type' => 'CUSTOMER',
+            'party_id' => $customerId,
+        ];
+        $lines[] = [
+            'account_code' => '3100',
+            'debit_amount' => 0.0,
+            'credit_amount' => $normalizedAmount,
+            'garage_id' => $effectiveGarageId,
+        ];
+    } else {
+        $lines[] = [
+            'account_code' => '3100',
+            'debit_amount' => $normalizedAmount,
+            'credit_amount' => 0.0,
+            'garage_id' => $effectiveGarageId,
+        ];
+        $lines[] = [
+            'account_code' => '2300',
+            'debit_amount' => 0.0,
+            'credit_amount' => $normalizedAmount,
+            'garage_id' => $effectiveGarageId,
+            'party_type' => 'CUSTOMER',
+            'party_id' => $customerId,
+        ];
+    }
+
+    $narrationText = trim((string) $narration);
+    if ($narrationText === '') {
+        $narrationText = 'Customer opening balance (' . $normalizedType . ') #' . $customerId;
+    }
+
+    return ledger_create_journal($pdo, [
+        'company_id' => $companyId,
+        'garage_id' => $effectiveGarageId,
+        'reference_type' => 'CUSTOMER_OPENING_BALANCE',
+        'reference_id' => $customerId,
+        'journal_date' => $dateValue,
+        'narration' => $narrationText,
+        'created_by' => $createdBy,
+    ], $lines);
+}
+
+function ledger_post_customer_balance_settlement(
+    PDO $pdo,
+    int $companyId,
+    int $customerId,
+    float $amount,
+    string $direction,
+    ?string $settlementDate = null,
+    ?string $paymentMode = null,
+    ?int $garageId = null,
+    ?int $createdBy = null,
+    ?string $narration = null
+): ?int {
+    $normalizedDirection = strtoupper(trim($direction));
+    if (!in_array($normalizedDirection, ['COLLECT', 'PAY'], true)) {
+        throw new RuntimeException('Invalid customer settlement direction.');
+    }
+    if ($companyId <= 0 || $customerId <= 0) {
+        return null;
+    }
+
+    $normalizedAmount = ledger_round(max(0.0, $amount));
+    if ($normalizedAmount <= 0.0) {
+        return null;
+    }
+
+    $dateValue = ledger_is_valid_date($settlementDate) ? (string) $settlementDate : date('Y-m-d');
+    $effectiveGarageId = $garageId !== null && $garageId > 0 ? $garageId : null;
+    $counterpartyAccount = ledger_payment_mode_account_code($paymentMode);
+    $referenceId = ledger_generate_reference_id();
+
+    $lines = [];
+    if ($normalizedDirection === 'COLLECT') {
+        $lines[] = [
+            'account_code' => $counterpartyAccount,
+            'debit_amount' => $normalizedAmount,
+            'credit_amount' => 0.0,
+            'garage_id' => $effectiveGarageId,
+        ];
+        $lines[] = [
+            'account_code' => '1200',
+            'debit_amount' => 0.0,
+            'credit_amount' => $normalizedAmount,
+            'garage_id' => $effectiveGarageId,
+            'party_type' => 'CUSTOMER',
+            'party_id' => $customerId,
+        ];
+    } else {
+        $lines[] = [
+            'account_code' => '2300',
+            'debit_amount' => $normalizedAmount,
+            'credit_amount' => 0.0,
+            'garage_id' => $effectiveGarageId,
+            'party_type' => 'CUSTOMER',
+            'party_id' => $customerId,
+        ];
+        $lines[] = [
+            'account_code' => $counterpartyAccount,
+            'debit_amount' => 0.0,
+            'credit_amount' => $normalizedAmount,
+            'garage_id' => $effectiveGarageId,
+        ];
+    }
+
+    $narrationText = trim((string) $narration);
+    if ($narrationText === '') {
+        $narrationText = 'Customer balance settlement (' . $normalizedDirection . ') #' . $customerId;
+    }
+
+    return ledger_create_journal($pdo, [
+        'company_id' => $companyId,
+        'garage_id' => $effectiveGarageId,
+        'reference_type' => 'CUSTOMER_BALANCE_SETTLEMENT',
+        'reference_id' => $referenceId,
+        'journal_date' => $dateValue,
+        'narration' => $narrationText,
+        'created_by' => $createdBy,
+    ], $lines);
+}
+
+function ledger_set_vendor_opening_balance(
+    PDO $pdo,
+    int $companyId,
+    int $vendorId,
+    float $amount,
+    string $openingType,
+    ?string $openingDate = null,
+    ?int $garageId = null,
+    ?int $createdBy = null,
+    ?string $narration = null
+): ?int {
+    $normalizedType = strtoupper(trim($openingType));
+    if (!in_array($normalizedType, ['PAYABLE', 'ADVANCE'], true)) {
+        throw new RuntimeException('Invalid vendor opening balance type.');
+    }
+    if ($companyId <= 0 || $vendorId <= 0) {
+        return null;
+    }
+
+    $normalizedAmount = ledger_round(max(0.0, $amount));
+    $dateValue = ledger_is_valid_date($openingDate) ? (string) $openingDate : date('Y-m-d');
+    $effectiveGarageId = $garageId !== null && $garageId > 0 ? $garageId : null;
+
+    ledger_reverse_reference(
+        $pdo,
+        $companyId,
+        'VENDOR_OPENING_BALANCE',
+        $vendorId,
+        'VENDOR_OPENING_BALANCE_REV',
+        $vendorId,
+        $dateValue,
+        'Vendor opening balance updated #' . $vendorId,
+        $createdBy,
+        true
+    );
+
+    if ($normalizedAmount <= 0.009) {
+        return null;
+    }
+
+    $lines = [];
+    if ($normalizedType === 'PAYABLE') {
+        $lines[] = [
+            'account_code' => '3100',
+            'debit_amount' => $normalizedAmount,
+            'credit_amount' => 0.0,
+            'garage_id' => $effectiveGarageId,
+        ];
+        $lines[] = [
+            'account_code' => '2100',
+            'debit_amount' => 0.0,
+            'credit_amount' => $normalizedAmount,
+            'garage_id' => $effectiveGarageId,
+            'party_type' => 'VENDOR',
+            'party_id' => $vendorId,
+        ];
+    } else {
+        $lines[] = [
+            'account_code' => '2100',
+            'debit_amount' => $normalizedAmount,
+            'credit_amount' => 0.0,
+            'garage_id' => $effectiveGarageId,
+            'party_type' => 'VENDOR',
+            'party_id' => $vendorId,
+        ];
+        $lines[] = [
+            'account_code' => '3100',
+            'debit_amount' => 0.0,
+            'credit_amount' => $normalizedAmount,
+            'garage_id' => $effectiveGarageId,
+        ];
+    }
+
+    $narrationText = trim((string) $narration);
+    if ($narrationText === '') {
+        $narrationText = 'Vendor opening balance (' . $normalizedType . ') #' . $vendorId;
+    }
+
+    return ledger_create_journal($pdo, [
+        'company_id' => $companyId,
+        'garage_id' => $effectiveGarageId,
+        'reference_type' => 'VENDOR_OPENING_BALANCE',
+        'reference_id' => $vendorId,
+        'journal_date' => $dateValue,
+        'narration' => $narrationText,
+        'created_by' => $createdBy,
+    ], $lines);
+}
+
+function ledger_post_vendor_balance_settlement(
+    PDO $pdo,
+    int $companyId,
+    int $vendorId,
+    float $amount,
+    string $direction,
+    ?string $settlementDate = null,
+    ?string $paymentMode = null,
+    ?int $garageId = null,
+    ?int $createdBy = null,
+    ?string $narration = null
+): ?int {
+    $normalizedDirection = strtoupper(trim($direction));
+    if (!in_array($normalizedDirection, ['PAY', 'COLLECT'], true)) {
+        throw new RuntimeException('Invalid vendor settlement direction.');
+    }
+    if ($companyId <= 0 || $vendorId <= 0) {
+        return null;
+    }
+
+    $normalizedAmount = ledger_round(max(0.0, $amount));
+    if ($normalizedAmount <= 0.0) {
+        return null;
+    }
+
+    $dateValue = ledger_is_valid_date($settlementDate) ? (string) $settlementDate : date('Y-m-d');
+    $effectiveGarageId = $garageId !== null && $garageId > 0 ? $garageId : null;
+    $counterpartyAccount = ledger_payment_mode_account_code($paymentMode);
+    $referenceId = ledger_generate_reference_id();
+
+    $lines = [];
+    if ($normalizedDirection === 'PAY') {
+        $lines[] = [
+            'account_code' => '2100',
+            'debit_amount' => $normalizedAmount,
+            'credit_amount' => 0.0,
+            'garage_id' => $effectiveGarageId,
+            'party_type' => 'VENDOR',
+            'party_id' => $vendorId,
+        ];
+        $lines[] = [
+            'account_code' => $counterpartyAccount,
+            'debit_amount' => 0.0,
+            'credit_amount' => $normalizedAmount,
+            'garage_id' => $effectiveGarageId,
+        ];
+    } else {
+        $lines[] = [
+            'account_code' => $counterpartyAccount,
+            'debit_amount' => $normalizedAmount,
+            'credit_amount' => 0.0,
+            'garage_id' => $effectiveGarageId,
+        ];
+        $lines[] = [
+            'account_code' => '2100',
+            'debit_amount' => 0.0,
+            'credit_amount' => $normalizedAmount,
+            'garage_id' => $effectiveGarageId,
+            'party_type' => 'VENDOR',
+            'party_id' => $vendorId,
+        ];
+    }
+
+    $narrationText = trim((string) $narration);
+    if ($narrationText === '') {
+        $narrationText = 'Vendor balance settlement (' . $normalizedDirection . ') #' . $vendorId;
+    }
+
+    return ledger_create_journal($pdo, [
+        'company_id' => $companyId,
+        'garage_id' => $effectiveGarageId,
+        'reference_type' => 'VENDOR_BALANCE_SETTLEMENT',
+        'reference_id' => $referenceId,
+        'journal_date' => $dateValue,
+        'narration' => $narrationText,
+        'created_by' => $createdBy,
+    ], $lines);
+}
+
 function ledger_post_advance_received(PDO $pdo, array $advance, ?int $createdBy = null): ?int
 {
     $advanceId = (int) ($advance['id'] ?? 0);

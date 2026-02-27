@@ -3692,3 +3692,952 @@ function job_condition_photo_purge_older_than(int $companyId, int $garageId, int
     ];
 }
 
+function job_vehicle_intake_table_exists(string $tableName, bool $refresh = false): bool
+{
+    static $cache = [];
+
+    if (!preg_match('/^[a-zA-Z0-9_]+$/', $tableName)) {
+        return false;
+    }
+
+    if (!$refresh && array_key_exists($tableName, $cache)) {
+        return (bool) $cache[$tableName];
+    }
+
+    try {
+        $stmt = db()->query("SHOW TABLES LIKE '" . $tableName . "'");
+        $cache[$tableName] = $stmt !== false && $stmt->fetchColumn() !== false;
+    } catch (Throwable $exception) {
+        $cache[$tableName] = false;
+    }
+
+    return (bool) $cache[$tableName];
+}
+
+function job_vehicle_intake_default_checklist_items(): array
+{
+    return [
+        'Stepney',
+        'Jack',
+        'Toolkit',
+        'Stereo',
+        'Floor Mats',
+        'Wheel Caps',
+        'RC Copy',
+        'Insurance Copy',
+        'FASTag',
+        'Dashcam',
+        'Accessories',
+    ];
+}
+
+function job_vehicle_intake_seed_checklist_master_defaults(): void
+{
+    if (!job_vehicle_intake_table_exists('checklist_master')) {
+        return;
+    }
+
+    $defaults = job_vehicle_intake_default_checklist_items();
+    if ($defaults === []) {
+        return;
+    }
+
+    try {
+        $existingStmt = db()->query('SELECT item_name FROM checklist_master');
+        $existing = [];
+        foreach (($existingStmt ? $existingStmt->fetchAll() : []) as $row) {
+            $name = mb_strtolower(trim((string) ($row['item_name'] ?? '')));
+            if ($name !== '') {
+                $existing[$name] = true;
+            }
+        }
+
+        $insertStmt = db()->prepare(
+            'INSERT INTO checklist_master
+              (item_name, is_default, active, created_at, updated_at)
+             VALUES
+              (:item_name, :is_default, :active, NOW(), NOW())'
+        );
+
+        foreach ($defaults as $itemName) {
+            $normalized = mb_strtolower(trim((string) $itemName));
+            if ($normalized === '' || isset($existing[$normalized])) {
+                continue;
+            }
+
+            $insertStmt->execute([
+                'item_name' => mb_substr(trim((string) $itemName), 0, 120),
+                'is_default' => 1,
+                'active' => 1,
+            ]);
+            $existing[$normalized] = true;
+        }
+    } catch (Throwable $exception) {
+        // Non-blocking seed step.
+    }
+}
+
+function job_vehicle_intake_feature_ready(bool $refresh = false): bool
+{
+    static $cached = null;
+
+    if (!$refresh && $cached !== null) {
+        return $cached;
+    }
+
+    if (
+        job_vehicle_intake_table_exists('job_vehicle_intake', $refresh)
+        && job_vehicle_intake_table_exists('job_vehicle_checklist_items', $refresh)
+        && job_vehicle_intake_table_exists('job_vehicle_images', $refresh)
+        && job_vehicle_intake_table_exists('checklist_master', $refresh)
+    ) {
+        job_vehicle_intake_seed_checklist_master_defaults();
+        $cached = true;
+        return true;
+    }
+
+    try {
+        db()->exec(
+            'CREATE TABLE IF NOT EXISTS checklist_master (
+                id INT UNSIGNED NOT NULL AUTO_INCREMENT,
+                item_name VARCHAR(120) NOT NULL,
+                is_default TINYINT(1) NOT NULL DEFAULT 1,
+                active TINYINT(1) NOT NULL DEFAULT 1,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                PRIMARY KEY (id),
+                UNIQUE KEY uq_checklist_master_item_name (item_name),
+                KEY idx_checklist_master_active (active, is_default)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4'
+        );
+
+        db()->exec(
+            'CREATE TABLE IF NOT EXISTS job_vehicle_intake (
+                id INT UNSIGNED NOT NULL AUTO_INCREMENT,
+                company_id INT UNSIGNED NOT NULL,
+                garage_id INT UNSIGNED NOT NULL,
+                job_card_id INT UNSIGNED NOT NULL,
+                fuel_level ENUM("EMPTY", "LOW", "QUARTER", "HALF", "THREE_QUARTER", "FULL") NOT NULL DEFAULT "LOW",
+                odometer_reading INT UNSIGNED NOT NULL DEFAULT 0,
+                exterior_condition_notes TEXT NULL,
+                interior_condition_notes TEXT NULL,
+                mechanical_condition_notes TEXT NULL,
+                remarks TEXT NULL,
+                customer_acknowledged TINYINT(1) NOT NULL DEFAULT 0,
+                acknowledged_at DATETIME NULL,
+                created_by INT UNSIGNED NULL,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                status_code VARCHAR(20) NOT NULL DEFAULT "ACTIVE",
+                deleted_at DATETIME NULL,
+                PRIMARY KEY (id),
+                UNIQUE KEY uq_job_vehicle_intake_job_card (job_card_id),
+                KEY idx_job_vehicle_intake_scope (company_id, garage_id, job_card_id, status_code),
+                KEY idx_job_vehicle_intake_created (created_at)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4'
+        );
+
+        db()->exec(
+            'CREATE TABLE IF NOT EXISTS job_vehicle_checklist_items (
+                id INT UNSIGNED NOT NULL AUTO_INCREMENT,
+                job_intake_id INT UNSIGNED NOT NULL,
+                item_name VARCHAR(120) NOT NULL,
+                status ENUM("PRESENT", "NOT_PRESENT", "DAMAGED") NOT NULL DEFAULT "NOT_PRESENT",
+                remarks VARCHAR(255) NULL,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                status_code VARCHAR(20) NOT NULL DEFAULT "ACTIVE",
+                deleted_at DATETIME NULL,
+                PRIMARY KEY (id),
+                KEY idx_job_vehicle_checklist_intake (job_intake_id, status_code)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4'
+        );
+
+        db()->exec(
+            'CREATE TABLE IF NOT EXISTS job_vehicle_images (
+                id INT UNSIGNED NOT NULL AUTO_INCREMENT,
+                job_intake_id INT UNSIGNED NOT NULL,
+                image_path VARCHAR(500) NOT NULL,
+                image_type ENUM("FRONT", "REAR", "LEFT", "RIGHT", "INTERIOR", "ENGINE", "OTHER") NOT NULL DEFAULT "OTHER",
+                mime_type VARCHAR(100) NULL,
+                file_size_bytes INT UNSIGNED NOT NULL DEFAULT 0,
+                uploaded_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                status_code VARCHAR(20) NOT NULL DEFAULT "ACTIVE",
+                deleted_at DATETIME NULL,
+                PRIMARY KEY (id),
+                KEY idx_job_vehicle_images_intake (job_intake_id, status_code, uploaded_at)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4'
+        );
+    } catch (Throwable $exception) {
+        $cached = false;
+        return false;
+    }
+
+    job_vehicle_intake_seed_checklist_master_defaults();
+    $cached =
+        job_vehicle_intake_table_exists('job_vehicle_intake', true)
+        && job_vehicle_intake_table_exists('job_vehicle_checklist_items', true)
+        && job_vehicle_intake_table_exists('job_vehicle_images', true)
+        && job_vehicle_intake_table_exists('checklist_master', true);
+
+    return $cached;
+}
+
+function job_vehicle_intake_allowed_fuel_levels(): array
+{
+    return ['EMPTY', 'LOW', 'QUARTER', 'HALF', 'THREE_QUARTER', 'FULL'];
+}
+
+function job_vehicle_intake_fuel_level_percent(string $fuelLevel): int
+{
+    $normalized = strtoupper(trim($fuelLevel));
+    return match ($normalized) {
+        'EMPTY' => 0,
+        'LOW' => 15,
+        'QUARTER' => 25,
+        'HALF' => 50,
+        'THREE_QUARTER' => 75,
+        'FULL' => 100,
+        default => 0,
+    };
+}
+
+function job_vehicle_intake_normalize_fuel_level(?string $fuelLevel): string
+{
+    $normalized = strtoupper(trim((string) $fuelLevel));
+    return in_array($normalized, job_vehicle_intake_allowed_fuel_levels(), true) ? $normalized : 'LOW';
+}
+
+function job_vehicle_intake_allowed_item_statuses(): array
+{
+    return ['PRESENT', 'NOT_PRESENT', 'DAMAGED'];
+}
+
+function job_vehicle_intake_normalize_item_status(?string $status): string
+{
+    $normalized = strtoupper(trim((string) $status));
+    return in_array($normalized, job_vehicle_intake_allowed_item_statuses(), true) ? $normalized : 'NOT_PRESENT';
+}
+
+function job_vehicle_intake_allowed_image_types(): array
+{
+    return ['FRONT', 'REAR', 'LEFT', 'RIGHT', 'INTERIOR', 'ENGINE', 'OTHER'];
+}
+
+function job_vehicle_intake_normalize_image_type(?string $type): string
+{
+    $normalized = strtoupper(trim((string) $type));
+    return in_array($normalized, job_vehicle_intake_allowed_image_types(), true) ? $normalized : 'OTHER';
+}
+
+function job_vehicle_intake_master_items(bool $activeOnly = true): array
+{
+    if (!job_vehicle_intake_feature_ready()) {
+        return [];
+    }
+
+    $sql =
+        'SELECT id, item_name, is_default, active, created_at, updated_at
+         FROM checklist_master';
+    $params = [];
+    if ($activeOnly) {
+        $sql .= ' WHERE active = 1';
+    }
+    $sql .= ' ORDER BY is_default DESC, item_name ASC';
+
+    $stmt = db()->prepare($sql);
+    $stmt->execute($params);
+    return $stmt->fetchAll();
+}
+
+function job_vehicle_intake_master_upsert(int $itemId, string $itemName, bool $isDefault, bool $active): int
+{
+    if (!job_vehicle_intake_feature_ready()) {
+        return 0;
+    }
+
+    $safeName = mb_substr(trim($itemName), 0, 120);
+    if ($safeName === '') {
+        return 0;
+    }
+
+    if ($itemId > 0) {
+        $stmt = db()->prepare(
+            'UPDATE checklist_master
+             SET item_name = :item_name,
+                 is_default = :is_default,
+                 active = :active,
+                 updated_at = NOW()
+             WHERE id = :id'
+        );
+        $stmt->execute([
+            'item_name' => $safeName,
+            'is_default' => $isDefault ? 1 : 0,
+            'active' => $active ? 1 : 0,
+            'id' => $itemId,
+        ]);
+        return $itemId;
+    }
+
+    $stmt = db()->prepare(
+        'INSERT INTO checklist_master
+          (item_name, is_default, active, created_at, updated_at)
+         VALUES
+          (:item_name, :is_default, :active, NOW(), NOW())'
+    );
+    $stmt->execute([
+        'item_name' => $safeName,
+        'is_default' => $isDefault ? 1 : 0,
+        'active' => $active ? 1 : 0,
+    ]);
+    return (int) db()->lastInsertId();
+}
+
+function job_vehicle_intake_master_set_active(int $itemId, bool $active): bool
+{
+    if (!job_vehicle_intake_feature_ready() || $itemId <= 0) {
+        return false;
+    }
+
+    $stmt = db()->prepare('UPDATE checklist_master SET active = :active, updated_at = NOW() WHERE id = :id');
+    $stmt->execute([
+        'active' => $active ? 1 : 0,
+        'id' => $itemId,
+    ]);
+    return $stmt->rowCount() > 0;
+}
+
+function job_vehicle_intake_image_base_relative_dir(): string
+{
+    return 'assets/uploads/job_intake';
+}
+
+function job_vehicle_intake_image_allowed_mimes(): array
+{
+    return [
+        'image/jpeg' => 'jpg',
+        'image/png' => 'png',
+        'image/webp' => 'webp',
+    ];
+}
+
+function job_vehicle_intake_image_max_upload_bytes(int $companyId, int $garageId): int
+{
+    $rawValue = system_setting_get_value($companyId, $garageId, 'job_intake_image_max_mb', '5');
+    $sizeMb = (int) trim((string) $rawValue);
+    if ($sizeMb < 1) {
+        $sizeMb = 1;
+    }
+    if ($sizeMb > 20) {
+        $sizeMb = 20;
+    }
+    return $sizeMb * 1024 * 1024;
+}
+
+function job_vehicle_intake_image_build_relative_dir(int $jobId): string
+{
+    return job_vehicle_intake_image_base_relative_dir() . '/' . max(0, $jobId);
+}
+
+function job_vehicle_intake_image_full_path(string $relativePath): ?string
+{
+    $normalized = str_replace('\\', '/', trim($relativePath));
+    $normalized = ltrim($normalized, '/');
+    if ($normalized === '' || str_contains($normalized, '..')) {
+        return null;
+    }
+
+    $base = job_vehicle_intake_image_base_relative_dir() . '/';
+    if (!str_starts_with($normalized, $base)) {
+        return null;
+    }
+
+    return APP_ROOT . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $normalized);
+}
+
+function job_vehicle_intake_image_url(?string $relativePath): ?string
+{
+    $path = trim((string) $relativePath);
+    if ($path === '') {
+        return null;
+    }
+    $fullPath = job_vehicle_intake_image_full_path($path);
+    if ($fullPath === null || !is_file($fullPath)) {
+        return null;
+    }
+    return url(str_replace('\\', '/', ltrim($path, '/')));
+}
+
+function job_vehicle_intake_image_delete_file(?string $relativePath): bool
+{
+    $path = trim((string) $relativePath);
+    if ($path === '') {
+        return true;
+    }
+    $fullPath = job_vehicle_intake_image_full_path($path);
+    if ($fullPath === null) {
+        return false;
+    }
+    if (!is_file($fullPath)) {
+        return true;
+    }
+    return @unlink($fullPath);
+}
+
+function job_vehicle_intake_normalize_uploads(mixed $files): array
+{
+    if (!is_array($files)) {
+        return [];
+    }
+
+    $names = $files['name'] ?? null;
+    $errors = $files['error'] ?? null;
+    $tmpNames = $files['tmp_name'] ?? null;
+    $sizes = $files['size'] ?? null;
+    $types = $files['type'] ?? null;
+
+    if (!is_array($names) || !is_array($errors) || !is_array($tmpNames) || !is_array($sizes)) {
+        return [];
+    }
+
+    $normalized = [];
+    $count = count($names);
+    for ($index = 0; $index < $count; $index++) {
+        $normalized[] = [
+            'name' => (string) ($names[$index] ?? ''),
+            'type' => is_array($types) ? (string) ($types[$index] ?? '') : '',
+            'tmp_name' => (string) ($tmpNames[$index] ?? ''),
+            'error' => (int) ($errors[$index] ?? UPLOAD_ERR_NO_FILE),
+            'size' => (int) ($sizes[$index] ?? 0),
+        ];
+    }
+
+    return $normalized;
+}
+
+function job_vehicle_intake_store_image_upload(
+    array $file,
+    int $companyId,
+    int $garageId,
+    int $jobId,
+    int $intakeId,
+    string $imageType = 'OTHER'
+): array {
+    if (!job_vehicle_intake_feature_ready()) {
+        return ['ok' => false, 'message' => 'Vehicle intake storage is not ready.'];
+    }
+
+    if ($companyId <= 0 || $garageId <= 0 || $jobId <= 0 || $intakeId <= 0) {
+        return ['ok' => false, 'message' => 'Invalid vehicle intake image reference.'];
+    }
+
+    $jobStmt = db()->prepare(
+        'SELECT id
+         FROM job_cards
+         WHERE id = :job_id
+           AND company_id = :company_id
+           AND garage_id = :garage_id
+           AND status_code <> "DELETED"
+         LIMIT 1'
+    );
+    $jobStmt->execute([
+        'job_id' => $jobId,
+        'company_id' => $companyId,
+        'garage_id' => $garageId,
+    ]);
+    if (!$jobStmt->fetch()) {
+        return ['ok' => false, 'message' => 'Job card not found for intake image upload.'];
+    }
+
+    $intakeStmt = db()->prepare(
+        'SELECT id
+         FROM job_vehicle_intake
+         WHERE id = :id
+           AND company_id = :company_id
+           AND garage_id = :garage_id
+           AND job_card_id = :job_card_id
+           AND status_code = "ACTIVE"
+         LIMIT 1'
+    );
+    $intakeStmt->execute([
+        'id' => $intakeId,
+        'company_id' => $companyId,
+        'garage_id' => $garageId,
+        'job_card_id' => $jobId,
+    ]);
+    if (!$intakeStmt->fetch()) {
+        return ['ok' => false, 'message' => 'Vehicle intake record not found for image upload.'];
+    }
+
+    $errorCode = (int) ($file['error'] ?? UPLOAD_ERR_NO_FILE);
+    if ($errorCode !== UPLOAD_ERR_OK) {
+        $message = match ($errorCode) {
+            UPLOAD_ERR_INI_SIZE, UPLOAD_ERR_FORM_SIZE => 'Uploaded intake image exceeds size limit.',
+            UPLOAD_ERR_NO_FILE => 'No image file selected.',
+            default => 'Unable to process uploaded intake image.',
+        };
+        return ['ok' => false, 'message' => $message];
+    }
+
+    $tmpPath = (string) ($file['tmp_name'] ?? '');
+    if ($tmpPath === '' || !is_uploaded_file($tmpPath)) {
+        return ['ok' => false, 'message' => 'Uploaded intake image is not valid.'];
+    }
+
+    $sizeBytes = (int) ($file['size'] ?? 0);
+    $maxBytes = job_vehicle_intake_image_max_upload_bytes($companyId, $garageId);
+    if ($sizeBytes <= 0 || $sizeBytes > $maxBytes) {
+        return ['ok' => false, 'message' => 'Image size exceeds configured intake upload limit.'];
+    }
+
+    $imageInfo = @getimagesize($tmpPath);
+    if (!is_array($imageInfo)) {
+        return ['ok' => false, 'message' => 'Only valid image files can be uploaded for intake.'];
+    }
+
+    $width = (int) ($imageInfo[0] ?? 0);
+    $height = (int) ($imageInfo[1] ?? 0);
+    if ($width <= 0 || $height <= 0 || $width > 12000 || $height > 12000) {
+        return ['ok' => false, 'message' => 'Intake image dimensions are invalid or too large.'];
+    }
+
+    $allowedMimes = job_vehicle_intake_image_allowed_mimes();
+    $finfo = finfo_open(FILEINFO_MIME_TYPE);
+    $mime = $finfo ? (string) finfo_file($finfo, $tmpPath) : '';
+    if ($finfo) {
+        finfo_close($finfo);
+    }
+    if (!isset($allowedMimes[$mime])) {
+        return ['ok' => false, 'message' => 'Only JPG, PNG, and WEBP intake images are allowed.'];
+    }
+
+    $relativeDir = job_vehicle_intake_image_build_relative_dir($jobId);
+    $fullDir = APP_ROOT . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $relativeDir);
+    if (!is_dir($fullDir) && !mkdir($fullDir, 0755, true) && !is_dir($fullDir)) {
+        return ['ok' => false, 'message' => 'Unable to prepare intake upload directory.'];
+    }
+
+    try {
+        $suffix = bin2hex(random_bytes(5));
+    } catch (Throwable $exception) {
+        $suffix = substr(sha1((string) microtime(true) . (string) mt_rand()), 0, 10);
+    }
+
+    $extension = $allowedMimes[$mime];
+    $imageType = job_vehicle_intake_normalize_image_type($imageType);
+    $fileName = 'intake_' . $intakeId . '_' . date('YmdHis') . '_' . $suffix . '.' . $extension;
+    $targetPath = $fullDir . DIRECTORY_SEPARATOR . $fileName;
+    if (!move_uploaded_file($tmpPath, $targetPath)) {
+        return ['ok' => false, 'message' => 'Unable to move intake image file.'];
+    }
+
+    $relativePath = $relativeDir . '/' . $fileName;
+    try {
+        $insertStmt = db()->prepare(
+            'INSERT INTO job_vehicle_images
+              (job_intake_id, image_path, image_type, mime_type, file_size_bytes, uploaded_at, status_code, deleted_at)
+             VALUES
+              (:job_intake_id, :image_path, :image_type, :mime_type, :file_size_bytes, NOW(), "ACTIVE", NULL)'
+        );
+        $insertStmt->execute([
+            'job_intake_id' => $intakeId,
+            'image_path' => $relativePath,
+            'image_type' => $imageType,
+            'mime_type' => $mime,
+            'file_size_bytes' => $sizeBytes,
+        ]);
+        $imageId = (int) db()->lastInsertId();
+    } catch (Throwable $exception) {
+        @unlink($targetPath);
+        return ['ok' => false, 'message' => 'Unable to save intake image metadata.'];
+    }
+
+    return [
+        'ok' => true,
+        'image_id' => $imageId,
+        'image_path' => $relativePath,
+        'image_type' => $imageType,
+        'file_size_bytes' => $sizeBytes,
+    ];
+}
+
+function job_vehicle_intake_save_for_job(
+    int $companyId,
+    int $garageId,
+    int $jobId,
+    array $payload,
+    array $checklistItems,
+    array $uploads,
+    int $actorUserId,
+    bool $allowUpdate = false
+): array {
+    if (!job_vehicle_intake_feature_ready()) {
+        throw new RuntimeException('Vehicle intake storage is not ready. Please run DB upgrade.');
+    }
+    if ($companyId <= 0 || $garageId <= 0 || $jobId <= 0) {
+        throw new RuntimeException('Invalid vehicle intake reference.');
+    }
+
+    $jobStmt = db()->prepare(
+        'SELECT id, status, status_code
+         FROM job_cards
+         WHERE id = :job_id
+           AND company_id = :company_id
+           AND garage_id = :garage_id
+         LIMIT 1'
+    );
+    $jobStmt->execute([
+        'job_id' => $jobId,
+        'company_id' => $companyId,
+        'garage_id' => $garageId,
+    ]);
+    $jobRow = $jobStmt->fetch();
+    if (!$jobRow) {
+        throw new RuntimeException('Job card not found for vehicle intake.');
+    }
+    if (job_normalize_status((string) ($jobRow['status'] ?? 'OPEN')) === 'CLOSED') {
+        throw new RuntimeException('Vehicle intake is immutable after job closure.');
+    }
+    if (normalize_status_code((string) ($jobRow['status_code'] ?? 'ACTIVE')) === 'DELETED') {
+        throw new RuntimeException('Cannot store vehicle intake on deleted job.');
+    }
+
+    $existingStmt = db()->prepare(
+        'SELECT id
+         FROM job_vehicle_intake
+         WHERE company_id = :company_id
+           AND garage_id = :garage_id
+           AND job_card_id = :job_card_id
+           AND status_code = "ACTIVE"
+         LIMIT 1'
+    );
+    $existingStmt->execute([
+        'company_id' => $companyId,
+        'garage_id' => $garageId,
+        'job_card_id' => $jobId,
+    ]);
+    $existingRow = $existingStmt->fetch() ?: null;
+    $existingIntakeId = (int) ($existingRow['id'] ?? 0);
+    if ($existingIntakeId > 0 && !$allowUpdate) {
+        throw new RuntimeException('Vehicle intake already exists for this job card.');
+    }
+
+    $fuelLevel = job_vehicle_intake_normalize_fuel_level((string) ($payload['fuel_level'] ?? 'LOW'));
+    $odometerReading = max(0, (int) ($payload['odometer_reading'] ?? 0));
+    $exteriorNotes = mb_substr(trim((string) ($payload['exterior_condition_notes'] ?? '')), 0, 5000);
+    $interiorNotes = mb_substr(trim((string) ($payload['interior_condition_notes'] ?? '')), 0, 5000);
+    $mechanicalNotes = mb_substr(trim((string) ($payload['mechanical_condition_notes'] ?? '')), 0, 5000);
+    $remarks = mb_substr(trim((string) ($payload['remarks'] ?? '')), 0, 5000);
+    $customerAcknowledged = !empty($payload['customer_acknowledged']) ? 1 : 0;
+
+    $acknowledgedAt = $customerAcknowledged === 1 ? date('Y-m-d H:i:s') : null;
+    if ($existingIntakeId > 0) {
+        $updateStmt = db()->prepare(
+            'UPDATE job_vehicle_intake
+             SET fuel_level = :fuel_level,
+                 odometer_reading = :odometer_reading,
+                 exterior_condition_notes = :exterior_condition_notes,
+                 interior_condition_notes = :interior_condition_notes,
+                 mechanical_condition_notes = :mechanical_condition_notes,
+                 remarks = :remarks,
+                 customer_acknowledged = :customer_acknowledged,
+                 acknowledged_at = :acknowledged_at
+             WHERE id = :id
+               AND company_id = :company_id
+               AND garage_id = :garage_id
+               AND job_card_id = :job_card_id
+               AND status_code = "ACTIVE"'
+        );
+        $updateStmt->execute([
+            'id' => $existingIntakeId,
+            'company_id' => $companyId,
+            'garage_id' => $garageId,
+            'job_card_id' => $jobId,
+            'fuel_level' => $fuelLevel,
+            'odometer_reading' => $odometerReading,
+            'exterior_condition_notes' => $exteriorNotes !== '' ? $exteriorNotes : null,
+            'interior_condition_notes' => $interiorNotes !== '' ? $interiorNotes : null,
+            'mechanical_condition_notes' => $mechanicalNotes !== '' ? $mechanicalNotes : null,
+            'remarks' => $remarks !== '' ? $remarks : null,
+            'customer_acknowledged' => $customerAcknowledged,
+            'acknowledged_at' => $acknowledgedAt,
+        ]);
+        $intakeId = $existingIntakeId;
+
+        $deactivateChecklistStmt = db()->prepare(
+            'UPDATE job_vehicle_checklist_items
+             SET status_code = "DELETED",
+                 deleted_at = NOW()
+             WHERE job_intake_id = :job_intake_id
+               AND status_code = "ACTIVE"'
+        );
+        $deactivateChecklistStmt->execute(['job_intake_id' => $intakeId]);
+    } else {
+        $insertStmt = db()->prepare(
+            'INSERT INTO job_vehicle_intake
+              (company_id, garage_id, job_card_id, fuel_level, odometer_reading, exterior_condition_notes, interior_condition_notes, mechanical_condition_notes, remarks, customer_acknowledged, acknowledged_at, created_by, created_at, status_code, deleted_at)
+             VALUES
+              (:company_id, :garage_id, :job_card_id, :fuel_level, :odometer_reading, :exterior_condition_notes, :interior_condition_notes, :mechanical_condition_notes, :remarks, :customer_acknowledged, :acknowledged_at, :created_by, NOW(), "ACTIVE", NULL)'
+        );
+        $insertStmt->execute([
+            'company_id' => $companyId,
+            'garage_id' => $garageId,
+            'job_card_id' => $jobId,
+            'fuel_level' => $fuelLevel,
+            'odometer_reading' => $odometerReading,
+            'exterior_condition_notes' => $exteriorNotes !== '' ? $exteriorNotes : null,
+            'interior_condition_notes' => $interiorNotes !== '' ? $interiorNotes : null,
+            'mechanical_condition_notes' => $mechanicalNotes !== '' ? $mechanicalNotes : null,
+            'remarks' => $remarks !== '' ? $remarks : null,
+            'customer_acknowledged' => $customerAcknowledged,
+            'acknowledged_at' => $acknowledgedAt,
+            'created_by' => $actorUserId > 0 ? $actorUserId : null,
+        ]);
+        $intakeId = (int) db()->lastInsertId();
+    }
+
+    $normalizedChecklist = [];
+    foreach ($checklistItems as $row) {
+        if (!is_array($row)) {
+            continue;
+        }
+        $itemName = mb_substr(trim((string) ($row['item_name'] ?? '')), 0, 120);
+        if ($itemName === '') {
+            continue;
+        }
+        $status = job_vehicle_intake_normalize_item_status((string) ($row['status'] ?? 'NOT_PRESENT'));
+        $itemRemarks = mb_substr(trim((string) ($row['remarks'] ?? '')), 0, 255);
+        $key = mb_strtolower($itemName);
+        $normalizedChecklist[$key] = [
+            'item_name' => $itemName,
+            'status' => $status,
+            'remarks' => $itemRemarks,
+        ];
+    }
+
+    if ($normalizedChecklist !== []) {
+        $checklistStmt = db()->prepare(
+            'INSERT INTO job_vehicle_checklist_items
+              (job_intake_id, item_name, status, remarks, created_at, status_code, deleted_at)
+             VALUES
+              (:job_intake_id, :item_name, :status, :remarks, NOW(), "ACTIVE", NULL)'
+        );
+        foreach ($normalizedChecklist as $item) {
+            $checklistStmt->execute([
+                'job_intake_id' => $intakeId,
+                'item_name' => (string) ($item['item_name'] ?? ''),
+                'status' => (string) ($item['status'] ?? 'NOT_PRESENT'),
+                'remarks' => (($item['remarks'] ?? '') !== '') ? (string) $item['remarks'] : null,
+            ]);
+        }
+    }
+
+    $uploadedCount = 0;
+    $uploadedBytes = 0;
+    $maxFilesPerRequest = 24;
+    $processed = 0;
+    foreach ($uploads as $upload) {
+        if (!is_array($upload)) {
+            continue;
+        }
+        if ($processed >= $maxFilesPerRequest) {
+            break;
+        }
+        $processed++;
+
+        $errorCode = (int) ($upload['error'] ?? UPLOAD_ERR_NO_FILE);
+        if ($errorCode === UPLOAD_ERR_NO_FILE) {
+            continue;
+        }
+
+        $uploadResult = job_vehicle_intake_store_image_upload(
+            $upload,
+            $companyId,
+            $garageId,
+            $jobId,
+            $intakeId,
+            (string) ($upload['image_type'] ?? 'OTHER')
+        );
+        if (!(bool) ($uploadResult['ok'] ?? false)) {
+            throw new RuntimeException((string) ($uploadResult['message'] ?? 'Unable to upload intake image.'));
+        }
+        $uploadedCount++;
+        $uploadedBytes += max(0, (int) ($uploadResult['file_size_bytes'] ?? 0));
+    }
+
+    return [
+        'intake_id' => $intakeId,
+        'checklist_count' => count($normalizedChecklist),
+        'image_count' => $uploadedCount,
+        'image_bytes' => $uploadedBytes,
+        'fuel_level' => $fuelLevel,
+        'odometer_reading' => $odometerReading,
+    ];
+}
+
+function job_vehicle_intake_fetch_by_job(int $companyId, int $garageId, int $jobId): ?array
+{
+    if (!job_vehicle_intake_feature_ready() || $companyId <= 0 || $garageId <= 0 || $jobId <= 0) {
+        return null;
+    }
+
+    $intakeStmt = db()->prepare(
+        'SELECT jvi.*, u.name AS created_by_name
+         FROM job_vehicle_intake jvi
+         LEFT JOIN users u ON u.id = jvi.created_by
+         WHERE jvi.company_id = :company_id
+           AND jvi.garage_id = :garage_id
+           AND jvi.job_card_id = :job_card_id
+           AND jvi.status_code = "ACTIVE"
+         ORDER BY jvi.id DESC
+         LIMIT 1'
+    );
+    $intakeStmt->execute([
+        'company_id' => $companyId,
+        'garage_id' => $garageId,
+        'job_card_id' => $jobId,
+    ]);
+    $intake = $intakeStmt->fetch();
+    if (!$intake) {
+        return null;
+    }
+
+    $intakeId = (int) ($intake['id'] ?? 0);
+    if ($intakeId <= 0) {
+        return null;
+    }
+
+    $checklistStmt = db()->prepare(
+        'SELECT id, job_intake_id, item_name, status, remarks, created_at
+         FROM job_vehicle_checklist_items
+         WHERE job_intake_id = :job_intake_id
+           AND status_code = "ACTIVE"
+         ORDER BY id ASC'
+    );
+    $checklistStmt->execute(['job_intake_id' => $intakeId]);
+    $checklistItems = $checklistStmt->fetchAll();
+
+    $imageStmt = db()->prepare(
+        'SELECT id, job_intake_id, image_path, image_type, mime_type, file_size_bytes, uploaded_at
+         FROM job_vehicle_images
+         WHERE job_intake_id = :job_intake_id
+           AND status_code = "ACTIVE"
+         ORDER BY id ASC'
+    );
+    $imageStmt->execute(['job_intake_id' => $intakeId]);
+    $images = $imageStmt->fetchAll();
+
+    $summary = [
+        'present' => 0,
+        'not_present' => 0,
+        'damaged' => 0,
+    ];
+    foreach ($checklistItems as $item) {
+        $status = job_vehicle_intake_normalize_item_status((string) ($item['status'] ?? 'NOT_PRESENT'));
+        if ($status === 'PRESENT') {
+            $summary['present']++;
+        } elseif ($status === 'DAMAGED') {
+            $summary['damaged']++;
+        } else {
+            $summary['not_present']++;
+        }
+    }
+
+    $damageFlag = $summary['damaged'] > 0
+        || trim((string) ($intake['exterior_condition_notes'] ?? '')) !== ''
+        || trim((string) ($intake['interior_condition_notes'] ?? '')) !== ''
+        || trim((string) ($intake['mechanical_condition_notes'] ?? '')) !== ''
+        || trim((string) ($intake['remarks'] ?? '')) !== '';
+
+    return [
+        'intake' => $intake,
+        'checklist_items' => $checklistItems,
+        'images' => $images,
+        'checklist_summary' => $summary,
+        'has_damage' => $damageFlag,
+    ];
+}
+
+function job_vehicle_intake_soft_delete_by_job(
+    int $companyId,
+    int $garageId,
+    int $jobId,
+    ?int $actorUserId = null,
+    ?string $reason = null
+): int {
+    if (!job_vehicle_intake_feature_ready() || $companyId <= 0 || $garageId <= 0 || $jobId <= 0) {
+        return 0;
+    }
+
+    $selectStmt = db()->prepare(
+        'SELECT id
+         FROM job_vehicle_intake
+         WHERE company_id = :company_id
+           AND garage_id = :garage_id
+           AND job_card_id = :job_card_id
+           AND status_code = "ACTIVE"'
+    );
+    $selectStmt->execute([
+        'company_id' => $companyId,
+        'garage_id' => $garageId,
+        'job_card_id' => $jobId,
+    ]);
+    $intakeIds = array_values(array_filter(array_map(
+        static fn (array $row): int => (int) ($row['id'] ?? 0),
+        $selectStmt->fetchAll()
+    ), static fn (int $id): bool => $id > 0));
+
+    if ($intakeIds === []) {
+        return 0;
+    }
+
+    $intakeUpdateStmt = db()->prepare(
+        'UPDATE job_vehicle_intake
+         SET status_code = "DELETED",
+             deleted_at = NOW()
+         WHERE company_id = :company_id
+           AND garage_id = :garage_id
+           AND job_card_id = :job_card_id
+           AND status_code = "ACTIVE"'
+    );
+    $intakeUpdateStmt->execute([
+        'company_id' => $companyId,
+        'garage_id' => $garageId,
+        'job_card_id' => $jobId,
+    ]);
+
+    $placeholders = implode(',', array_fill(0, count($intakeIds), '?'));
+    $itemUpdateStmt = db()->prepare(
+        'UPDATE job_vehicle_checklist_items
+         SET status_code = "DELETED",
+             deleted_at = NOW()
+         WHERE job_intake_id IN (' . $placeholders . ')
+           AND status_code = "ACTIVE"'
+    );
+    $itemUpdateStmt->execute($intakeIds);
+
+    $imageUpdateStmt = db()->prepare(
+        'UPDATE job_vehicle_images
+         SET status_code = "DELETED",
+             deleted_at = NOW()
+         WHERE job_intake_id IN (' . $placeholders . ')
+           AND status_code = "ACTIVE"'
+    );
+    $imageUpdateStmt->execute($intakeIds);
+
+    try {
+        log_audit('job_cards', 'soft_delete_intake', $jobId, 'Soft deleted vehicle intake with job delete', [
+            'entity' => 'job_vehicle_intake',
+            'source' => 'SYSTEM',
+            'metadata' => [
+                'job_id' => $jobId,
+                'intake_ids' => $intakeIds,
+                'deleted_by' => $actorUserId !== null ? (int) $actorUserId : null,
+                'reason' => $reason !== null ? mb_substr(trim($reason), 0, 255) : null,
+            ],
+        ]);
+    } catch (Throwable $exception) {
+        // Non-blocking audit.
+    }
+
+    return count($intakeIds);
+}
+

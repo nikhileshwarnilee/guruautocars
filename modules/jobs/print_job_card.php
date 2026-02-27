@@ -87,7 +87,7 @@ $showNextServiceReminders = !empty($jobCardPrintSettings['show_next_service_remi
 $showCostsInPrint = !empty($jobCardPrintSettings['show_costs_in_job_card_print']);
 $showTotals = !empty($jobCardPrintSettings['show_totals']) && $showCostsInPrint;
 $showCancelNote = !empty($jobCardPrintSettings['show_cancel_note']);
-$canManagePrintSettings = has_permission('job.manage') || has_permission('settings.manage');
+$canManagePrintSettings = has_permission('settings.view') && (has_permission('job.manage') || has_permission('settings.manage'));
 
 $laborStmt = db()->prepare(
     'SELECT jl.*, s.service_name
@@ -122,6 +122,22 @@ $nextServiceReminders = $showNextServiceReminders && service_reminder_feature_re
     ? service_reminder_fetch_active_by_vehicle($companyId, (int) ($job['vehicle_id'] ?? 0), $garageId, 6)
     : [];
 $companyLogoUrl = company_logo_url((int) ($job['company_id'] ?? $companyId), $garageId);
+$includeVehicleIntake = get_int('include_intake') === 1;
+$vehicleIntakeBundle = job_vehicle_intake_feature_ready()
+    ? job_vehicle_intake_fetch_by_job($companyId, $garageId, $jobId)
+    : null;
+$vehicleIntake = is_array($vehicleIntakeBundle) && is_array($vehicleIntakeBundle['intake'] ?? null)
+    ? (array) $vehicleIntakeBundle['intake']
+    : null;
+$vehicleIntakeChecklist = is_array($vehicleIntakeBundle)
+    ? (array) ($vehicleIntakeBundle['checklist_items'] ?? [])
+    : [];
+$vehicleIntakeImages = is_array($vehicleIntakeBundle)
+    ? (array) ($vehicleIntakeBundle['images'] ?? [])
+    : [];
+$vehicleIntakeSummary = is_array($vehicleIntakeBundle)
+    ? (array) ($vehicleIntakeBundle['checklist_summary'] ?? ['present' => 0, 'not_present' => 0, 'damaged' => 0])
+    : ['present' => 0, 'not_present' => 0, 'damaged' => 0];
 ?>
 <!doctype html>
 <html lang="en">
@@ -180,7 +196,11 @@ $companyLogoUrl = company_logo_url((int) ($job['company_id'] ?? $companyId), $ga
         <div class="d-flex gap-2">
           <a href="<?= e(url('modules/jobs/view.php?id=' . $jobId)); ?>" class="btn btn-outline-secondary btn-sm">Back</a>
           <?php if ($canManagePrintSettings): ?>
-            <a href="<?= e(url('modules/jobs/print_settings.php')); ?>" class="btn btn-outline-dark btn-sm">Print Settings</a>
+            <a href="<?= e(url('modules/system/settings.php?tab=job_card_print')); ?>" class="btn btn-outline-dark btn-sm">Print Settings</a>
+          <?php endif; ?>
+          <?php if ($vehicleIntake !== null): ?>
+            <a href="<?= e(url('modules/jobs/print_vehicle_intake.php?id=' . $jobId)); ?>" class="btn btn-outline-primary btn-sm" target="_blank">Vehicle Intake</a>
+            <a href="<?= e(url('modules/jobs/print_job_card.php?id=' . $jobId . '&include_intake=1')); ?>" class="btn btn-outline-primary btn-sm">Print With Intake</a>
           <?php endif; ?>
         </div>
         <button onclick="window.print()" class="btn btn-primary btn-sm">Print / Save PDF</button>
@@ -364,6 +384,80 @@ $companyLogoUrl = company_logo_url((int) ($job['company_id'] ?? $companyId), $ga
                   <?php endif; ?>
                 </tbody>
               </table>
+            </div>
+          <?php endif; ?>
+
+          <?php if ($includeVehicleIntake && $vehicleIntake !== null): ?>
+            <?php
+              $intakeFuel = job_vehicle_intake_normalize_fuel_level((string) ($vehicleIntake['fuel_level'] ?? 'LOW'));
+              $intakeFuelPercent = job_vehicle_intake_fuel_level_percent($intakeFuel);
+              $intakeFuelClass = $intakeFuelPercent >= 60 ? 'bg-success' : ($intakeFuelPercent >= 30 ? 'bg-info' : ($intakeFuelPercent > 0 ? 'bg-warning' : 'bg-danger'));
+            ?>
+            <div class="mb-3">
+              <h6 class="mb-1">Vehicle Intake Attachment</h6>
+              <div class="border rounded p-2 mb-2">
+                <div class="row g-2">
+                  <div class="col-md-6">
+                    <div><strong>Odometer:</strong> <?= e(number_format((float) ($vehicleIntake['odometer_reading'] ?? 0), 0)); ?> KM</div>
+                  </div>
+                  <div class="col-md-6">
+                    <div class="small text-muted mb-1">Fuel Level</div>
+                    <div class="progress" style="height: 14px;">
+                      <div class="progress-bar <?= e($intakeFuelClass); ?>" role="progressbar" style="width: <?= (int) $intakeFuelPercent; ?>%;">
+                        <?= e(str_replace('_', ' ', $intakeFuel)); ?>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+                <div class="mt-2">
+                  <span class="badge text-bg-success">Present: <?= (int) ($vehicleIntakeSummary['present'] ?? 0); ?></span>
+                  <span class="badge text-bg-secondary">Not Present: <?= (int) ($vehicleIntakeSummary['not_present'] ?? 0); ?></span>
+                  <span class="badge text-bg-danger">Damaged: <?= (int) ($vehicleIntakeSummary['damaged'] ?? 0); ?></span>
+                </div>
+              </div>
+              <div class="table-responsive mb-2">
+                <table class="table table-bordered table-sm mb-0">
+                  <thead>
+                    <tr>
+                      <th>Item</th>
+                      <th style="width: 120px;">Status</th>
+                      <th>Remarks</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <?php if ($vehicleIntakeChecklist === []): ?>
+                      <tr><td colspan="3" class="text-center text-muted">No checklist rows.</td></tr>
+                    <?php else: ?>
+                      <?php foreach ($vehicleIntakeChecklist as $intakeItem): ?>
+                        <tr>
+                          <td><?= e((string) ($intakeItem['item_name'] ?? '')); ?></td>
+                          <td><?= e(job_vehicle_intake_normalize_item_status((string) ($intakeItem['status'] ?? 'NOT_PRESENT'))); ?></td>
+                          <td><?= e((string) (($intakeItem['remarks'] ?? '') !== '' ? $intakeItem['remarks'] : '-')); ?></td>
+                        </tr>
+                      <?php endforeach; ?>
+                    <?php endif; ?>
+                  </tbody>
+                </table>
+              </div>
+              <div class="small mb-2"><strong>Damage Notes:</strong>
+                <?= e((string) (($vehicleIntake['exterior_condition_notes'] ?? '') !== '' ? $vehicleIntake['exterior_condition_notes'] : '-')); ?> |
+                <?= e((string) (($vehicleIntake['interior_condition_notes'] ?? '') !== '' ? $vehicleIntake['interior_condition_notes'] : '-')); ?> |
+                <?= e((string) (($vehicleIntake['mechanical_condition_notes'] ?? '') !== '' ? $vehicleIntake['mechanical_condition_notes'] : '-')); ?>
+              </div>
+              <?php if ($vehicleIntakeImages !== []): ?>
+                <div class="row g-2">
+                  <?php foreach (array_slice($vehicleIntakeImages, 0, 12) as $intakeImage): ?>
+                    <?php $intakeImageUrl = job_vehicle_intake_image_url((string) ($intakeImage['image_path'] ?? '')); ?>
+                    <div class="col-3">
+                      <?php if ($intakeImageUrl !== null): ?>
+                        <img src="<?= e($intakeImageUrl); ?>" alt="Intake Image" class="img-fluid rounded border" style="height:85px;width:100%;object-fit:cover;">
+                      <?php else: ?>
+                        <div class="border rounded bg-light d-flex align-items-center justify-content-center" style="height:85px;"><span class="small text-muted">Missing</span></div>
+                      <?php endif; ?>
+                    </div>
+                  <?php endforeach; ?>
+                </div>
+              <?php endif; ?>
             </div>
           <?php endif; ?>
 

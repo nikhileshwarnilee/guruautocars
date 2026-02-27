@@ -496,6 +496,64 @@ final class RegressionDatasetSeeder
             $this->h->insert('job_cards', $job);
             $this->jobs[$jobId] = $job;
 
+            if ($this->h->tableExists('job_vehicle_intake')) {
+                $intakeId = 918000 + $i;
+                $fuelLevels = ['EMPTY', 'LOW', 'QUARTER', 'HALF', 'THREE_QUARTER', 'FULL'];
+                $fuelLevel = $fuelLevels[$i % count($fuelLevels)];
+                $intake = [
+                    'id' => $intakeId,
+                    'company_id' => $this->h->companyId,
+                    'garage_id' => $this->h->garageId,
+                    'job_card_id' => $jobId,
+                    'fuel_level' => $fuelLevel,
+                    'odometer_reading' => (int) ($job['odometer_km'] ?? 0),
+                    'exterior_condition_notes' => $i % 5 === 0 ? 'Minor bumper scratch' : null,
+                    'interior_condition_notes' => null,
+                    'mechanical_condition_notes' => null,
+                    'remarks' => $this->h->datasetTag . ' intake seed',
+                    'customer_acknowledged' => 1,
+                    'acknowledged_at' => $openedDate . ' 09:20:00',
+                    'created_by' => $this->h->adminUserId,
+                    'created_at' => $openedDate . ' 09:20:00',
+                    'status_code' => 'ACTIVE',
+                ];
+                $this->h->insert('job_vehicle_intake', $intake);
+
+                if ($this->h->tableExists('job_vehicle_checklist_items')) {
+                    $this->h->insert('job_vehicle_checklist_items', [
+                        'id' => 918300 + ($i * 2) + 1,
+                        'job_intake_id' => $intakeId,
+                        'item_name' => 'Stepney',
+                        'status' => 'PRESENT',
+                        'remarks' => null,
+                        'created_at' => $openedDate . ' 09:21:00',
+                        'status_code' => 'ACTIVE',
+                    ]);
+                    $this->h->insert('job_vehicle_checklist_items', [
+                        'id' => 918300 + ($i * 2) + 2,
+                        'job_intake_id' => $intakeId,
+                        'item_name' => 'Floor Mats',
+                        'status' => $i % 5 === 0 ? 'DAMAGED' : 'PRESENT',
+                        'remarks' => $i % 5 === 0 ? 'Driver side torn' : null,
+                        'created_at' => $openedDate . ' 09:21:10',
+                        'status_code' => 'ACTIVE',
+                    ]);
+                }
+
+                if ($this->h->tableExists('job_vehicle_images')) {
+                    $this->h->insert('job_vehicle_images', [
+                        'id' => 918800 + $i,
+                        'job_intake_id' => $intakeId,
+                        'image_path' => 'assets/uploads/job_intake/' . $jobId . '/seed_' . $jobId . '.jpg',
+                        'image_type' => 'FRONT',
+                        'mime_type' => 'image/jpeg',
+                        'file_size_bytes' => 204800,
+                        'uploaded_at' => $openedDate . ' 09:22:00',
+                        'status_code' => 'ACTIVE',
+                    ]);
+                }
+            }
+
             $laborId = 914000 + $i;
             $isOutsourced = in_array($i, $outsourceJobIndexes, true);
             $labor = [

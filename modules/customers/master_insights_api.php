@@ -19,13 +19,13 @@ function customer_master_badge_class(string $customerType): string
     };
 }
 
-function customer_master_render_rows(array $customers, bool $canManage, bool $canVehicleManage): string
+function customer_master_render_rows(array $customers, bool $canManage, bool $canVehicleManage, bool $ledgerReady): string
 {
     ob_start();
 
     if ($customers === []) {
         ?>
-        <tr><td colspan="8" class="text-center text-muted py-4">No customers found for selected filters.</td></tr>
+        <tr><td colspan="9" class="text-center text-muted py-4">No customers found for selected filters.</td></tr>
         <?php
         return (string) ob_get_clean();
     }
@@ -36,12 +36,16 @@ function customer_master_render_rows(array $customers, bool $canManage, bool $ca
         if ($customerType === '') {
             $customerType = 'INDIVIDUAL';
         }
+        $customerId = (int) ($customer['id'] ?? 0);
+        $ledgerBalance = ledger_round((float) ($customer['ledger_balance'] ?? 0));
+        $isReceivable = $ledgerBalance > 0.009;
+        $isAdvance = $ledgerBalance < -0.009;
 
         ?>
         <tr>
-          <td><?= (int) ($customer['id'] ?? 0); ?></td>
+          <td><?= $customerId; ?></td>
           <td>
-            <a href="<?= e(url('modules/customers/view.php?id=' . (int) ($customer['id'] ?? 0))); ?>" class="fw-semibold text-decoration-none">
+            <a href="<?= e(url('modules/customers/view.php?id=' . $customerId)); ?>" class="fw-semibold text-decoration-none">
               <?= e((string) ($customer['full_name'] ?? '')); ?>
             </a>
             <span class="badge text-bg-<?= e(customer_master_badge_class($customerType)); ?> ms-1"><?= e($customerType); ?></span><br>
@@ -59,20 +63,37 @@ function customer_master_render_rows(array $customers, bool $canManage, bool $ca
               <small class="text-muted">Single/new service profile</small>
             <?php endif; ?>
           </td>
+          <td>
+            <div class="fw-semibold <?= $isReceivable ? 'text-danger' : ($isAdvance ? 'text-success' : 'text-muted'); ?>">
+              <?= e(format_currency(abs($ledgerBalance))); ?>
+            </div>
+            <small class="text-muted"><?= $isReceivable ? 'Receivable' : ($isAdvance ? 'Advance' : 'Nil'); ?></small>
+          </td>
           <td><span class="badge text-bg-<?= e(status_badge_class($statusCode)); ?>"><?= e(record_status_label($statusCode)); ?></span></td>
           <td class="d-flex gap-1">
-            <a class="btn btn-sm btn-outline-success" href="<?= e(url('modules/customers/view.php?id=' . (int) ($customer['id'] ?? 0))); ?>">View</a>
-            <a class="btn btn-sm btn-outline-info" href="<?= e(url('modules/customers/index.php?history_id=' . (int) ($customer['id'] ?? 0))); ?>">History</a>
+            <a class="btn btn-sm btn-outline-success" href="<?= e(url('modules/customers/view.php?id=' . $customerId)); ?>">View</a>
+            <a class="btn btn-sm btn-outline-info" href="<?= e(url('modules/customers/index.php?history_id=' . $customerId)); ?>">History</a>
+            <?php if ($canManage && $ledgerReady): ?>
+              <a class="btn btn-sm btn-outline-secondary" href="<?= e(url('modules/reports/customer_ledger.php?customer_id=' . $customerId)); ?>">Ledger</a>
+              <?php if ($statusCode !== 'DELETED'): ?>
+                <a class="btn btn-sm btn-outline-primary" href="<?= e(url('modules/customers/index.php?financial_customer_id=' . $customerId . '&financial_action=opening#customer-financial-actions')); ?>">Opening</a>
+                <?php if ($isReceivable): ?>
+                  <a class="btn btn-sm btn-outline-success" href="<?= e(url('modules/customers/index.php?financial_customer_id=' . $customerId . '&financial_action=collect#customer-financial-actions')); ?>">Collect</a>
+                <?php elseif ($isAdvance): ?>
+                  <a class="btn btn-sm btn-outline-warning" href="<?= e(url('modules/customers/index.php?financial_customer_id=' . $customerId . '&financial_action=pay#customer-financial-actions')); ?>">Pay</a>
+                <?php endif; ?>
+              <?php endif; ?>
+            <?php endif; ?>
             <?php if ($canVehicleManage && $statusCode !== 'DELETED'): ?>
-              <a class="btn btn-sm btn-outline-dark" href="<?= e(url('modules/vehicles/index.php?prefill_customer_id=' . (int) ($customer['id'] ?? 0))); ?>">Add Vehicle</a>
+              <a class="btn btn-sm btn-outline-dark" href="<?= e(url('modules/vehicles/index.php?prefill_customer_id=' . $customerId)); ?>">Add Vehicle</a>
             <?php endif; ?>
             <?php if ($canManage): ?>
-              <a class="btn btn-sm btn-outline-primary" href="<?= e(url('modules/customers/index.php?edit_id=' . (int) ($customer['id'] ?? 0))); ?>">Edit</a>
+              <a class="btn btn-sm btn-outline-primary" href="<?= e(url('modules/customers/index.php?edit_id=' . $customerId)); ?>">Edit</a>
               <?php if ($statusCode !== 'DELETED'): ?>
                 <form method="post" class="d-inline" data-confirm="Change customer status?">
                   <?= csrf_field(); ?>
                   <input type="hidden" name="_action" value="change_status" />
-                  <input type="hidden" name="customer_id" value="<?= (int) ($customer['id'] ?? 0); ?>" />
+                  <input type="hidden" name="customer_id" value="<?= $customerId; ?>" />
                   <input type="hidden" name="next_status" value="<?= e($statusCode === 'ACTIVE' ? 'INACTIVE' : 'ACTIVE'); ?>" />
                   <button type="submit" class="btn btn-sm btn-outline-secondary"><?= $statusCode === 'ACTIVE' ? 'Inactivate' : 'Activate'; ?></button>
                 </form>
@@ -84,7 +105,7 @@ function customer_master_render_rows(array $customers, bool $canManage, bool $ca
                       data-safe-delete-reason-field="deletion_reason">
                   <?= csrf_field(); ?>
                   <input type="hidden" name="_action" value="change_status" />
-                  <input type="hidden" name="customer_id" value="<?= (int) ($customer['id'] ?? 0); ?>" />
+                  <input type="hidden" name="customer_id" value="<?= $customerId; ?>" />
                   <input type="hidden" name="next_status" value="DELETED" />
                   <button type="submit" class="btn btn-sm btn-outline-danger">Soft Delete</button>
                 </form>
@@ -202,6 +223,20 @@ if ($toDate !== '') {
     $params['to_date'] = $toDate;
 }
 
+$ledgerReady = table_columns('ledger_entries') !== []
+    && table_columns('ledger_journals') !== []
+    && table_columns('chart_of_accounts') !== [];
+$customerLedgerBalanceExpr = $ledgerReady
+    ? '(SELECT COALESCE(SUM(le.debit_amount), 0) - COALESCE(SUM(le.credit_amount), 0)
+        FROM ledger_entries le
+        INNER JOIN ledger_journals lj ON lj.id = le.journal_id
+        INNER JOIN chart_of_accounts coa ON coa.id = le.account_id
+        WHERE lj.company_id = c.company_id
+          AND le.party_type = "CUSTOMER"
+          AND le.party_id = c.id
+          AND coa.code IN ("1200", "2300"))'
+    : '0';
+
 try {
     $statsSql =
         'SELECT COUNT(*) AS total_customers,
@@ -227,7 +262,8 @@ try {
                 COALESCE(js.total_jobs, 0) AS job_count,
                 COALESCE(js.open_jobs, 0) AS open_job_count,
                 (SELECT COUNT(*) FROM vehicles v WHERE v.customer_id = c.id AND v.status_code <> "DELETED") AS vehicle_count,
-                (SELECT COUNT(*) FROM customer_history h WHERE h.customer_id = c.id) AS history_count
+                (SELECT COUNT(*) FROM customer_history h WHERE h.customer_id = c.id) AS history_count,
+                ' . $customerLedgerBalanceExpr . ' AS ledger_balance
          FROM customers c
          LEFT JOIN (' . $jobSummarySql . ') js ON js.customer_id = c.id
          WHERE ' . implode(' AND ', $whereParts) . '
@@ -249,7 +285,7 @@ try {
         'rows_count' => $totalRows,
         'page_rows_count' => count($rows),
         'pagination' => $paginationMeta,
-        'table_rows_html' => customer_master_render_rows($rows, $canManage, $canVehicleManage),
+        'table_rows_html' => customer_master_render_rows($rows, $canManage, $canVehicleManage, $ledgerReady),
     ], JSON_UNESCAPED_UNICODE);
 } catch (Throwable $exception) {
     http_response_code(500);

@@ -327,6 +327,13 @@ function reports_module_links(): array
 
     if (has_permission('job.view') || has_permission('job.manage') || has_permission('reports.financial')) {
         $links[] = [
+            'menu_key' => 'reports.vehicle_intake_audit',
+            'label' => 'Vehicle Intake Audit',
+            'icon' => 'bi bi-clipboard2-check',
+            'path' => 'modules/reports/vehicle_intake_audit.php',
+        ];
+
+        $links[] = [
             'menu_key' => 'reports.insurance_claims',
             'label' => 'Insurance Claims',
             'icon' => 'bi bi-shield-check',
