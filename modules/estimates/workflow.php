@@ -149,11 +149,16 @@ function estimate_fetch_row(int $estimateId, int $companyId, int $garageId): ?ar
     return $row ?: null;
 }
 
-function estimate_convert_to_job_card(int $estimateId, int $companyId, int $garageId, int $actorUserId): array
+function estimate_convert_to_job_card(int $estimateId, int $companyId, int $garageId, int $actorUserId, array $conversionOptions = []): array
 {
     $pdo = db();
     $jobCardsColumns = table_columns('job_cards');
     $jobEstimateColumnSupported = in_array('estimate_id', $jobCardsColumns, true);
+    $jobOdometerEnabled = in_array('odometer_km', $jobCardsColumns, true);
+    $jobTypeEnabled = job_type_feature_ready();
+    $jobRecommendationNoteEnabled = job_recommendation_note_feature_ready();
+    $jobInsuranceEnabled = job_insurance_feature_ready();
+    $maintenanceReminderFeatureReady = service_reminder_feature_ready();
     $pdo->beginTransaction();
 
     try {
@@ -255,6 +260,130 @@ function estimate_convert_to_job_card(int $estimateId, int $companyId, int $gara
             }
         }
 
+        $strictInputMode = !empty($conversionOptions['strict_conversion_input']);
+
+        $priority = strtoupper(trim((string) ($conversionOptions['priority'] ?? 'MEDIUM')));
+        if (!in_array($priority, ['LOW', 'MEDIUM', 'HIGH', 'URGENT'], true)) {
+            $priority = 'MEDIUM';
+        }
+
+        $promisedAtRaw = trim((string) ($conversionOptions['promised_at'] ?? ''));
+        if ($promisedAtRaw === '' && !$strictInputMode) {
+            $promisedAtRaw = date('Y-m-d\TH:i', strtotime('+1 day'));
+        }
+        if ($promisedAtRaw === '') {
+            throw new RuntimeException('Promised date and time are required before conversion.');
+        }
+        $promisedAt = str_replace('T', ' ', $promisedAtRaw);
+        $promisedAtDate = DateTime::createFromFormat('Y-m-d H:i', $promisedAt);
+        if (!$promisedAtDate) {
+            throw new RuntimeException('Invalid promised date/time provided.');
+        }
+        $promisedAt = $promisedAtDate->format('Y-m-d H:i:s');
+
+        $diagnosis = trim((string) ($conversionOptions['diagnosis'] ?? ''));
+        if ($diagnosis === '' && !$strictInputMode) {
+            $diagnosis = trim((string) ($estimate['notes'] ?? ''));
+            if ($diagnosis === '') {
+                $diagnosis = 'Converted from estimate ' . (string) ($estimate['estimate_number'] ?? ('#' . $estimateId));
+            }
+        }
+        if ($diagnosis === '') {
+            throw new RuntimeException('Diagnosis is required before conversion.');
+        }
+
+        $odometerKm = null;
+        if ($jobOdometerEnabled) {
+            $odometerRaw = $conversionOptions['odometer_km'] ?? null;
+            if (!is_numeric((string) $odometerRaw)) {
+                if ($strictInputMode) {
+                    throw new RuntimeException('Current odometer is required before conversion.');
+                }
+                $odometerRaw = 0;
+            }
+            $odometerKm = (int) $odometerRaw;
+            if ($odometerKm < 0) {
+                throw new RuntimeException('Current odometer must be a non-negative number.');
+            }
+        }
+
+        $jobTypeId = 0;
+        if ($jobTypeEnabled) {
+            $jobTypeId = (int) ($conversionOptions['job_type_id'] ?? 0);
+            if ($jobTypeId <= 0 && !$strictInputMode) {
+                $activeJobTypes = job_type_active_options($companyId);
+                $fallbackJobType = $activeJobTypes !== [] ? (int) ($activeJobTypes[0]['id'] ?? 0) : 0;
+                $jobTypeId = $fallbackJobType > 0 ? $fallbackJobType : 0;
+            }
+            if ($jobTypeId <= 0) {
+                throw new RuntimeException('Job type selection is required before conversion.');
+            }
+            $activeJobTypes = job_type_active_options($companyId);
+            $activeIds = array_map(static fn (array $row): int => (int) ($row['id'] ?? 0), $activeJobTypes);
+            if (!in_array($jobTypeId, $activeIds, true)) {
+                throw new RuntimeException('Selected job type is invalid or inactive.');
+            }
+        }
+
+        $recommendationNote = trim((string) ($conversionOptions['recommendation_note'] ?? ''));
+
+        $insuranceCompanyName = null;
+        $insuranceClaimNumber = null;
+        $insuranceSurveyorName = null;
+        $insuranceClaimAmountApproved = null;
+        $insuranceCustomerPayableAmount = null;
+        $insuranceClaimStatus = 'PENDING';
+        if ($jobInsuranceEnabled) {
+            $insuranceCompanyName = trim((string) ($conversionOptions['insurance_company_name'] ?? ''));
+            $insuranceClaimNumber = trim((string) ($conversionOptions['insurance_claim_number'] ?? ''));
+            $insuranceSurveyorName = trim((string) ($conversionOptions['insurance_surveyor_name'] ?? ''));
+
+            $rawClaimApproved = $conversionOptions['insurance_claim_amount_approved'] ?? null;
+            if ($rawClaimApproved !== null && trim((string) $rawClaimApproved) !== '') {
+                if (!is_numeric((string) $rawClaimApproved)) {
+                    throw new RuntimeException('Insurance approved amount is invalid.');
+                }
+                $insuranceClaimAmountApproved = round((float) $rawClaimApproved, 2);
+            }
+
+            $rawCustomerPayable = $conversionOptions['insurance_customer_payable_amount'] ?? null;
+            if ($rawCustomerPayable !== null && trim((string) $rawCustomerPayable) !== '') {
+                if (!is_numeric((string) $rawCustomerPayable)) {
+                    throw new RuntimeException('Insurance customer payable amount is invalid.');
+                }
+                $insuranceCustomerPayableAmount = round((float) $rawCustomerPayable, 2);
+            }
+
+            $insuranceClaimStatus = job_insurance_normalize_status((string) ($conversionOptions['insurance_claim_status'] ?? 'PENDING'));
+        }
+
+        $assignedUserIds = [];
+        $rawAssignedUserIds = $conversionOptions['assigned_user_ids'] ?? [];
+        if (is_array($rawAssignedUserIds)) {
+            foreach ($rawAssignedUserIds as $rawUserId) {
+                if (is_numeric((string) $rawUserId) && (int) $rawUserId > 0) {
+                    $assignedUserIds[] = (int) $rawUserId;
+                }
+            }
+        }
+        $assignedUserIds = array_values(array_unique($assignedUserIds));
+
+        $maintenanceActions = [];
+        $rawMaintenanceActions = $conversionOptions['maintenance_actions'] ?? [];
+        if (is_array($rawMaintenanceActions)) {
+            foreach ($rawMaintenanceActions as $reminderId => $actionRaw) {
+                $reminderKey = (int) $reminderId;
+                if ($reminderKey <= 0) {
+                    continue;
+                }
+                $actionKey = strtolower(trim((string) $actionRaw));
+                if (!in_array($actionKey, ['add', 'ignore', 'postpone'], true)) {
+                    $actionKey = 'ignore';
+                }
+                $maintenanceActions[$reminderKey] = $actionKey;
+            }
+        }
+
         $customerVehicleCheck = $pdo->prepare(
             'SELECT v.id
              FROM vehicles v
@@ -274,6 +403,28 @@ function estimate_convert_to_job_card(int $estimateId, int $companyId, int $gara
         ]);
         if (!$customerVehicleCheck->fetch()) {
             throw new RuntimeException('Estimate customer and vehicle are not active/matched anymore.');
+        }
+
+        $allowParallelJobsForType = $jobTypeEnabled
+            && $jobTypeId > 0
+            && job_type_allows_multiple_active_jobs($companyId, $jobTypeId);
+        if (!$allowParallelJobsForType) {
+            $blockingJob = job_find_active_non_closed_vehicle_job(
+                $companyId,
+                (int) $estimate['vehicle_id'],
+                null,
+                $pdo,
+                true
+            );
+            if ($blockingJob !== null) {
+                throw new RuntimeException(
+                    'Vehicle already has active job card '
+                    . (string) ($blockingJob['job_number'] ?? ('#' . (int) ($blockingJob['id'] ?? 0)))
+                    . ' with status '
+                    . (string) ($blockingJob['status'] ?? 'OPEN')
+                    . '. Close that job first before converting this estimate.'
+                );
+            }
         }
 
         $serviceLinesStmt = $pdo->prepare(
@@ -299,50 +450,64 @@ function estimate_convert_to_job_card(int $estimateId, int $companyId, int $gara
         }
 
         $jobNumber = job_generate_number($pdo, $garageId);
-        if ($jobEstimateColumnSupported) {
-            $jobInsert = $pdo->prepare(
-                'INSERT INTO job_cards
-                  (company_id, garage_id, job_number, customer_id, vehicle_id, assigned_to, service_advisor_id, estimate_id,
-                   complaint, diagnosis, status, priority, promised_at, status_code, created_by, updated_by)
-                 VALUES
-                  (:company_id, :garage_id, :job_number, :customer_id, :vehicle_id, NULL, :service_advisor_id, :estimate_id,
-                   :complaint, :diagnosis, "OPEN", "MEDIUM", NULL, "ACTIVE", :created_by, :updated_by)'
-            );
-            $jobInsert->execute([
-                'company_id' => $companyId,
-                'garage_id' => $garageId,
-                'job_number' => $jobNumber,
-                'customer_id' => (int) $estimate['customer_id'],
-                'vehicle_id' => (int) $estimate['vehicle_id'],
-                'service_advisor_id' => $actorUserId > 0 ? $actorUserId : null,
-                'estimate_id' => $estimateId,
-                'complaint' => (string) $estimate['complaint'],
-                'diagnosis' => !empty($estimate['notes']) ? (string) $estimate['notes'] : null,
-                'created_by' => $actorUserId > 0 ? $actorUserId : null,
-                'updated_by' => $actorUserId > 0 ? $actorUserId : null,
-            ]);
-        } else {
-            $jobInsert = $pdo->prepare(
-                'INSERT INTO job_cards
-                  (company_id, garage_id, job_number, customer_id, vehicle_id, assigned_to, service_advisor_id,
-                   complaint, diagnosis, status, priority, promised_at, status_code, created_by, updated_by)
-                 VALUES
-                  (:company_id, :garage_id, :job_number, :customer_id, :vehicle_id, NULL, :service_advisor_id,
-                   :complaint, :diagnosis, "OPEN", "MEDIUM", NULL, "ACTIVE", :created_by, :updated_by)'
-            );
-            $jobInsert->execute([
-                'company_id' => $companyId,
-                'garage_id' => $garageId,
-                'job_number' => $jobNumber,
-                'customer_id' => (int) $estimate['customer_id'],
-                'vehicle_id' => (int) $estimate['vehicle_id'],
-                'service_advisor_id' => $actorUserId > 0 ? $actorUserId : null,
-                'complaint' => (string) $estimate['complaint'],
-                'diagnosis' => !empty($estimate['notes']) ? (string) $estimate['notes'] : null,
-                'created_by' => $actorUserId > 0 ? $actorUserId : null,
-                'updated_by' => $actorUserId > 0 ? $actorUserId : null,
-            ]);
+        $odometerColumnSql = $jobOdometerEnabled ? ', odometer_km' : '';
+        $odometerValueSql = $jobOdometerEnabled ? ', :odometer_km' : '';
+        $estimateColumnSql = $jobEstimateColumnSupported ? ', estimate_id' : '';
+        $estimateValueSql = $jobEstimateColumnSupported ? ', :estimate_id' : '';
+        $recommendationColumnSql = $jobRecommendationNoteEnabled ? ', recommendation_note' : '';
+        $recommendationValueSql = $jobRecommendationNoteEnabled ? ', :recommendation_note' : '';
+        $insuranceColumnSql = $jobInsuranceEnabled
+            ? ', insurance_company_name, insurance_claim_number, insurance_surveyor_name, insurance_claim_amount_approved, insurance_customer_payable_amount, insurance_claim_status'
+            : '';
+        $insuranceValueSql = $jobInsuranceEnabled
+            ? ', :insurance_company_name, :insurance_claim_number, :insurance_surveyor_name, :insurance_claim_amount_approved, :insurance_customer_payable_amount, :insurance_claim_status'
+            : '';
+        $jobTypeColumnSql = $jobTypeEnabled ? ', job_type_id' : '';
+        $jobTypeValueSql = $jobTypeEnabled ? ', :job_type_id' : '';
+
+        $jobInsert = $pdo->prepare(
+            'INSERT INTO job_cards
+              (company_id, garage_id, job_number, customer_id, vehicle_id' . $odometerColumnSql . ', assigned_to, service_advisor_id' . $estimateColumnSql . ',
+               complaint, diagnosis' . $recommendationColumnSql . $insuranceColumnSql . ', status, priority' . $jobTypeColumnSql . ', promised_at, status_code, created_by, updated_by)
+             VALUES
+              (:company_id, :garage_id, :job_number, :customer_id, :vehicle_id' . $odometerValueSql . ', NULL, :service_advisor_id' . $estimateValueSql . ',
+               :complaint, :diagnosis' . $recommendationValueSql . $insuranceValueSql . ', "OPEN", :priority' . $jobTypeValueSql . ', :promised_at, "ACTIVE", :created_by, :updated_by)'
+        );
+        $jobInsertParams = [
+            'company_id' => $companyId,
+            'garage_id' => $garageId,
+            'job_number' => $jobNumber,
+            'customer_id' => (int) $estimate['customer_id'],
+            'vehicle_id' => (int) $estimate['vehicle_id'],
+            'service_advisor_id' => $actorUserId > 0 ? $actorUserId : null,
+            'complaint' => (string) $estimate['complaint'],
+            'diagnosis' => $diagnosis !== '' ? $diagnosis : null,
+            'priority' => $priority,
+            'promised_at' => $promisedAt,
+            'created_by' => $actorUserId > 0 ? $actorUserId : null,
+            'updated_by' => $actorUserId > 0 ? $actorUserId : null,
+        ];
+        if ($jobOdometerEnabled) {
+            $jobInsertParams['odometer_km'] = $odometerKm !== null ? $odometerKm : 0;
         }
+        if ($jobEstimateColumnSupported) {
+            $jobInsertParams['estimate_id'] = $estimateId;
+        }
+        if ($jobRecommendationNoteEnabled) {
+            $jobInsertParams['recommendation_note'] = $recommendationNote !== '' ? $recommendationNote : null;
+        }
+        if ($jobInsuranceEnabled) {
+            $jobInsertParams['insurance_company_name'] = $insuranceCompanyName !== null && $insuranceCompanyName !== '' ? $insuranceCompanyName : null;
+            $jobInsertParams['insurance_claim_number'] = $insuranceClaimNumber !== null && $insuranceClaimNumber !== '' ? $insuranceClaimNumber : null;
+            $jobInsertParams['insurance_surveyor_name'] = $insuranceSurveyorName !== null && $insuranceSurveyorName !== '' ? $insuranceSurveyorName : null;
+            $jobInsertParams['insurance_claim_amount_approved'] = $insuranceClaimAmountApproved;
+            $jobInsertParams['insurance_customer_payable_amount'] = $insuranceCustomerPayableAmount;
+            $jobInsertParams['insurance_claim_status'] = $insuranceClaimStatus;
+        }
+        if ($jobTypeEnabled) {
+            $jobInsertParams['job_type_id'] = $jobTypeId > 0 ? $jobTypeId : null;
+        }
+        $jobInsert->execute($jobInsertParams);
         $jobId = (int) $pdo->lastInsertId();
 
         if (!empty($serviceLines)) {
@@ -384,6 +549,26 @@ function estimate_convert_to_job_card(int $estimateId, int $companyId, int $gara
             }
         }
 
+        $assignedUserIds = job_sync_assignments($jobId, $companyId, $garageId, $assignedUserIds, $actorUserId);
+        $maintenanceResult = [
+            'added_count' => 0,
+            'postponed_count' => 0,
+            'ignored_count' => 0,
+            'warnings' => [],
+        ];
+        if ($maintenanceReminderFeatureReady && $maintenanceActions !== []) {
+            $maintenanceResult = service_reminder_apply_job_creation_actions(
+                $companyId,
+                $garageId,
+                $jobId,
+                (int) $estimate['vehicle_id'],
+                (int) $estimate['customer_id'],
+                $jobOdometerEnabled ? $odometerKm : null,
+                $actorUserId,
+                $maintenanceActions
+            );
+        }
+
         job_recalculate_estimate($jobId);
         job_append_history(
             $jobId,
@@ -394,6 +579,14 @@ function estimate_convert_to_job_card(int $estimateId, int $companyId, int $gara
             [
                 'estimate_id' => $estimateId,
                 'estimate_number' => (string) ($estimate['estimate_number'] ?? ''),
+                'priority' => $priority,
+                'job_type_id' => $jobTypeEnabled ? ($jobTypeId > 0 ? $jobTypeId : null) : null,
+                'promised_at' => $promisedAt,
+                'odometer_km' => $jobOdometerEnabled ? $odometerKm : null,
+                'assigned_count' => count($assignedUserIds),
+                'maintenance_added' => (int) ($maintenanceResult['added_count'] ?? 0),
+                'maintenance_postponed' => (int) ($maintenanceResult['postponed_count'] ?? 0),
+                'maintenance_ignored' => (int) ($maintenanceResult['ignored_count'] ?? 0),
             ]
         );
 
@@ -438,6 +631,10 @@ function estimate_convert_to_job_card(int $estimateId, int $companyId, int $gara
                 'job_number' => $jobNumber,
                 'service_line_count' => count($serviceLines),
                 'part_line_count' => count($partLines),
+                'assigned_count' => count($assignedUserIds),
+                'maintenance_added' => (int) ($maintenanceResult['added_count'] ?? 0),
+                'maintenance_postponed' => (int) ($maintenanceResult['postponed_count'] ?? 0),
+                'maintenance_ignored' => (int) ($maintenanceResult['ignored_count'] ?? 0),
             ],
         ]);
 
@@ -447,6 +644,7 @@ function estimate_convert_to_job_card(int $estimateId, int $companyId, int $gara
             'job_id' => $jobId,
             'job_number' => $jobNumber,
             'already_converted' => false,
+            'maintenance_result' => $maintenanceResult,
         ];
     } catch (Throwable $exception) {
         $pdo->rollBack();

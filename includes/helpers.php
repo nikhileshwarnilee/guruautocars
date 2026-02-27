@@ -604,6 +604,174 @@ function part_unit_label(int $companyId, ?string $unitCode): string
     return $code;
 }
 
+function job_type_default_catalog(): array
+{
+    return [];
+}
+
+function job_type_sanitize_row(array $row): ?array
+{
+    $id = (int) ($row['id'] ?? 0);
+    if ($id <= 0) {
+        return null;
+    }
+
+    $name = trim((string) ($row['name'] ?? ''));
+    if ($name === '') {
+        return null;
+    }
+
+    $statusCode = normalize_status_code((string) ($row['status_code'] ?? 'ACTIVE'));
+    $allowMultipleRaw = $row['allow_multiple_active_jobs'] ?? 0;
+    $allowMultiple = false;
+    if (is_bool($allowMultipleRaw)) {
+        $allowMultiple = $allowMultipleRaw;
+    } elseif (is_numeric((string) $allowMultipleRaw)) {
+        $allowMultiple = (int) $allowMultipleRaw > 0;
+    } else {
+        $allowMultiple = in_array(
+            strtolower(trim((string) $allowMultipleRaw)),
+            ['1', 'true', 'yes', 'on'],
+            true
+        );
+    }
+
+    return [
+        'id' => $id,
+        'name' => mb_substr($name, 0, 80),
+        'status_code' => $statusCode,
+        'allow_multiple_active_jobs' => $allowMultiple ? 1 : 0,
+    ];
+}
+
+function job_type_catalog(int $companyId): array
+{
+    static $cache = [];
+    if ($companyId <= 0) {
+        return job_type_default_catalog();
+    }
+    if (isset($cache[$companyId])) {
+        return $cache[$companyId];
+    }
+
+    $rows = [];
+    $rawJson = system_setting_get_value($companyId, 0, 'job_types_catalog_json', null);
+    if ($rawJson !== null && trim($rawJson) !== '') {
+        $decoded = json_decode($rawJson, true);
+        if (is_array($decoded)) {
+            foreach ($decoded as $row) {
+                if (!is_array($row)) {
+                    continue;
+                }
+                $sanitized = job_type_sanitize_row($row);
+                if ($sanitized === null) {
+                    continue;
+                }
+                $rows[(int) $sanitized['id']] = $sanitized;
+            }
+        }
+    }
+
+    if ($rows === []) {
+        foreach (job_type_default_catalog() as $defaultRow) {
+            $sanitized = job_type_sanitize_row($defaultRow);
+            if ($sanitized !== null) {
+                $rows[(int) $sanitized['id']] = $sanitized;
+            }
+        }
+    }
+
+    $cache[$companyId] = array_values($rows);
+    return $cache[$companyId];
+}
+
+function job_type_save_catalog(int $companyId, array $rows, ?int $actorUserId = null): int
+{
+    if ($companyId <= 0) {
+        return 0;
+    }
+
+    $normalized = [];
+    foreach ($rows as $row) {
+        if (!is_array($row)) {
+            continue;
+        }
+        $sanitized = job_type_sanitize_row($row);
+        if ($sanitized === null) {
+            continue;
+        }
+        $normalized[(int) $sanitized['id']] = $sanitized;
+    }
+
+    if ($normalized === []) {
+        foreach (job_type_default_catalog() as $defaultRow) {
+            $sanitized = job_type_sanitize_row($defaultRow);
+            if ($sanitized !== null) {
+                $normalized[(int) $sanitized['id']] = $sanitized;
+            }
+        }
+    }
+
+    $payload = json_encode(array_values($normalized), JSON_UNESCAPED_UNICODE);
+    if (!is_string($payload)) {
+        return 0;
+    }
+
+    return system_setting_upsert_value(
+        $companyId,
+        0,
+        'JOBS',
+        'job_types_catalog_json',
+        $payload,
+        'JSON',
+        'ACTIVE',
+        $actorUserId
+    );
+}
+
+function job_type_active_options(int $companyId): array
+{
+    $options = [];
+    foreach (job_type_catalog($companyId) as $row) {
+        $sanitized = job_type_sanitize_row((array) $row);
+        if ($sanitized === null) {
+            continue;
+        }
+        if (normalize_status_code((string) ($sanitized['status_code'] ?? 'ACTIVE')) !== 'ACTIVE') {
+            continue;
+        }
+        $options[(int) $sanitized['id']] = $sanitized;
+    }
+
+    return array_values($options);
+}
+
+function job_type_allows_multiple_active_jobs(int $companyId, int $jobTypeId): bool
+{
+    if ($companyId <= 0 || $jobTypeId <= 0) {
+        return false;
+    }
+
+    foreach (job_type_catalog($companyId) as $row) {
+        $sanitized = job_type_sanitize_row((array) $row);
+        if ($sanitized === null) {
+            continue;
+        }
+
+        if ((int) ($sanitized['id'] ?? 0) !== $jobTypeId) {
+            continue;
+        }
+
+        if (normalize_status_code((string) ($sanitized['status_code'] ?? 'ACTIVE')) === 'DELETED') {
+            return false;
+        }
+
+        return !empty($sanitized['allow_multiple_active_jobs']);
+    }
+
+    return false;
+}
+
 function date_filter_modes(): array
 {
     return [

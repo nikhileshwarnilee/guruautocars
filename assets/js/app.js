@@ -3794,14 +3794,18 @@ function initSearchableSelects() {
     select.gacSearchableRefresh = function () {
       var preserveTypedQuery = document.activeElement === input;
       var typedQuery = preserveTypedQuery ? (input.value || '') : '';
+      var isDisabled = !!select.disabled;
+      input.disabled = isDisabled;
       refreshIndexedOptions(state);
       applyOptionVisibility(state);
-      if (!preserveTypedQuery) {
+      if (!preserveTypedQuery || isDisabled) {
         syncInputWithSelection(state);
       }
       renderComboboxMenu(state, preserveTypedQuery ? typedQuery : (input.value || ''));
-      if (preserveTypedQuery) {
+      if (preserveTypedQuery && !isDisabled) {
         openComboboxMenu(state);
+      } else if (isDisabled) {
+        closeComboboxMenu(state);
       }
     };
     select.gacSearchableState = state;

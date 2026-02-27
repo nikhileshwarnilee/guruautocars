@@ -26,8 +26,45 @@ $fromDate = (string) $scope['from_date'];
 $toDate = (string) $scope['to_date'];
 $canExportData = (bool) $scope['can_export_data'];
 $baseParams = $scope['base_params'];
+$jobTypeEnabled = in_array('job_type_id', table_columns('job_cards'), true);
+$jobTypeCatalog = [];
+$jobTypeLabelsById = [];
+if ($jobTypeEnabled) {
+    foreach (job_type_catalog($companyId) as $jobTypeRow) {
+        $sanitized = job_type_sanitize_row((array) $jobTypeRow);
+        if ($sanitized === null) {
+            continue;
+        }
+        $jobTypeId = (int) ($sanitized['id'] ?? 0);
+        if ($jobTypeId <= 0) {
+            continue;
+        }
+        if (normalize_status_code((string) ($sanitized['status_code'] ?? 'ACTIVE')) === 'DELETED') {
+            continue;
+        }
+        $jobTypeCatalog[$jobTypeId] = [
+            'id' => $jobTypeId,
+            'name' => (string) ($sanitized['name'] ?? ('Job Type #' . $jobTypeId)),
+            'status_code' => normalize_status_code((string) ($sanitized['status_code'] ?? 'ACTIVE')),
+        ];
+        $jobTypeLabelsById[$jobTypeId] = (string) ($jobTypeCatalog[$jobTypeId]['name'] ?? ('Job Type #' . $jobTypeId));
+    }
+    uasort($jobTypeCatalog, static fn (array $a, array $b): int => strcmp((string) ($a['name'] ?? ''), (string) ($b['name'] ?? '')));
+}
+$jobTypeFilterId = $jobTypeEnabled ? max(0, get_int('job_type_id', 0)) : 0;
+$jobTypeFilterLabel = $jobTypeFilterId > 0
+    ? ((string) ($jobTypeLabelsById[$jobTypeFilterId] ?? ('Job Type #' . $jobTypeFilterId)))
+    : 'All Job Types';
+$jobTypeFilterSql = $jobTypeEnabled && $jobTypeFilterId > 0 ? ' AND jc.job_type_id = :job_type_id' : '';
+$reportParams = $baseParams;
+if ($jobTypeEnabled && $jobTypeFilterId > 0) {
+    $reportParams['job_type_id'] = $jobTypeFilterId;
+}
 
 $summaryParams = ['company_id' => $companyId, 'from_date' => $fromDate, 'to_date' => $toDate];
+if ($jobTypeEnabled && $jobTypeFilterId > 0) {
+    $summaryParams['job_type_id'] = $jobTypeFilterId;
+}
 $summaryScopeSql = analytics_garage_scope_sql('jc.garage_id', $selectedGarageId, $garageIds, $summaryParams, 'job_summary_scope');
 $summaryStmt = db()->prepare(
     'SELECT COUNT(*) AS closed_jobs,
@@ -40,12 +77,16 @@ $summaryStmt = db()->prepare(
        AND jc.opened_at IS NOT NULL
        AND jc.closed_at IS NOT NULL
        ' . $summaryScopeSql . '
+       ' . $jobTypeFilterSql . '
        AND DATE(jc.closed_at) BETWEEN :from_date AND :to_date'
 );
 $summaryStmt->execute($summaryParams);
 $jobSummary = $summaryStmt->fetch() ?: ['closed_jobs' => 0, 'avg_completion_hours' => 0, 'estimated_total' => 0];
 
 $dailyParams = ['company_id' => $companyId, 'from_date' => $fromDate, 'to_date' => $toDate];
+if ($jobTypeEnabled && $jobTypeFilterId > 0) {
+    $dailyParams['job_type_id'] = $jobTypeFilterId;
+}
 $dailyScopeSql = analytics_garage_scope_sql('jc.garage_id', $selectedGarageId, $garageIds, $dailyParams, 'job_daily_scope');
 $dailyStmt = db()->prepare(
     'SELECT DATE(jc.closed_at) AS closed_date,
@@ -56,6 +97,7 @@ $dailyStmt = db()->prepare(
        AND jc.status = "CLOSED"
        AND jc.status_code = "ACTIVE"
        ' . $dailyScopeSql . '
+       ' . $jobTypeFilterSql . '
        AND DATE(jc.closed_at) BETWEEN :from_date AND :to_date
      GROUP BY DATE(jc.closed_at)
      ORDER BY closed_date ASC'
@@ -64,6 +106,9 @@ $dailyStmt->execute($dailyParams);
 $closedJobsDaily = $dailyStmt->fetchAll();
 
 $completionTrendParams = ['company_id' => $companyId, 'from_date' => $fromDate, 'to_date' => $toDate];
+if ($jobTypeEnabled && $jobTypeFilterId > 0) {
+    $completionTrendParams['job_type_id'] = $jobTypeFilterId;
+}
 $completionTrendScopeSql = analytics_garage_scope_sql('jc.garage_id', $selectedGarageId, $garageIds, $completionTrendParams, 'job_completion_scope');
 $completionTrendStmt = db()->prepare(
     'SELECT DATE(jc.closed_at) AS closed_date,
@@ -75,6 +120,7 @@ $completionTrendStmt = db()->prepare(
        AND jc.opened_at IS NOT NULL
        AND jc.closed_at IS NOT NULL
        ' . $completionTrendScopeSql . '
+       ' . $jobTypeFilterSql . '
        AND DATE(jc.closed_at) BETWEEN :from_date AND :to_date
      GROUP BY DATE(jc.closed_at)
      ORDER BY closed_date ASC'
@@ -83,6 +129,9 @@ $completionTrendStmt->execute($completionTrendParams);
 $completionTrendRows = $completionTrendStmt->fetchAll();
 
 $mechanicParams = ['company_id' => $companyId, 'from_date' => $fromDate, 'to_date' => $toDate];
+if ($jobTypeEnabled && $jobTypeFilterId > 0) {
+    $mechanicParams['job_type_id'] = $jobTypeFilterId;
+}
 $mechanicScopeSql = analytics_garage_scope_sql('jc.garage_id', $selectedGarageId, $garageIds, $mechanicParams, 'job_mechanic_scope');
 $mechanicStmt = db()->prepare(
     'SELECT u.name AS mechanic_name,
@@ -97,6 +146,7 @@ $mechanicStmt = db()->prepare(
        AND jc.opened_at IS NOT NULL
        AND jc.closed_at IS NOT NULL
        ' . $mechanicScopeSql . '
+       ' . $jobTypeFilterSql . '
        AND DATE(jc.closed_at) BETWEEN :from_date AND :to_date
      WHERE u.company_id = :company_id
        AND u.status_code = "ACTIVE"
@@ -109,6 +159,9 @@ $mechanicStmt->execute($mechanicParams);
 $mechanicRows = $mechanicStmt->fetchAll();
 
 $serviceMixParams = ['company_id' => $companyId, 'from_date' => $fromDate, 'to_date' => $toDate];
+if ($jobTypeEnabled && $jobTypeFilterId > 0) {
+    $serviceMixParams['job_type_id'] = $jobTypeFilterId;
+}
 $serviceMixScopeSql = analytics_garage_scope_sql('jc.garage_id', $selectedGarageId, $garageIds, $serviceMixParams, 'job_service_scope');
 $serviceMixStmt = db()->prepare(
     'SELECT COALESCE(NULLIF(TRIM(s.service_name), ""), NULLIF(TRIM(jl.description), ""), "Other") AS service_name,
@@ -121,6 +174,7 @@ $serviceMixStmt = db()->prepare(
        AND jc.status = "CLOSED"
        AND jc.status_code = "ACTIVE"
        ' . $serviceMixScopeSql . '
+       ' . $jobTypeFilterSql . '
        AND DATE(jc.closed_at) BETWEEN :from_date AND :to_date
      GROUP BY service_name
      ORDER BY line_count DESC, billed_value DESC
@@ -130,6 +184,9 @@ $serviceMixStmt->execute($serviceMixParams);
 $serviceMixRows = $serviceMixStmt->fetchAll();
 
 $jobTypeParams = ['company_id' => $companyId, 'from_date' => $fromDate, 'to_date' => $toDate];
+if ($jobTypeEnabled && $jobTypeFilterId > 0) {
+    $jobTypeParams['job_type_id'] = $jobTypeFilterId;
+}
 $jobTypeScopeSql = analytics_garage_scope_sql('jc.garage_id', $selectedGarageId, $garageIds, $jobTypeParams, 'job_type_scope');
 $jobTypeStmt = db()->prepare(
     'SELECT
@@ -148,6 +205,7 @@ $jobTypeStmt = db()->prepare(
        AND jc.status = "CLOSED"
        AND jc.status_code = "ACTIVE"
        ' . $jobTypeScopeSql . '
+       ' . $jobTypeFilterSql . '
        AND DATE(jc.closed_at) BETWEEN :from_date AND :to_date'
 );
 $jobTypeStmt->execute($jobTypeParams);
@@ -245,7 +303,7 @@ if ($exportKey !== '') {
 
         default:
             flash_set('report_error', 'Unknown export requested.', 'warning');
-            redirect('modules/reports/jobs.php?' . http_build_query(reports_compact_query_params($baseParams)));
+            redirect('modules/reports/jobs.php?' . http_build_query(reports_compact_query_params($reportParams)));
     }
 }
 
@@ -276,7 +334,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
           <div class="btn-group flex-wrap" role="group" aria-label="Report Pages">
             <?php foreach (reports_module_links() as $link): ?>
               <?php $isActive = $active_menu === (string) $link['menu_key']; ?>
-              <a href="<?= e(reports_page_url((string) $link['path'], $baseParams)); ?>" class="btn btn-sm <?= $isActive ? 'btn-primary' : 'btn-outline-primary'; ?>">
+              <a href="<?= e(reports_page_url((string) $link['path'], $reportParams)); ?>" class="btn btn-sm <?= $isActive ? 'btn-primary' : 'btn-outline-primary'; ?>">
                 <i class="<?= e((string) $link['icon']); ?> me-1"></i><?= e((string) $link['label']); ?>
               </a>
             <?php endforeach; ?>
@@ -329,6 +387,20 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                 <?php endif; ?>
               </select>
             </div>
+            <?php if ($jobTypeEnabled): ?>
+              <div class="col-md-3">
+                <label class="form-label">Job Type</label>
+                <select name="job_type_id" class="form-select">
+                  <option value="0">All Job Types</option>
+                  <?php foreach ($jobTypeCatalog as $jobTypeOption): ?>
+                    <?php $jobTypeOptionId = (int) ($jobTypeOption['id'] ?? 0); ?>
+                    <option value="<?= $jobTypeOptionId; ?>" <?= $jobTypeFilterId === $jobTypeOptionId ? 'selected' : ''; ?>>
+                      <?= e((string) ($jobTypeOption['name'] ?? ('Job Type #' . $jobTypeOptionId))); ?>
+                    </option>
+                  <?php endforeach; ?>
+                </select>
+              </div>
+            <?php endif; ?>
             <div class="col-md-2">
               <label class="form-label">Date Mode</label>
               <select name="date_mode" class="form-select">
@@ -349,6 +421,9 @@ require_once __DIR__ . '/../../includes/sidebar.php';
           <div class="mt-3">
             <span class="badge text-bg-light border me-2">Garage: <?= e($scopeGarageLabel); ?></span>
             <span class="badge text-bg-light border me-2">FY: <?= e($fyLabel); ?></span>
+            <?php if ($jobTypeEnabled): ?>
+              <span class="badge text-bg-light border me-2">Job Type: <?= e($jobTypeFilterLabel); ?></span>
+            <?php endif; ?>
             <span class="badge text-bg-light border me-2">Range: <?= e($fromDate); ?> to <?= e($toDate); ?></span>
             <span class="badge text-bg-success">Trusted Data: Closed Jobs Only</span>
           </div>
@@ -437,7 +512,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
           <div class="card h-100">
             <div class="card-header d-flex justify-content-between align-items-center">
               <h3 class="card-title mb-0">Closed Jobs Daily Trend</h3>
-              <a href="<?= e(reports_export_url('modules/reports/jobs.php', $baseParams, 'closed_jobs_daily')); ?>" class="btn btn-sm btn-outline-primary">CSV</a>
+              <a href="<?= e(reports_export_url('modules/reports/jobs.php', $reportParams, 'closed_jobs_daily')); ?>" class="btn btn-sm btn-outline-primary">CSV</a>
             </div>
             <div class="card-body p-0 table-responsive">
               <table class="table table-sm table-striped mb-0">
@@ -462,7 +537,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
           <div class="card h-100">
             <div class="card-header d-flex justify-content-between align-items-center">
               <h3 class="card-title mb-0">Mechanic Productivity (Closed Jobs)</h3>
-              <a href="<?= e(reports_export_url('modules/reports/jobs.php', $baseParams, 'mechanic_productivity')); ?>" class="btn btn-sm btn-outline-secondary">CSV</a>
+              <a href="<?= e(reports_export_url('modules/reports/jobs.php', $reportParams, 'mechanic_productivity')); ?>" class="btn btn-sm btn-outline-secondary">CSV</a>
             </div>
             <div class="card-body p-0 table-responsive">
               <table class="table table-sm table-striped mb-0">
@@ -487,7 +562,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       <div class="card mb-3">
         <div class="card-header d-flex justify-content-between align-items-center">
           <h3 class="card-title mb-0">Closed Job Service Mix</h3>
-          <a href="<?= e(reports_export_url('modules/reports/jobs.php', $baseParams, 'service_mix')); ?>" class="btn btn-sm btn-outline-primary">CSV</a>
+          <a href="<?= e(reports_export_url('modules/reports/jobs.php', $reportParams, 'service_mix')); ?>" class="btn btn-sm btn-outline-primary">CSV</a>
         </div>
         <div class="card-body p-0 table-responsive">
           <table class="table table-sm table-striped mb-0">

@@ -5,6 +5,7 @@ require_once __DIR__ . '/../../includes/app.php';
 require_login();
 require_permission('estimate.view');
 require_once __DIR__ . '/workflow.php';
+require_once __DIR__ . '/../jobs/insurance.php';
 
 $estimateTablesReady = table_columns('estimates') !== []
     && table_columns('estimate_counters') !== []
@@ -27,6 +28,12 @@ $canApprove = has_permission('estimate.approve') || has_permission('estimate.man
 $canReject = has_permission('estimate.reject') || has_permission('estimate.manage');
 $canConvert = has_permission('estimate.convert') || has_permission('estimate.manage');
 $canPrint = has_permission('estimate.print') || has_permission('estimate.manage') || has_permission('estimate.view');
+$jobCardColumns = table_columns('job_cards');
+$jobOdometerEnabled = in_array('odometer_km', $jobCardColumns, true);
+$jobTypeEnabled = job_type_feature_ready();
+$jobRecommendationNoteEnabled = job_recommendation_note_feature_ready();
+$jobInsuranceEnabled = job_insurance_feature_ready();
+$maintenanceReminderFeatureReady = service_reminder_feature_ready();
 
 function estimate_post_decimal(string $key, float $default = 0.0): float
 {
@@ -67,12 +74,28 @@ function estimate_post_date(string $key): ?string
     return $value;
 }
 
+function estimate_parse_ids(mixed $value): array
+{
+    if (!is_array($value)) {
+        return [];
+    }
+
+    $ids = [];
+    foreach ($value as $rawId) {
+        if (filter_var($rawId, FILTER_VALIDATE_INT) !== false && (int) $rawId > 0) {
+            $ids[] = (int) $rawId;
+        }
+    }
+
+    return array_values(array_unique($ids));
+}
+
 function estimate_fetch_details(int $estimateId, int $companyId, int $garageId): ?array
 {
     $stmt = db()->prepare(
         'SELECT e.*,
                 c.full_name AS customer_name, c.phone AS customer_phone,
-                v.registration_no, v.brand, v.model, v.variant, v.fuel_type,
+                v.registration_no, v.brand, v.model, v.variant, v.fuel_type, v.odometer_km AS vehicle_odometer_km,
                 g.name AS garage_name,
                 j.job_number AS converted_job_number
          FROM estimates e
@@ -178,6 +201,7 @@ if ($estimateId <= 0) {
     flash_set('estimate_error', 'Invalid estimate id.', 'danger');
     redirect('modules/estimates/index.php');
 }
+$openConvertSetup = get_int('open_convert_setup', 0) === 1;
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     require_csrf();
@@ -343,22 +367,100 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             redirect('modules/estimates/view.php?id=' . $estimateId);
         }
 
+        $odometerRaw = trim((string) ($_POST['odometer_km'] ?? ''));
+        $parsedOdometer = filter_var($odometerRaw, FILTER_VALIDATE_INT);
+        $odometerKm = ($parsedOdometer !== false && (int) $parsedOdometer >= 0) ? (int) $parsedOdometer : null;
+
+        $jobTypeId = $jobTypeEnabled ? post_int('job_type_id') : 0;
+        $priority = strtoupper(post_string('priority', 10));
+        $promisedAtRaw = trim((string) ($_POST['promised_at'] ?? ''));
+        $diagnosis = post_string('diagnosis', 3000);
+        $recommendationNote = $jobRecommendationNoteEnabled ? post_string('recommendation_note', 5000) : '';
+
+        $insuranceCompanyName = $jobInsuranceEnabled ? post_string('insurance_company_name', 150) : '';
+        $insuranceClaimNumber = $jobInsuranceEnabled ? post_string('insurance_claim_number', 80) : '';
+        $insuranceSurveyorName = $jobInsuranceEnabled ? post_string('insurance_surveyor_name', 120) : '';
+        $insuranceClaimAmountApproved = $jobInsuranceEnabled ? job_insurance_parse_amount($_POST['insurance_claim_amount_approved'] ?? null) : null;
+        $insuranceCustomerPayableAmount = $jobInsuranceEnabled ? job_insurance_parse_amount($_POST['insurance_customer_payable_amount'] ?? null) : null;
+        $insuranceClaimStatus = $jobInsuranceEnabled
+            ? job_insurance_normalize_status((string) ($_POST['insurance_claim_status'] ?? 'PENDING'))
+            : 'PENDING';
+
+        $assignedUserIds = estimate_parse_ids($_POST['assigned_user_ids'] ?? []);
+        $maintenanceActions = [];
+        if ($maintenanceReminderFeatureReady) {
+            $rawMaintenanceActions = $_POST['maintenance_action'] ?? [];
+            if (is_array($rawMaintenanceActions)) {
+                foreach ($rawMaintenanceActions as $reminderId => $actionValue) {
+                    $id = (int) $reminderId;
+                    if ($id <= 0) {
+                        continue;
+                    }
+                    $actionKey = strtolower(trim((string) $actionValue));
+                    if (!in_array($actionKey, ['add', 'ignore', 'postpone'], true)) {
+                        $actionKey = 'ignore';
+                    }
+                    $maintenanceActions[$id] = $actionKey;
+                }
+            }
+        }
+
+        if (!in_array($priority, ['LOW', 'MEDIUM', 'HIGH', 'URGENT'], true)) {
+            $priority = 'MEDIUM';
+        }
+
         try {
-            $conversion = estimate_convert_to_job_card($estimateId, $companyId, $garageId, $userId);
+            $conversion = estimate_convert_to_job_card($estimateId, $companyId, $garageId, $userId, [
+                'strict_conversion_input' => true,
+                'odometer_km' => $odometerKm,
+                'job_type_id' => $jobTypeId,
+                'priority' => $priority,
+                'promised_at' => $promisedAtRaw,
+                'diagnosis' => $diagnosis,
+                'recommendation_note' => $recommendationNote,
+                'insurance_company_name' => $insuranceCompanyName,
+                'insurance_claim_number' => $insuranceClaimNumber,
+                'insurance_surveyor_name' => $insuranceSurveyorName,
+                'insurance_claim_amount_approved' => $insuranceClaimAmountApproved,
+                'insurance_customer_payable_amount' => $insuranceCustomerPayableAmount,
+                'insurance_claim_status' => $insuranceClaimStatus,
+                'assigned_user_ids' => $assignedUserIds,
+                'maintenance_actions' => $maintenanceActions,
+            ]);
             $jobId = (int) ($conversion['job_id'] ?? 0);
             $jobNumber = (string) ($conversion['job_number'] ?? ('#' . $jobId));
             $alreadyConverted = !empty($conversion['already_converted']);
+            $maintenanceResult = (array) ($conversion['maintenance_result'] ?? []);
 
             if ($alreadyConverted) {
                 flash_set('estimate_success', 'Estimate already converted. Opening existing job card ' . $jobNumber . '.', 'info');
             } else {
                 flash_set('estimate_success', 'Estimate converted successfully to Job Card ' . $jobNumber . '.', 'success');
             }
+            if ((int) ($maintenanceResult['added_count'] ?? 0) > 0
+                || (int) ($maintenanceResult['postponed_count'] ?? 0) > 0
+                || (int) ($maintenanceResult['ignored_count'] ?? 0) > 0) {
+                flash_set(
+                    'estimate_info_maintenance',
+                    'Maintenance recommendations: Added ' . (int) ($maintenanceResult['added_count'] ?? 0)
+                    . ', Postponed ' . (int) ($maintenanceResult['postponed_count'] ?? 0)
+                    . ', Ignored ' . (int) ($maintenanceResult['ignored_count'] ?? 0) . '.',
+                    'info'
+                );
+            }
+            $maintenanceWarnings = (array) ($maintenanceResult['warnings'] ?? []);
+            foreach ($maintenanceWarnings as $index => $warning) {
+                $warningMessage = trim((string) $warning);
+                if ($warningMessage === '') {
+                    continue;
+                }
+                flash_set('estimate_warning_maintenance_' . $index, $warningMessage, 'warning');
+            }
 
             redirect('modules/jobs/view.php?id=' . $jobId);
         } catch (Throwable $exception) {
             flash_set('estimate_error', $exception->getMessage(), 'danger');
-            redirect('modules/estimates/view.php?id=' . $estimateId);
+            redirect('modules/estimates/view.php?id=' . $estimateId . '&open_convert_setup=1');
         }
     }
 
@@ -751,6 +853,44 @@ if (!$estimate) {
 
 $estimateStatus = estimate_normalize_status((string) $estimate['estimate_status']);
 $editable = estimate_is_editable($estimate);
+$canRunConversionFlow = $canConvert && estimate_can_convert($estimate);
+
+$jobTypeOptions = [];
+if ($jobTypeEnabled) {
+    foreach (job_type_active_options($companyId) as $jobTypeRow) {
+        $jobTypeId = (int) ($jobTypeRow['id'] ?? 0);
+        if ($jobTypeId <= 0) {
+            continue;
+        }
+        $jobTypeOptions[$jobTypeId] = [
+            'id' => $jobTypeId,
+            'name' => (string) ($jobTypeRow['name'] ?? ('Job Type #' . $jobTypeId)),
+        ];
+    }
+    uasort($jobTypeOptions, static fn (array $left, array $right): int => strcmp((string) ($left['name'] ?? ''), (string) ($right['name'] ?? '')));
+}
+
+$assignmentCandidates = $canRunConversionFlow ? job_assignment_candidates($companyId, $garageId) : [];
+$convertMaintenanceRecommendations = [];
+if ($canRunConversionFlow && $maintenanceReminderFeatureReady) {
+    try {
+        $convertMaintenanceRecommendations = service_reminder_due_recommendations_for_vehicle(
+            $companyId,
+            $garageId,
+            (int) ($estimate['vehicle_id'] ?? 0),
+            20
+        );
+    } catch (Throwable $exception) {
+        $convertMaintenanceRecommendations = [];
+    }
+}
+$vehicleOdometerDefault = (int) ($estimate['vehicle_odometer_km'] ?? 0);
+$conversionPromisedDefault = date('Y-m-d\TH:i', strtotime('+1 day'));
+$conversionPriorityDefault = 'MEDIUM';
+$conversionDiagnosisDefault = trim((string) ($estimate['notes'] ?? ''));
+$conversionRecommendationDefault = '';
+$conversionJobTypeDefault = 0;
+$jobTypeSelectionReady = !$jobTypeEnabled || $jobTypeOptions !== [];
 
 $customersStmt = db()->prepare(
     'SELECT id, full_name, phone
@@ -911,6 +1051,194 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                 </div>
               </div>
             <?php endif; ?>
+
+            <?php if ($canRunConversionFlow): ?>
+              <div class="card-body border-top">
+                <button
+                  type="button"
+                  class="btn btn-success w-100"
+                  data-bs-toggle="collapse"
+                  data-bs-target="#estimate-convert-setup"
+                  aria-expanded="<?= $openConvertSetup ? 'true' : 'false'; ?>"
+                  aria-controls="estimate-convert-setup">
+                  Setup & Convert to Job Card
+                </button>
+                <div class="form-hint mt-1 mb-2">Fill conversion details below, then convert.</div>
+
+                <div class="collapse mt-2<?= $openConvertSetup ? ' show' : ''; ?>" id="estimate-convert-setup">
+                  <form method="post" class="border rounded p-2 bg-light">
+                    <?= csrf_field(); ?>
+                    <input type="hidden" name="_action" value="convert_to_job" />
+                    <div class="row g-2">
+                      <?php if ($jobOdometerEnabled): ?>
+                        <div class="col-md-6">
+                          <label class="form-label">Current Odometer (KM)</label>
+                          <input type="number" name="odometer_km" class="form-control" min="0" required value="<?= e((string) $vehicleOdometerDefault); ?>" />
+                        </div>
+                      <?php endif; ?>
+                      <?php if ($jobTypeEnabled): ?>
+                        <div class="col-md-6">
+                          <label class="form-label">Job Type</label>
+                          <select name="job_type_id" class="form-select" required <?= $jobTypeOptions === [] ? 'disabled' : ''; ?>>
+                            <option value="">Select Job Type</option>
+                            <?php foreach ($jobTypeOptions as $jobTypeOption): ?>
+                              <option value="<?= (int) $jobTypeOption['id']; ?>" <?= $conversionJobTypeDefault === (int) $jobTypeOption['id'] ? 'selected' : ''; ?>>
+                                <?= e((string) $jobTypeOption['name']); ?>
+                              </option>
+                            <?php endforeach; ?>
+                          </select>
+                        </div>
+                      <?php endif; ?>
+                      <?php if ($jobTypeEnabled && $jobTypeOptions === []): ?>
+                        <div class="col-12">
+                          <div class="alert alert-warning mb-0">No active job types are configured. Add job types from Administration > Settings first.</div>
+                        </div>
+                      <?php endif; ?>
+                      <div class="col-md-6">
+                        <label class="form-label">Promised Date/Time</label>
+                        <input type="datetime-local" name="promised_at" class="form-control" required value="<?= e($conversionPromisedDefault); ?>" />
+                      </div>
+                      <div class="col-md-6">
+                        <label class="form-label">Priority</label>
+                        <select name="priority" class="form-select" required>
+                          <?php foreach (['LOW', 'MEDIUM', 'HIGH', 'URGENT'] as $priorityOption): ?>
+                            <option value="<?= e($priorityOption); ?>" <?= $conversionPriorityDefault === $priorityOption ? 'selected' : ''; ?>>
+                              <?= e($priorityOption); ?>
+                            </option>
+                          <?php endforeach; ?>
+                        </select>
+                      </div>
+                      <div class="col-12">
+                        <label class="form-label">Diagnosis</label>
+                        <textarea name="diagnosis" class="form-control" rows="2" required><?= e($conversionDiagnosisDefault); ?></textarea>
+                      </div>
+                      <?php if ($jobRecommendationNoteEnabled): ?>
+                        <div class="col-12">
+                          <label class="form-label">Recommendation Note</label>
+                          <textarea name="recommendation_note" class="form-control" rows="2" maxlength="5000"><?= e($conversionRecommendationDefault); ?></textarea>
+                        </div>
+                      <?php endif; ?>
+
+                      <?php if ($jobInsuranceEnabled): ?>
+                        <div class="col-12"><hr class="my-1"></div>
+                        <div class="col-12">
+                          <h6 class="mb-0 text-muted">Insurance Claim Details</h6>
+                        </div>
+                        <div class="col-md-6">
+                          <label class="form-label">Insurance Company</label>
+                          <input type="text" name="insurance_company_name" class="form-control" maxlength="150" value="" />
+                        </div>
+                        <div class="col-md-6">
+                          <label class="form-label">Claim Number</label>
+                          <input type="text" name="insurance_claim_number" class="form-control" maxlength="80" value="" />
+                        </div>
+                        <div class="col-md-6">
+                          <label class="form-label">Surveyor Name</label>
+                          <input type="text" name="insurance_surveyor_name" class="form-control" maxlength="120" value="" />
+                        </div>
+                        <div class="col-md-6">
+                          <label class="form-label">Claim Status</label>
+                          <select name="insurance_claim_status" class="form-select">
+                            <?php foreach (job_insurance_allowed_statuses() as $insuranceStatus): ?>
+                              <option value="<?= e($insuranceStatus); ?>" <?= $insuranceStatus === 'PENDING' ? 'selected' : ''; ?>><?= e($insuranceStatus); ?></option>
+                            <?php endforeach; ?>
+                          </select>
+                        </div>
+                        <div class="col-md-6">
+                          <label class="form-label">Claim Amount Approved</label>
+                          <input type="number" name="insurance_claim_amount_approved" class="form-control" step="0.01" min="0" value="" />
+                        </div>
+                        <div class="col-md-6">
+                          <label class="form-label">Customer Payable Difference</label>
+                          <input type="number" name="insurance_customer_payable_amount" class="form-control" step="0.01" min="0" value="" />
+                        </div>
+                      <?php endif; ?>
+
+                      <div class="col-12"><hr class="my-1"></div>
+                      <div class="col-12">
+                        <label class="form-label">Assign Staff (Multiple)</label>
+                        <select name="assigned_user_ids[]" class="form-select" multiple size="4">
+                          <?php foreach ($assignmentCandidates as $staff): ?>
+                            <option value="<?= (int) $staff['id']; ?>">
+                              <?= e((string) $staff['name']); ?> - <?= e((string) $staff['role_name']); ?>
+                            </option>
+                          <?php endforeach; ?>
+                        </select>
+                      </div>
+
+                      <div class="col-12"><hr class="my-1"></div>
+                      <div class="col-12">
+                        <label class="form-label">Recommended Services/Parts Due</label>
+                        <?php if (!$maintenanceReminderFeatureReady): ?>
+                          <div class="text-muted small">Maintenance recommendation storage is not ready in this database.</div>
+                        <?php elseif ($convertMaintenanceRecommendations === []): ?>
+                          <div class="text-muted small">No due recommendations found for this vehicle.</div>
+                        <?php else: ?>
+                          <div class="table-responsive">
+                            <table class="table table-sm table-striped mb-0">
+                              <thead>
+                                <tr>
+                                  <th>Item</th>
+                                  <th>Due</th>
+                                  <th>Next Due</th>
+                                  <th>Action</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                <?php foreach ($convertMaintenanceRecommendations as $recommendation): ?>
+                                  <?php
+                                    $reminderId = (int) ($recommendation['reminder_id'] ?? 0);
+                                    $dueState = strtoupper(trim((string) ($recommendation['due_state'] ?? 'UPCOMING')));
+                                    $dueBadge = match ($dueState) {
+                                        'OVERDUE' => 'danger',
+                                        'DUE' => 'warning',
+                                        'UPCOMING' => 'info',
+                                        default => 'secondary',
+                                    };
+                                  ?>
+                                  <tr>
+                                    <td>
+                                      <?= e((string) ($recommendation['item_name'] ?? '-')); ?>
+                                      <div class="small text-muted"><?= e((string) ($recommendation['item_type'] ?? '')); ?></div>
+                                    </td>
+                                    <td><span class="badge text-bg-<?= e($dueBadge); ?>"><?= e($dueState); ?></span></td>
+                                    <td>
+                                      <div class="small">KM: <?= e((string) (($recommendation['next_due_km'] ?? null) !== null ? number_format((int) $recommendation['next_due_km']) : '-')); ?></div>
+                                      <div class="small">Date: <?= e((string) (($recommendation['next_due_date'] ?? '') !== '' ? $recommendation['next_due_date'] : '-')); ?></div>
+                                    </td>
+                                    <td>
+                                      <select name="maintenance_action[<?= $reminderId; ?>]" class="form-select form-select-sm">
+                                        <?php
+                                          $defaultAction = strtolower(trim((string) ($recommendation['action_default'] ?? 'ignore')));
+                                          if (!in_array($defaultAction, ['add', 'ignore', 'postpone'], true)) {
+                                              $defaultAction = 'ignore';
+                                          }
+                                        ?>
+                                        <option value="add" <?= $defaultAction === 'add' ? 'selected' : ''; ?>>Add</option>
+                                        <option value="ignore" <?= $defaultAction === 'ignore' ? 'selected' : ''; ?>>Ignore</option>
+                                        <option value="postpone" <?= $defaultAction === 'postpone' ? 'selected' : ''; ?>>Postpone</option>
+                                      </select>
+                                    </td>
+                                  </tr>
+                                <?php endforeach; ?>
+                              </tbody>
+                            </table>
+                          </div>
+                        <?php endif; ?>
+                      </div>
+                    </div>
+
+                    <div class="d-grid mt-3">
+                      <button type="submit" class="btn btn-success" <?= $jobTypeSelectionReady ? '' : 'disabled'; ?>>Convert to Job Card</button>
+                    </div>
+                  </form>
+                </div>
+              </div>
+            <?php elseif ($estimateStatus === 'APPROVED' && !$canConvert): ?>
+              <div class="card-body border-top">
+                <div class="text-muted">Estimate is approved but you do not have conversion permission.</div>
+              </div>
+            <?php endif; ?>
           </div>
         </div>
 
@@ -944,16 +1272,6 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                 </form>
               <?php endif; ?>
 
-              <?php if ($canConvert && estimate_can_convert($estimate)): ?>
-                <form method="post" data-confirm="Convert approved estimate into a job card now?">
-                  <?= csrf_field(); ?>
-                  <input type="hidden" name="_action" value="convert_to_job" />
-                  <button type="submit" class="btn btn-success w-100">Convert to Job Card</button>
-                  <div class="form-hint mt-1">Services and parts will be copied automatically. No re-entry required.</div>
-                </form>
-              <?php elseif ($estimateStatus === 'APPROVED' && !$canConvert): ?>
-                <div class="text-muted">Estimate is approved but you do not have conversion permission.</div>
-              <?php endif; ?>
             </div>
           </div>
         </div>

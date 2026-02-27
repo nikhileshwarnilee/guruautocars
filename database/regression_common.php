@@ -109,10 +109,10 @@ final class RegressionHarness
     }
 
     /**
-     * Build SQL filter for operational payment rows while treating reversals as audit-only.
-     * Reversed payment rows are excluded from calculations via NOT EXISTS on reversal link.
+     * Build SQL filter for operational rows while treating reversals as audit-only.
+     * Reversed rows are excluded from calculations via NOT EXISTS on reversal link.
      */
-    private function unreversedPaymentFilterSql(string $table, string $alias): string
+    private function unreversedPaymentFilterSql(string $table, string $alias, string $operationalEntryType = 'PAYMENT'): string
     {
         if (!preg_match('/^[A-Za-z0-9_]+$/', $table)) {
             return '1 = 0';
@@ -120,12 +120,25 @@ final class RegressionHarness
         if (!preg_match('/^[A-Za-z0-9_]+$/', $alias)) {
             $alias = 'p';
         }
+        if (!preg_match('/^[A-Z_]+$/', $operationalEntryType)) {
+            $operationalEntryType = 'PAYMENT';
+        }
 
         $cols = $this->columns($table);
         $hasEntryType = in_array('entry_type', $cols, true);
-        $hasReversedPaymentId = in_array('reversed_payment_id', $cols, true);
         $hasIsReversed = in_array('is_reversed', $cols, true);
         $hasDeletedAt = in_array('deleted_at', $cols, true);
+        $reverseLinkColumn = null;
+        if (in_array('reversed_payment_id', $cols, true)) {
+            $reverseLinkColumn = 'reversed_payment_id';
+        } else {
+            foreach ($cols as $col) {
+                if (preg_match('/^reversed_[A-Za-z0-9_]+_id$/', $col) === 1) {
+                    $reverseLinkColumn = $col;
+                    break;
+                }
+            }
+        }
 
         $conditions = [];
         if ($hasDeletedAt) {
@@ -133,7 +146,7 @@ final class RegressionHarness
         }
 
         if ($hasEntryType) {
-            $conditions[] = 'COALESCE(' . $alias . '.entry_type, "PAYMENT") = "PAYMENT"';
+            $conditions[] = 'UPPER(COALESCE(' . $alias . '.entry_type, "' . $operationalEntryType . '")) = "' . $operationalEntryType . '"';
         } else {
             $conditions[] = $alias . '.amount > 0';
         }
@@ -142,10 +155,10 @@ final class RegressionHarness
             $conditions[] = 'COALESCE(' . $alias . '.is_reversed, 0) = 0';
         }
 
-        if ($hasReversedPaymentId) {
+        if (is_string($reverseLinkColumn) && $reverseLinkColumn !== '') {
             $reverseAlias = $alias . '_rev';
             $reverseConditions = [
-                $reverseAlias . '.reversed_payment_id = ' . $alias . '.id',
+                $reverseAlias . '.' . $reverseLinkColumn . ' = ' . $alias . '.id',
             ];
             if ($hasEntryType) {
                 $reverseConditions[] = 'COALESCE(' . $reverseAlias . '.entry_type, "REVERSAL") = "REVERSAL"';
@@ -461,7 +474,18 @@ final class RegressionHarness
                 $this->exec('DELETE FROM chart_of_accounts WHERE company_id = :company_id', ['company_id' => $this->companyId]);
             }
             if ($this->tableExists('audit_logs') && $this->hasColumn('audit_logs', 'company_id')) {
-                $this->exec('DELETE FROM audit_logs WHERE company_id = :company_id', ['company_id' => $this->companyId]);
+                try {
+                    $this->exec('DELETE FROM audit_logs WHERE company_id = :company_id', ['company_id' => $this->companyId]);
+                } catch (Throwable $e) {
+                    $msg = strtolower($e->getMessage());
+                    $immutableAudit = str_contains($msg, 'immutable')
+                        || str_contains($msg, 'cannot be deleted')
+                        || str_contains($msg, 'rows are immutable');
+                    if (!$immutableAudit) {
+                        throw $e;
+                    }
+                    $this->logLine('Skipping audit_logs purge due to immutable policy: ' . $e->getMessage());
+                }
             }
 
             if ($this->tableExists('invoice_items') && $this->tableExists('invoices')) {
@@ -866,7 +890,16 @@ final class RegressionHarness
             ) ?? 0);
         }
         if ($this->tableExists('payroll_salary_items') && $this->tableExists('payroll_salary_sheets')) $counts['payroll_entries'] = (int) ($this->qv('SELECT COUNT(*) FROM payroll_salary_items psi INNER JOIN payroll_salary_sheets pss ON pss.id=psi.sheet_id WHERE pss.company_id=:c AND psi.deleted_at IS NULL', ['c' => $this->companyId]) ?? 0);
-        if ($this->tableExists('expenses')) $counts['expenses'] = (int) ($this->qv('SELECT COUNT(*) FROM expenses WHERE company_id=:c AND deleted_at IS NULL AND entry_type="EXPENSE"', ['c' => $this->companyId]) ?? 0);
+        if ($this->tableExists('expenses')) {
+            $expenseFilterSql = $this->unreversedPaymentFilterSql('expenses', 'e', 'EXPENSE');
+            $counts['expenses'] = (int) ($this->qv(
+                'SELECT COUNT(*)
+                 FROM expenses e
+                 WHERE e.company_id = :c
+                   AND ' . $expenseFilterSql,
+                ['c' => $this->companyId]
+            ) ?? 0);
+        }
         if ($this->tableExists('outsourced_works')) $counts['outsourced_jobs'] = (int) ($this->qv('SELECT COUNT(*) FROM outsourced_works WHERE company_id=:c AND COALESCE(status_code,"ACTIVE")<>"DELETED"', ['c' => $this->companyId]) ?? 0);
         return $counts;
     }
@@ -978,14 +1011,16 @@ final class RegressionHarness
         }
 
         if ($this->tableExists('expenses')) {
+            $expenseFilterSql = $this->unreversedPaymentFilterSql('expenses', 'e', 'EXPENSE');
             $totals['expenses'] = $this->qr(
-                'SELECT COUNT(*) AS row_count,
-                        ROUND(COALESCE(SUM(CASE WHEN entry_type="EXPENSE" THEN amount ELSE 0 END),0),2) AS expense_total,
-                        ROUND(COALESCE(SUM(CASE WHEN entry_type="REVERSAL" THEN amount ELSE 0 END),0),2) AS reversal_total,
-                        ROUND(COALESCE(SUM(amount),0),2) AS net_total
-                 FROM expenses
-                 WHERE company_id = :c
-                   AND deleted_at IS NULL',
+                'SELECT
+                        SUM(CASE WHEN ' . $expenseFilterSql . ' THEN 1 ELSE 0 END) AS row_count,
+                        ROUND(COALESCE(SUM(CASE WHEN ' . $expenseFilterSql . ' THEN ABS(e.amount) ELSE 0 END),0),2) AS expense_total,
+                        ROUND(COALESCE(SUM(CASE WHEN UPPER(COALESCE(e.entry_type,"EXPENSE"))="REVERSAL" THEN e.amount ELSE 0 END),0),2) AS reversal_total,
+                        ROUND(COALESCE(SUM(CASE WHEN ' . $expenseFilterSql . ' THEN ABS(e.amount) ELSE 0 END),0),2) AS net_total
+                 FROM expenses e
+                 WHERE e.company_id = :c
+                   AND e.deleted_at IS NULL',
                 ['c' => $this->companyId]
             );
         }
@@ -1029,9 +1064,12 @@ final class RegressionHarness
         }
 
         if ($this->tableExists('outsourced_work_payments') && $this->tableExists('outsourced_works')) {
+            $outsourcedPaymentFilterSql = $this->unreversedPaymentFilterSql('outsourced_work_payments', 'owp');
             $totals['outsourced_payments'] = $this->qr(
-                'SELECT COUNT(*) AS payment_count,
-                        ROUND(COALESCE(SUM(CASE WHEN owp.entry_type="REVERSAL" THEN -ABS(owp.amount) ELSE ABS(owp.amount) END),0),2) AS net_paid
+                'SELECT
+                        SUM(CASE WHEN ' . $outsourcedPaymentFilterSql . ' THEN 1 ELSE 0 END) AS payment_count,
+                        ROUND(COALESCE(SUM(CASE WHEN ' . $outsourcedPaymentFilterSql . ' THEN ABS(owp.amount) ELSE 0 END),0),2) AS net_paid,
+                        ROUND(COALESCE(SUM(CASE WHEN UPPER(COALESCE(owp.entry_type,"PAYMENT"))="REVERSAL" THEN ABS(owp.amount) ELSE 0 END),0),2) AS reversal_audit_total
                  FROM outsourced_work_payments owp
                  INNER JOIN outsourced_works ow ON ow.id = owp.outsourced_work_id
                  WHERE ow.company_id = :c',

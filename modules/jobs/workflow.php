@@ -68,6 +68,61 @@ function job_is_locked(array $job): bool
     return $status === 'CLOSED' || $statusCode !== 'ACTIVE';
 }
 
+function job_find_active_non_closed_vehicle_job(
+    int $companyId,
+    int $vehicleId,
+    ?int $excludeJobId = null,
+    ?PDO $pdo = null,
+    bool $forUpdate = false
+): ?array {
+    if ($companyId <= 0 || $vehicleId <= 0) {
+        return null;
+    }
+
+    $connection = $pdo ?? db();
+    $sql =
+        'SELECT id, job_number, status, garage_id
+         FROM job_cards
+         WHERE company_id = :company_id
+           AND vehicle_id = :vehicle_id
+           AND status_code = "ACTIVE"
+           AND UPPER(COALESCE(status, "OPEN")) <> "CLOSED"';
+    $params = [
+        'company_id' => $companyId,
+        'vehicle_id' => $vehicleId,
+    ];
+
+    if ($excludeJobId !== null && $excludeJobId > 0) {
+        $sql .= ' AND id <> :exclude_job_id';
+        $params['exclude_job_id'] = $excludeJobId;
+    }
+
+    $sql .= ' ORDER BY id DESC LIMIT 1';
+    if ($forUpdate) {
+        $sql .= ' FOR UPDATE';
+    }
+
+    $stmt = $connection->prepare($sql);
+    $stmt->execute($params);
+    $row = $stmt->fetch();
+    if (!$row) {
+        return null;
+    }
+
+    $jobId = (int) ($row['id'] ?? 0);
+    $jobNumber = trim((string) ($row['job_number'] ?? ''));
+    if ($jobNumber === '') {
+        $jobNumber = '#' . $jobId;
+    }
+
+    return [
+        'id' => $jobId,
+        'job_number' => $jobNumber,
+        'status' => job_normalize_status((string) ($row['status'] ?? 'OPEN')),
+        'garage_id' => (int) ($row['garage_id'] ?? 0),
+    ];
+}
+
 function job_append_history(
     int $jobId,
     string $actionType,
@@ -130,6 +185,42 @@ function job_recommendation_note_feature_ready(bool $refresh = false): bool
             $columns = table_columns('job_cards');
         }
         $cached = in_array('recommendation_note', $columns, true);
+    } catch (Throwable $exception) {
+        $cached = false;
+    }
+
+    return $cached;
+}
+
+function job_type_feature_ready(bool $refresh = false): bool
+{
+    static $cached = null;
+
+    if (!$refresh && $cached !== null) {
+        return $cached;
+    }
+
+    try {
+        $columns = table_columns('job_cards');
+        if (!in_array('job_type_id', $columns, true)) {
+            db()->exec('ALTER TABLE job_cards ADD COLUMN job_type_id INT UNSIGNED NULL AFTER priority');
+            $columns = table_columns('job_cards');
+        }
+        if (in_array('job_type_id', $columns, true)) {
+            try {
+                $indexExists = false;
+                $indexStmt = db()->query('SHOW INDEX FROM job_cards WHERE Key_name = "idx_job_cards_job_type_id"');
+                if ($indexStmt) {
+                    $indexExists = (bool) $indexStmt->fetch();
+                }
+                if (!$indexExists) {
+                    db()->exec('ALTER TABLE job_cards ADD INDEX idx_job_cards_job_type_id (job_type_id)');
+                }
+            } catch (Throwable $exception) {
+                // Index may already exist on older upgraded installs.
+            }
+        }
+        $cached = in_array('job_type_id', $columns, true);
     } catch (Throwable $exception) {
         $cached = false;
     }

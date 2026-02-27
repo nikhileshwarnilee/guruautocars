@@ -9,6 +9,7 @@ $page_title = 'System Settings';
 $active_menu = 'system.settings';
 $canManage = has_permission('settings.manage');
 $companyId = active_company_id();
+$actorUserId = (int) ($_SESSION['user_id'] ?? 0);
 $dateModeOptions = date_filter_modes();
 
 $garagesStmt = db()->prepare(
@@ -20,6 +21,61 @@ $garagesStmt = db()->prepare(
 );
 $garagesStmt->execute(['company_id' => $companyId]);
 $garages = $garagesStmt->fetchAll();
+
+function job_type_sort_rows(array $rows): array
+{
+    usort(
+        $rows,
+        static function (array $left, array $right): int {
+            $leftStatus = normalize_status_code((string) ($left['status_code'] ?? 'ACTIVE'));
+            $rightStatus = normalize_status_code((string) ($right['status_code'] ?? 'ACTIVE'));
+            if ($leftStatus !== $rightStatus) {
+                $rank = ['ACTIVE' => 0, 'INACTIVE' => 1, 'DELETED' => 2];
+                return ($rank[$leftStatus] ?? 9) <=> ($rank[$rightStatus] ?? 9);
+            }
+
+            return strcmp((string) ($left['name'] ?? ''), (string) ($right['name'] ?? ''));
+        }
+    );
+
+    return $rows;
+}
+
+function job_type_name_exists(array $jobTypesById, string $name, ?int $excludeId = null): bool
+{
+    $needle = mb_strtolower(trim($name));
+    if ($needle === '') {
+        return false;
+    }
+
+    foreach ($jobTypesById as $id => $row) {
+        if ($excludeId !== null && (int) $id === $excludeId) {
+            continue;
+        }
+
+        $statusCode = normalize_status_code((string) ($row['status_code'] ?? 'ACTIVE'));
+        if ($statusCode === 'DELETED') {
+            continue;
+        }
+
+        $rowName = mb_strtolower(trim((string) ($row['name'] ?? '')));
+        if ($rowName !== '' && $rowName === $needle) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+$jobTypeCatalog = job_type_catalog($companyId);
+$jobTypesById = [];
+foreach ($jobTypeCatalog as $jobTypeRow) {
+    $sanitized = job_type_sanitize_row((array) $jobTypeRow);
+    if ($sanitized === null) {
+        continue;
+    }
+    $jobTypesById[(int) $sanitized['id']] = $sanitized;
+}
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     require_csrf();
@@ -58,6 +114,139 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             flash_set('settings_error', 'Unable to update default date filter mode right now.', 'danger');
         }
 
+        redirect('modules/system/settings.php');
+    }
+
+    if ($action === 'create_job_type') {
+        $jobTypeName = post_string('job_type_name', 80);
+        $statusCode = normalize_status_code((string) ($_POST['status_code'] ?? 'ACTIVE'));
+        $allowMultipleActiveJobs = !empty($_POST['allow_multiple_active_jobs']) ? 1 : 0;
+
+        if ($statusCode === 'DELETED') {
+            flash_set('settings_error', 'Use delete action to mark a job type as deleted.', 'danger');
+            redirect('modules/system/settings.php');
+        }
+
+        if ($jobTypeName === '') {
+            flash_set('settings_error', 'Job type name is required.', 'danger');
+            redirect('modules/system/settings.php');
+        }
+
+        if (job_type_name_exists($jobTypesById, $jobTypeName, null)) {
+            flash_set('settings_error', 'Job type name already exists. Use edit to modify it.', 'danger');
+            redirect('modules/system/settings.php');
+        }
+
+        $nextId = $jobTypesById !== [] ? (max(array_map('intval', array_keys($jobTypesById))) + 1) : 1;
+        $jobTypesById[$nextId] = [
+            'id' => $nextId,
+            'name' => $jobTypeName,
+            'status_code' => $statusCode,
+            'allow_multiple_active_jobs' => $allowMultipleActiveJobs,
+        ];
+
+        $settingId = job_type_save_catalog($companyId, array_values($jobTypesById), $actorUserId > 0 ? $actorUserId : null);
+        if ($settingId <= 0) {
+            flash_set('settings_error', 'Unable to save job type right now.', 'danger');
+            redirect('modules/system/settings.php');
+        }
+
+        log_audit('system_settings', 'job_type_create', $settingId, 'Created job type ' . $jobTypeName, [
+            'entity' => 'job_type_option',
+            'company_id' => $companyId,
+            'metadata' => [
+                'job_type_id' => $nextId,
+                'job_type_name' => $jobTypeName,
+                'status_code' => $statusCode,
+                'allow_multiple_active_jobs' => $allowMultipleActiveJobs,
+                'setting_key' => 'job_types_catalog_json',
+            ],
+        ]);
+        flash_set('settings_success', 'Job type created successfully.', 'success');
+        redirect('modules/system/settings.php');
+    }
+
+    if ($action === 'update_job_type') {
+        $jobTypeId = post_int('job_type_id');
+        $jobTypeName = post_string('job_type_name', 80);
+        $statusCode = normalize_status_code((string) ($_POST['status_code'] ?? 'ACTIVE'));
+        $allowMultipleActiveJobs = !empty($_POST['allow_multiple_active_jobs']) ? 1 : 0;
+
+        if ($statusCode === 'DELETED') {
+            flash_set('settings_error', 'Use delete action to mark a job type as deleted.', 'danger');
+            redirect('modules/system/settings.php');
+        }
+
+        if ($jobTypeId <= 0 || !isset($jobTypesById[$jobTypeId])) {
+            flash_set('settings_error', 'Job type not found for update.', 'danger');
+            redirect('modules/system/settings.php');
+        }
+
+        if ($jobTypeName === '') {
+            flash_set('settings_error', 'Job type name is required.', 'danger');
+            redirect('modules/system/settings.php?edit_job_type_id=' . $jobTypeId);
+        }
+
+        if (job_type_name_exists($jobTypesById, $jobTypeName, $jobTypeId)) {
+            flash_set('settings_error', 'Job type name already exists. Choose a different name.', 'danger');
+            redirect('modules/system/settings.php?edit_job_type_id=' . $jobTypeId);
+        }
+
+        $before = $jobTypesById[$jobTypeId];
+        $jobTypesById[$jobTypeId] = [
+            'id' => $jobTypeId,
+            'name' => $jobTypeName,
+            'status_code' => $statusCode,
+            'allow_multiple_active_jobs' => $allowMultipleActiveJobs,
+        ];
+
+        $settingId = job_type_save_catalog($companyId, array_values($jobTypesById), $actorUserId > 0 ? $actorUserId : null);
+        if ($settingId <= 0) {
+            flash_set('settings_error', 'Unable to update job type right now.', 'danger');
+            redirect('modules/system/settings.php?edit_job_type_id=' . $jobTypeId);
+        }
+
+        log_audit('system_settings', 'job_type_update', $settingId, 'Updated job type ' . $jobTypeName, [
+            'entity' => 'job_type_option',
+            'company_id' => $companyId,
+            'before' => $before,
+            'after' => $jobTypesById[$jobTypeId],
+            'metadata' => [
+                'setting_key' => 'job_types_catalog_json',
+            ],
+        ]);
+        flash_set('settings_success', 'Job type updated successfully.', 'success');
+        redirect('modules/system/settings.php');
+    }
+
+    if ($action === 'change_job_type_status') {
+        $jobTypeId = post_int('job_type_id');
+        $nextStatus = normalize_status_code((string) ($_POST['next_status'] ?? 'INACTIVE'));
+
+        if ($jobTypeId <= 0 || !isset($jobTypesById[$jobTypeId])) {
+            flash_set('settings_error', 'Job type not found for status update.', 'danger');
+            redirect('modules/system/settings.php');
+        }
+
+        $before = $jobTypesById[$jobTypeId];
+        $jobTypesById[$jobTypeId]['status_code'] = $nextStatus;
+
+        $settingId = job_type_save_catalog($companyId, array_values($jobTypesById), $actorUserId > 0 ? $actorUserId : null);
+        if ($settingId <= 0) {
+            flash_set('settings_error', 'Unable to update job type status right now.', 'danger');
+            redirect('modules/system/settings.php');
+        }
+
+        log_audit('system_settings', 'job_type_status', $settingId, 'Changed job type status to ' . $nextStatus, [
+            'entity' => 'job_type_option',
+            'company_id' => $companyId,
+            'before' => $before,
+            'after' => $jobTypesById[$jobTypeId],
+            'metadata' => [
+                'setting_key' => 'job_types_catalog_json',
+            ],
+        ]);
+        flash_set('settings_success', 'Job type status updated.', 'success');
         redirect('modules/system/settings.php');
     }
 
@@ -203,6 +392,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 }
 
+$jobTypeCatalog = job_type_sort_rows(job_type_catalog($companyId));
+$jobTypesById = [];
+foreach ($jobTypeCatalog as $jobTypeRow) {
+    $sanitized = job_type_sanitize_row((array) $jobTypeRow);
+    if ($sanitized === null) {
+        continue;
+    }
+    $jobTypesById[(int) $sanitized['id']] = $sanitized;
+}
+$editJobTypeId = get_int('edit_job_type_id');
+$editJobType = $editJobTypeId > 0 ? ($jobTypesById[$editJobTypeId] ?? null) : null;
+
 $editId = get_int('edit_id');
 $editSetting = null;
 if ($editId > 0) {
@@ -276,6 +477,68 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         </div>
 
         <div class="card card-primary">
+          <div class="card-header"><h3 class="card-title"><?= $editJobType ? 'Edit Job Type Option' : 'Add Job Type Option'; ?></h3></div>
+          <form method="post">
+            <div class="card-body row g-3">
+              <?= csrf_field(); ?>
+              <input type="hidden" name="_action" value="<?= $editJobType ? 'update_job_type' : 'create_job_type'; ?>" />
+              <input type="hidden" name="job_type_id" value="<?= (int) ($editJobType['id'] ?? 0); ?>" />
+
+              <div class="col-md-8">
+                <label class="form-label">Job Type Name</label>
+                <input
+                  type="text"
+                  name="job_type_name"
+                  class="form-control"
+                  maxlength="80"
+                  required
+                  value="<?= e((string) ($editJobType['name'] ?? '')); ?>"
+                  placeholder="Example: Insurance Claim Repair"
+                />
+              </div>
+              <div class="col-md-4">
+                <label class="form-label">Status</label>
+                <select name="status_code" class="form-select" required>
+                  <?php foreach (status_options((string) ($editJobType['status_code'] ?? 'ACTIVE')) as $option): ?>
+                    <?php if ((string) ($option['value'] ?? '') === 'DELETED'): ?>
+                      <?php continue; ?>
+                    <?php endif; ?>
+                    <option value="<?= e((string) $option['value']); ?>" <?= !empty($option['selected']) ? 'selected' : ''; ?>>
+                      <?= e((string) $option['value']); ?>
+                    </option>
+                  <?php endforeach; ?>
+                </select>
+              </div>
+              <div class="col-12">
+                <div class="form-check form-switch mt-1">
+                  <input
+                    class="form-check-input"
+                    type="checkbox"
+                    role="switch"
+                    id="job-type-allow-multiple"
+                    name="allow_multiple_active_jobs"
+                    value="1"
+                    <?= !empty($editJobType['allow_multiple_active_jobs']) ? 'checked' : ''; ?>
+                  />
+                  <label class="form-check-label" for="job-type-allow-multiple">
+                    Allow multiple active job cards for this job type
+                  </label>
+                  <div class="form-text">
+                    If enabled, users can create this job type even when another non-closed active job exists for the same vehicle.
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div class="card-footer d-flex gap-2">
+              <button type="submit" class="btn btn-primary"><?= $editJobType ? 'Update Job Type' : 'Create Job Type'; ?></button>
+              <?php if ($editJobType): ?>
+                <a href="<?= e(url('modules/system/settings.php')); ?>" class="btn btn-outline-secondary">Cancel Edit</a>
+              <?php endif; ?>
+            </div>
+          </form>
+        </div>
+
+        <div class="card card-primary">
           <div class="card-header"><h3 class="card-title"><?= $editSetting ? 'Edit Setting' : 'Add Setting'; ?></h3></div>
           <form method="post">
             <div class="card-body row g-3">
@@ -334,6 +597,70 @@ require_once __DIR__ . '/../../includes/sidebar.php';
           </form>
         </div>
       <?php endif; ?>
+
+      <div class="card">
+        <div class="card-header"><h3 class="card-title mb-0">Job Type Options</h3></div>
+        <div class="card-body table-responsive p-0">
+          <table class="table table-striped mb-0">
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>Job Type</th>
+                <th>Status</th>
+                <th>Parallel Jobs</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              <?php if (empty($jobTypeCatalog)): ?>
+                <tr><td colspan="5" class="text-center text-muted py-4">No job type options configured.</td></tr>
+              <?php else: ?>
+                <?php foreach ($jobTypeCatalog as $jobType): ?>
+                  <?php
+                    $jobTypeId = (int) ($jobType['id'] ?? 0);
+                    $jobTypeStatus = normalize_status_code((string) ($jobType['status_code'] ?? 'ACTIVE'));
+                    $nextJobTypeStatus = $jobTypeStatus === 'ACTIVE' ? 'INACTIVE' : 'ACTIVE';
+                    $allowMultipleActiveJobs = !empty($jobType['allow_multiple_active_jobs']);
+                  ?>
+                  <tr>
+                    <td><?= $jobTypeId; ?></td>
+                    <td><?= e((string) ($jobType['name'] ?? '')); ?></td>
+                    <td><span class="badge text-bg-<?= e(status_badge_class($jobTypeStatus)); ?>"><?= e($jobTypeStatus); ?></span></td>
+                    <td>
+                      <span class="badge text-bg-<?= $allowMultipleActiveJobs ? 'success' : 'secondary'; ?>">
+                        <?= $allowMultipleActiveJobs ? 'Allowed' : 'Restricted'; ?>
+                      </span>
+                    </td>
+                    <td class="d-flex gap-1">
+                      <?php if ($canManage): ?>
+                        <a class="btn btn-sm btn-outline-primary" href="<?= e(url('modules/system/settings.php?edit_job_type_id=' . $jobTypeId)); ?>">Edit</a>
+                        <?php if ($jobTypeStatus !== 'DELETED'): ?>
+                          <form method="post" class="d-inline" data-confirm="Change job type status?">
+                            <?= csrf_field(); ?>
+                            <input type="hidden" name="_action" value="change_job_type_status" />
+                            <input type="hidden" name="job_type_id" value="<?= $jobTypeId; ?>" />
+                            <input type="hidden" name="next_status" value="<?= e($nextJobTypeStatus); ?>" />
+                            <button type="submit" class="btn btn-sm btn-outline-secondary"><?= $jobTypeStatus === 'ACTIVE' ? 'Inactivate' : 'Activate'; ?></button>
+                          </form>
+                          <form method="post" class="d-inline" data-confirm="Delete this job type option?">
+                            <?= csrf_field(); ?>
+                            <input type="hidden" name="_action" value="change_job_type_status" />
+                            <input type="hidden" name="job_type_id" value="<?= $jobTypeId; ?>" />
+                            <input type="hidden" name="next_status" value="DELETED" />
+                            <button type="submit" class="btn btn-sm btn-outline-danger">Delete</button>
+                          </form>
+                        <?php endif; ?>
+                      <?php else: ?>
+                        <span class="text-muted">View only</span>
+                      <?php endif; ?>
+                    </td>
+                  </tr>
+                <?php endforeach; ?>
+              <?php endif; ?>
+            </tbody>
+          </table>
+        </div>
+      </div>
 
       <div class="card">
         <div class="card-header"><h3 class="card-title">Settings List</h3></div>

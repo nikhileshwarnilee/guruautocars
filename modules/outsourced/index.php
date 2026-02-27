@@ -1573,12 +1573,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             <div class="col-lg-7">
               <div class="card card-success h-100">
                 <div class="card-header"><h3 class="card-title">Record Outsourced Payment</h3></div>
-                <form method="post"
-                      data-safe-delete
-                      data-safe-delete-entity="outsourced_payment"
-                      data-safe-delete-record-field="payment_id"
-                      data-safe-delete-operation="reverse"
-                      data-safe-delete-reason-field="reverse_reason">
+                <form method="post">
                   <div class="card-body row g-2">
                     <?= csrf_field(); ?>
                     <input type="hidden" name="_action" value="add_payment" />
@@ -1630,7 +1625,12 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             <div class="col-lg-5">
               <div class="card card-warning h-100">
                 <div class="card-header"><h3 class="card-title">Reverse Payment</h3></div>
-                <form method="post">
+                <form method="post"
+                      data-safe-delete
+                      data-safe-delete-entity="outsourced_payment"
+                      data-safe-delete-record-field="payment_id"
+                      data-safe-delete-operation="reverse"
+                      data-safe-delete-reason-field="reverse_reason">
                   <div class="card-body row g-2">
                     <?= csrf_field(); ?>
                     <input type="hidden" name="_action" value="reverse_payment" />

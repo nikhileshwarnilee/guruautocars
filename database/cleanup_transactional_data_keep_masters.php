@@ -34,12 +34,21 @@ $targetTables = [
     // Billing / customer financials
     'advance_adjustments',
     'job_advances',
+    'advance_number_sequences',
     'invoice_payment_history',
     'invoice_status_history',
     'payments',
     'invoice_items',
     'invoices',
+    'invoice_counters',
+    'invoice_number_sequences',
+    'payment_receipt_sequences',
     'customer_ledger_entries',
+
+    // Accounting / ledger
+    'ledger_entries',
+    'ledger_journals',
+    'chart_of_accounts',
 
     // Purchases
     'purchase_payments',
@@ -51,6 +60,7 @@ $targetTables = [
     'return_attachments',
     'return_items',
     'returns_rma',
+    'returns_number_sequences',
 
     // Outsourced works
     'outsourced_work_payments',
@@ -62,6 +72,7 @@ $targetTables = [
     'estimate_parts',
     'estimate_services',
     'estimates',
+    'estimate_counters',
 
     // Jobs
     'job_assignments',
@@ -72,6 +83,7 @@ $targetTables = [
     'job_parts',
     'job_labor',
     'job_cards',
+    'job_counters',
 
     // Stock movements / temp stock
     'temp_stock_events',

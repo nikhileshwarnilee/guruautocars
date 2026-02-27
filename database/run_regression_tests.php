@@ -281,23 +281,27 @@ final class RegressionCrudRunner
         ) ?? 0);
 
         $vendorOutstanding = 0.0;
-        if ($this->h->tableExists('purchase_payments')) {
-            $vendorOutstanding = (float) ($this->h->qv(
-                'SELECT ROUND(COALESCE(SUM(GREATEST(p.grand_total - COALESCE(pay.total_paid, 0), 0)),0),2)
-                 FROM purchases p
-                 LEFT JOIN (
-                    SELECT purchase_id, COALESCE(SUM(CASE WHEN entry_type = "REVERSAL" THEN -ABS(amount) ELSE ABS(amount) END), 0) AS total_paid
-                    FROM purchase_payments
-                    WHERE deleted_at IS NULL
-                    GROUP BY purchase_id
-                 ) pay ON pay.purchase_id = p.id
-                 WHERE p.company_id = :c
-                   AND p.vendor_id = :v
-                   AND p.purchase_status = "FINALIZED"
-                   AND COALESCE(p.status_code, "ACTIVE") <> "DELETED"',
-                ['c' => $this->h->companyId, 'v' => $vendorId]
-            ) ?? 0);
+        $vendorPurchases = $this->h->qa(
+            'SELECT id, grand_total
+             FROM purchases
+             WHERE company_id = :c
+               AND vendor_id = :v
+               AND purchase_status = "FINALIZED"
+               AND COALESCE(status_code, "ACTIVE") <> "DELETED"',
+            ['c' => $this->h->companyId, 'v' => $vendorId]
+        );
+        foreach ($vendorPurchases as $vendorPurchase) {
+            $vendorPurchaseId = (int) ($vendorPurchase['id'] ?? 0);
+            if ($vendorPurchaseId <= 0) {
+                continue;
+            }
+            $vendorGrand = round((float) ($vendorPurchase['grand_total'] ?? 0), 2);
+            $vendorPaid = $this->h->tableExists('purchase_payments')
+                ? $this->h->effectivePaymentTotal('purchase_payments', 'purchase_id', $vendorPurchaseId)
+                : 0.0;
+            $vendorOutstanding += max($vendorGrand - $vendorPaid, 0.0);
         }
+        $vendorOutstanding = round($vendorOutstanding, 2);
 
         return [
             'purchase_id' => $purchaseId,
@@ -820,8 +824,9 @@ final class RegressionCrudRunner
 
         $baselineState = $this->purchaseDependencyState($purchaseId, $partId, $vendorId);
         $baselineStockQty = (float) ($baselineState['stock_quantity_part'] ?? 0.0);
+        $baselineVendorOutstanding = (float) ($baselineState['vendor_outstanding_total'] ?? 0.0);
 
-        $this->withValidationAndSnapshot($module, 'CREATE', function () use ($purchaseId, $paymentId, $purchase, $amount, $partId, $vendorId, $grand, $baselineStockQty): array {
+        $this->withValidationAndSnapshot($module, 'CREATE', function () use ($purchaseId, $paymentId, $purchase, $amount, $partId, $vendorId, $grand, $baselineStockQty, $baselineVendorOutstanding): array {
             $payment = [
                 'id' => $paymentId,
                 'purchase_id' => $purchaseId,
@@ -845,6 +850,8 @@ final class RegressionCrudRunner
             $this->h->assert(abs((float) ($state['purchase_paid_total'] ?? 0) - $amount) <= 0.01, 'Purchase paid total mismatch after payment create.');
             $this->h->assert(abs((float) ($state['purchase_outstanding_total'] ?? 0) - round($grand - $amount, 2)) <= 0.01, 'Purchase outstanding mismatch after payment create.');
             $this->h->assert(abs((float) ($state['stock_quantity_part'] ?? 0) - $baselineStockQty) <= 0.01, 'Stock should not change when posting purchase payment.');
+            $expectedVendorOutstanding = round(max($baselineVendorOutstanding - $amount, 0.0), 2);
+            $this->h->assert(abs((float) ($state['vendor_outstanding_total'] ?? 0) - $expectedVendorOutstanding) <= 0.01, 'Vendor outstanding should reduce by payment amount after purchase payment create.');
 
             return ['payment_id' => $paymentId, 'state' => $state];
         }, [
@@ -858,7 +865,7 @@ final class RegressionCrudRunner
             'ledger_totals.by_account.1110.net' => -$amount,
         ]);
 
-        $this->withValidationAndSnapshot($module, 'EDIT', function () use ($paymentId, $purchaseId, $partId, $vendorId, $amount, $baselineStockQty): array {
+        $this->withValidationAndSnapshot($module, 'EDIT', function () use ($paymentId, $purchaseId, $partId, $vendorId, $amount, $baselineStockQty, $baselineVendorOutstanding): array {
             $this->h->updateById('purchase_payments', $paymentId, [
                 'notes' => $this->h->datasetTag . ' TEST purchase payment edited',
                 'reference_no' => 'REG-TEST-PPAY-EDIT',
@@ -869,11 +876,13 @@ final class RegressionCrudRunner
             $this->h->assert((string) ($state['purchase_payment_status'] ?? '') === 'PARTIAL', 'Purchase payment status should stay PARTIAL after edit.');
             $this->h->assert(abs((float) ($state['purchase_paid_total'] ?? 0) - $amount) <= 0.01, 'Purchase paid total should stay unchanged after payment edit.');
             $this->h->assert(abs((float) ($state['stock_quantity_part'] ?? 0) - $baselineStockQty) <= 0.01, 'Stock should not change when editing purchase payment metadata.');
+            $expectedVendorOutstanding = round(max($baselineVendorOutstanding - $amount, 0.0), 2);
+            $this->h->assert(abs((float) ($state['vendor_outstanding_total'] ?? 0) - $expectedVendorOutstanding) <= 0.01, 'Vendor outstanding should stay unchanged after purchase payment edit.');
 
             return ['payment_id' => $paymentId, 'state' => $state];
         });
 
-        $this->withValidationAndSnapshot($module, 'DELETE_REVERSE', function () use ($paymentId, $reversalId, $purchaseId, $partId, $vendorId, $grand, $amount, $baselineStockQty): array {
+        $this->withValidationAndSnapshot($module, 'DELETE_REVERSE', function () use ($paymentId, $reversalId, $purchaseId, $partId, $vendorId, $grand, $amount, $baselineStockQty, $baselineVendorOutstanding): array {
             $reversal = [
                 'id' => $reversalId,
                 'purchase_id' => $purchaseId,
@@ -904,6 +913,7 @@ final class RegressionCrudRunner
             $this->h->assert(abs((float) ($state['purchase_paid_total'] ?? 0)) <= 0.01, 'Purchase paid total should return to zero after reversal.');
             $this->h->assert(abs((float) ($state['purchase_outstanding_total'] ?? 0) - $grand) <= 0.01, 'Purchase outstanding should return to purchase grand total after reversal.');
             $this->h->assert(abs((float) ($state['stock_quantity_part'] ?? 0) - $baselineStockQty) <= 0.01, 'Stock should not change when reversing purchase payment.');
+            $this->h->assert(abs((float) ($state['vendor_outstanding_total'] ?? 0) - $baselineVendorOutstanding) <= 0.01, 'Vendor outstanding should return to baseline after purchase payment reversal.');
 
             return ['payment_id' => $paymentId, 'reversal_id' => $reversalId, 'state' => $state];
         }, [

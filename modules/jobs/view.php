@@ -23,6 +23,7 @@ $jobCardColumns = table_columns('job_cards');
 $jobOdometerEnabled = in_array('odometer_km', $jobCardColumns, true);
 $jobRecommendationNoteEnabled = job_recommendation_note_feature_ready();
 $jobInsuranceEnabled = job_insurance_feature_ready();
+$jobTypeEnabled = job_type_feature_ready();
 $jobLaborColumns = table_columns('job_labor');
 $outsourceExpectedReturnSupported = in_array('outsource_expected_return_date', $jobLaborColumns, true);
 $outsourcedModuleReady = table_columns('outsourced_works') !== [] && table_columns('outsourced_work_payments') !== [];
@@ -1257,11 +1258,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if ($activeInvoice) {
                     throw new RuntimeException('Cancel the active invoice ' . (string) ($activeInvoice['invoice_number'] ?? ('#' . (int) ($activeInvoice['id'] ?? 0))) . ' before reopening this job.');
                 }
-
-                $reopenResult = job_reverse_inventory_on_reopen($jobId, $companyId, $garageId, $userId);
-                $inventoryWarnings = array_values(array_filter(array_map('trim', (array) ($reopenResult['warnings'] ?? []))));
             } catch (Throwable $exception) {
-                flash_set('job_error', 'Unable to reopen job inventory posting: ' . $exception->getMessage(), 'danger');
+                flash_set('job_error', 'Unable to reopen job: ' . $exception->getMessage(), 'danger');
                 redirect('modules/jobs/view.php?id=' . $jobId);
             }
         }
@@ -1366,11 +1364,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             ],
         ]);
 
-        flash_set('job_success', 'Job status updated to ' . $targetStatus . '.', 'success');
+        $targetStatusLabel = $isReopenFromClosed ? 'REOPEN' : $targetStatus;
+        flash_set('job_success', 'Job status updated to ' . $targetStatusLabel . '.', 'success');
         if ($targetStatus === 'CLOSED' && (int) ($reminderResult['created_count'] ?? 0) > 0) {
             flash_set('job_success', 'Auto maintenance reminders created: ' . (int) $reminderResult['created_count'] . '.', 'success');
-        } elseif ($isReopenFromClosed && (int) ($reopenResult['reversal_count'] ?? 0) > 0) {
-            flash_set('job_success', 'Job reopened and stock postings reversed: ' . (int) ($reopenResult['reversal_count'] ?? 0) . ' line(s).', 'success');
         }
         if (!empty($inventoryWarnings)) {
             $preview = implode(' | ', array_slice($inventoryWarnings, 0, 3));
@@ -2410,6 +2407,26 @@ if (!$job) {
     redirect('modules/jobs/index.php');
 }
 
+$jobTypeLabelsById = [];
+if ($jobTypeEnabled) {
+    foreach (job_type_catalog($companyId) as $jobTypeRow) {
+        $sanitized = job_type_sanitize_row((array) $jobTypeRow);
+        if ($sanitized === null) {
+            continue;
+        }
+        $jobTypeOptionId = (int) ($sanitized['id'] ?? 0);
+        if ($jobTypeOptionId <= 0) {
+            continue;
+        }
+        if (normalize_status_code((string) ($sanitized['status_code'] ?? 'ACTIVE')) === 'DELETED') {
+            continue;
+        }
+        $jobTypeLabelsById[$jobTypeOptionId] = (string) ($sanitized['name'] ?? ('Job Type #' . $jobTypeOptionId));
+    }
+}
+$jobTypeId = $jobTypeEnabled ? (int) ($job['job_type_id'] ?? 0) : 0;
+$jobTypeLabel = $jobTypeId > 0 ? ((string) ($jobTypeLabelsById[$jobTypeId] ?? ('Job Type #' . $jobTypeId))) : 'Not Set';
+
 $jobStatus = job_normalize_status((string) $job['status']);
 $jobLocked = job_is_locked($job);
 
@@ -2728,6 +2745,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             <div class="card-body">
               <p class="mb-2"><strong>Status:</strong> <span class="badge text-bg-<?= e(job_status_badge_class((string) $job['status'])); ?>"><?= e((string) $job['status']); ?></span></p>
               <p class="mb-2"><strong>Priority:</strong> <span class="badge text-bg-<?= e(job_priority_badge_class((string) $job['priority'])); ?>"><?= e((string) $job['priority']); ?></span></p>
+              <p class="mb-2"><strong>Job Type:</strong> <?= e($jobTypeLabel); ?></p>
               <p class="mb-2"><strong>Opened At:</strong> <?= e((string) $job['opened_at']); ?></p>
               <p class="mb-2"><strong>Promised At:</strong> <?= e((string) ($job['promised_at'] ?? '-')); ?></p>
               <p class="mb-2"><strong>Service Advisor:</strong> <?= e((string) ($job['advisor_name'] ?? '-')); ?></p>
@@ -3007,7 +3025,8 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                       <label class="form-label">Next Status</label>
                       <select id="next-status-select" name="next_status" class="form-select" required <?= $workflowTransitionLocked ? 'disabled' : ''; ?>>
                         <?php foreach ($nextStatuses as $status): ?>
-                          <option value="<?= e($status); ?>"><?= e($status); ?></option>
+                          <?php $statusLabel = ($jobStatus === 'CLOSED' && $status === 'OPEN') ? 'REOPEN' : $status; ?>
+                          <option value="<?= e($status); ?>"><?= e($statusLabel); ?></option>
                         <?php endforeach; ?>
                       </select>
                     </div>
@@ -3206,7 +3225,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                   </div>
                   <div class="col-md-2">
                     <label class="form-label">Execution</label>
-                    <select id="add-labor-execution" name="execution_type" class="form-select" <?= $jobLocked ? 'disabled' : ''; ?>>
+                    <select id="add-labor-execution" name="execution_type" class="form-select" data-searchable-select="off" <?= $jobLocked ? 'disabled' : ''; ?>>
                       <option value="IN_HOUSE">In-house</option>
                       <option value="OUTSOURCED">Outsourced</option>
                     </select>
@@ -3401,7 +3420,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                                 <input type="text" name="description" class="form-control form-control-sm" value="<?= e((string) $line['description']); ?>" required>
                               </div>
                               <div class="col-md-2">
-                                <select name="execution_type" class="form-select form-select-sm js-labor-execution">
+                                <select name="execution_type" class="form-select form-select-sm js-labor-execution" data-searchable-select="off">
                                   <option value="IN_HOUSE" <?= $lineExecutionType === 'IN_HOUSE' ? 'selected' : ''; ?>>In-house</option>
                                   <option value="OUTSOURCED" <?= $lineExecutionType === 'OUTSOURCED' ? 'selected' : ''; ?>>Outsourced</option>
                                 </select>
@@ -3775,7 +3794,18 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                         <div>
                           <span class="badge text-bg-secondary"><?= e((string) $entry['action_type']); ?></span>
                           <?php if (!empty($entry['from_status']) || !empty($entry['to_status'])): ?>
-                            <span class="ms-2 text-muted"><?= e((string) ($entry['from_status'] ?? '-')); ?> -> <?= e((string) ($entry['to_status'] ?? '-')); ?></span>
+                            <?php
+                              $fromStatusLabel = (string) ($entry['from_status'] ?? '-');
+                              $toStatusLabel = (string) ($entry['to_status'] ?? '-');
+                              if (
+                                  strtoupper((string) ($entry['action_type'] ?? '')) === 'STATUS_CHANGE'
+                                  && strtoupper((string) ($entry['from_status'] ?? '')) === 'CLOSED'
+                                  && strtoupper((string) ($entry['to_status'] ?? '')) === 'OPEN'
+                              ) {
+                                  $toStatusLabel = 'REOPEN';
+                              }
+                            ?>
+                            <span class="ms-2 text-muted"><?= e($fromStatusLabel); ?> -> <?= e($toStatusLabel); ?></span>
                           <?php endif; ?>
                         </div>
                         <small class="text-muted"><?= e((string) $entry['created_at']); ?></small>
@@ -3872,6 +3902,9 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       if (expectedReturnInput) {
         expectedReturnInput.disabled = !!locked || !outsourced;
         expectedReturnInput.required = false;
+      }
+      if (typeof gacRefreshSearchableSelect === 'function') {
+        gacRefreshSearchableSelect(vendorSelect);
       }
 
       if (!outsourced) {

@@ -19,6 +19,7 @@ $canCreate = billing_can_create();
 $canFinalize = billing_can_finalize();
 $canCancel = billing_can_cancel();
 $canPay = billing_can_pay();
+$canEditDraftDiscount = $canCreate || $canFinalize || billing_has_permission(['invoice.manage']);
 $canManageInvoiceSettings = billing_has_permission(['invoice.manage', 'settings.manage']);
 $canViewJobs = has_permission('job.view');
 $financialExtensionsReady = billing_financial_extensions_ready();
@@ -225,6 +226,24 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 throw new RuntimeException('Invoice already exists for this job card (' . (string) $existingInvoice['invoice_number'] . ').');
             }
 
+            $cancelledInvoiceStmt = $pdo->prepare(
+                'SELECT id, invoice_number
+                 FROM invoices
+                 WHERE job_card_id = :job_id
+                   AND company_id = :company_id
+                   AND garage_id = :garage_id
+                   AND invoice_status = "CANCELLED"
+                 ORDER BY id DESC
+                 LIMIT 1
+                 FOR UPDATE'
+            );
+            $cancelledInvoiceStmt->execute([
+                'job_id' => $jobCardId,
+                'company_id' => $companyId,
+                'garage_id' => $garageId,
+            ]);
+            $cancelledInvoice = $cancelledInvoiceStmt->fetch() ?: null;
+
             $laborStmt = $pdo->prepare(
                 'SELECT jl.id, jl.service_id, jl.description, jl.quantity, jl.unit_price, jl.gst_rate,
                         s.service_code
@@ -360,54 +379,146 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'generated_at' => date('c'),
             ];
 
-            $invoiceInsert = $pdo->prepare(
-                'INSERT INTO invoices
-                  (company_id, garage_id, invoice_number, job_card_id, customer_id, vehicle_id, invoice_date, due_date, invoice_status,
-                   subtotal_service, subtotal_parts, taxable_amount, tax_regime,
-                   cgst_rate, sgst_rate, igst_rate, cgst_amount, sgst_amount, igst_amount,
-                   service_tax_amount, parts_tax_amount, total_tax_amount, gross_total, round_off, grand_total,
-                   payment_status, payment_mode, notes, created_by, financial_year_id, financial_year_label, sequence_number, snapshot_json)
-                 VALUES
-                  (:company_id, :garage_id, :invoice_number, :job_card_id, :customer_id, :vehicle_id, :invoice_date, :due_date, "DRAFT",
-                   :subtotal_service, :subtotal_parts, :taxable_amount, :tax_regime,
-                   :cgst_rate, :sgst_rate, :igst_rate, :cgst_amount, :sgst_amount, :igst_amount,
-                   :service_tax_amount, :parts_tax_amount, :total_tax_amount, :gross_total, :round_off, :grand_total,
-                   "UNPAID", NULL, :notes, :created_by, :financial_year_id, :financial_year_label, :sequence_number, :snapshot_json)'
-            );
-            $invoiceInsert->execute([
-                'company_id' => $companyId,
-                'garage_id' => $garageId,
-                'invoice_number' => $invoiceNumber,
-                'job_card_id' => (int) $job['id'],
-                'customer_id' => (int) $job['customer_id'],
-                'vehicle_id' => (int) $job['vehicle_id'],
-                'invoice_date' => $invoiceDate,
-                'due_date' => $dueDate,
-                'subtotal_service' => $totals['subtotal_service'],
-                'subtotal_parts' => $totals['subtotal_parts'],
-                'taxable_amount' => $totals['taxable_amount'],
-                'tax_regime' => $taxRegime,
-                'cgst_rate' => $totals['cgst_rate'],
-                'sgst_rate' => $totals['sgst_rate'],
-                'igst_rate' => $totals['igst_rate'],
-                'cgst_amount' => $totals['cgst_amount'],
-                'sgst_amount' => $totals['sgst_amount'],
-                'igst_amount' => $totals['igst_amount'],
-                'service_tax_amount' => $totals['service_tax_amount'],
-                'parts_tax_amount' => $totals['parts_tax_amount'],
-                'total_tax_amount' => $totals['total_tax_amount'],
-                'gross_total' => $totals['gross_total'],
-                'round_off' => $totals['round_off'],
-                'grand_total' => $totals['grand_total'],
-                'notes' => $notes !== '' ? $notes : null,
-                'created_by' => $userId > 0 ? $userId : null,
-                'financial_year_id' => $numberMeta['financial_year_id'],
-                'financial_year_label' => (string) $numberMeta['financial_year_label'],
-                'sequence_number' => (int) $numberMeta['sequence_number'],
-                'snapshot_json' => json_encode($snapshot, JSON_UNESCAPED_UNICODE),
-            ]);
+            $invoiceId = 0;
+            if ($cancelledInvoice) {
+                $invoiceId = (int) ($cancelledInvoice['id'] ?? 0);
+                if ($invoiceId <= 0) {
+                    throw new RuntimeException('Invalid cancelled invoice selected for regeneration.');
+                }
 
-            $invoiceId = (int) $pdo->lastInsertId();
+                $paymentCountStmt = $pdo->prepare(
+                    'SELECT COUNT(*)
+                     FROM payments
+                     WHERE invoice_id = :invoice_id'
+                );
+                $paymentCountStmt->execute(['invoice_id' => $invoiceId]);
+                $paymentCount = (int) $paymentCountStmt->fetchColumn();
+                if ($paymentCount > 0) {
+                    throw new RuntimeException('Cancelled invoice has payment records. Please reverse payment entries before regenerating invoice.');
+                }
+
+                $clearItemsStmt = $pdo->prepare('DELETE FROM invoice_items WHERE invoice_id = :invoice_id');
+                $clearItemsStmt->execute(['invoice_id' => $invoiceId]);
+
+                $invoiceUpdate = $pdo->prepare(
+                    'UPDATE invoices
+                     SET invoice_number = :invoice_number,
+                         customer_id = :customer_id,
+                         vehicle_id = :vehicle_id,
+                         invoice_date = :invoice_date,
+                         due_date = :due_date,
+                         invoice_status = "DRAFT",
+                         subtotal_service = :subtotal_service,
+                         subtotal_parts = :subtotal_parts,
+                         taxable_amount = :taxable_amount,
+                         tax_regime = :tax_regime,
+                         cgst_rate = :cgst_rate,
+                         sgst_rate = :sgst_rate,
+                         igst_rate = :igst_rate,
+                         cgst_amount = :cgst_amount,
+                         sgst_amount = :sgst_amount,
+                         igst_amount = :igst_amount,
+                         service_tax_amount = :service_tax_amount,
+                         parts_tax_amount = :parts_tax_amount,
+                         total_tax_amount = :total_tax_amount,
+                         gross_total = :gross_total,
+                         round_off = :round_off,
+                         grand_total = :grand_total,
+                         payment_status = "UNPAID",
+                         payment_mode = NULL,
+                         notes = :notes,
+                         created_by = :created_by,
+                         financial_year_id = :financial_year_id,
+                         financial_year_label = :financial_year_label,
+                         sequence_number = :sequence_number,
+                         snapshot_json = :snapshot_json,
+                         finalized_at = NULL,
+                         finalized_by = NULL,
+                         cancelled_at = NULL,
+                         cancelled_by = NULL,
+                         cancel_reason = NULL
+                     WHERE id = :invoice_id'
+                );
+                $invoiceUpdate->execute([
+                    'invoice_number' => $invoiceNumber,
+                    'customer_id' => (int) $job['customer_id'],
+                    'vehicle_id' => (int) $job['vehicle_id'],
+                    'invoice_date' => $invoiceDate,
+                    'due_date' => $dueDate,
+                    'subtotal_service' => $totals['subtotal_service'],
+                    'subtotal_parts' => $totals['subtotal_parts'],
+                    'taxable_amount' => $totals['taxable_amount'],
+                    'tax_regime' => $taxRegime,
+                    'cgst_rate' => $totals['cgst_rate'],
+                    'sgst_rate' => $totals['sgst_rate'],
+                    'igst_rate' => $totals['igst_rate'],
+                    'cgst_amount' => $totals['cgst_amount'],
+                    'sgst_amount' => $totals['sgst_amount'],
+                    'igst_amount' => $totals['igst_amount'],
+                    'service_tax_amount' => $totals['service_tax_amount'],
+                    'parts_tax_amount' => $totals['parts_tax_amount'],
+                    'total_tax_amount' => $totals['total_tax_amount'],
+                    'gross_total' => $totals['gross_total'],
+                    'round_off' => $totals['round_off'],
+                    'grand_total' => $totals['grand_total'],
+                    'notes' => $notes !== '' ? $notes : null,
+                    'created_by' => $userId > 0 ? $userId : null,
+                    'financial_year_id' => $numberMeta['financial_year_id'],
+                    'financial_year_label' => (string) $numberMeta['financial_year_label'],
+                    'sequence_number' => (int) $numberMeta['sequence_number'],
+                    'snapshot_json' => json_encode($snapshot, JSON_UNESCAPED_UNICODE),
+                    'invoice_id' => $invoiceId,
+                ]);
+            } else {
+                $invoiceInsert = $pdo->prepare(
+                    'INSERT INTO invoices
+                      (company_id, garage_id, invoice_number, job_card_id, customer_id, vehicle_id, invoice_date, due_date, invoice_status,
+                       subtotal_service, subtotal_parts, taxable_amount, tax_regime,
+                       cgst_rate, sgst_rate, igst_rate, cgst_amount, sgst_amount, igst_amount,
+                       service_tax_amount, parts_tax_amount, total_tax_amount, gross_total, round_off, grand_total,
+                       payment_status, payment_mode, notes, created_by, financial_year_id, financial_year_label, sequence_number, snapshot_json)
+                     VALUES
+                      (:company_id, :garage_id, :invoice_number, :job_card_id, :customer_id, :vehicle_id, :invoice_date, :due_date, "DRAFT",
+                       :subtotal_service, :subtotal_parts, :taxable_amount, :tax_regime,
+                       :cgst_rate, :sgst_rate, :igst_rate, :cgst_amount, :sgst_amount, :igst_amount,
+                       :service_tax_amount, :parts_tax_amount, :total_tax_amount, :gross_total, :round_off, :grand_total,
+                       "UNPAID", NULL, :notes, :created_by, :financial_year_id, :financial_year_label, :sequence_number, :snapshot_json)'
+                );
+                $invoiceInsert->execute([
+                    'company_id' => $companyId,
+                    'garage_id' => $garageId,
+                    'invoice_number' => $invoiceNumber,
+                    'job_card_id' => (int) $job['id'],
+                    'customer_id' => (int) $job['customer_id'],
+                    'vehicle_id' => (int) $job['vehicle_id'],
+                    'invoice_date' => $invoiceDate,
+                    'due_date' => $dueDate,
+                    'subtotal_service' => $totals['subtotal_service'],
+                    'subtotal_parts' => $totals['subtotal_parts'],
+                    'taxable_amount' => $totals['taxable_amount'],
+                    'tax_regime' => $taxRegime,
+                    'cgst_rate' => $totals['cgst_rate'],
+                    'sgst_rate' => $totals['sgst_rate'],
+                    'igst_rate' => $totals['igst_rate'],
+                    'cgst_amount' => $totals['cgst_amount'],
+                    'sgst_amount' => $totals['sgst_amount'],
+                    'igst_amount' => $totals['igst_amount'],
+                    'service_tax_amount' => $totals['service_tax_amount'],
+                    'parts_tax_amount' => $totals['parts_tax_amount'],
+                    'total_tax_amount' => $totals['total_tax_amount'],
+                    'gross_total' => $totals['gross_total'],
+                    'round_off' => $totals['round_off'],
+                    'grand_total' => $totals['grand_total'],
+                    'notes' => $notes !== '' ? $notes : null,
+                    'created_by' => $userId > 0 ? $userId : null,
+                    'financial_year_id' => $numberMeta['financial_year_id'],
+                    'financial_year_label' => (string) $numberMeta['financial_year_label'],
+                    'sequence_number' => (int) $numberMeta['sequence_number'],
+                    'snapshot_json' => json_encode($snapshot, JSON_UNESCAPED_UNICODE),
+                ]);
+
+                $invoiceId = (int) $pdo->lastInsertId();
+            }
 
             $itemInsert = $pdo->prepare(
                 'INSERT INTO invoice_items
@@ -458,10 +569,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             billing_record_status_history(
                 $pdo,
                 $invoiceId,
-                null,
+                $cancelledInvoice ? 'CANCELLED' : null,
                 'DRAFT',
-                'CREATE_DRAFT',
-                'Draft invoice created from closed job card.',
+                $cancelledInvoice ? 'REOPEN_DRAFT' : 'CREATE_DRAFT',
+                $cancelledInvoice ? 'Draft invoice regenerated from cancelled invoice.' : 'Draft invoice created from closed job card.',
                 $userId > 0 ? $userId : null,
                 [
                     'job_card_id' => (int) $job['id'],
@@ -471,10 +582,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'discount_value' => (float) ($totals['discount_value'] ?? 0),
                     'discount_amount' => (float) ($totals['discount_amount'] ?? 0),
                     'advance_auto_adjusted' => (float) ($autoAdjustedAdvance['adjusted_total'] ?? 0),
+                    'reused_cancelled_invoice_id' => $cancelledInvoice ? (int) ($cancelledInvoice['id'] ?? 0) : null,
+                    'previous_invoice_number' => $cancelledInvoice ? (string) ($cancelledInvoice['invoice_number'] ?? '') : null,
                 ]
             );
 
-            log_audit('billing', 'create', $invoiceId, 'Created draft invoice ' . $invoiceNumber . ' from Job ' . (string) $job['job_number'], [
+            log_audit('billing', $cancelledInvoice ? 'reopen_draft' : 'create', $invoiceId, 'Created draft invoice ' . $invoiceNumber . ' from Job ' . (string) $job['job_number'], [
                 'entity' => 'invoice',
                 'source' => 'UI',
                 'before' => ['exists' => false],
@@ -496,7 +609,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             ]);
 
             $pdo->commit();
-            $successMessage = 'Draft invoice created: ' . $invoiceNumber;
+            $successMessage = $cancelledInvoice
+                ? 'Draft invoice regenerated from cancelled invoice: ' . $invoiceNumber
+                : 'Draft invoice created: ' . $invoiceNumber;
             if ((float) ($autoAdjustedAdvance['adjusted_total'] ?? 0) > 0.009) {
                 $successMessage .= ' | Advance auto-adjusted: ' . number_format((float) $autoAdjustedAdvance['adjusted_total'], 2);
             }
@@ -504,6 +619,202 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         } catch (Throwable $exception) {
             $pdo->rollBack();
             flash_set('billing_error', $exception->getMessage(), 'danger');
+        }
+
+        redirect('modules/billing/index.php');
+    }
+
+    if ($action === 'update_invoice_discount') {
+        if (!$canEditDraftDiscount) {
+            flash_set('billing_error', 'You do not have permission to edit draft invoice discounts.', 'danger');
+            redirect('modules/billing/index.php');
+        }
+
+        $invoiceId = post_int('invoice_id');
+        $discountType = billing_normalize_discount_type((string) ($_POST['discount_type'] ?? 'AMOUNT'));
+        $discountValue = max(0.0, billing_round((float) ($_POST['discount_value'] ?? 0)));
+        if ($invoiceId <= 0) {
+            flash_set('billing_error', 'Invalid invoice selected for discount update.', 'danger');
+            redirect('modules/billing/index.php');
+        }
+
+        $pdo = db();
+        $pdo->beginTransaction();
+        try {
+            $invoiceStmt = $pdo->prepare(
+                'SELECT *
+                 FROM invoices
+                 WHERE id = :invoice_id
+                   AND company_id = :company_id
+                   AND garage_id = :garage_id
+                 LIMIT 1
+                 FOR UPDATE'
+            );
+            $invoiceStmt->execute([
+                'invoice_id' => $invoiceId,
+                'company_id' => $companyId,
+                'garage_id' => $garageId,
+            ]);
+            $invoice = $invoiceStmt->fetch();
+            if (!$invoice) {
+                throw new RuntimeException('Invoice not found for discount update.');
+            }
+
+            $currentStatus = strtoupper((string) ($invoice['invoice_status'] ?? ''));
+            if ($currentStatus === 'CANCELLED') {
+                throw new RuntimeException('Cancelled invoices cannot be edited.');
+            }
+            if ($currentStatus === 'FINALIZED') {
+                throw new RuntimeException('Finalized invoices cannot be edited.');
+            }
+            if ($currentStatus !== 'DRAFT') {
+                throw new RuntimeException('Only draft invoices can be edited.');
+            }
+
+            $paymentStmt = $pdo->prepare(
+                'SELECT COALESCE(SUM(amount), 0)
+                 FROM payments
+                 WHERE invoice_id = :invoice_id'
+            );
+            $paymentStmt->execute(['invoice_id' => $invoiceId]);
+            $paidAmount = billing_round((float) $paymentStmt->fetchColumn());
+            if ($paidAmount > 0.009) {
+                throw new RuntimeException('Discount cannot be edited after payments are recorded.');
+            }
+
+            $itemStmt = $pdo->prepare(
+                'SELECT item_type, taxable_value, cgst_amount, sgst_amount, igst_amount, tax_amount
+                 FROM invoice_items
+                 WHERE invoice_id = :invoice_id
+                 ORDER BY id ASC'
+            );
+            $itemStmt->execute(['invoice_id' => $invoiceId]);
+            $invoiceItems = $itemStmt->fetchAll();
+            if ($invoiceItems === []) {
+                throw new RuntimeException('Invoice has no billable items.');
+            }
+
+            $baseTotals = billing_calculate_totals($invoiceItems);
+            $totals = billing_apply_invoice_discount($baseTotals, $discountType, $discountValue);
+            if (((float) ($totals['grand_total'] ?? 0)) <= 0.0) {
+                throw new RuntimeException('Discount reduces invoice total to zero. Please lower discount.');
+            }
+
+            if ($financialExtensionsReady && table_columns('advance_adjustments') !== []) {
+                $advanceAdjustedStmt = $pdo->prepare(
+                    'SELECT COALESCE(SUM(adjusted_amount), 0)
+                     FROM advance_adjustments
+                     WHERE invoice_id = :invoice_id'
+                );
+                $advanceAdjustedStmt->execute(['invoice_id' => $invoiceId]);
+                $advanceAdjustedTotal = billing_round((float) $advanceAdjustedStmt->fetchColumn());
+                if ($advanceAdjustedTotal > (float) ($totals['grand_total'] ?? 0) + 0.009) {
+                    throw new RuntimeException('Discount is too high because advance adjusted amount exceeds the new invoice total.');
+                }
+            }
+
+            $snapshot = json_decode((string) ($invoice['snapshot_json'] ?? ''), true);
+            if (!is_array($snapshot)) {
+                $snapshot = [];
+            }
+            if (!isset($snapshot['billing']) || !is_array($snapshot['billing'])) {
+                $snapshot['billing'] = [];
+            }
+            $snapshot['billing']['discount_type'] = (string) ($totals['discount_type'] ?? 'AMOUNT');
+            $snapshot['billing']['discount_value'] = (float) ($totals['discount_value'] ?? 0);
+            $snapshot['billing']['discount_amount'] = (float) ($totals['discount_amount'] ?? 0);
+            $snapshot['billing']['gross_before_discount'] = (float) ($totals['gross_total'] ?? 0);
+            $snapshot['billing']['net_after_discount'] = (float) ($totals['net_total'] ?? 0);
+            $snapshot['discount_updated_at'] = date('c');
+            $snapshotJson = json_encode($snapshot, JSON_UNESCAPED_UNICODE);
+            if (!is_string($snapshotJson)) {
+                throw new RuntimeException('Unable to store updated discount details.');
+            }
+
+            $updateStmt = $pdo->prepare(
+                'UPDATE invoices
+                 SET subtotal_service = :subtotal_service,
+                     subtotal_parts = :subtotal_parts,
+                     taxable_amount = :taxable_amount,
+                     cgst_rate = :cgst_rate,
+                     sgst_rate = :sgst_rate,
+                     igst_rate = :igst_rate,
+                     cgst_amount = :cgst_amount,
+                     sgst_amount = :sgst_amount,
+                     igst_amount = :igst_amount,
+                     service_tax_amount = :service_tax_amount,
+                     parts_tax_amount = :parts_tax_amount,
+                     total_tax_amount = :total_tax_amount,
+                     gross_total = :gross_total,
+                     round_off = :round_off,
+                     grand_total = :grand_total,
+                     snapshot_json = :snapshot_json
+                 WHERE id = :invoice_id'
+            );
+            $updateStmt->execute([
+                'subtotal_service' => (float) ($totals['subtotal_service'] ?? 0),
+                'subtotal_parts' => (float) ($totals['subtotal_parts'] ?? 0),
+                'taxable_amount' => (float) ($totals['taxable_amount'] ?? 0),
+                'cgst_rate' => (float) ($totals['cgst_rate'] ?? 0),
+                'sgst_rate' => (float) ($totals['sgst_rate'] ?? 0),
+                'igst_rate' => (float) ($totals['igst_rate'] ?? 0),
+                'cgst_amount' => (float) ($totals['cgst_amount'] ?? 0),
+                'sgst_amount' => (float) ($totals['sgst_amount'] ?? 0),
+                'igst_amount' => (float) ($totals['igst_amount'] ?? 0),
+                'service_tax_amount' => (float) ($totals['service_tax_amount'] ?? 0),
+                'parts_tax_amount' => (float) ($totals['parts_tax_amount'] ?? 0),
+                'total_tax_amount' => (float) ($totals['total_tax_amount'] ?? 0),
+                'gross_total' => (float) ($totals['gross_total'] ?? 0),
+                'round_off' => (float) ($totals['round_off'] ?? 0),
+                'grand_total' => (float) ($totals['grand_total'] ?? 0),
+                'snapshot_json' => $snapshotJson,
+                'invoice_id' => $invoiceId,
+            ]);
+
+            billing_record_status_history(
+                $pdo,
+                $invoiceId,
+                'DRAFT',
+                'DRAFT',
+                'UPDATE_DRAFT_DISCOUNT',
+                'Updated draft invoice discount.',
+                $userId > 0 ? $userId : null,
+                [
+                    'discount_type' => (string) ($totals['discount_type'] ?? 'AMOUNT'),
+                    'discount_value' => (float) ($totals['discount_value'] ?? 0),
+                    'discount_amount' => (float) ($totals['discount_amount'] ?? 0),
+                    'grand_total' => (float) ($totals['grand_total'] ?? 0),
+                ]
+            );
+
+            log_audit('billing', 'update_discount', $invoiceId, 'Updated draft invoice discount for invoice #' . (string) ($invoice['invoice_number'] ?? ''), [
+                'entity' => 'invoice',
+                'source' => 'UI',
+                'before' => [
+                    'invoice_status' => 'DRAFT',
+                    'grand_total' => (float) ($invoice['grand_total'] ?? 0),
+                ],
+                'after' => [
+                    'invoice_status' => 'DRAFT',
+                    'grand_total' => (float) ($totals['grand_total'] ?? 0),
+                    'discount_type' => (string) ($totals['discount_type'] ?? 'AMOUNT'),
+                    'discount_value' => (float) ($totals['discount_value'] ?? 0),
+                    'discount_amount' => (float) ($totals['discount_amount'] ?? 0),
+                ],
+                'metadata' => [
+                    'invoice_number' => (string) ($invoice['invoice_number'] ?? ''),
+                ],
+            ]);
+
+            $pdo->commit();
+            flash_set('billing_success', 'Draft invoice discount updated successfully.', 'success');
+        } catch (Throwable $exception) {
+            $pdo->rollBack();
+            $errorMessage = $exception->getMessage();
+            if ($exception instanceof PDOException && str_contains($errorMessage, 'uniq_invoice_job_card')) {
+                $errorMessage = 'Invoice already exists for this job card. Cancel or reuse the existing invoice before generating a new draft.';
+            }
+            flash_set('billing_error', $errorMessage, 'danger');
         }
 
         redirect('modules/billing/index.php');
@@ -1514,14 +1825,20 @@ $eligibleJobsStmt = db()->prepare(
      FROM job_cards jc
      INNER JOIN customers c ON c.id = jc.customer_id
      INNER JOIN vehicles v ON v.id = jc.vehicle_id
-     LEFT JOIN invoices i ON i.job_card_id = jc.id
      WHERE jc.company_id = :company_id
        AND jc.garage_id = :garage_id
        AND jc.status = "CLOSED"
        AND jc.status_code = "ACTIVE"
        AND (c.status_code IS NULL OR c.status_code <> "DELETED")
        AND (v.status_code IS NULL OR v.status_code <> "DELETED")
-       AND i.id IS NULL
+       AND NOT EXISTS (
+            SELECT 1
+            FROM invoices i
+            WHERE i.job_card_id = jc.id
+              AND i.company_id = jc.company_id
+              AND i.garage_id = jc.garage_id
+              AND i.invoice_status IN ("DRAFT", "FINALIZED")
+       )
      ORDER BY jc.closed_at DESC, jc.id DESC'
 );
 $eligibleJobsStmt->execute([
@@ -1566,7 +1883,7 @@ $advanceAdjustedSql = $financialExtensionsReady
     ? 'COALESCE((SELECT SUM(aa.adjusted_amount) FROM advance_adjustments aa WHERE aa.invoice_id = i.id), 0)'
     : '0';
 $invoicesStmt = db()->prepare(
-    'SELECT i.id, i.job_card_id, i.invoice_number, i.invoice_date, i.financial_year_label, i.invoice_status, i.tax_regime,
+    'SELECT i.id, i.job_card_id, i.invoice_number, i.invoice_date, i.due_date, i.notes, i.financial_year_label, i.invoice_status, i.tax_regime,
             i.taxable_amount, i.total_tax_amount, i.grand_total, i.payment_status, i.payment_mode, i.cancel_reason,
             i.snapshot_json,
             c.full_name AS live_customer_name, v.registration_no AS live_registration_no, jc.job_number AS live_job_number,
@@ -1605,6 +1922,8 @@ foreach ($invoices as &$invoice) {
     $invoice['display_registration_no'] = $snapVehicle !== '' ? $snapVehicle : (string) ($invoice['live_registration_no'] ?? '-');
     $invoice['display_job_number'] = $snapJobNumber !== '' ? $snapJobNumber : (string) ($invoice['live_job_number'] ?? '-');
     $invoice['display_job_card_id'] = $snapJobId > 0 ? $snapJobId : $liveJobId;
+    $invoice['discount_type'] = $discountType;
+    $invoice['discount_value'] = $discountValue;
     $invoice['discount_amount'] = $discountAmount;
     if ($discountAmount > 0.009 && $discountType === 'PERCENT' && $discountValue > 0.009) {
         $invoice['discount_label'] = rtrim(rtrim(number_format($discountValue, 2), '0'), '.') . '%';
@@ -1615,6 +1934,56 @@ foreach ($invoices as &$invoice) {
     }
 }
 unset($invoice);
+
+$editDraftInvoiceId = get_int('edit_draft_invoice_id');
+$editDraftInvoice = null;
+if ($editDraftInvoiceId > 0) {
+    if (!$canEditDraftDiscount) {
+        flash_set('billing_error', 'You do not have permission to edit draft invoice discounts.', 'danger');
+        redirect('modules/billing/index.php');
+    }
+
+    foreach ($invoices as $invoiceRow) {
+        if ((int) ($invoiceRow['id'] ?? 0) !== $editDraftInvoiceId) {
+            continue;
+        }
+        $editDraftInvoice = $invoiceRow;
+        break;
+    }
+
+    if ($editDraftInvoice === null) {
+        flash_set('billing_error', 'Draft invoice not found for editing.', 'danger');
+        redirect('modules/billing/index.php');
+    }
+
+    $editDraftStatus = strtoupper((string) ($editDraftInvoice['invoice_status'] ?? ''));
+    if ($editDraftStatus !== 'DRAFT') {
+        flash_set('billing_error', 'Only draft invoices can be edited.', 'danger');
+        redirect('modules/billing/index.php');
+    }
+
+    $editPaidAmount = billing_round((float) ($editDraftInvoice['paid_amount'] ?? 0));
+    if ($editPaidAmount > 0.009) {
+        flash_set('billing_error', 'Discount cannot be edited after payments are recorded.', 'danger');
+        redirect('modules/billing/index.php');
+    }
+}
+
+$isDraftFormEditMode = $editDraftInvoice !== null;
+$draftFormAction = $isDraftFormEditMode ? 'update_invoice_discount' : 'create_invoice';
+$draftFormTitle = $isDraftFormEditMode ? 'Edit Draft Invoice Discount' : 'Generate Draft Invoice from Closed Job Card';
+$draftFormSubmitLabel = $isDraftFormEditMode ? 'Update Draft Discount' : 'Create Draft Invoice';
+$draftFormDiscountType = $isDraftFormEditMode
+    ? (string) ($editDraftInvoice['discount_type'] ?? 'AMOUNT')
+    : 'AMOUNT';
+$draftFormDiscountValue = $isDraftFormEditMode
+    ? number_format((float) ($editDraftInvoice['discount_value'] ?? 0), 2, '.', '')
+    : '0.00';
+$draftFormDueDate = $isDraftFormEditMode ? (string) ($editDraftInvoice['due_date'] ?? '') : '';
+$draftFormNotes = $isDraftFormEditMode ? (string) ($editDraftInvoice['notes'] ?? '') : '';
+$draftFormInvoiceDate = $isDraftFormEditMode
+    ? (string) ($editDraftInvoice['invoice_date'] ?? date('Y-m-d'))
+    : date('Y-m-d');
 
 $paymentRecentSelect = 'p.*, i.invoice_number, u.name AS received_by_name';
 $paymentRecentJoin = '';
@@ -1880,51 +2249,81 @@ require_once __DIR__ . '/../../includes/sidebar.php';
           </a>
         </div>
       <?php endif; ?>
-      <?php if ($canCreate): ?>
-        <div class="card card-primary">
-          <div class="card-header"><h3 class="card-title">Generate Draft Invoice from Closed Job Card</h3></div>
+      <?php if ($canCreate || $isDraftFormEditMode): ?>
+        <div class="card card-primary" id="draft-invoice-form">
+          <div class="card-header"><h3 class="card-title"><?= e($draftFormTitle); ?></h3></div>
           <form method="post">
             <div class="card-body row g-3">
               <?= csrf_field(); ?>
-              <input type="hidden" name="_action" value="create_invoice" />
-              <div class="col-md-6">
-                <label class="form-label">Eligible Closed Job Card</label>
-                <select name="job_card_id" class="form-select" required>
-                  <option value="">Select CLOSED Job Card</option>
-                  <?php foreach ($eligibleJobs as $job): ?>
-                    <option value="<?= (int) $job['id']; ?>">
-                      <?= e((string) $job['job_number']); ?> | <?= e((string) $job['customer_name']); ?> | <?= e((string) $job['registration_no']); ?> | Labor <?= e(number_format((float) $job['labor_total'], 2)); ?> + Parts <?= e(number_format((float) $job['parts_total'], 2)); ?>
-                    </option>
-                  <?php endforeach; ?>
-                </select>
-                <small class="text-muted">Only active CLOSED jobs in this garage are billable.</small>
-              </div>
+              <input type="hidden" name="_action" value="<?= e($draftFormAction); ?>" />
+              <?php if ($isDraftFormEditMode): ?>
+                <input type="hidden" name="invoice_id" value="<?= (int) ($editDraftInvoice['id'] ?? 0); ?>" />
+                <div class="col-md-6">
+                  <label class="form-label">Draft Invoice</label>
+                  <input
+                    type="text"
+                    class="form-control"
+                    value="<?= e((string) ($editDraftInvoice['invoice_number'] ?? '-') . ' | ' . (string) ($editDraftInvoice['display_job_number'] ?? '-') . ' | ' . (string) ($editDraftInvoice['display_customer_name'] ?? '-') . ' | ' . (string) ($editDraftInvoice['display_registration_no'] ?? '-')); ?>"
+                    readonly
+                  />
+                  <small class="text-muted">Draft details are prefilled. Update discount and submit.</small>
+                </div>
+              <?php else: ?>
+                <div class="col-md-6">
+                  <label class="form-label">Eligible Closed Job Card</label>
+                  <select name="job_card_id" class="form-select" required>
+                    <option value="">Select CLOSED Job Card</option>
+                    <?php foreach ($eligibleJobs as $job): ?>
+                      <option value="<?= (int) $job['id']; ?>">
+                        <?= e((string) $job['job_number']); ?> | <?= e((string) $job['customer_name']); ?> | <?= e((string) $job['registration_no']); ?> | Labor <?= e(number_format((float) $job['labor_total'], 2)); ?> + Parts <?= e(number_format((float) $job['parts_total'], 2)); ?>
+                      </option>
+                    <?php endforeach; ?>
+                  </select>
+                  <small class="text-muted">Only active CLOSED jobs in this garage are billable.</small>
+                </div>
+              <?php endif; ?>
               <div class="col-md-2">
                 <label class="form-label">Due Date</label>
-                <input type="date" name="due_date" class="form-control" />
+                <input
+                  type="date"
+                  name="due_date"
+                  class="form-control"
+                  value="<?= e($draftFormDueDate); ?>"
+                  <?= $isDraftFormEditMode ? 'readonly' : ''; ?>
+                />
               </div>
               <div class="col-md-2">
                 <label class="form-label">Invoice Date</label>
-                <input type="text" class="form-control" value="<?= e(date('Y-m-d')); ?>" readonly />
+                <input type="text" class="form-control" value="<?= e($draftFormInvoiceDate); ?>" readonly />
               </div>
               <div class="col-md-1">
                 <label class="form-label">Discount Type</label>
                 <select name="discount_type" class="form-select">
-                  <option value="AMOUNT" selected>Flat</option>
-                  <option value="PERCENT">%</option>
+                  <option value="AMOUNT" <?= $draftFormDiscountType === 'AMOUNT' ? 'selected' : ''; ?>>Flat</option>
+                  <option value="PERCENT" <?= $draftFormDiscountType === 'PERCENT' ? 'selected' : ''; ?>>%</option>
                 </select>
               </div>
               <div class="col-md-1">
                 <label class="form-label">Discount</label>
-                <input type="number" name="discount_value" class="form-control" min="0" step="0.01" value="0" />
+                <input type="number" name="discount_value" class="form-control" min="0" step="0.01" value="<?= e($draftFormDiscountValue); ?>" />
               </div>
               <div class="col-md-12">
                 <label class="form-label">Notes</label>
-                <input type="text" name="notes" class="form-control" placeholder="Optional internal note" />
+                <input
+                  type="text"
+                  name="notes"
+                  class="form-control"
+                  placeholder="Optional internal note"
+                  value="<?= e($draftFormNotes); ?>"
+                  <?= $isDraftFormEditMode ? 'readonly' : ''; ?>
+                />
               </div>
             </div>
-            <div class="card-footer">
-              <button type="submit" class="btn btn-primary">Create Draft Invoice</button>
+            <div class="card-footer d-flex gap-2">
+              <button type="submit" class="btn btn-primary"><?= e($draftFormSubmitLabel); ?></button>
+              <?php if ($isDraftFormEditMode): ?>
+                <a href="<?= e(url('modules/billing/index.php')); ?>" class="btn btn-outline-secondary">Cancel Edit</a>
+              <?php endif; ?>
             </div>
           </form>
         </div>
@@ -2126,6 +2525,12 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                       <?php endif; ?>
                     </td>
                     <td class="d-flex gap-1">
+                      <?php if ($canEditDraftDiscount && $invoiceStatus === 'DRAFT'): ?>
+                        <a
+                          href="<?= e(url('modules/billing/index.php?edit_draft_invoice_id=' . (int) $invoice['id']) . '#draft-invoice-form'); ?>"
+                          class="btn btn-sm btn-outline-primary"
+                        >Edit</a>
+                      <?php endif; ?>
                       <?php if ($canFinalize && $invoiceStatus === 'DRAFT'): ?>
                         <form method="post" class="d-inline" data-confirm="Finalize this invoice? GST values will be locked.">
                           <?= csrf_field(); ?>

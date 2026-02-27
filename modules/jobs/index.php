@@ -16,15 +16,52 @@ $userId = (int) ($_SESSION['user_id'] ?? 0);
 $canCreate = has_permission('job.create') || has_permission('job.manage');
 $canEdit = has_permission('job.edit') || has_permission('job.update') || has_permission('job.manage');
 $canAssign = has_permission('job.assign') || has_permission('job.manage');
+$canJobTypeSettingsManage = has_permission('settings.manage');
 $canInlineVehicleCreate = has_permission('vehicle.view') && has_permission('vehicle.manage');
 $canConditionPhotoManage = has_permission('job.manage') || has_permission('settings.manage');
 $jobCardColumns = table_columns('job_cards');
 $jobOdometerEnabled = in_array('odometer_km', $jobCardColumns, true);
 $jobRecommendationNoteEnabled = job_recommendation_note_feature_ready();
 $jobInsuranceEnabled = job_insurance_feature_ready();
+$jobTypeEnabled = job_type_feature_ready();
 $odometerEditableStatuses = ['OPEN', 'IN_PROGRESS'];
 $maintenanceReminderFeatureReady = service_reminder_feature_ready();
 $maintenanceRecommendationApiUrl = url('modules/jobs/maintenance_recommendations_api.php');
+
+$jobTypeCatalogRows = [];
+$jobTypeActiveOptions = [];
+$jobTypeLabelsById = [];
+if ($jobTypeEnabled) {
+    foreach (job_type_catalog($companyId) as $jobTypeRow) {
+        $sanitized = job_type_sanitize_row((array) $jobTypeRow);
+        if ($sanitized === null) {
+            continue;
+        }
+
+        $jobTypeId = (int) ($sanitized['id'] ?? 0);
+        if ($jobTypeId <= 0) {
+            continue;
+        }
+
+        $statusCode = normalize_status_code((string) ($sanitized['status_code'] ?? 'ACTIVE'));
+        if ($statusCode === 'DELETED') {
+            continue;
+        }
+
+        $jobTypeCatalogRows[$jobTypeId] = [
+            'id' => $jobTypeId,
+            'name' => trim((string) ($sanitized['name'] ?? '')),
+            'status_code' => $statusCode,
+        ];
+        $jobTypeLabelsById[$jobTypeId] = (string) ($sanitized['name'] ?? ('Job Type #' . $jobTypeId));
+        if ($statusCode === 'ACTIVE') {
+            $jobTypeActiveOptions[$jobTypeId] = $jobTypeCatalogRows[$jobTypeId];
+        }
+    }
+
+    uasort($jobTypeCatalogRows, static fn (array $a, array $b): int => strcmp((string) ($a['name'] ?? ''), (string) ($b['name'] ?? '')));
+    uasort($jobTypeActiveOptions, static fn (array $a, array $b): int => strcmp((string) ($a['name'] ?? ''), (string) ($b['name'] ?? '')));
+}
 
 function parse_ids(mixed $value): array
 {
@@ -48,7 +85,7 @@ function job_row(int $id, int $companyId, int $garageId): ?array
     return $row ?: null;
 }
 
-function job_filter_url(string $query, string $status): string
+function job_filter_url(string $query, string $status, int $jobTypeId = 0): string
 {
     $params = [];
     if ($query !== '') {
@@ -56,6 +93,9 @@ function job_filter_url(string $query, string $status): string
     }
     if ($status !== '') {
         $params['status'] = $status;
+    }
+    if ($jobTypeId > 0) {
+        $params['job_type_id'] = $jobTypeId;
     }
 
     $path = 'modules/jobs/index.php';
@@ -154,6 +194,80 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         redirect('modules/jobs/index.php');
     }
 
+    if ($action === 'quick_add_job_type') {
+        if (!$canJobTypeSettingsManage) {
+            flash_set('job_error', 'You do not have permission to add job type options.', 'danger');
+            redirect('modules/jobs/index.php?open_job_settings=1');
+        }
+        if (!$jobTypeEnabled) {
+            flash_set('job_error', 'Job type feature is not ready in this database.', 'danger');
+            redirect('modules/jobs/index.php');
+        }
+
+        $jobTypeName = post_string('job_type_name', 80);
+        $statusCode = normalize_status_code((string) ($_POST['status_code'] ?? 'ACTIVE'));
+        $allowMultipleActiveJobs = !empty($_POST['allow_multiple_active_jobs']) ? 1 : 0;
+
+        if ($statusCode === 'DELETED') {
+            flash_set('job_error', 'Use status Active or Inactive while creating a job type option.', 'danger');
+            redirect('modules/jobs/index.php?open_job_settings=1');
+        }
+        if ($jobTypeName === '') {
+            flash_set('job_error', 'Job type name is required.', 'danger');
+            redirect('modules/jobs/index.php?open_job_settings=1');
+        }
+
+        $jobTypesById = [];
+        foreach (job_type_catalog($companyId) as $row) {
+            $sanitized = job_type_sanitize_row((array) $row);
+            if ($sanitized === null) {
+                continue;
+            }
+            $jobTypesById[(int) $sanitized['id']] = $sanitized;
+        }
+
+        $needleName = mb_strtolower(trim($jobTypeName));
+        foreach ($jobTypesById as $row) {
+            $rowStatus = normalize_status_code((string) ($row['status_code'] ?? 'ACTIVE'));
+            if ($rowStatus === 'DELETED') {
+                continue;
+            }
+            if (mb_strtolower(trim((string) ($row['name'] ?? ''))) === $needleName) {
+                flash_set('job_error', 'Job type already exists. Use a different name.', 'danger');
+                redirect('modules/jobs/index.php?open_job_settings=1');
+            }
+        }
+
+        $nextId = $jobTypesById !== [] ? (max(array_map('intval', array_keys($jobTypesById))) + 1) : 1;
+        $jobTypesById[$nextId] = [
+            'id' => $nextId,
+            'name' => $jobTypeName,
+            'status_code' => $statusCode,
+            'allow_multiple_active_jobs' => $allowMultipleActiveJobs,
+        ];
+
+        $settingId = job_type_save_catalog($companyId, array_values($jobTypesById), $userId > 0 ? $userId : null);
+        if ($settingId <= 0) {
+            flash_set('job_error', 'Unable to save job type option right now.', 'danger');
+            redirect('modules/jobs/index.php?open_job_settings=1');
+        }
+
+        log_audit('system_settings', 'job_type_create', $settingId, 'Created job type ' . $jobTypeName . ' from job card create page', [
+            'entity' => 'job_type_option',
+            'company_id' => $companyId,
+            'source' => 'UI',
+            'metadata' => [
+                'job_type_id' => $nextId,
+                'job_type_name' => $jobTypeName,
+                'status_code' => $statusCode,
+                'allow_multiple_active_jobs' => $allowMultipleActiveJobs,
+                'origin' => 'modules/jobs/index.php',
+            ],
+        ]);
+        flash_set('job_success', 'Job type option added successfully.', 'success');
+        redirect('modules/jobs/index.php?open_job_settings=1&prefill_job_type_id=' . $nextId);
+    }
+
     if ($action === 'create' && !$canCreate) {
         flash_set('job_error', 'You do not have permission to create job cards.', 'danger');
         redirect('modules/jobs/index.php');
@@ -181,6 +295,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $odometerRaw = trim((string) ($_POST['odometer_km'] ?? ''));
         $odometerKm = null;
         $priority = strtoupper(post_string('priority', 10));
+        $jobTypeId = $jobTypeEnabled ? post_int('job_type_id') : 0;
         $promisedAt = post_string('promised_at', 25);
         $assignedUserIds = $canAssign ? parse_ids($_POST['assigned_user_ids'] ?? []) : [];
         $maintenanceActions = [];
@@ -202,6 +317,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
         if (!in_array($priority, ['LOW', 'MEDIUM', 'HIGH', 'URGENT'], true)) {
             $priority = 'MEDIUM';
+        }
+        if ($jobTypeEnabled) {
+            if ($jobTypeId <= 0) {
+                flash_set('job_error', 'Job type is required.', 'danger');
+                redirect('modules/jobs/index.php');
+            }
+            if (!isset($jobTypeActiveOptions[$jobTypeId])) {
+                flash_set('job_error', 'Selected job type is invalid or inactive.', 'danger');
+                redirect('modules/jobs/index.php');
+            }
         }
         if ($jobOdometerEnabled) {
             $parsedOdometer = filter_var($odometerRaw, FILTER_VALIDATE_INT);
@@ -245,10 +370,26 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             flash_set('job_error', 'Vehicle must belong to selected active customer.', 'danger');
             redirect('modules/jobs/index.php');
         }
+        $allowParallelJobsForType = $jobTypeEnabled
+            && $jobTypeId > 0
+            && job_type_allows_multiple_active_jobs($companyId, $jobTypeId);
 
         $pdo = db();
         $pdo->beginTransaction();
         try {
+            if (!$allowParallelJobsForType) {
+                $blockingJob = job_find_active_non_closed_vehicle_job($companyId, $vehicleId, null, $pdo, true);
+                if ($blockingJob !== null) {
+                    throw new RuntimeException(
+                        'Vehicle already has active job card '
+                        . (string) ($blockingJob['job_number'] ?? ('#' . (int) ($blockingJob['id'] ?? 0)))
+                        . ' with status '
+                        . (string) ($blockingJob['status'] ?? 'OPEN')
+                        . '. Close that job first before creating a new one.'
+                    );
+                }
+            }
+
             $jobNumber = job_generate_number($pdo, $garageId);
             $recommendationColumnSql = $jobRecommendationNoteEnabled ? ', recommendation_note' : '';
             $recommendationValueSql = $jobRecommendationNoteEnabled ? ', :recommendation_note' : '';
@@ -258,19 +399,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $insuranceValueSql = $jobInsuranceEnabled
                 ? ', :insurance_company_name, :insurance_claim_number, :insurance_surveyor_name, :insurance_claim_amount_approved, :insurance_customer_payable_amount, :insurance_claim_status'
                 : '';
+            $jobTypeColumnSql = $jobTypeEnabled ? ', job_type_id' : '';
+            $jobTypeValueSql = $jobTypeEnabled ? ', :job_type_id' : '';
             if ($jobOdometerEnabled) {
                 $stmt = $pdo->prepare(
                     'INSERT INTO job_cards
-                      (company_id, garage_id, job_number, customer_id, vehicle_id, odometer_km, assigned_to, service_advisor_id, complaint, diagnosis' . $recommendationColumnSql . $insuranceColumnSql . ', status, priority, promised_at, status_code, created_by, updated_by)
+                      (company_id, garage_id, job_number, customer_id, vehicle_id, odometer_km, assigned_to, service_advisor_id, complaint, diagnosis' . $recommendationColumnSql . $insuranceColumnSql . ', status, priority' . $jobTypeColumnSql . ', promised_at, status_code, created_by, updated_by)
                      VALUES
-                      (:company_id, :garage_id, :job_number, :customer_id, :vehicle_id, :odometer_km, NULL, :service_advisor_id, :complaint, :diagnosis' . $recommendationValueSql . $insuranceValueSql . ', "OPEN", :priority, :promised_at, "ACTIVE", :created_by, :updated_by)'
+                      (:company_id, :garage_id, :job_number, :customer_id, :vehicle_id, :odometer_km, NULL, :service_advisor_id, :complaint, :diagnosis' . $recommendationValueSql . $insuranceValueSql . ', "OPEN", :priority' . $jobTypeValueSql . ', :promised_at, "ACTIVE", :created_by, :updated_by)'
                 );
             } else {
                 $stmt = $pdo->prepare(
                     'INSERT INTO job_cards
-                      (company_id, garage_id, job_number, customer_id, vehicle_id, assigned_to, service_advisor_id, complaint, diagnosis' . $recommendationColumnSql . $insuranceColumnSql . ', status, priority, promised_at, status_code, created_by, updated_by)
+                      (company_id, garage_id, job_number, customer_id, vehicle_id, assigned_to, service_advisor_id, complaint, diagnosis' . $recommendationColumnSql . $insuranceColumnSql . ', status, priority' . $jobTypeColumnSql . ', promised_at, status_code, created_by, updated_by)
                      VALUES
-                      (:company_id, :garage_id, :job_number, :customer_id, :vehicle_id, NULL, :service_advisor_id, :complaint, :diagnosis' . $recommendationValueSql . $insuranceValueSql . ', "OPEN", :priority, :promised_at, "ACTIVE", :created_by, :updated_by)'
+                      (:company_id, :garage_id, :job_number, :customer_id, :vehicle_id, NULL, :service_advisor_id, :complaint, :diagnosis' . $recommendationValueSql . $insuranceValueSql . ', "OPEN", :priority' . $jobTypeValueSql . ', :promised_at, "ACTIVE", :created_by, :updated_by)'
                 );
             }
 
@@ -301,6 +444,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
             if ($jobOdometerEnabled) {
                 $insertParams['odometer_km'] = $odometerKm !== null ? $odometerKm : 0;
+            }
+            if ($jobTypeEnabled) {
+                $insertParams['job_type_id'] = $jobTypeId > 0 ? $jobTypeId : null;
             }
             $stmt->execute($insertParams);
             $jobId = (int) $pdo->lastInsertId();
@@ -337,6 +483,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             if ($jobOdometerEnabled && $odometerKm !== null) {
                 $createHistoryPayload['odometer_km'] = $odometerKm;
             }
+            if ($jobTypeEnabled) {
+                $createHistoryPayload['job_type_id'] = $jobTypeId > 0 ? $jobTypeId : null;
+                $createHistoryPayload['job_type_name'] = $jobTypeId > 0 ? ($jobTypeLabelsById[$jobTypeId] ?? ('Job Type #' . $jobTypeId)) : null;
+            }
             job_append_history($jobId, 'CREATE', null, 'OPEN', 'Job created', $createHistoryPayload);
             log_audit('job_cards', 'create', $jobId, 'Created job card ' . $jobNumber, [
                 'entity' => 'job_card',
@@ -348,6 +498,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'status' => 'OPEN',
                     'status_code' => 'ACTIVE',
                     'priority' => $priority,
+                    'job_type_id' => $jobTypeEnabled ? ($jobTypeId > 0 ? $jobTypeId : null) : null,
                     'customer_id' => $customerId,
                     'vehicle_id' => $vehicleId,
                     'odometer_km' => $jobOdometerEnabled && $odometerKm !== null ? $odometerKm : null,
@@ -389,7 +540,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             redirect('modules/jobs/view.php?id=' . $jobId . '&prompt_condition_photos=1#condition-photos');
         } catch (Throwable $exception) {
             $pdo->rollBack();
-            flash_set('job_error', 'Unable to create job card. Please retry.', 'danger');
+            $errorMessage = $exception instanceof RuntimeException
+                ? trim((string) $exception->getMessage())
+                : '';
+            if ($errorMessage === '') {
+                $errorMessage = 'Unable to create job card. Please retry.';
+            }
+            flash_set('job_error', $errorMessage, 'danger');
             redirect('modules/jobs/index.php');
         }
     }
@@ -420,12 +577,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $odometerRaw = trim((string) ($_POST['odometer_km'] ?? ''));
         $odometerKm = null;
         $priority = strtoupper(post_string('priority', 10));
+        $jobTypeId = $jobTypeEnabled ? post_int('job_type_id') : 0;
         $promisedAt = post_string('promised_at', 25);
         $assignedUserIds = $canAssign ? parse_ids($_POST['assigned_user_ids'] ?? []) : [];
         $currentStatus = job_normalize_status((string) ($job['status'] ?? 'OPEN'));
         $odometerEditable = $jobOdometerEnabled && in_array($currentStatus, $odometerEditableStatuses, true);
         if (!in_array($priority, ['LOW', 'MEDIUM', 'HIGH', 'URGENT'], true)) {
             $priority = 'MEDIUM';
+        }
+        if ($jobTypeEnabled) {
+            if ($jobTypeId > 0 && !isset($jobTypeCatalogRows[$jobTypeId])) {
+                flash_set('job_error', 'Selected job type is invalid or deleted.', 'danger');
+                redirect('modules/jobs/index.php?edit_id=' . $jobId);
+            }
+            if ($jobTypeId <= 0) {
+                $jobTypeId = 0;
+            }
         }
         if ($complaint === '') {
             flash_set('job_error', 'Complaint is required.', 'danger');
@@ -491,6 +658,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                  odometer_km = :odometer_km';
             $updateParams['odometer_km'] = $odometerKm;
         }
+        if ($jobTypeEnabled) {
+            $updateSql .= ',
+                 job_type_id = :job_type_id';
+            $updateParams['job_type_id'] = $jobTypeId > 0 ? $jobTypeId : null;
+        }
         $updateSql .= '
              WHERE id = :id
                AND company_id = :company_id
@@ -523,6 +695,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'complaint' => (string) ($job['complaint'] ?? ''),
                 'diagnosis' => (string) ($job['diagnosis'] ?? ''),
                 'priority' => (string) ($job['priority'] ?? ''),
+                'job_type_id' => $jobTypeEnabled ? (($job['job_type_id'] ?? null) !== null ? (int) $job['job_type_id'] : null) : null,
                 'promised_at' => (string) ($job['promised_at'] ?? ''),
                 'odometer_km' => $jobOdometerEnabled ? (int) ($job['odometer_km'] ?? 0) : null,
                 'recommendation_note' => $jobRecommendationNoteEnabled ? (string) ($job['recommendation_note'] ?? '') : null,
@@ -541,6 +714,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'complaint' => $complaint,
                 'diagnosis' => $diagnosis,
                 'priority' => $priority,
+                'job_type_id' => $jobTypeEnabled ? ($jobTypeId > 0 ? $jobTypeId : null) : null,
                 'promised_at' => $promisedAt !== '' ? str_replace('T', ' ', $promisedAt) : null,
                 'odometer_km' => $jobOdometerEnabled
                     ? ($odometerEditable && $odometerKm !== null ? $odometerKm : (int) ($job['odometer_km'] ?? 0))
@@ -620,9 +794,28 @@ if ($editJob) {
 $editJobOdometerEditable = $editJob !== null
     && $jobOdometerEnabled
     && in_array(job_normalize_status((string) ($editJob['status'] ?? 'OPEN')), $odometerEditableStatuses, true);
+$editJobTypeId = $jobTypeEnabled ? (int) ($editJob['job_type_id'] ?? 0) : 0;
+$jobTypeFormOptions = $jobTypeActiveOptions;
+if ($jobTypeEnabled && $editJobTypeId > 0 && isset($jobTypeCatalogRows[$editJobTypeId]) && !isset($jobTypeFormOptions[$editJobTypeId])) {
+    $jobTypeFormOptions[$editJobTypeId] = $jobTypeCatalogRows[$editJobTypeId];
+    uasort($jobTypeFormOptions, static fn (array $a, array $b): int => strcmp((string) ($a['name'] ?? ''), (string) ($b['name'] ?? '')));
+}
+$openJobSettings = !$editJob && get_int('open_job_settings', 0) === 1;
+$prefillJobTypeId = 0;
+if (!$editJob && $jobTypeEnabled) {
+    $requestedPrefillJobTypeId = get_int('prefill_job_type_id', 0);
+    if ($requestedPrefillJobTypeId > 0 && isset($jobTypeFormOptions[$requestedPrefillJobTypeId])) {
+        $prefillJobTypeId = $requestedPrefillJobTypeId;
+    }
+}
+$selectedJobTypeForForm = $editJob ? $editJobTypeId : $prefillJobTypeId;
 
 $statusFilter = strtoupper(trim((string) ($_GET['status'] ?? '')));
 $query = trim((string) ($_GET['q'] ?? ''));
+$jobTypeFilterId = $jobTypeEnabled ? max(0, (int) ($_GET['job_type_id'] ?? 0)) : 0;
+$jobTypeFilterLabel = $jobTypeFilterId > 0
+    ? ((string) ($jobTypeLabelsById[$jobTypeFilterId] ?? ('Job Type #' . $jobTypeFilterId)))
+    : 'All Job Types';
 $allowedJobStatuses = job_workflow_statuses(true);
 if (!in_array($statusFilter, $allowedJobStatuses, true)) {
     $statusFilter = '';
@@ -643,9 +836,15 @@ if ($query !== '') {
     $where[] = '(jc.job_number LIKE :q OR c.full_name LIKE :q OR v.registration_no LIKE :q OR jc.complaint LIKE :q)';
     $params['q'] = '%' . $query . '%';
 }
+if ($jobTypeEnabled && $jobTypeFilterId > 0) {
+    $baseWhere[] = 'jc.job_type_id = :job_type_id';
+    $baseParams['job_type_id'] = $jobTypeFilterId;
+    $where[] = 'jc.job_type_id = :job_type_id';
+    $params['job_type_id'] = $jobTypeFilterId;
+}
 
 $sql =
-    'SELECT jc.id, jc.job_number, jc.status, jc.status_code, jc.priority, jc.opened_at, jc.estimated_cost,
+    'SELECT jc.id, jc.job_number, jc.status, jc.status_code, jc.priority, ' . ($jobTypeEnabled ? 'jc.job_type_id' : 'NULL AS job_type_id') . ', jc.opened_at, jc.estimated_cost,
             c.full_name AS customer_name, v.registration_no, v.model AS vehicle_model,
             GROUP_CONCAT(DISTINCT au.name ORDER BY ja.is_primary DESC, au.name SEPARATOR ", ") AS assigned_staff
      FROM job_cards jc
@@ -667,6 +866,10 @@ $conditionPhotoCounts = job_condition_photo_counts_by_job(
 foreach ($jobs as &$job) {
     $jobId = (int) ($job['id'] ?? 0);
     $job['condition_photo_count'] = (int) ($conditionPhotoCounts[$jobId] ?? 0);
+    $selectedJobTypeId = (int) ($job['job_type_id'] ?? 0);
+    $job['job_type_label'] = $selectedJobTypeId > 0
+        ? ((string) ($jobTypeLabelsById[$selectedJobTypeId] ?? ('Job Type #' . $selectedJobTypeId)))
+        : 'Not Set';
 }
 unset($job);
 $conditionPhotoFeatureReady = job_condition_photo_feature_ready();
@@ -704,13 +907,73 @@ require_once __DIR__ . '/../../includes/sidebar.php';
   <div class="app-content"><div class="container-fluid">
     <?php if ($canCreate || ($canEdit && $editJob)): ?>
     <div class="card card-primary">
-      <div class="card-header"><h3 class="card-title"><?= $editJob ? 'Edit Job Card' : 'Create Job Card'; ?></h3></div>
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <h3 class="card-title mb-0"><?= $editJob ? 'Edit Job Card' : 'Create Job Card'; ?></h3>
+        <?php if (!$editJob && $jobTypeEnabled): ?>
+          <button
+            type="button"
+            class="btn btn-sm btn-outline-light"
+            data-bs-toggle="collapse"
+            data-bs-target="#job-type-settings-panel"
+            aria-expanded="<?= $openJobSettings ? 'true' : 'false'; ?>"
+            aria-controls="job-type-settings-panel">
+            Job Settings
+          </button>
+        <?php endif; ?>
+      </div>
+      <?php if (!$editJob && $jobTypeEnabled): ?>
+        <div class="collapse<?= $openJobSettings ? ' show' : ''; ?>" id="job-type-settings-panel">
+          <div class="card-body border-bottom bg-light">
+            <h6 class="mb-3">Add Job Type Option</h6>
+            <?php if ($canJobTypeSettingsManage): ?>
+              <form method="post" class="row g-2 align-items-end">
+                <?= csrf_field(); ?>
+                <input type="hidden" name="_action" value="quick_add_job_type">
+                <div class="col-md-5">
+                  <label class="form-label">Job Type Name</label>
+                  <input type="text" name="job_type_name" class="form-control" maxlength="80" required placeholder="Example: Periodic Maintenance">
+                </div>
+                <div class="col-md-3">
+                  <label class="form-label">Status</label>
+                  <select name="status_code" class="form-select">
+                    <option value="ACTIVE">ACTIVE</option>
+                    <option value="INACTIVE">INACTIVE</option>
+                  </select>
+                </div>
+                <div class="col-md-4">
+                  <div class="form-check mt-4">
+                    <input class="form-check-input" type="checkbox" name="allow_multiple_active_jobs" id="quick-job-type-allow-multiple" value="1">
+                    <label class="form-check-label" for="quick-job-type-allow-multiple">
+                      Allow multiple active jobs for this type
+                    </label>
+                  </div>
+                </div>
+                <div class="col-12">
+                  <button type="submit" class="btn btn-outline-primary btn-sm">Add Job Type Option</button>
+                  <a href="<?= e(url('modules/system/settings.php')); ?>" class="btn btn-outline-secondary btn-sm">Open Full Settings</a>
+                </div>
+              </form>
+            <?php else: ?>
+              <div class="alert alert-warning mb-0">
+                You do not have permission to add job type options here.
+              </div>
+            <?php endif; ?>
+          </div>
+        </div>
+      <?php endif; ?>
       <form method="post"><div class="card-body row g-3">
         <?= csrf_field(); ?><input type="hidden" name="_action" value="<?= $editJob ? 'update' : 'create'; ?>"><input type="hidden" name="job_id" value="<?= (int) ($editJob['id'] ?? 0); ?>">
         <?php if (!$jobOdometerEnabled): ?>
           <div class="col-12">
             <div class="alert alert-warning mb-0">
               Job-card odometer tracking is disabled in this database. Run <code>database/odometer_flow_upgrade.sql</code> to enable mandatory per-job odometer flow.
+            </div>
+          </div>
+        <?php endif; ?>
+        <?php if (!$jobTypeEnabled): ?>
+          <div class="col-12">
+            <div class="alert alert-warning mb-0">
+              Job type field is unavailable because <code>job_cards.job_type_id</code> could not be provisioned.
             </div>
           </div>
         <?php endif; ?>
@@ -799,6 +1062,23 @@ require_once __DIR__ . '/../../includes/sidebar.php';
           </div>
         </div>
         <div class="col-md-2"><label class="form-label">Priority</label><select name="priority" class="form-select"><?php $priority = (string) ($editJob['priority'] ?? 'MEDIUM'); ?><option value="LOW" <?= $priority === 'LOW' ? 'selected' : ''; ?>>Low</option><option value="MEDIUM" <?= $priority === 'MEDIUM' ? 'selected' : ''; ?>>Medium</option><option value="HIGH" <?= $priority === 'HIGH' ? 'selected' : ''; ?>>High</option><option value="URGENT" <?= $priority === 'URGENT' ? 'selected' : ''; ?>>Urgent</option></select></div>
+        <?php if ($jobTypeEnabled): ?>
+          <div class="col-md-3">
+            <label class="form-label">Job Type</label>
+            <select name="job_type_id" class="form-select" <?= $editJob ? '' : 'required'; ?>>
+              <option value="" <?= $selectedJobTypeForForm <= 0 ? 'selected' : ''; ?>>Select Job Type</option>
+              <?php foreach ($jobTypeFormOptions as $jobTypeOption): ?>
+                <?php $optionId = (int) ($jobTypeOption['id'] ?? 0); ?>
+                <option value="<?= $optionId; ?>" <?= $selectedJobTypeForForm === $optionId ? 'selected' : ''; ?>>
+                  <?= e((string) ($jobTypeOption['name'] ?? 'Job Type #' . $optionId)); ?>
+                </option>
+              <?php endforeach; ?>
+            </select>
+            <?php if (!$editJob && $jobTypeFormOptions === []): ?>
+              <div class="form-hint text-danger mt-1">Add at least one active job type from Job Settings or Administration > Settings.</div>
+            <?php endif; ?>
+          </div>
+        <?php endif; ?>
         <div class="col-md-2"><label class="form-label">Promised</label><input type="datetime-local" name="promised_at" class="form-control" value="<?= e((string) (!empty($editJob['promised_at']) ? str_replace(' ', 'T', substr((string) $editJob['promised_at'], 0, 16)) : '')); ?>"></div>
         <div class="col-md-12"><label class="form-label">Complaint</label><textarea name="complaint" class="form-control" rows="2" required><?= e((string) ($editJob['complaint'] ?? '')); ?></textarea></div>
         <div class="col-md-12"><label class="form-label">Diagnosis</label><textarea name="diagnosis" class="form-control" rows="2"><?= e((string) ($editJob['diagnosis'] ?? '')); ?></textarea></div>
@@ -934,30 +1214,59 @@ require_once __DIR__ . '/../../includes/sidebar.php';
     <?php endif; ?>
 
     <div class="card" id="job-list-section">
-      <div class="card-header"><h3 class="card-title">Job List</h3><div class="card-tools"><form method="get" action="<?= e(url('modules/jobs/index.php#job-list-section')); ?>" class="d-flex gap-2"><input name="q" value="<?= e($query); ?>" class="form-control form-control-sm" placeholder="Search"><select name="status" class="form-select form-select-sm"><option value="">All</option><?php foreach (job_workflow_statuses(true) as $status): ?><option value="<?= e($status); ?>" <?= $statusFilter === $status ? 'selected' : ''; ?>><?= e($status); ?></option><?php endforeach; ?></select><button class="btn btn-sm btn-outline-primary" type="submit">Filter</button></form></div></div>
+      <div class="card-header">
+        <h3 class="card-title">Job List</h3>
+        <div class="card-tools">
+          <form method="get" action="<?= e(url('modules/jobs/index.php#job-list-section')); ?>" class="d-flex gap-2 flex-wrap">
+            <input name="q" value="<?= e($query); ?>" class="form-control form-control-sm" placeholder="Search">
+            <?php if ($jobTypeEnabled): ?>
+              <select name="job_type_id" class="form-select form-select-sm">
+                <option value="0">All Job Types</option>
+                <?php foreach ($jobTypeCatalogRows as $jobTypeOption): ?>
+                  <?php $jobTypeOptionId = (int) ($jobTypeOption['id'] ?? 0); ?>
+                  <option value="<?= $jobTypeOptionId; ?>" <?= $jobTypeFilterId === $jobTypeOptionId ? 'selected' : ''; ?>>
+                    <?= e((string) ($jobTypeOption['name'] ?? ('Job Type #' . $jobTypeOptionId))); ?>
+                  </option>
+                <?php endforeach; ?>
+              </select>
+            <?php endif; ?>
+            <select name="status" class="form-select form-select-sm">
+              <option value="">All</option>
+              <?php foreach (job_workflow_statuses(true) as $status): ?>
+                <option value="<?= e($status); ?>" <?= $statusFilter === $status ? 'selected' : ''; ?>><?= e($status); ?></option>
+              <?php endforeach; ?>
+            </select>
+            <button class="btn btn-sm btn-outline-primary" type="submit">Filter</button>
+          </form>
+        </div>
+      </div>
       <div class="card-body border-bottom py-2">
         <ul class="nav nav-pills gap-2 flex-wrap">
           <li class="nav-item">
-            <a class="nav-link py-1 px-2 <?= $statusFilter === '' ? 'active' : ''; ?>" href="<?= e(job_filter_url($query, '')); ?>">
+            <a class="nav-link py-1 px-2 <?= $statusFilter === '' ? 'active' : ''; ?>" href="<?= e(job_filter_url($query, '', $jobTypeFilterId)); ?>">
               All
               <span class="badge <?= $statusFilter === '' ? 'text-bg-light' : 'text-bg-secondary'; ?> ms-1"><?= (int) ($jobStatusCounts[''] ?? 0); ?></span>
             </a>
           </li>
           <?php foreach ($allowedJobStatuses as $status): ?>
             <li class="nav-item">
-              <a class="nav-link py-1 px-2 <?= $statusFilter === $status ? 'active' : ''; ?>" href="<?= e(job_filter_url($query, $status)); ?>">
+              <a class="nav-link py-1 px-2 <?= $statusFilter === $status ? 'active' : ''; ?>" href="<?= e(job_filter_url($query, $status, $jobTypeFilterId)); ?>">
                 <?= e(str_replace('_', ' ', $status)); ?>
                 <span class="badge <?= $statusFilter === $status ? 'text-bg-light' : 'text-bg-secondary'; ?> ms-1"><?= (int) ($jobStatusCounts[$status] ?? 0); ?></span>
               </a>
             </li>
           <?php endforeach; ?>
         </ul>
+        <?php if ($jobTypeEnabled): ?>
+          <div class="small text-muted mt-2">Job Type Filter: <?= e($jobTypeFilterLabel); ?></div>
+        <?php endif; ?>
       </div>
-      <div class="card-body table-responsive p-0"><table class="table table-striped mb-0"><thead><tr><th>Job</th><th>Customer</th><th>Vehicle</th><th>Model</th><th>Assigned</th><th>Priority</th><th>Status</th><th>Estimate</th><th>Opened</th><th>Photos</th><th></th></tr></thead><tbody>
-        <?php if (empty($jobs)): ?><tr><td colspan="11" class="text-center text-muted py-4">No job cards found.</td></tr><?php else: foreach ($jobs as $job): ?>
+      <div class="card-body table-responsive p-0"><table class="table table-striped mb-0"><thead><tr><th>Job</th><th>Customer</th><th>Vehicle</th><th>Model</th><th>Job Type</th><th>Assigned</th><th>Priority</th><th>Status</th><th>Estimate</th><th>Opened</th><th>Photos</th><th></th></tr></thead><tbody>
+        <?php if (empty($jobs)): ?><tr><td colspan="12" class="text-center text-muted py-4">No job cards found.</td></tr><?php else: foreach ($jobs as $job): ?>
         <tr>
           <td><?= e((string) $job['job_number']); ?></td><td><?= e((string) $job['customer_name']); ?></td><td><?= e((string) $job['registration_no']); ?></td>
           <td><?= e((string) ($job['vehicle_model'] ?? '-')); ?></td>
+          <td><?= e((string) ($job['job_type_label'] ?? 'Not Set')); ?></td>
           <td><?= e((string) (($job['assigned_staff'] ?? '') !== '' ? $job['assigned_staff'] : 'Unassigned')); ?></td>
           <td><span class="badge text-bg-warning"><?= e((string) $job['priority']); ?></span></td>
           <td><span class="badge text-bg-secondary"><?= e((string) $job['status']); ?></span></td>
