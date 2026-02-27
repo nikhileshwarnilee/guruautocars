@@ -28,6 +28,7 @@ $canApprove = has_permission('estimate.approve') || has_permission('estimate.man
 $canReject = has_permission('estimate.reject') || has_permission('estimate.manage');
 $canConvert = has_permission('estimate.convert') || has_permission('estimate.manage');
 $canPrint = has_permission('estimate.print') || has_permission('estimate.manage') || has_permission('estimate.view');
+$canDelete = has_permission('estimate.edit') || has_permission('estimate.manage');
 $jobCardColumns = table_columns('job_cards');
 $jobOdometerEnabled = in_array('odometer_km', $jobCardColumns, true);
 $jobTypeEnabled = job_type_feature_ready();
@@ -106,6 +107,7 @@ function estimate_fetch_details(int $estimateId, int $companyId, int $garageId):
          WHERE e.id = :estimate_id
            AND e.company_id = :company_id
            AND e.garage_id = :garage_id
+           AND e.status_code <> "DELETED"
          LIMIT 1'
     );
     $stmt->execute([
@@ -462,6 +464,42 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             flash_set('estimate_error', $exception->getMessage(), 'danger');
             redirect('modules/estimates/view.php?id=' . $estimateId . '&open_convert_setup=1');
         }
+    }
+
+    if ($action === 'delete_estimate') {
+        if (!$canDelete) {
+            flash_set('estimate_error', 'You do not have permission to delete estimates.', 'danger');
+            redirect('modules/estimates/view.php?id=' . $estimateId);
+        }
+
+        if (!estimate_is_deletable($estimateForWrite)) {
+            flash_set('estimate_error', 'Only Draft or Rejected estimates can be deleted.', 'danger');
+            redirect('modules/estimates/view.php?id=' . $estimateId);
+        }
+
+        if (!estimate_soft_delete($estimateId, $companyId, $garageId, $userId)) {
+            flash_set('estimate_error', 'Unable to delete estimate. Please retry.', 'danger');
+            redirect('modules/estimates/view.php?id=' . $estimateId);
+        }
+
+        $statusBeforeDelete = estimate_normalize_status((string) ($estimateForWrite['estimate_status'] ?? 'DRAFT'));
+        $estimateNumber = (string) ($estimateForWrite['estimate_number'] ?? ('#' . $estimateId));
+        estimate_append_history($estimateId, 'DELETE', $statusBeforeDelete, $statusBeforeDelete, 'Estimate deleted');
+        log_audit('estimates', 'delete', $estimateId, 'Deleted estimate ' . $estimateNumber, [
+            'entity' => 'estimate',
+            'source' => 'UI',
+            'before' => [
+                'estimate_status' => $statusBeforeDelete,
+                'status_code' => 'ACTIVE',
+            ],
+            'after' => [
+                'estimate_status' => $statusBeforeDelete,
+                'status_code' => 'DELETED',
+            ],
+        ]);
+
+        flash_set('estimate_success', 'Estimate deleted successfully: ' . $estimateNumber, 'success');
+        redirect('modules/estimates/index.php');
     }
 
     $lineActions = ['add_service', 'update_service', 'delete_service', 'add_part', 'update_part', 'delete_part'];
@@ -854,6 +892,7 @@ if (!$estimate) {
 $estimateStatus = estimate_normalize_status((string) $estimate['estimate_status']);
 $editable = estimate_is_editable($estimate);
 $canRunConversionFlow = $canConvert && estimate_can_convert($estimate);
+$canDeleteEstimate = $canDelete && estimate_is_deletable($estimate);
 
 $jobTypeOptions = [];
 if ($jobTypeEnabled) {
@@ -978,6 +1017,13 @@ require_once __DIR__ . '/../../includes/sidebar.php';
               <?php endif; ?>
               <?php if ((int) ($estimate['converted_job_card_id'] ?? 0) > 0): ?>
                 <a href="<?= e(url('modules/jobs/view.php?id=' . (int) $estimate['converted_job_card_id'])); ?>" class="btn btn-success btn-sm">Open Job</a>
+              <?php endif; ?>
+              <?php if ($canDeleteEstimate): ?>
+                <form method="post" class="d-inline" data-confirm="Delete this estimate? This cannot be undone.">
+                  <?= csrf_field(); ?>
+                  <input type="hidden" name="_action" value="delete_estimate" />
+                  <button type="submit" class="btn btn-outline-danger btn-sm">Delete</button>
+                </form>
               <?php endif; ?>
             </div>
           </div>

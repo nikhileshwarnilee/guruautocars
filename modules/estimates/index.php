@@ -27,6 +27,7 @@ $vehicleAttributesApiUrl = url('modules/vehicles/attributes_api.php');
 $canCreate = has_permission('estimate.create') || has_permission('estimate.manage');
 $canEdit = has_permission('estimate.edit') || has_permission('estimate.manage');
 $canPrint = has_permission('estimate.print') || has_permission('estimate.manage') || has_permission('estimate.view');
+$canDelete = has_permission('estimate.edit') || has_permission('estimate.manage');
 
 function estimate_post_date(string $key): ?string
 {
@@ -50,6 +51,54 @@ function estimate_post_date(string $key): ?string
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     require_csrf();
     $action = (string) ($_POST['_action'] ?? '');
+
+    if ($action === 'delete_estimate') {
+        if (!$canDelete) {
+            flash_set('estimate_error', 'You do not have permission to delete estimates.', 'danger');
+            redirect('modules/estimates/index.php');
+        }
+
+        $estimateId = post_int('estimate_id');
+        if ($estimateId <= 0) {
+            flash_set('estimate_error', 'Invalid estimate selected for deletion.', 'danger');
+            redirect('modules/estimates/index.php');
+        }
+
+        $estimate = estimate_fetch_row($estimateId, $companyId, $garageId);
+        if (!$estimate) {
+            flash_set('estimate_error', 'Estimate not found for active garage.', 'danger');
+            redirect('modules/estimates/index.php');
+        }
+
+        if (!estimate_is_deletable($estimate)) {
+            flash_set('estimate_error', 'Only Draft or Rejected estimates can be deleted.', 'danger');
+            redirect('modules/estimates/index.php');
+        }
+
+        if (!estimate_soft_delete($estimateId, $companyId, $garageId, $userId)) {
+            flash_set('estimate_error', 'Unable to delete estimate. Please retry.', 'danger');
+            redirect('modules/estimates/index.php');
+        }
+
+        $statusBeforeDelete = estimate_normalize_status((string) ($estimate['estimate_status'] ?? 'DRAFT'));
+        $estimateNumber = (string) ($estimate['estimate_number'] ?? ('#' . $estimateId));
+        estimate_append_history($estimateId, 'DELETE', $statusBeforeDelete, $statusBeforeDelete, 'Estimate deleted');
+        log_audit('estimates', 'delete', $estimateId, 'Deleted estimate ' . $estimateNumber, [
+            'entity' => 'estimate',
+            'source' => 'UI',
+            'before' => [
+                'estimate_status' => $statusBeforeDelete,
+                'status_code' => 'ACTIVE',
+            ],
+            'after' => [
+                'estimate_status' => $statusBeforeDelete,
+                'status_code' => 'DELETED',
+            ],
+        ]);
+
+        flash_set('estimate_success', 'Estimate deleted successfully: ' . $estimateNumber, 'success');
+        redirect('modules/estimates/index.php');
+    }
 
     if ($action === 'create') {
         if (!$canCreate) {
@@ -190,7 +239,7 @@ if ($query !== '') {
 }
 
 $listStmt = db()->prepare(
-    'SELECT e.id, e.estimate_number, e.estimate_status, e.estimate_total, e.valid_until, e.created_at, e.converted_job_card_id,
+    'SELECT e.id, e.estimate_number, e.estimate_status, e.estimate_total, e.valid_until, e.created_at, e.converted_job_card_id, e.status_code,
             c.full_name AS customer_name,
             v.registration_no,
             jc.job_number AS converted_job_number
@@ -349,13 +398,18 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                 <?php foreach ($estimates as $estimate): ?>
                   <?php
                     $estimateId = (int) $estimate['id'];
+                    $estimateStatus = estimate_normalize_status((string) ($estimate['estimate_status'] ?? 'DRAFT'));
                     $convertedJobId = (int) ($estimate['converted_job_card_id'] ?? 0);
+                    $canDeleteEstimate = $canDelete && estimate_is_deletable([
+                        'estimate_status' => $estimateStatus,
+                        'status_code' => (string) ($estimate['status_code'] ?? 'ACTIVE'),
+                    ]);
                   ?>
                   <tr>
                     <td><?= e((string) $estimate['estimate_number']); ?></td>
                     <td><?= e((string) $estimate['customer_name']); ?></td>
                     <td><?= e((string) $estimate['registration_no']); ?></td>
-                    <td><span class="badge text-bg-<?= e(estimate_status_badge_class((string) $estimate['estimate_status'])); ?>"><?= e((string) $estimate['estimate_status']); ?></span></td>
+                    <td><span class="badge text-bg-<?= e(estimate_status_badge_class($estimateStatus)); ?>"><?= e($estimateStatus); ?></span></td>
                     <td><?= e(format_currency((float) ($estimate['estimate_total'] ?? 0))); ?></td>
                     <td><?= e((string) (($estimate['valid_until'] ?? '') !== '' ? $estimate['valid_until'] : '-')); ?></td>
                     <td><?= e((string) $estimate['created_at']); ?></td>
@@ -366,6 +420,14 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                       <?php endif; ?>
                       <?php if ($convertedJobId > 0): ?>
                         <a href="<?= e(url('modules/jobs/view.php?id=' . $convertedJobId)); ?>" class="btn btn-sm btn-outline-success">Job <?= e((string) ($estimate['converted_job_number'] ?? ('#' . $convertedJobId))); ?></a>
+                      <?php endif; ?>
+                      <?php if ($canDeleteEstimate): ?>
+                        <form method="post" class="d-inline" data-confirm="Delete this estimate? This cannot be undone.">
+                          <?= csrf_field(); ?>
+                          <input type="hidden" name="_action" value="delete_estimate" />
+                          <input type="hidden" name="estimate_id" value="<?= $estimateId; ?>" />
+                          <button type="submit" class="btn btn-sm btn-outline-danger">Delete</button>
+                        </form>
                       <?php endif; ?>
                     </td>
                   </tr>

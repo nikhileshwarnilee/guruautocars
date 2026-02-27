@@ -5691,6 +5691,14 @@ function resolveTableEnhancementMode(table) {
     return 'skip';
   }
 
+  var requestedMode = String(table.getAttribute('data-gac-table-mode') || '').trim().toLowerCase();
+  if (requestedMode === 'search-only') {
+    return 'search-only';
+  }
+  if (requestedMode === 'local') {
+    return 'local';
+  }
+
   // Master insights tables are server-paginated/searchable via their own filter form.
   // Do not attach local table search, which only scans current page rows.
   if (isMasterInsightsTable(table)) {

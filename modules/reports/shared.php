@@ -228,15 +228,41 @@ function reports_build_scope_context(bool $includeVehicleFilters = false): array
     ];
 }
 
-function reports_module_links(): array
+function reports_link_is_active(array $link, string $activeMenu): bool
 {
-    $links = [
-        [
+    $menuKeys = [];
+    $primaryKey = trim((string) ($link['menu_key'] ?? ''));
+    if ($primaryKey !== '') {
+        $menuKeys[] = $primaryKey;
+    }
+
+    $aliases = is_array($link['active_menu_keys'] ?? null) ? (array) $link['active_menu_keys'] : [];
+    foreach ($aliases as $alias) {
+        $menuKey = trim((string) $alias);
+        if ($menuKey !== '') {
+            $menuKeys[] = $menuKey;
+        }
+    }
+
+    return in_array($activeMenu, $menuKeys, true);
+}
+
+function reports_module_sections(): array
+{
+    $sections = [];
+
+    $sections[] = [
+        'section_key' => 'overview',
+        'label' => 'Overview',
+        'links' => [[
             'menu_key' => 'reports',
             'label' => 'Overview',
             'icon' => 'bi bi-grid',
             'path' => 'modules/reports/index.php',
-        ],
+        ]],
+    ];
+
+    $operations = [
         [
             'menu_key' => 'reports.jobs',
             'label' => 'Job Reports',
@@ -280,84 +306,43 @@ function reports_module_links(): array
             'path' => 'modules/reports/service_reminders.php',
         ],
     ];
+    $sections[] = [
+        'section_key' => 'operations',
+        'label' => 'Operations',
+        'links' => $operations,
+    ];
 
+    $financial = [];
     if (reports_can_view_financial()) {
-        array_splice($links, 3, 0, [[
+        $financial[] = [
             'menu_key' => 'reports.sales',
+            'active_menu_keys' => ['reports.billing'],
             'label' => 'Sales Report',
             'icon' => 'bi bi-receipt',
             'path' => 'modules/reports/billing_gst.php',
-        ], [
+        ];
+        $financial[] = [
             'menu_key' => 'reports.payments',
             'label' => 'Payments Report',
             'icon' => 'bi bi-wallet2',
             'path' => 'modules/reports/payments.php',
-        ], [
+        ];
+        $financial[] = [
             'menu_key' => 'reports.advance_collections',
             'label' => 'Advance Collections',
             'icon' => 'bi bi-cash-stack',
             'path' => 'modules/reports/advance_collections.php',
-        ], [
+        ];
+        $financial[] = [
             'menu_key' => 'reports.profit_loss',
             'label' => 'Profit & Loss',
             'icon' => 'bi bi-graph-up-arrow',
             'path' => 'modules/reports/profit_loss.php',
-        ], [
-            'menu_key' => 'reports.ledger_trial_balance',
-            'label' => 'Trial Balance (GL)',
-            'icon' => 'bi bi-list-check',
-            'path' => 'modules/reports/trial_balance_ledger.php',
-        ], [
-            'menu_key' => 'reports.ledger_profit_loss',
-            'label' => 'P&L (GL)',
-            'icon' => 'bi bi-bar-chart-line',
-            'path' => 'modules/reports/profit_loss_ledger.php',
-        ], [
-            'menu_key' => 'reports.ledger_balance_sheet',
-            'label' => 'Balance Sheet (GL)',
-            'icon' => 'bi bi-columns-gap',
-            'path' => 'modules/reports/balance_sheet_ledger.php',
-        ], [
-            'menu_key' => 'reports.ledger_cash_flow',
-            'label' => 'Cash Flow (GL)',
-            'icon' => 'bi bi-water',
-            'path' => 'modules/reports/cash_flow_ledger.php',
-        ], [
-            'menu_key' => 'reports.ledger_general_ledger',
-            'label' => 'General Ledger',
-            'icon' => 'bi bi-journal-bookmark',
-            'path' => 'modules/reports/general_ledger.php',
-        ], [
-            'menu_key' => 'reports.ledger_customer_ledger',
-            'label' => 'Customer Ledger',
-            'icon' => 'bi bi-person-lines-fill',
-            'path' => 'modules/reports/customer_ledger.php',
-        ], [
-            'menu_key' => 'reports.ledger_vendor_ledger',
-            'label' => 'Vendor Ledger',
-            'icon' => 'bi bi-building',
-            'path' => 'modules/reports/vendor_ledger.php',
-        ]]);
-    }
-
-    if (has_permission('job.view') || has_permission('job.manage') || has_permission('reports.financial')) {
-        $links[] = [
-            'menu_key' => 'reports.vehicle_intake_audit',
-            'label' => 'Vehicle Intake Audit',
-            'icon' => 'bi bi-clipboard2-check',
-            'path' => 'modules/reports/vehicle_intake_audit.php',
-        ];
-
-        $links[] = [
-            'menu_key' => 'reports.insurance_claims',
-            'label' => 'Insurance Claims',
-            'icon' => 'bi bi-shield-check',
-            'path' => 'modules/reports/insurance_claims.php',
         ];
     }
 
     if (has_permission('purchase.view') || has_permission('purchase.manage')) {
-        $links[] = [
+        $financial[] = [
             'menu_key' => 'reports.purchases',
             'label' => 'Purchase Report',
             'icon' => 'bi bi-bag-check',
@@ -365,17 +350,8 @@ function reports_module_links(): array
         ];
     }
 
-    if (has_permission('payroll.view') || has_permission('payroll.manage')) {
-        $links[] = [
-            'menu_key' => 'reports.payroll',
-            'label' => 'Payroll Reports',
-            'icon' => 'bi bi-wallet2',
-            'path' => 'modules/reports/payroll.php',
-        ];
-    }
-
     if (has_permission('expense.view') || has_permission('expense.manage')) {
-        $links[] = [
+        $financial[] = [
             'menu_key' => 'reports.expenses',
             'label' => 'Expense Reports',
             'icon' => 'bi bi-cash-stack',
@@ -383,8 +359,17 @@ function reports_module_links(): array
         ];
     }
 
+    if (has_permission('payroll.view') || has_permission('payroll.manage')) {
+        $financial[] = [
+            'menu_key' => 'reports.payroll',
+            'label' => 'Payroll Reports',
+            'icon' => 'bi bi-wallet2',
+            'path' => 'modules/reports/payroll.php',
+        ];
+    }
+
     if (has_permission('outsourced.view')) {
-        $links[] = [
+        $financial[] = [
             'menu_key' => 'reports.outsourced',
             'label' => 'Outsourced Labour',
             'icon' => 'bi bi-gear-wide-connected',
@@ -392,14 +377,148 @@ function reports_module_links(): array
         ];
     }
 
+    if ($financial !== []) {
+        $sections[] = [
+            'section_key' => 'financial',
+            'label' => 'Financial',
+            'links' => $financial,
+        ];
+    }
+
+    if (reports_can_view_financial()) {
+        $sections[] = [
+            'section_key' => 'ledger',
+            'label' => 'Ledger (GL)',
+            'links' => [
+                [
+                    'menu_key' => 'reports.ledger_trial_balance',
+                    'label' => 'Trial Balance (GL)',
+                    'icon' => 'bi bi-list-check',
+                    'path' => 'modules/reports/trial_balance_ledger.php',
+                ],
+                [
+                    'menu_key' => 'reports.ledger_profit_loss',
+                    'label' => 'P&L (GL)',
+                    'icon' => 'bi bi-bar-chart-line',
+                    'path' => 'modules/reports/profit_loss_ledger.php',
+                ],
+                [
+                    'menu_key' => 'reports.ledger_balance_sheet',
+                    'label' => 'Balance Sheet (GL)',
+                    'icon' => 'bi bi-columns-gap',
+                    'path' => 'modules/reports/balance_sheet_ledger.php',
+                ],
+                [
+                    'menu_key' => 'reports.ledger_cash_flow',
+                    'label' => 'Cash Flow (GL)',
+                    'icon' => 'bi bi-water',
+                    'path' => 'modules/reports/cash_flow_ledger.php',
+                ],
+                [
+                    'menu_key' => 'reports.ledger_general_ledger',
+                    'label' => 'General Ledger',
+                    'icon' => 'bi bi-journal-bookmark',
+                    'path' => 'modules/reports/general_ledger.php',
+                ],
+                [
+                    'menu_key' => 'reports.ledger_customer_ledger',
+                    'label' => 'Customer Ledger',
+                    'icon' => 'bi bi-person-lines-fill',
+                    'path' => 'modules/reports/customer_ledger.php',
+                ],
+                [
+                    'menu_key' => 'reports.ledger_vendor_ledger',
+                    'label' => 'Vendor Ledger',
+                    'icon' => 'bi bi-building',
+                    'path' => 'modules/reports/vendor_ledger.php',
+                ],
+            ],
+        ];
+    }
+
+    $auditCompliance = [];
+    if (has_permission('job.view') || has_permission('job.manage') || has_permission('reports.financial')) {
+        $auditCompliance[] = [
+            'menu_key' => 'reports.vehicle_intake_audit',
+            'label' => 'Vehicle Intake Audit',
+            'icon' => 'bi bi-clipboard2-check',
+            'path' => 'modules/reports/vehicle_intake_audit.php',
+        ];
+        $auditCompliance[] = [
+            'menu_key' => 'reports.insurance_claims',
+            'label' => 'Insurance Claims',
+            'icon' => 'bi bi-shield-check',
+            'path' => 'modules/reports/insurance_claims.php',
+        ];
+    }
     if (has_permission('gst.reports') || has_permission('financial.reports')) {
-        $links[] = [
+        $auditCompliance[] = [
             'menu_key' => 'reports.gst_compliance',
             'label' => 'GST Compliance',
             'icon' => 'bi bi-journal-text',
             'path' => 'modules/reports/gst_compliance.php',
         ];
     }
+    if ($auditCompliance !== []) {
+        $sections[] = [
+            'section_key' => 'audit_compliance',
+            'label' => 'Audit & Compliance',
+            'links' => $auditCompliance,
+        ];
+    }
 
+    return $sections;
+}
+
+function reports_module_links(): array
+{
+    $links = [];
+    foreach (reports_module_sections() as $section) {
+        $sectionLinks = is_array($section['links'] ?? null) ? (array) $section['links'] : [];
+        foreach ($sectionLinks as $link) {
+            $links[] = $link;
+        }
+    }
     return $links;
+}
+
+function reports_render_page_navigation(string $activeMenu, array $params = []): void
+{
+    $sections = reports_module_sections();
+    if ($sections === []) {
+        return;
+    }
+    ?>
+    <div class="card card-outline card-primary mb-3">
+      <div class="card-body">
+        <?php foreach ($sections as $section): ?>
+          <?php
+            $sectionLinks = is_array($section['links'] ?? null) ? (array) $section['links'] : [];
+            if ($sectionLinks === []) {
+                continue;
+            }
+            $sectionLabel = trim((string) ($section['label'] ?? ''));
+          ?>
+          <div class="mb-2">
+            <?php if ($sectionLabel !== ''): ?>
+              <div class="small text-uppercase text-muted fw-semibold mb-1"><?= e($sectionLabel); ?></div>
+            <?php endif; ?>
+            <div class="btn-group flex-wrap" role="group" aria-label="<?= e($sectionLabel !== '' ? $sectionLabel : 'Report Pages'); ?>">
+              <?php foreach ($sectionLinks as $link): ?>
+                <?php
+                  $isActive = reports_link_is_active($link, $activeMenu);
+                  $path = trim((string) ($link['path'] ?? 'modules/reports/index.php'));
+                  $label = trim((string) ($link['label'] ?? 'Report'));
+                  $icon = trim((string) ($link['icon'] ?? 'bi bi-file-earmark-text'));
+                ?>
+                <a href="<?= e(reports_page_url($path, $params)); ?>" class="btn btn-sm <?= $isActive ? 'btn-primary' : 'btn-outline-primary'; ?>">
+                  <i class="<?= e($icon); ?> me-1"></i><?= e($label); ?>
+                </a>
+              <?php endforeach; ?>
+            </div>
+          </div>
+        <?php endforeach; ?>
+      </div>
+    </div>
+    <?php
 }

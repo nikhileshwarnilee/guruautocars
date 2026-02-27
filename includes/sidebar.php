@@ -29,7 +29,13 @@ $isAdministrationOpen = is_menu_group_open('organization.', $activeMenu)
 $servicesMenuActive = ($activeMenu === 'services.master' || $activeMenu === 'services.categories') ? 'active' : '';
 $partsMenuActive = ($activeMenu === 'inventory.parts_master' || $activeMenu === 'inventory.categories' || $activeMenu === 'inventory.units') ? 'active' : '';
 $canViewReports = has_permission('reports.view') || has_permission('report.view');
-$canViewFinancialReports = has_permission('reports.financial') || has_permission('financial.reports') || has_permission('gst.reports');
+$reportsSidebarSections = [];
+if ($canViewReports) {
+    require_once __DIR__ . '/../modules/reports/shared.php';
+    if (function_exists('reports_module_sections')) {
+        $reportsSidebarSections = reports_module_sections();
+    }
+}
 $canViewUsersPermissions = has_permission('staff.view')
     || has_permission('staff.manage')
     || has_permission('role.view')
@@ -337,134 +343,39 @@ $sidebarBrandLinkClass = 'brand-link gac-sidebar-brand-link gac-sidebar-brand-li
               </p>
             </a>
             <ul class="nav nav-treeview">
-              <li class="nav-item">
-                <a href="<?= e(url('modules/reports/index.php')); ?>" class="nav-link <?= e(is_active_menu('reports', $activeMenu)); ?>">
-                  <i class="nav-icon bi bi-grid-1x2"></i>
-                  <p>Overview</p>
-                </a>
-              </li>
-              <li class="nav-item">
-                <a href="<?= e(url('modules/reports/jobs.php')); ?>" class="nav-link <?= e(is_active_menu('reports.jobs', $activeMenu)); ?>">
-                  <i class="nav-icon bi bi-clipboard-data"></i>
-                  <p>Job Reports</p>
-                </a>
-              </li>
-              <li class="nav-item">
-                <a href="<?= e(url('modules/reports/inventory.php')); ?>" class="nav-link <?= e(is_active_menu('reports.inventory', $activeMenu)); ?>">
-                  <i class="nav-icon bi bi-boxes"></i>
-                  <p>Inventory Reports</p>
-                </a>
-              </li>
-              <?php if ($canViewFinancialReports): ?>
-                <li class="nav-item">
-                  <a href="<?= e(url('modules/reports/billing_gst.php')); ?>" class="nav-link <?= e(($activeMenu === 'reports.sales' || $activeMenu === 'reports.billing') ? 'active' : ''); ?>">
-                    <i class="nav-icon bi bi-receipt-cutoff"></i>
-                    <p>Sales Report</p>
-                  </a>
-                </li>
-                <li class="nav-item">
-                  <a href="<?= e(url('modules/reports/payments.php')); ?>" class="nav-link <?= e(is_active_menu('reports.payments', $activeMenu)); ?>">
-                    <i class="nav-icon bi bi-wallet2"></i>
-                    <p>Payments Report</p>
-                  </a>
-                </li>
-                <li class="nav-item">
-                  <a href="<?= e(url('modules/reports/advance_collections.php')); ?>" class="nav-link <?= e(is_active_menu('reports.advance_collections', $activeMenu)); ?>">
-                    <i class="nav-icon bi bi-cash-stack"></i>
-                    <p>Advance Collections</p>
-                  </a>
-                </li>
-                <li class="nav-item">
-                  <a href="<?= e(url('modules/reports/profit_loss.php')); ?>" class="nav-link <?= e(is_active_menu('reports.profit_loss', $activeMenu)); ?>">
-                    <i class="nav-icon bi bi-graph-up-arrow"></i>
-                    <p>Profit &amp; Loss</p>
-                  </a>
-                </li>
-              <?php endif; ?>
-              <li class="nav-item">
-                <a href="<?= e(url('modules/reports/inventory_valuation.php')); ?>" class="nav-link <?= e(is_active_menu('reports.inventory_valuation', $activeMenu)); ?>">
-                  <i class="nav-icon bi bi-calculator"></i>
-                  <p>Inventory Valuation</p>
-                </a>
-              </li>
-              <li class="nav-item">
-                <a href="<?= e(url('modules/reports/returns.php')); ?>" class="nav-link <?= e(is_active_menu('reports.returns', $activeMenu)); ?>">
-                  <i class="nav-icon bi bi-arrow-counterclockwise"></i>
-                  <p>Returns Report</p>
-                </a>
-              </li>
-              <li class="nav-item">
-                <a href="<?= e(url('modules/reports/customers.php')); ?>" class="nav-link <?= e(is_active_menu('reports.customers', $activeMenu)); ?>">
-                  <i class="nav-icon bi bi-people-fill"></i>
-                  <p>Customer Reports</p>
-                </a>
-              </li>
-              <li class="nav-item">
-                <a href="<?= e(url('modules/reports/vehicles.php')); ?>" class="nav-link <?= e(is_active_menu('reports.vehicles', $activeMenu)); ?>">
-                  <i class="nav-icon bi bi-car-front-fill"></i>
-                  <p>Vehicle Reports</p>
-                </a>
-              </li>
-              <li class="nav-item">
-                <a href="<?= e(url('modules/reports/service_reminders.php')); ?>" class="nav-link <?= e(is_active_menu('reports.service_reminders', $activeMenu)); ?>">
-                  <i class="nav-icon bi bi-bell"></i>
-                  <p>Maintenance Reminders</p>
-                </a>
-              </li>
-              <?php if (has_permission('job.view') || has_permission('job.manage') || has_permission('reports.financial')): ?>
-                <li class="nav-item">
-                  <a href="<?= e(url('modules/reports/vehicle_intake_audit.php')); ?>" class="nav-link <?= e(is_active_menu('reports.vehicle_intake_audit', $activeMenu)); ?>">
-                    <i class="nav-icon bi bi-clipboard2-check"></i>
-                    <p>Vehicle Intake Audit</p>
-                  </a>
-                </li>
-                <li class="nav-item">
-                  <a href="<?= e(url('modules/reports/insurance_claims.php')); ?>" class="nav-link <?= e(is_active_menu('reports.insurance_claims', $activeMenu)); ?>">
-                    <i class="nav-icon bi bi-shield-check"></i>
-                    <p>Insurance Claims</p>
-                  </a>
-                </li>
-              <?php endif; ?>
-              <?php if (has_permission('purchase.view') || has_permission('purchase.manage')): ?>
-                <li class="nav-item">
-                  <a href="<?= e(url('modules/reports/purchases.php')); ?>" class="nav-link <?= e(is_active_menu('reports.purchases', $activeMenu)); ?>">
-                    <i class="nav-icon bi bi-bag"></i>
-                    <p>Purchase Report</p>
-                  </a>
-                </li>
-              <?php endif; ?>
-              <?php if (has_permission('payroll.view') || has_permission('payroll.manage')): ?>
-                <li class="nav-item">
-                  <a href="<?= e(url('modules/reports/payroll.php')); ?>" class="nav-link <?= e(is_active_menu('reports.payroll', $activeMenu)); ?>">
-                    <i class="nav-icon bi bi-wallet"></i>
-                    <p>Payroll Reports</p>
-                  </a>
-                </li>
-              <?php endif; ?>
-              <?php if (has_permission('expense.view') || has_permission('expense.manage')): ?>
-                <li class="nav-item">
-                  <a href="<?= e(url('modules/reports/expenses.php')); ?>" class="nav-link <?= e(is_active_menu('reports.expenses', $activeMenu)); ?>">
-                    <i class="nav-icon bi bi-credit-card"></i>
-                    <p>Expense Reports</p>
-                  </a>
-                </li>
-              <?php endif; ?>
-              <?php if (has_permission('outsourced.view')): ?>
-                <li class="nav-item">
-                  <a href="<?= e(url('modules/reports/outsourced_labour.php')); ?>" class="nav-link <?= e(is_active_menu('reports.outsourced', $activeMenu)); ?>">
-                    <i class="nav-icon bi bi-people"></i>
-                    <p>Outsourced Reports</p>
-                  </a>
-                </li>
-              <?php endif; ?>
-              <?php if (has_permission('gst.reports') || has_permission('financial.reports')): ?>
-                <li class="nav-item">
-                  <a href="<?= e(url('modules/reports/gst_compliance.php')); ?>" class="nav-link <?= e(is_active_menu('reports.gst_compliance', $activeMenu)); ?>">
-                    <i class="nav-icon bi bi-journal-text"></i>
-                    <p>GST Compliance</p>
-                  </a>
-                </li>
-              <?php endif; ?>
+              <?php foreach ($reportsSidebarSections as $section): ?>
+                <?php
+                  $sectionLinks = is_array($section['links'] ?? null) ? (array) $section['links'] : [];
+                  $sectionLabel = trim((string) ($section['label'] ?? ''));
+                  if ($sectionLinks === []) {
+                      continue;
+                  }
+                ?>
+                <?php if ($sectionLabel !== ''): ?>
+                  <li class="nav-item">
+                    <span class="nav-link disabled py-1">
+                      <i class="nav-icon bi bi-dot"></i>
+                      <p class="text-uppercase small fw-semibold mb-0"><?= e($sectionLabel); ?></p>
+                    </span>
+                  </li>
+                <?php endif; ?>
+                <?php foreach ($sectionLinks as $link): ?>
+                  <?php
+                    $path = trim((string) ($link['path'] ?? 'modules/reports/index.php'));
+                    $icon = trim((string) ($link['icon'] ?? 'bi bi-file-earmark-text'));
+                    $label = trim((string) ($link['label'] ?? 'Report'));
+                    $isLinkActive = function_exists('reports_link_is_active')
+                        ? reports_link_is_active($link, $activeMenu)
+                        : is_active_menu(trim((string) ($link['menu_key'] ?? '')), $activeMenu) === 'active';
+                  ?>
+                  <li class="nav-item">
+                    <a href="<?= e(url($path)); ?>" class="nav-link <?= e($isLinkActive ? 'active' : ''); ?>">
+                      <i class="nav-icon <?= e($icon); ?>"></i>
+                      <p><?= e($label); ?></p>
+                    </a>
+                  </li>
+                <?php endforeach; ?>
+              <?php endforeach; ?>
             </ul>
           </li>
         <?php endif; ?>

@@ -240,7 +240,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
           <span class="badge text-bg-light border"><span id="maintenance-rows-count">0</span> rows</span>
         </div>
         <div class="card-body table-responsive p-0">
-          <table class="table table-sm table-striped mb-0">
+          <table class="table table-sm table-striped mb-0" data-gac-table-mode="search-only">
             <thead>
               <tr>
                 <th>Vehicle</th>

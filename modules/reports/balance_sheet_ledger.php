@@ -65,6 +65,8 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       </div>
     </div>
 
+    <?php reports_render_page_navigation($active_menu, (array) ($scope['base_params'] ?? [])); ?>
+
     <form method="get" class="card card-body mb-3">
       <div class="row g-2">
         <div class="col-md-3">
@@ -158,4 +160,3 @@ require_once __DIR__ . '/../../includes/sidebar.php';
   </div>
 </main>
 <?php require_once __DIR__ . '/../../includes/footer.php'; ?>
-

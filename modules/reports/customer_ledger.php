@@ -112,6 +112,8 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       <div class="text-end"><strong><?= e((string) ($scope['scope_garage_label'] ?? '-')) ?></strong></div>
     </div>
 
+    <?php reports_render_page_navigation($active_menu, (array) ($scope['base_params'] ?? [])); ?>
+
     <form method="get" class="card card-body mb-3">
       <div class="row g-2">
         <div class="col-md-3"><label class="form-label">Garage</label><select name="garage_id" class="form-select"><?php if ((bool) ($scope['allow_all_garages'] ?? false)): ?><option value="0" <?= ((int) ($scope['selected_garage_id'] ?? 0) === 0) ? 'selected' : '' ?>>All Accessible Garages</option><?php endif; ?><?php foreach ((array) ($scope['garage_options'] ?? []) as $garage): ?><option value="<?= (int) ($garage['id'] ?? 0) ?>" <?= ((int) ($scope['selected_garage_id'] ?? 0) === (int) ($garage['id'] ?? 0)) ? 'selected' : '' ?>><?= e((string) ($garage['name'] ?? '')) ?></option><?php endforeach; ?></select></div>
@@ -161,4 +163,3 @@ require_once __DIR__ . '/../../includes/sidebar.php';
   </div>
 </main>
 <?php require_once __DIR__ . '/../../includes/footer.php'; ?>
-

@@ -43,6 +43,7 @@ $estimateStmt = db()->prepare(
      WHERE e.id = :estimate_id
        AND e.company_id = :company_id
        AND e.garage_id = :garage_id
+       AND e.status_code <> "DELETED"
      LIMIT 1'
 );
 $estimateStmt->execute([

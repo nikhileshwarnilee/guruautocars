@@ -235,24 +235,13 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 
   <div class="app-content">
     <div class="container-fluid">
-      <div class="card card-outline card-primary mb-3">
-        <div class="card-body d-flex flex-wrap justify-content-between align-items-center gap-2">
-          <div class="btn-group flex-wrap" role="group" aria-label="Report Pages">
-            <?php foreach (reports_module_links() as $link): ?>
-              <?php $isActive = $active_menu === (string) $link['menu_key']; ?>
-              <a href="<?= e(reports_page_url((string) $link['path'], $baseParams)); ?>" class="btn btn-sm <?= $isActive ? 'btn-primary' : 'btn-outline-primary'; ?>">
-                <i class="<?= e((string) $link['icon']); ?> me-1"></i><?= e((string) $link['label']); ?>
-              </a>
-            <?php endforeach; ?>
-          </div>
-          <?php if ($canExportData): ?>
-            <div class="d-flex gap-2">
-              <a href="<?= e(reports_export_url('modules/reports/vehicle_intake_audit.php', $pageParams, 'intake_ledger')); ?>" class="btn btn-outline-secondary btn-sm">Export Ledger CSV</a>
-              <a href="<?= e(reports_export_url('modules/reports/vehicle_intake_audit.php', $pageParams, 'fuel_summary')); ?>" class="btn btn-outline-secondary btn-sm">Export Fuel Summary</a>
-            </div>
-          <?php endif; ?>
+      <?php reports_render_page_navigation($active_menu, $baseParams); ?>
+      <?php if ($canExportData): ?>
+        <div class="d-flex flex-wrap justify-content-end gap-2 mb-3">
+          <a href="<?= e(reports_export_url('modules/reports/vehicle_intake_audit.php', $pageParams, 'intake_ledger')); ?>" class="btn btn-outline-secondary btn-sm">Export Ledger CSV</a>
+          <a href="<?= e(reports_export_url('modules/reports/vehicle_intake_audit.php', $pageParams, 'fuel_summary')); ?>" class="btn btn-outline-secondary btn-sm">Export Fuel Summary</a>
         </div>
-      </div>
+      <?php endif; ?>
 
       <div class="card card-primary mb-3">
         <div class="card-header"><h3 class="card-title">Filters</h3></div>
@@ -402,4 +391,3 @@ require_once __DIR__ . '/../../includes/sidebar.php';
   </div>
 </main>
 <?php require_once __DIR__ . '/../../includes/footer.php'; ?>
-

@@ -343,18 +343,9 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 
   <div class="app-content">
     <div class="container-fluid">
-      <div class="card card-outline card-primary mb-3">
-        <div class="card-body d-flex flex-wrap justify-content-between align-items-center gap-2">
-          <div class="btn-group flex-wrap" role="group" aria-label="Report Pages">
-            <?php foreach (reports_module_links() as $link): ?>
-              <?php $isActive = $active_menu === (string) $link['menu_key']; ?>
-              <a href="<?= e(reports_page_url((string) $link['path'], $baseParams)); ?>" class="btn btn-sm <?= $isActive ? 'btn-primary' : 'btn-outline-primary'; ?>">
-                <i class="<?= e((string) $link['icon']); ?> me-1"></i><?= e((string) $link['label']); ?>
-              </a>
-            <?php endforeach; ?>
-          </div>
-          <a href="<?= e(url('modules/purchases/index.php')); ?>" class="btn btn-sm btn-outline-secondary">Open Purchase Entry & List</a>
-        </div>
+      <?php reports_render_page_navigation($active_menu, $baseParams); ?>
+      <div class="d-flex justify-content-end mb-3">
+        <a href="<?= e(url('modules/purchases/index.php')); ?>" class="btn btn-sm btn-outline-secondary">Open Purchase Entry & List</a>
       </div>
 
       <div class="card card-primary mb-3">

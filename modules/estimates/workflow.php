@@ -83,6 +83,43 @@ function estimate_can_convert(array $estimate): bool
     return $statusCode === 'ACTIVE' && $status === 'APPROVED' && $convertedJobId <= 0;
 }
 
+function estimate_is_deletable(array $estimate): bool
+{
+    $status = estimate_normalize_status((string) ($estimate['estimate_status'] ?? 'DRAFT'));
+    $statusCode = normalize_status_code((string) ($estimate['status_code'] ?? 'ACTIVE'));
+
+    return $statusCode === 'ACTIVE' && in_array($status, ['DRAFT', 'REJECTED'], true);
+}
+
+function estimate_soft_delete(int $estimateId, int $companyId, int $garageId, ?int $actorUserId = null): bool
+{
+    $columns = table_columns('estimates');
+    $setClauses = [
+        'status_code = "DELETED"',
+        'updated_by = :updated_by',
+    ];
+    if (in_array('deleted_at', $columns, true)) {
+        $setClauses[] = 'deleted_at = NOW()';
+    }
+
+    $stmt = db()->prepare(
+        'UPDATE estimates
+         SET ' . implode(', ', $setClauses) . '
+         WHERE id = :id
+           AND company_id = :company_id
+           AND garage_id = :garage_id
+           AND status_code = "ACTIVE"'
+    );
+    $stmt->execute([
+        'updated_by' => $actorUserId !== null && $actorUserId > 0 ? $actorUserId : null,
+        'id' => $estimateId,
+        'company_id' => $companyId,
+        'garage_id' => $garageId,
+    ]);
+
+    return (int) $stmt->rowCount() > 0;
+}
+
 function estimate_append_history(
     int $estimateId,
     string $actionType,
@@ -138,6 +175,7 @@ function estimate_fetch_row(int $estimateId, int $companyId, int $garageId): ?ar
          WHERE id = :id
            AND company_id = :company_id
            AND garage_id = :garage_id
+           AND status_code <> "DELETED"
          LIMIT 1'
     );
     $stmt->execute([
