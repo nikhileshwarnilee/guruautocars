@@ -7,14 +7,33 @@ if (is_logged_in()) {
     redirect('dashboard.php');
 }
 
-$loginError = flash_get('login_error');
-$loginNotice = flash_get('login_notice');
+$requestMethod = strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET'));
+if ($requestMethod === 'POST') {
+    require_csrf();
+
+    $email = password_reset_normalize_email((string) ($_POST['email'] ?? ''));
+    if ($email === '' || filter_var($email, FILTER_VALIDATE_EMAIL) === false) {
+        flash_set('forgot_password_error', 'Enter a valid email address.', 'danger');
+        redirect('forgot_password.php');
+    }
+
+    password_reset_request($email);
+    flash_set(
+        'forgot_password_status',
+        'If the email is registered, a password reset link has been sent.',
+        'success'
+    );
+    redirect('forgot_password.php');
+}
+
+$status = flash_get('forgot_password_status');
+$error = flash_get('forgot_password_error');
 ?>
 <!doctype html>
 <html lang="en">
   <head>
     <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
-    <title>Login | <?= e(APP_SHORT_NAME); ?></title>
+    <title>Forgot Password | <?= e(APP_SHORT_NAME); ?></title>
     <meta name="viewport" content="width=device-width, initial-scale=1" />
 
     <link rel="stylesheet" href="<?= e(url('assets/plugins/bootstrap-icons/bootstrap-icons.min.css')); ?>" />
@@ -29,36 +48,33 @@ $loginNotice = flash_get('login_notice');
       </div>
       <div class="card">
         <div class="card-body login-card-body">
-          <p class="login-box-msg">Sign in to access Garage ERP</p>
+          <p class="login-box-msg">Reset your password via email</p>
 
-          <?php if ($loginError !== null): ?>
-            <div class="alert alert-<?= e((string) ($loginError['type'] ?? 'danger')); ?>" role="alert">
-              <?= e((string) $loginError['message']); ?>
-            </div>
-          <?php endif; ?>
-          <?php if ($loginNotice !== null): ?>
-            <div class="alert alert-<?= e((string) ($loginNotice['type'] ?? 'info')); ?>" role="alert">
-              <?= e((string) $loginNotice['message']); ?>
+          <?php if ($error !== null): ?>
+            <div class="alert alert-<?= e((string) ($error['type'] ?? 'danger')); ?>" role="alert">
+              <?= e((string) ($error['message'] ?? 'Unable to process request.')); ?>
             </div>
           <?php endif; ?>
 
-          <form action="<?= e(url('authenticate.php')); ?>" method="post" autocomplete="off">
+          <?php if ($status !== null): ?>
+            <div class="alert alert-<?= e((string) ($status['type'] ?? 'info')); ?>" role="alert">
+              <?= e((string) ($status['message'] ?? 'Request accepted.')); ?>
+            </div>
+          <?php endif; ?>
+
+          <form action="<?= e(url('forgot_password.php')); ?>" method="post" autocomplete="off">
             <?= csrf_field(); ?>
             <div class="input-group mb-3">
-              <input type="text" name="identifier" class="form-control" placeholder="Email or Username" required autofocus />
-              <div class="input-group-text"><span class="bi bi-person"></span></div>
-            </div>
-            <div class="input-group mb-3">
-              <input type="password" name="password" class="form-control" placeholder="Password" required />
-              <div class="input-group-text"><span class="bi bi-lock-fill"></span></div>
+              <input type="email" name="email" class="form-control" placeholder="Registered Email" required autofocus />
+              <div class="input-group-text"><span class="bi bi-envelope-fill"></span></div>
             </div>
             <div class="row">
               <div class="col-12 mb-3 text-end">
-                <a href="<?= e(url('forgot_password.php')); ?>" class="small text-decoration-none">Forgot password?</a>
+                <a href="<?= e(url('login.php')); ?>" class="small text-decoration-none">Back to sign in</a>
               </div>
               <div class="col-12">
                 <div class="d-grid gap-2">
-                  <button type="submit" class="btn btn-primary">Sign In</button>
+                  <button type="submit" class="btn btn-primary">Send Reset Link</button>
                 </div>
               </div>
             </div>

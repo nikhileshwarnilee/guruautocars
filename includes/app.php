@@ -18,6 +18,8 @@ if (session_status() !== PHP_SESSION_ACTIVE) {
 
 require_once __DIR__ . '/db.php';
 require_once __DIR__ . '/helpers.php';
+require_once __DIR__ . '/mailer.php';
+require_once __DIR__ . '/password_reset.php';
 require_once __DIR__ . '/auth.php';
 require_once __DIR__ . '/finance.php';
 require_once __DIR__ . '/ledger_posting_service.php';
