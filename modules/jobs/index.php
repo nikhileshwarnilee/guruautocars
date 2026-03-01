@@ -927,15 +927,27 @@ if (!$editJob && $jobTypeEnabled) {
 }
 $selectedJobTypeForForm = $editJob ? $editJobTypeId : $prefillJobTypeId;
 
-$statusFilter = strtoupper(trim((string) ($_GET['status'] ?? '')));
+$statusFilterRaw = strtoupper(trim((string) ($_GET['status'] ?? '')));
+$statusGroupFilter = strtoupper(trim((string) ($_GET['status_group'] ?? '')));
+$statusFilter = $statusFilterRaw;
 $query = trim((string) ($_GET['q'] ?? ''));
 $jobTypeFilterId = $jobTypeEnabled ? max(0, (int) ($_GET['job_type_id'] ?? 0)) : 0;
 $jobTypeFilterLabel = $jobTypeFilterId > 0
     ? ((string) ($jobTypeLabelsById[$jobTypeFilterId] ?? ('Job Type #' . $jobTypeFilterId)))
     : 'All Job Types';
 $allowedJobStatuses = job_workflow_statuses(true);
+if ($statusFilterRaw === 'COMPLETED_BUCKET') {
+    $statusGroupFilter = 'COMPLETED_BUCKET';
+    $statusFilter = '';
+}
+if ($statusGroupFilter !== 'COMPLETED_BUCKET') {
+    $statusGroupFilter = '';
+}
 if (!in_array($statusFilter, $allowedJobStatuses, true)) {
     $statusFilter = '';
+}
+if ($statusFilter !== '') {
+    $statusGroupFilter = '';
 }
 
 $baseWhere = ['jc.company_id = :company_id', 'jc.garage_id = :garage_id', 'jc.status_code <> "DELETED"'];
@@ -943,6 +955,9 @@ $baseParams = ['company_id' => $companyId, 'garage_id' => $garageId];
 if (in_array($statusFilter, $allowedJobStatuses, true)) {
     $where = array_merge($baseWhere, ['jc.status = :status']);
     $params = array_merge($baseParams, ['status' => $statusFilter]);
+} elseif ($statusGroupFilter === 'COMPLETED_BUCKET') {
+    $where = array_merge($baseWhere, ['jc.status IN ("COMPLETED", "READY_FOR_DELIVERY")']);
+    $params = $baseParams;
 } else {
     $where = $baseWhere;
     $params = $baseParams;
@@ -1558,6 +1573,9 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             <?php endif; ?>
             <select name="status" class="form-select form-select-sm">
               <option value="">All</option>
+              <?php if ($statusGroupFilter === 'COMPLETED_BUCKET'): ?>
+                <option value="COMPLETED_BUCKET" selected>COMPLETED + READY_FOR_DELIVERY</option>
+              <?php endif; ?>
               <?php foreach (job_workflow_statuses(true) as $status): ?>
                 <option value="<?= e($status); ?>" <?= $statusFilter === $status ? 'selected' : ''; ?>><?= e($status); ?></option>
               <?php endforeach; ?>
@@ -1575,14 +1593,18 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             </a>
           </li>
           <?php foreach ($allowedJobStatuses as $status): ?>
+            <?php $isStatusActive = $statusFilter === $status || ($status === 'COMPLETED' && $statusGroupFilter === 'COMPLETED_BUCKET'); ?>
             <li class="nav-item">
-              <a class="nav-link py-1 px-2 <?= $statusFilter === $status ? 'active' : ''; ?>" href="<?= e(job_filter_url($query, $status, $jobTypeFilterId)); ?>">
+              <a class="nav-link py-1 px-2 <?= $isStatusActive ? 'active' : ''; ?>" href="<?= e(job_filter_url($query, $status, $jobTypeFilterId)); ?>">
                 <?= e(str_replace('_', ' ', $status)); ?>
-                <span class="badge <?= $statusFilter === $status ? 'text-bg-light' : 'text-bg-secondary'; ?> ms-1"><?= (int) ($jobStatusCounts[$status] ?? 0); ?></span>
+                <span class="badge <?= $isStatusActive ? 'text-bg-light' : 'text-bg-secondary'; ?> ms-1"><?= (int) ($jobStatusCounts[$status] ?? 0); ?></span>
               </a>
             </li>
           <?php endforeach; ?>
         </ul>
+        <?php if ($statusGroupFilter === 'COMPLETED_BUCKET'): ?>
+          <div class="small text-muted mt-2">Status Filter: COMPLETED + READY_FOR_DELIVERY</div>
+        <?php endif; ?>
         <?php if ($jobTypeEnabled): ?>
           <div class="small text-muted mt-2">Job Type Filter: <?= e($jobTypeFilterLabel); ?></div>
         <?php endif; ?>

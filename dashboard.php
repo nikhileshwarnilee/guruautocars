@@ -88,6 +88,7 @@ if (!in_array($dashboardTrendMode, ['daily', 'monthly'], true)) {
 }
 
 $canViewFinancial = has_permission('reports.financial');
+$canViewJobsList = has_permission('job.view');
 
 if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'charts') {
     $chartFrom = (string) ($dashboardDateFilter['from_date'] ?? $dashboardChartDefaultFrom);
@@ -128,7 +129,11 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'charts') {
     $chartPayload = [
         'revenue_daily' => ['labels' => [], 'values' => [], 'invoice_counts' => []],
         'revenue_monthly' => ['labels' => [], 'values' => [], 'invoice_counts' => []],
-        'job_status' => ['labels' => ['Open', 'In Progress', 'Waiting Parts', 'Completed', 'Closed'], 'values' => [0, 0, 0, 0, 0]],
+        'job_status' => [
+            'labels' => ['Open', 'In Progress', 'Waiting Parts', 'Completed', 'Closed'],
+            'keys' => ['OPEN', 'IN_PROGRESS', 'WAITING_PARTS', 'COMPLETED_BUCKET', 'CLOSED'],
+            'values' => [0, 0, 0, 0, 0],
+        ],
         'revenue_vs_expense' => ['labels' => [], 'revenue' => [], 'expense' => []],
         'top_services' => ['labels' => [], 'counts' => []],
         'inventory_movement' => ['labels' => [], 'stock_in' => [], 'stock_out' => [], 'transfers' => []],
@@ -354,6 +359,7 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'charts') {
     }
     $chartPayload['job_status'] = [
         'labels' => ['Open', 'In Progress', 'Waiting Parts', 'Completed', 'Closed'],
+        'keys' => ['OPEN', 'IN_PROGRESS', 'WAITING_PARTS', 'COMPLETED_BUCKET', 'CLOSED'],
         'values' => [
             $statusMap['OPEN'],
             $statusMap['IN_PROGRESS'],
@@ -1080,9 +1086,26 @@ require_once __DIR__ . '/includes/sidebar.php';
     var toInput = form.querySelector('input[name="to"]');
     var dateModeSelector = form.querySelector('select[name="date_mode"]');
     var trendSelector = form.querySelector('select[name="trend_mode"]');
+    var canNavigateJobStatus = <?= $canViewJobsList ? 'true' : 'false'; ?>;
+    var jobsIndexUrl = <?= json_encode(url('modules/jobs/index.php')); ?>;
 
     function currencyTick(value) {
       return window.GacCharts.asCurrency(value);
+    }
+
+    function jobStatusFilterUrl(statusKey) {
+      var key = String(statusKey || '').toUpperCase();
+      if (key === '') {
+        return '';
+      }
+      var target = new URL(jobsIndexUrl, window.location.origin);
+      if (key === 'COMPLETED_BUCKET') {
+        target.searchParams.set('status_group', 'COMPLETED_BUCKET');
+      } else {
+        target.searchParams.set('status', key);
+      }
+      target.hash = 'job-list-section';
+      return target.toString();
     }
 
     function renderDashboardCharts(payload) {
@@ -1135,16 +1158,45 @@ require_once __DIR__ . '/includes/sidebar.php';
         emptyMessage: payload.can_view_financial ? 'No finalized revenue rows in selected scope.' : 'Financial charts require reports.financial permission.'
       });
 
+      var jobStatusLabels = payload.charts.job_status ? payload.charts.job_status.labels : [];
+      var jobStatusKeys = payload.charts.job_status ? payload.charts.job_status.keys : [];
+      var jobStatusValues = payload.charts.job_status ? payload.charts.job_status.values : [];
+      var jobStatusOptions = window.GacCharts.commonOptions();
+      jobStatusOptions.onClick = function (_event, elements) {
+        if (!canNavigateJobStatus || !elements || elements.length === 0) {
+          return;
+        }
+        var hit = elements[0];
+        var index = hit && typeof hit.index === 'number' ? hit.index : -1;
+        if (index < 0) {
+          return;
+        }
+        var count = Number(jobStatusValues[index] || 0);
+        if (!(count > 0)) {
+          return;
+        }
+        var targetUrl = jobStatusFilterUrl(jobStatusKeys[index] || '');
+        if (targetUrl !== '') {
+          window.location.href = targetUrl;
+        }
+      };
+      jobStatusOptions.onHover = function (event, elements) {
+        var canvas = event && event.native ? event.native.target : null;
+        if (canvas && canvas.style) {
+          canvas.style.cursor = canNavigateJobStatus && elements && elements.length ? 'pointer' : 'default';
+        }
+      };
+
       charts.render('#dashboard-chart-job-status', {
         type: 'doughnut',
         data: {
-          labels: payload.charts.job_status ? payload.charts.job_status.labels : [],
+          labels: jobStatusLabels,
           datasets: [{
-            data: payload.charts.job_status ? payload.charts.job_status.values : [],
+            data: jobStatusValues,
             backgroundColor: window.GacCharts.pickColors(5)
           }]
         },
-        options: window.GacCharts.commonOptions()
+        options: jobStatusOptions
       });
 
       charts.render('#dashboard-chart-revenue-expense', {
