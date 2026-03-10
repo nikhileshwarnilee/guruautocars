@@ -4156,6 +4156,15 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         return;
       }
 
+      var body = table.querySelector('tbody');
+      var rowTemplateHtml = '';
+      if (body) {
+        var initialTemplateRow = body.querySelector('tr');
+        if (initialTemplateRow) {
+          rowTemplateHtml = initialTemplateRow.outerHTML;
+        }
+      }
+
       var summaryEl = summaryId ? document.getElementById(summaryId) : null;
       var recalculateAndRender = function () {
         updateSummary(summaryEl, calculateTableTotals(table));
@@ -4167,17 +4176,20 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 
       if (addRowBtn) {
         addRowBtn.addEventListener('click', function () {
-          var body = table.querySelector('tbody');
           if (!body) {
             return;
           }
-
-          var templateRow = body.querySelector('tr');
-          if (!templateRow) {
+          if (rowTemplateHtml === '') {
             return;
           }
 
-          var clone = templateRow.cloneNode(true);
+          var fragment = document.createElement('tbody');
+          fragment.innerHTML = rowTemplateHtml;
+          var clone = fragment.querySelector('tr');
+          if (!clone) {
+            return;
+          }
+
           clone.querySelectorAll('input').forEach(function (input) {
             input.value = '';
           });
@@ -4190,6 +4202,9 @@ require_once __DIR__ . '/../../includes/sidebar.php';
           }
 
           body.appendChild(clone);
+          if (typeof initSearchableSelects === 'function') {
+            initSearchableSelects();
+          }
           wireRowEvents(clone, recalculateAndRender);
           recalculateAndRender();
         });
