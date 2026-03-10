@@ -160,6 +160,86 @@ function pur_payment_status_from_amounts(float $grandTotal, float $paidAmount): 
   return 'PARTIAL';
 }
 
+function pur_normalize_discount_type(string $discountType): string
+{
+  $normalized = strtoupper(trim($discountType));
+  return in_array($normalized, ['AMOUNT', 'PERCENT'], true) ? $normalized : 'AMOUNT';
+}
+
+function pur_supports_discount_columns(): bool
+{
+  static $supports = null;
+  if ($supports !== null) {
+    return $supports;
+  }
+
+  $columns = table_columns('purchases');
+  $supports =
+    $columns !== []
+    && in_array('discount_type', $columns, true)
+    && in_array('discount_value', $columns, true)
+    && in_array('discount_amount', $columns, true)
+    && in_array('gross_total', $columns, true);
+
+  return $supports;
+}
+
+function pur_apply_purchase_discount(float $grossTotal, string $discountType, float $discountValue): array
+{
+  $grossTotal = round(max(0.0, $grossTotal), 2);
+  $normalizedType = pur_normalize_discount_type($discountType);
+  $normalizedValue = round(max(0.0, $discountValue), 2);
+
+  $discountAmount = $normalizedType === 'PERCENT'
+    ? round(($grossTotal * $normalizedValue) / 100, 2)
+    : $normalizedValue;
+  $discountAmount = round(min(max(0.0, $discountAmount), $grossTotal), 2);
+  $netTotal = round(max(0.0, $grossTotal - $discountAmount), 2);
+
+  return [
+    'type' => $normalizedType,
+    'value' => $normalizedValue,
+    'amount' => $discountAmount,
+    'gross' => $grossTotal,
+    'net' => $netTotal,
+  ];
+}
+
+function pur_purchase_discount_meta_from_row(array $purchase, ?float $fallbackGrossTotal = null): array
+{
+  $netTotal = round(max(0.0, (float) ($purchase['grand_total'] ?? 0)), 2);
+  $grossTotal = $netTotal;
+  $discountType = 'AMOUNT';
+  $discountValue = 0.0;
+  $discountAmount = 0.0;
+
+  if (pur_supports_discount_columns()) {
+    $discountType = pur_normalize_discount_type((string) ($purchase['discount_type'] ?? 'AMOUNT'));
+    $discountValue = round(max(0.0, (float) ($purchase['discount_value'] ?? 0)), 2);
+    $discountAmount = round(max(0.0, (float) ($purchase['discount_amount'] ?? 0)), 2);
+    $grossTotal = round(max(0.0, (float) ($purchase['gross_total'] ?? ($netTotal + $discountAmount))), 2);
+  } elseif ($fallbackGrossTotal !== null && $fallbackGrossTotal > $netTotal + 0.009) {
+    $grossTotal = round(max(0.0, $fallbackGrossTotal), 2);
+    $discountAmount = round(max(0.0, $grossTotal - $netTotal), 2);
+    $discountValue = $discountAmount;
+  }
+
+  if ($discountAmount > $grossTotal) {
+    $discountAmount = $grossTotal;
+  }
+  if ($grossTotal < $netTotal) {
+    $grossTotal = $netTotal;
+  }
+
+  return [
+    'type' => $discountType,
+    'value' => $discountValue,
+    'amount' => $discountAmount,
+    'gross' => $grossTotal,
+    'net' => $netTotal,
+  ];
+}
+
 function pur_fetch_purchase_for_update(PDO $pdo, int $purchaseId, int $companyId, int $garageId): ?array
 {
   $sql =
@@ -271,6 +351,7 @@ function pur_csv_download(string $filename, array $headers, array $rows, array $
 
 $purchasesReady = table_columns('purchases') !== [] && table_columns('purchase_items') !== [];
 $purchasePaymentsReady = table_columns('purchase_payments') !== [];
+$purchaseDiscountColumnsReady = pur_supports_discount_columns();
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     require_csrf();
@@ -298,6 +379,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $invoiceNumber = post_string('invoice_number', 80);
         $purchaseDate = trim((string) ($_POST['purchase_date'] ?? date('Y-m-d')));
         $paymentStatus = strtoupper(trim((string) ($_POST['payment_status'] ?? 'UNPAID')));
+        $discountType = pur_normalize_discount_type((string) ($_POST['discount_type'] ?? 'AMOUNT'));
+        $discountValue = round(max(0.0, pur_decimal($_POST['discount_value'] ?? 0.0, 0.0)), 2);
         $notes = post_string('notes', 255);
         $targetStatus = strtoupper(trim((string) ($_POST['target_status'] ?? 'DRAFT')));
 
@@ -310,6 +393,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
         if (!in_array($targetStatus, $allowedTargetStatuses, true)) {
             flash_set('purchase_error', 'Invalid purchase status target.', 'danger');
+            redirect('modules/purchases/index.php');
+        }
+        if ($discountType === 'PERCENT' && $discountValue > 100) {
+            flash_set('purchase_error', 'Discount percent cannot exceed 100%.', 'danger');
             redirect('modules/purchases/index.php');
         }
         if ($vendorId <= 0) {
@@ -449,32 +536,67 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'gst' => round($totals['gst'], 2),
             'grand' => round($totals['grand'], 2),
         ];
+        $discountMeta = pur_apply_purchase_discount((float) $totals['grand'], $discountType, $discountValue);
+        $totals['discount_type'] = (string) ($discountMeta['type'] ?? 'AMOUNT');
+        $totals['discount_value'] = (float) ($discountMeta['value'] ?? 0);
+        $totals['discount_amount'] = (float) ($discountMeta['amount'] ?? 0);
+        $totals['gross'] = (float) ($discountMeta['gross'] ?? $totals['grand']);
+        $totals['grand'] = (float) ($discountMeta['net'] ?? $totals['grand']);
 
         $pdo = db();
         $pdo->beginTransaction();
         try {
-            $purchaseInsert = $pdo->prepare(
-                'INSERT INTO purchases
-                  (company_id, garage_id, vendor_id, invoice_number, purchase_date, purchase_source, assignment_status, purchase_status, payment_status, taxable_amount, gst_amount, grand_total, notes, created_by, finalized_by, finalized_at)
-                 VALUES
-                  (:company_id, :garage_id, :vendor_id, :invoice_number, :purchase_date, "VENDOR_ENTRY", "ASSIGNED", :purchase_status, :payment_status, :taxable_amount, :gst_amount, :grand_total, :notes, :created_by, :finalized_by, :finalized_at)'
-            );
-            $purchaseInsert->execute([
-                'company_id' => $companyId,
-                'garage_id' => $activeGarageId,
-                'vendor_id' => $vendorId,
-                'invoice_number' => $invoiceNumber !== '' ? $invoiceNumber : null,
-                'purchase_date' => $purchaseDate,
-                'purchase_status' => $targetStatus,
-                'payment_status' => $paymentStatus,
-                'taxable_amount' => $totals['taxable'],
-                'gst_amount' => $totals['gst'],
-                'grand_total' => $totals['grand'],
-                'notes' => $notes !== '' ? $notes : null,
-                'created_by' => $userId,
-                'finalized_by' => $targetStatus === 'FINALIZED' ? $userId : null,
-                'finalized_at' => $targetStatus === 'FINALIZED' ? date('Y-m-d H:i:s') : null,
-            ]);
+            if ($purchaseDiscountColumnsReady) {
+                $purchaseInsert = $pdo->prepare(
+                    'INSERT INTO purchases
+                      (company_id, garage_id, vendor_id, invoice_number, purchase_date, purchase_source, assignment_status, purchase_status, payment_status, taxable_amount, gst_amount, gross_total, discount_type, discount_value, discount_amount, grand_total, notes, created_by, finalized_by, finalized_at)
+                     VALUES
+                      (:company_id, :garage_id, :vendor_id, :invoice_number, :purchase_date, "VENDOR_ENTRY", "ASSIGNED", :purchase_status, :payment_status, :taxable_amount, :gst_amount, :gross_total, :discount_type, :discount_value, :discount_amount, :grand_total, :notes, :created_by, :finalized_by, :finalized_at)'
+                );
+                $purchaseInsert->execute([
+                    'company_id' => $companyId,
+                    'garage_id' => $activeGarageId,
+                    'vendor_id' => $vendorId,
+                    'invoice_number' => $invoiceNumber !== '' ? $invoiceNumber : null,
+                    'purchase_date' => $purchaseDate,
+                    'purchase_status' => $targetStatus,
+                    'payment_status' => $paymentStatus,
+                    'taxable_amount' => $totals['taxable'],
+                    'gst_amount' => $totals['gst'],
+                    'gross_total' => $totals['gross'],
+                    'discount_type' => $totals['discount_type'],
+                    'discount_value' => $totals['discount_value'],
+                    'discount_amount' => $totals['discount_amount'],
+                    'grand_total' => $totals['grand'],
+                    'notes' => $notes !== '' ? $notes : null,
+                    'created_by' => $userId,
+                    'finalized_by' => $targetStatus === 'FINALIZED' ? $userId : null,
+                    'finalized_at' => $targetStatus === 'FINALIZED' ? date('Y-m-d H:i:s') : null,
+                ]);
+            } else {
+                $purchaseInsert = $pdo->prepare(
+                    'INSERT INTO purchases
+                      (company_id, garage_id, vendor_id, invoice_number, purchase_date, purchase_source, assignment_status, purchase_status, payment_status, taxable_amount, gst_amount, grand_total, notes, created_by, finalized_by, finalized_at)
+                     VALUES
+                      (:company_id, :garage_id, :vendor_id, :invoice_number, :purchase_date, "VENDOR_ENTRY", "ASSIGNED", :purchase_status, :payment_status, :taxable_amount, :gst_amount, :grand_total, :notes, :created_by, :finalized_by, :finalized_at)'
+                );
+                $purchaseInsert->execute([
+                    'company_id' => $companyId,
+                    'garage_id' => $activeGarageId,
+                    'vendor_id' => $vendorId,
+                    'invoice_number' => $invoiceNumber !== '' ? $invoiceNumber : null,
+                    'purchase_date' => $purchaseDate,
+                    'purchase_status' => $targetStatus,
+                    'payment_status' => $paymentStatus,
+                    'taxable_amount' => $totals['taxable'],
+                    'gst_amount' => $totals['gst'],
+                    'grand_total' => $totals['grand'],
+                    'notes' => $notes !== '' ? $notes : null,
+                    'created_by' => $userId,
+                    'finalized_by' => $targetStatus === 'FINALIZED' ? $userId : null,
+                    'finalized_at' => $targetStatus === 'FINALIZED' ? date('Y-m-d H:i:s') : null,
+                ]);
+            }
             $purchaseId = (int) $pdo->lastInsertId();
             $autoPaymentId = 0;
 
@@ -596,6 +718,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         'payment_status' => $paymentStatus,
                         'taxable_amount' => $totals['taxable'],
                         'gst_amount' => $totals['gst'],
+                        'gross_total' => (float) ($totals['gross'] ?? $totals['grand']),
+                        'discount_type' => (string) ($totals['discount_type'] ?? 'AMOUNT'),
+                        'discount_value' => (float) ($totals['discount_value'] ?? 0),
+                        'discount_amount' => (float) ($totals['discount_amount'] ?? 0),
                         'grand_total' => $totals['grand'],
                     ],
                     'metadata' => [
@@ -630,6 +756,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $invoiceNumber = post_string('invoice_number', 80);
         $purchaseDate = trim((string) ($_POST['purchase_date'] ?? date('Y-m-d')));
         $paymentStatus = strtoupper(trim((string) ($_POST['payment_status'] ?? 'UNPAID')));
+        $discountType = pur_normalize_discount_type((string) ($_POST['discount_type'] ?? 'AMOUNT'));
+        $discountValue = round(max(0.0, pur_decimal($_POST['discount_value'] ?? 0.0, 0.0)), 2);
         $notes = post_string('notes', 255);
         $finalizeRequested = post_int('finalize_purchase') === 1;
 
@@ -652,6 +780,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
         if (!in_array($paymentStatus, $allowedPaymentStatuses, true)) {
             flash_set('purchase_error', 'Invalid payment status.', 'danger');
+            redirect('modules/purchases/index.php');
+        }
+        if ($discountType === 'PERCENT' && $discountValue > 100) {
+            flash_set('purchase_error', 'Discount percent cannot exceed 100%.', 'danger');
             redirect('modules/purchases/index.php');
         }
         if ($finalizeRequested && !$canFinalize) {
@@ -711,9 +843,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
 
             $updatedTotals = [
-                'taxable' => round((float) ($purchase['taxable_amount'] ?? 0), 2),
-                'gst' => round((float) ($purchase['gst_amount'] ?? 0), 2),
-                'grand' => round((float) ($purchase['grand_total'] ?? 0), 2),
+                'taxable' => 0.0,
+                'gst' => 0.0,
+                'gross' => 0.0,
+                'grand' => 0.0,
             ];
 
             $assignItemIds = $_POST['assign_item_id'] ?? [];
@@ -818,7 +951,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                      WHERE id = :id
                        AND purchase_id = :purchase_id'
                 );
-                $updatedTotals = ['taxable' => 0.0, 'gst' => 0.0, 'grand' => 0.0];
+                $updatedTotals = ['taxable' => 0.0, 'gst' => 0.0, 'gross' => 0.0, 'grand' => 0.0];
                 foreach ($recalculatedRows as $row) {
                     $itemUpdateStmt->execute([
                         'unit_cost' => (float) $row['unit_cost'],
@@ -831,49 +964,110 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     ]);
                     $updatedTotals['taxable'] += (float) $row['taxable_amount'];
                     $updatedTotals['gst'] += (float) $row['gst_amount'];
-                    $updatedTotals['grand'] += (float) $row['total_amount'];
+                    $updatedTotals['gross'] += (float) $row['total_amount'];
                 }
                 $updatedTotals = [
                     'taxable' => round($updatedTotals['taxable'], 2),
                     'gst' => round($updatedTotals['gst'], 2),
-                    'grand' => round($updatedTotals['grand'], 2),
+                    'gross' => round($updatedTotals['gross'], 2),
+                    'grand' => round($updatedTotals['gross'], 2),
                 ];
             }
+
+            $itemTotalsStmt = $pdo->prepare(
+                'SELECT COALESCE(SUM(taxable_amount), 0) AS taxable_total,
+                        COALESCE(SUM(gst_amount), 0) AS gst_total,
+                        COALESCE(SUM(total_amount), 0) AS gross_total
+                 FROM purchase_items
+                 WHERE purchase_id = :purchase_id'
+            );
+            $itemTotalsStmt->execute(['purchase_id' => $purchaseId]);
+            $itemTotalsRow = $itemTotalsStmt->fetch() ?: [];
+            $updatedTotals['taxable'] = round((float) ($itemTotalsRow['taxable_total'] ?? 0), 2);
+            $updatedTotals['gst'] = round((float) ($itemTotalsRow['gst_total'] ?? 0), 2);
+            $updatedTotals['gross'] = round((float) ($itemTotalsRow['gross_total'] ?? 0), 2);
+
+            $discountMeta = pur_apply_purchase_discount((float) $updatedTotals['gross'], $discountType, $discountValue);
+            $updatedTotals['discount_type'] = (string) ($discountMeta['type'] ?? 'AMOUNT');
+            $updatedTotals['discount_value'] = (float) ($discountMeta['value'] ?? 0);
+            $updatedTotals['discount_amount'] = (float) ($discountMeta['amount'] ?? 0);
+            $updatedTotals['grand'] = (float) ($discountMeta['net'] ?? $updatedTotals['gross']);
 
             $finalizedAt = $finalizeRequested ? date('Y-m-d H:i:s') : null;
             $finalizedBy = $finalizeRequested ? $userId : null;
             $nextStatus = $finalizeRequested ? 'FINALIZED' : 'DRAFT';
 
-            $updateStmt = $pdo->prepare(
-                'UPDATE purchases
-                 SET vendor_id = :vendor_id,
-                     invoice_number = :invoice_number,
-                     purchase_date = :purchase_date,
-                     assignment_status = "ASSIGNED",
-                     purchase_status = :purchase_status,
-                     payment_status = :payment_status,
-                     taxable_amount = :taxable_amount,
-                     gst_amount = :gst_amount,
-                     grand_total = :grand_total,
-                     notes = :notes,
-                     finalized_by = :finalized_by,
-                     finalized_at = :finalized_at
-                 WHERE id = :id'
-            );
-            $updateStmt->execute([
-                'vendor_id' => $vendorId,
-                'invoice_number' => $invoiceNumber,
-                'purchase_date' => $purchaseDate,
-                'purchase_status' => $nextStatus,
-                'payment_status' => $paymentStatus,
-                'taxable_amount' => (float) $updatedTotals['taxable'],
-                'gst_amount' => (float) $updatedTotals['gst'],
-                'grand_total' => (float) $updatedTotals['grand'],
-                'notes' => $notes !== '' ? $notes : ((string) ($purchase['notes'] ?? '') !== '' ? (string) $purchase['notes'] : null),
-                'finalized_by' => $finalizedBy,
-                'finalized_at' => $finalizedAt,
-                'id' => $purchaseId,
-            ]);
+            if ($purchaseDiscountColumnsReady) {
+                $updateStmt = $pdo->prepare(
+                    'UPDATE purchases
+                     SET vendor_id = :vendor_id,
+                         invoice_number = :invoice_number,
+                         purchase_date = :purchase_date,
+                         assignment_status = "ASSIGNED",
+                         purchase_status = :purchase_status,
+                         payment_status = :payment_status,
+                         taxable_amount = :taxable_amount,
+                         gst_amount = :gst_amount,
+                         gross_total = :gross_total,
+                         discount_type = :discount_type,
+                         discount_value = :discount_value,
+                         discount_amount = :discount_amount,
+                         grand_total = :grand_total,
+                         notes = :notes,
+                         finalized_by = :finalized_by,
+                         finalized_at = :finalized_at
+                     WHERE id = :id'
+                );
+                $updateStmt->execute([
+                    'vendor_id' => $vendorId,
+                    'invoice_number' => $invoiceNumber,
+                    'purchase_date' => $purchaseDate,
+                    'purchase_status' => $nextStatus,
+                    'payment_status' => $paymentStatus,
+                    'taxable_amount' => (float) $updatedTotals['taxable'],
+                    'gst_amount' => (float) $updatedTotals['gst'],
+                    'gross_total' => (float) $updatedTotals['gross'],
+                    'discount_type' => (string) ($updatedTotals['discount_type'] ?? 'AMOUNT'),
+                    'discount_value' => (float) ($updatedTotals['discount_value'] ?? 0),
+                    'discount_amount' => (float) ($updatedTotals['discount_amount'] ?? 0),
+                    'grand_total' => (float) $updatedTotals['grand'],
+                    'notes' => $notes !== '' ? $notes : ((string) ($purchase['notes'] ?? '') !== '' ? (string) $purchase['notes'] : null),
+                    'finalized_by' => $finalizedBy,
+                    'finalized_at' => $finalizedAt,
+                    'id' => $purchaseId,
+                ]);
+            } else {
+                $updateStmt = $pdo->prepare(
+                    'UPDATE purchases
+                     SET vendor_id = :vendor_id,
+                         invoice_number = :invoice_number,
+                         purchase_date = :purchase_date,
+                         assignment_status = "ASSIGNED",
+                         purchase_status = :purchase_status,
+                         payment_status = :payment_status,
+                         taxable_amount = :taxable_amount,
+                         gst_amount = :gst_amount,
+                         grand_total = :grand_total,
+                         notes = :notes,
+                         finalized_by = :finalized_by,
+                         finalized_at = :finalized_at
+                     WHERE id = :id'
+                );
+                $updateStmt->execute([
+                    'vendor_id' => $vendorId,
+                    'invoice_number' => $invoiceNumber,
+                    'purchase_date' => $purchaseDate,
+                    'purchase_status' => $nextStatus,
+                    'payment_status' => $paymentStatus,
+                    'taxable_amount' => (float) $updatedTotals['taxable'],
+                    'gst_amount' => (float) $updatedTotals['gst'],
+                    'grand_total' => (float) $updatedTotals['grand'],
+                    'notes' => $notes !== '' ? $notes : ((string) ($purchase['notes'] ?? '') !== '' ? (string) $purchase['notes'] : null),
+                    'finalized_by' => $finalizedBy,
+                    'finalized_at' => $finalizedAt,
+                    'id' => $purchaseId,
+                ]);
+            }
 
             $autoPaymentId = 0;
             if ($purchasePaymentsReady && $paymentStatus === 'PAID') {
@@ -946,6 +1140,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         'payment_status' => $paymentStatus,
                         'taxable_amount' => (float) $updatedTotals['taxable'],
                         'gst_amount' => (float) $updatedTotals['gst'],
+                        'gross_total' => (float) ($updatedTotals['gross'] ?? $updatedTotals['grand']),
+                        'discount_type' => (string) ($updatedTotals['discount_type'] ?? 'AMOUNT'),
+                        'discount_value' => (float) ($updatedTotals['discount_value'] ?? 0),
+                        'discount_amount' => (float) ($updatedTotals['discount_amount'] ?? 0),
                         'grand_total' => (float) $updatedTotals['grand'],
                     ],
                 ]
@@ -1064,6 +1262,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $vendorId = post_int('vendor_id');
         $invoiceNumber = post_string('invoice_number', 80);
         $purchaseDate = trim((string) ($_POST['purchase_date'] ?? date('Y-m-d')));
+        $discountType = pur_normalize_discount_type((string) ($_POST['discount_type'] ?? 'AMOUNT'));
+        $discountValue = round(max(0.0, pur_decimal($_POST['discount_value'] ?? 0.0, 0.0)), 2);
         $notes = post_string('notes', 255);
         $editReason = post_string('edit_reason', 255);
 
@@ -1073,6 +1273,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
         if (!pur_is_valid_date($purchaseDate)) {
             flash_set('purchase_error', 'Invalid purchase date.', 'danger');
+            redirect('modules/purchases/index.php?edit_purchase_id=' . $purchaseId);
+        }
+        if ($discountType === 'PERCENT' && $discountValue > 100) {
+            flash_set('purchase_error', 'Discount percent cannot exceed 100%.', 'danger');
             redirect('modules/purchases/index.php?edit_purchase_id=' . $purchaseId);
         }
 
@@ -1166,17 +1370,23 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
         }
 
-        $totals = ['taxable' => 0.0, 'gst' => 0.0, 'grand' => 0.0];
+        $totals = ['taxable' => 0.0, 'gst' => 0.0, 'gross' => 0.0, 'grand' => 0.0];
         foreach ($lineItems as $item) {
             $totals['taxable'] += (float) $item['taxable_amount'];
             $totals['gst'] += (float) $item['gst_amount'];
-            $totals['grand'] += (float) $item['total_amount'];
+            $totals['gross'] += (float) $item['total_amount'];
         }
         $totals = [
             'taxable' => round($totals['taxable'], 2),
             'gst' => round($totals['gst'], 2),
-            'grand' => round($totals['grand'], 2),
+            'gross' => round($totals['gross'], 2),
+            'grand' => round($totals['gross'], 2),
         ];
+        $discountMeta = pur_apply_purchase_discount((float) $totals['gross'], $discountType, $discountValue);
+        $totals['discount_type'] = (string) ($discountMeta['type'] ?? 'AMOUNT');
+        $totals['discount_value'] = (float) ($discountMeta['value'] ?? 0);
+        $totals['discount_amount'] = (float) ($discountMeta['amount'] ?? 0);
+        $totals['grand'] = (float) ($discountMeta['net'] ?? $totals['gross']);
 
         $pdo = db();
         $pdo->beginTransaction();
@@ -1332,35 +1542,74 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $effectivePaid = max(0.0, round((float) ($purchase['total_paid'] ?? 0), 2));
             $nextPaymentStatus = pur_payment_status_from_amounts((float) $totals['grand'], $effectivePaid);
 
-            $purchaseUpdateStmt = $pdo->prepare(
-                'UPDATE purchases
-                 SET vendor_id = :vendor_id,
-                     invoice_number = :invoice_number,
-                     purchase_date = :purchase_date,
-                     payment_status = :payment_status,
-                     taxable_amount = :taxable_amount,
-                     gst_amount = :gst_amount,
-                     grand_total = :grand_total,
-                     notes = :notes
-                 WHERE id = :id
-                   AND company_id = :company_id
-                   AND garage_id = :garage_id'
-            );
-            $purchaseUpdateStmt->execute([
-                'vendor_id' => $vendorId > 0 ? $vendorId : null,
-                'invoice_number' => $invoiceNumber !== '' ? $invoiceNumber : null,
-                'purchase_date' => $purchaseDate,
-                'payment_status' => $nextPaymentStatus,
-                'taxable_amount' => (float) $totals['taxable'],
-                'gst_amount' => (float) $totals['gst'],
-                'grand_total' => (float) $totals['grand'],
-                'notes' => $notes !== '' ? $notes : null,
-                'id' => $purchaseId,
-                'company_id' => $companyId,
-                'garage_id' => $activeGarageId,
-            ]);
+            if ($purchaseDiscountColumnsReady) {
+                $purchaseUpdateStmt = $pdo->prepare(
+                    'UPDATE purchases
+                     SET vendor_id = :vendor_id,
+                         invoice_number = :invoice_number,
+                         purchase_date = :purchase_date,
+                         payment_status = :payment_status,
+                         taxable_amount = :taxable_amount,
+                         gst_amount = :gst_amount,
+                         gross_total = :gross_total,
+                         discount_type = :discount_type,
+                         discount_value = :discount_value,
+                         discount_amount = :discount_amount,
+                         grand_total = :grand_total,
+                         notes = :notes
+                     WHERE id = :id
+                       AND company_id = :company_id
+                       AND garage_id = :garage_id'
+                );
+                $purchaseUpdateStmt->execute([
+                    'vendor_id' => $vendorId > 0 ? $vendorId : null,
+                    'invoice_number' => $invoiceNumber !== '' ? $invoiceNumber : null,
+                    'purchase_date' => $purchaseDate,
+                    'payment_status' => $nextPaymentStatus,
+                    'taxable_amount' => (float) $totals['taxable'],
+                    'gst_amount' => (float) $totals['gst'],
+                    'gross_total' => (float) ($totals['gross'] ?? $totals['grand']),
+                    'discount_type' => (string) ($totals['discount_type'] ?? 'AMOUNT'),
+                    'discount_value' => (float) ($totals['discount_value'] ?? 0),
+                    'discount_amount' => (float) ($totals['discount_amount'] ?? 0),
+                    'grand_total' => (float) $totals['grand'],
+                    'notes' => $notes !== '' ? $notes : null,
+                    'id' => $purchaseId,
+                    'company_id' => $companyId,
+                    'garage_id' => $activeGarageId,
+                ]);
+            } else {
+                $purchaseUpdateStmt = $pdo->prepare(
+                    'UPDATE purchases
+                     SET vendor_id = :vendor_id,
+                         invoice_number = :invoice_number,
+                         purchase_date = :purchase_date,
+                         payment_status = :payment_status,
+                         taxable_amount = :taxable_amount,
+                         gst_amount = :gst_amount,
+                         grand_total = :grand_total,
+                         notes = :notes
+                     WHERE id = :id
+                       AND company_id = :company_id
+                       AND garage_id = :garage_id'
+                );
+                $purchaseUpdateStmt->execute([
+                    'vendor_id' => $vendorId > 0 ? $vendorId : null,
+                    'invoice_number' => $invoiceNumber !== '' ? $invoiceNumber : null,
+                    'purchase_date' => $purchaseDate,
+                    'payment_status' => $nextPaymentStatus,
+                    'taxable_amount' => (float) $totals['taxable'],
+                    'gst_amount' => (float) $totals['gst'],
+                    'grand_total' => (float) $totals['grand'],
+                    'notes' => $notes !== '' ? $notes : null,
+                    'id' => $purchaseId,
+                    'company_id' => $companyId,
+                    'garage_id' => $activeGarageId,
+                ]);
+            }
 
             $pdo->commit();
+            $beforeDiscountMeta = pur_purchase_discount_meta_from_row($purchase);
             log_audit('purchases', 'update', $purchaseId, 'Edited purchase #' . $purchaseId, [
                 'entity' => 'purchase',
                 'source' => 'UI',
@@ -1371,6 +1620,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'payment_status' => (string) ($purchase['payment_status'] ?? ''),
                     'taxable_amount' => (float) ($purchase['taxable_amount'] ?? 0),
                     'gst_amount' => (float) ($purchase['gst_amount'] ?? 0),
+                    'gross_total' => (float) ($beforeDiscountMeta['gross'] ?? 0),
+                    'discount_type' => (string) ($beforeDiscountMeta['type'] ?? 'AMOUNT'),
+                    'discount_value' => (float) ($beforeDiscountMeta['value'] ?? 0),
+                    'discount_amount' => (float) ($beforeDiscountMeta['amount'] ?? 0),
                     'grand_total' => (float) ($purchase['grand_total'] ?? 0),
                 ],
                 'after' => [
@@ -1380,6 +1633,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'payment_status' => $nextPaymentStatus,
                     'taxable_amount' => (float) $totals['taxable'],
                     'gst_amount' => (float) $totals['gst'],
+                    'gross_total' => (float) ($totals['gross'] ?? $totals['grand']),
+                    'discount_type' => (string) ($totals['discount_type'] ?? 'AMOUNT'),
+                    'discount_value' => (float) ($totals['discount_value'] ?? 0),
+                    'discount_amount' => (float) ($totals['discount_amount'] ?? 0),
                     'grand_total' => (float) $totals['grand'],
                 ],
                 'metadata' => [
@@ -2442,6 +2699,10 @@ if ($purchasesReady) {
 
       switch ($export) {
         case 'csv':
+          $exportGrossExpr = $purchaseDiscountColumnsReady ? 'COALESCE(p.gross_total, p.grand_total)' : 'p.grand_total';
+          $exportDiscountExpr = $purchaseDiscountColumnsReady
+            ? 'COALESCE(p.discount_amount, 0)'
+            : 'GREATEST((' . $exportGrossExpr . ') - p.grand_total, 0)';
           $exportStmt = db()->prepare(
             'SELECT p.id AS purchase_id, p.purchase_date, p.purchase_source, p.assignment_status, p.purchase_status, p.payment_status,
                 COALESCE(v.vendor_name, "UNASSIGNED") AS vendor_name,
@@ -2450,6 +2711,8 @@ if ($purchasesReady) {
                 pi.quantity, pi.unit_cost, pi.gst_rate, pi.taxable_amount, pi.gst_amount, pi.total_amount,
                 p.taxable_amount AS purchase_taxable_amount,
                 p.gst_amount AS purchase_gst_amount,
+                ' . $exportGrossExpr . ' AS purchase_gross_total,
+                ' . $exportDiscountExpr . ' AS purchase_discount_amount,
                 p.grand_total AS purchase_grand_total,
                 u.name AS created_by_name
              FROM purchases p
@@ -2483,6 +2746,8 @@ if ($purchasesReady) {
             'Line Total',
             'Purchase Taxable',
             'Purchase GST',
+            'Purchase Gross Total',
+            'Purchase Discount',
             'Purchase Grand Total',
             'Created By',
           ];
@@ -2507,6 +2772,8 @@ if ($purchasesReady) {
               number_format((float) ($row['total_amount'] ?? 0), 2, '.', ''),
               number_format((float) ($row['purchase_taxable_amount'] ?? 0), 2, '.', ''),
               number_format((float) ($row['purchase_gst_amount'] ?? 0), 2, '.', ''),
+              number_format((float) ($row['purchase_gross_total'] ?? 0), 2, '.', ''),
+              number_format((float) ($row['purchase_discount_amount'] ?? 0), 2, '.', ''),
               number_format((float) ($row['purchase_grand_total'] ?? 0), 2, '.', ''),
               (string) ($row['created_by_name'] ?? ''),
             ];
@@ -2726,6 +2993,20 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                       </div>
                     </div>
 
+                    <div class="row g-2 mb-3">
+                      <div class="col-md-3">
+                        <label class="form-label">Discount Type</label>
+                        <select name="discount_type" class="form-select js-discount-type">
+                          <option value="AMOUNT">Amount</option>
+                          <option value="PERCENT">Percent (%)</option>
+                        </select>
+                      </div>
+                      <div class="col-md-3">
+                        <label class="form-label">Discount Value</label>
+                        <input type="number" name="discount_value" class="form-control js-discount-value" min="0" step="0.01" value="0.00">
+                      </div>
+                    </div>
+
                     <div class="table-responsive">
                       <table class="table table-sm table-bordered align-middle mb-2" id="purchase-item-table">
                         <thead>
@@ -2798,8 +3079,10 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                       </div>
                       <div class="col-6 col-md-3">
                         <div class="border rounded p-2 bg-light-subtle">
-                          <div class="text-muted small">Grand Total</div>
+                          <div class="text-muted small">Net Grand Total</div>
                           <div class="fw-semibold js-live-total-grand">0.00</div>
+                          <div class="small text-muted">Gross: <span class="js-live-total-gross">0.00</span></div>
+                          <div class="small text-muted">Discount: <span class="js-live-discount-amount">0.00</span></div>
                         </div>
                       </div>
                     </div>
@@ -2838,6 +3121,15 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                         $assignDateValue = (string) ($assignPurchase['purchase_date'] ?? date('Y-m-d'));
                         $assignPaymentStatusValue = (string) ($assignPurchase['payment_status'] ?? 'UNPAID');
                         $assignNotesValue = (string) ($assignPurchase['notes'] ?? '');
+                        $assignLineGrossTotal = 0.0;
+                        foreach ($assignPurchaseItems as $assignItemRow) {
+                          $assignLineGrossTotal += (float) ($assignItemRow['total_amount'] ?? 0);
+                        }
+                        $assignDiscountMeta = $assignPurchase
+                          ? pur_purchase_discount_meta_from_row($assignPurchase, $assignLineGrossTotal > 0.009 ? round($assignLineGrossTotal, 2) : null)
+                          : ['type' => 'AMOUNT', 'value' => 0.0, 'amount' => 0.0, 'gross' => 0.0, 'net' => 0.0];
+                        $assignDiscountTypeValue = (string) ($assignDiscountMeta['type'] ?? 'AMOUNT');
+                        $assignDiscountValue = number_format((float) ($assignDiscountMeta['value'] ?? 0), 2, '.', '');
                       ?>
 
                       <div class="mb-2">
@@ -2877,6 +3169,19 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                           <option value="PARTIAL" <?= strtoupper($assignPaymentStatusValue) === 'PARTIAL' ? 'selected' : ''; ?>>PARTIAL</option>
                           <option value="PAID" <?= strtoupper($assignPaymentStatusValue) === 'PAID' ? 'selected' : ''; ?>>PAID</option>
                         </select>
+                      </div>
+                      <div class="row g-2 mb-2">
+                        <div class="col-6">
+                          <label class="form-label">Discount Type</label>
+                          <select name="discount_type" class="form-select js-discount-type">
+                            <option value="AMOUNT" <?= $assignDiscountTypeValue === 'AMOUNT' ? 'selected' : ''; ?>>Amount</option>
+                            <option value="PERCENT" <?= $assignDiscountTypeValue === 'PERCENT' ? 'selected' : ''; ?>>Percent (%)</option>
+                          </select>
+                        </div>
+                        <div class="col-6">
+                          <label class="form-label">Discount Value</label>
+                          <input type="number" name="discount_value" class="form-control js-discount-value" min="0" step="0.01" value="<?= e($assignDiscountValue); ?>">
+                        </div>
                       </div>
                       <div class="mb-2">
                         <label class="form-label">Notes</label>
@@ -2958,8 +3263,10 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                           </div>
                           <div class="col-6">
                             <div class="border rounded p-2 bg-light-subtle">
-                              <div class="text-muted small">Grand Total</div>
-                              <div class="fw-semibold js-live-total-grand"><?= e(number_format((float) ($assignPurchase['grand_total'] ?? 0), 2)); ?></div>
+                              <div class="text-muted small">Net Grand Total</div>
+                              <div class="fw-semibold js-live-total-grand"><?= e(number_format((float) ($assignDiscountMeta['net'] ?? 0), 2)); ?></div>
+                              <div class="small text-muted">Gross: <span class="js-live-total-gross"><?= e(number_format((float) ($assignDiscountMeta['gross'] ?? 0), 2)); ?></span></div>
+                              <div class="small text-muted">Discount: <span class="js-live-discount-amount"><?= e(number_format((float) ($assignDiscountMeta['amount'] ?? 0), 2)); ?></span></div>
                             </div>
                           </div>
                         </div>
@@ -2992,6 +3299,13 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             $editBlockedByPayments = (int) ($editPurchasePaymentSummary['unreversed_count'] ?? 0) > 0;
             $editAssignmentStatus = strtoupper((string) ($editPurchase['assignment_status'] ?? 'ASSIGNED'));
             $editVendorRequired = $editAssignmentStatus !== 'UNASSIGNED';
+            $editLineGrossTotal = 0.0;
+            foreach ($editPurchaseItems as $editItemRow) {
+                $editLineGrossTotal += (float) ($editItemRow['total_amount'] ?? 0);
+            }
+            $editDiscountMeta = pur_purchase_discount_meta_from_row($editPurchase, $editLineGrossTotal > 0.009 ? round($editLineGrossTotal, 2) : null);
+            $editDiscountTypeValue = (string) ($editDiscountMeta['type'] ?? 'AMOUNT');
+            $editDiscountValue = number_format((float) ($editDiscountMeta['value'] ?? 0), 2, '.', '');
           ?>
           <div class="card card-warning mb-3" id="purchase-edit-section">
             <div class="card-header d-flex justify-content-between align-items-center">
@@ -3040,6 +3354,20 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                   <div class="col-md-2">
                     <label class="form-label">Net Paid</label>
                     <input type="text" class="form-control" value="<?= e(format_currency((float) ($editPurchasePaymentSummary['net_paid_amount'] ?? 0))); ?>" readonly />
+                  </div>
+                </div>
+
+                <div class="row g-2 mb-3">
+                  <div class="col-md-3">
+                    <label class="form-label">Discount Type</label>
+                    <select name="discount_type" class="form-select js-discount-type">
+                      <option value="AMOUNT" <?= $editDiscountTypeValue === 'AMOUNT' ? 'selected' : ''; ?>>Amount</option>
+                      <option value="PERCENT" <?= $editDiscountTypeValue === 'PERCENT' ? 'selected' : ''; ?>>Percent (%)</option>
+                    </select>
+                  </div>
+                  <div class="col-md-3">
+                    <label class="form-label">Discount Value</label>
+                    <input type="number" name="discount_value" class="form-control js-discount-value" min="0" step="0.01" value="<?= e($editDiscountValue); ?>">
                   </div>
                 </div>
 
@@ -3158,8 +3486,10 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                   </div>
                   <div class="col-6 col-md-3">
                     <div class="border rounded p-2 bg-light-subtle">
-                      <div class="text-muted small">Grand Total</div>
-                      <div class="fw-semibold js-live-total-grand">0.00</div>
+                      <div class="text-muted small">Net Grand Total</div>
+                      <div class="fw-semibold js-live-total-grand"><?= e(number_format((float) ($editDiscountMeta['net'] ?? 0), 2)); ?></div>
+                      <div class="small text-muted">Gross: <span class="js-live-total-gross"><?= e(number_format((float) ($editDiscountMeta['gross'] ?? 0), 2)); ?></span></div>
+                      <div class="small text-muted">Discount: <span class="js-live-discount-amount"><?= e(number_format((float) ($editDiscountMeta['amount'] ?? 0), 2)); ?></span></div>
                     </div>
                   </div>
                 </div>
@@ -3184,6 +3514,13 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         <?php endif; ?>
 
         <?php if ($viewPurchase): ?>
+          <?php
+            $viewLineGrossTotal = 0.0;
+            foreach ($viewPurchaseItems as $viewItemRow) {
+              $viewLineGrossTotal += (float) ($viewItemRow['total_amount'] ?? 0);
+            }
+            $viewDiscountMeta = pur_purchase_discount_meta_from_row($viewPurchase, $viewLineGrossTotal > 0.009 ? round($viewLineGrossTotal, 2) : null);
+          ?>
           <div class="card mb-3" id="purchase-detail-print-card">
             <div class="card-header d-flex justify-content-between align-items-center gap-2">
               <h3 class="card-title mb-0">Purchase Details #<?= (int) ($viewPurchase['id'] ?? 0); ?></h3>
@@ -3234,7 +3571,13 @@ require_once __DIR__ . '/../../includes/sidebar.php';
               <div class="row g-2 mb-3">
                 <div class="col-md-3"><strong>Taxable:</strong> <?= e(format_currency((float) ($viewPurchase['taxable_amount'] ?? 0))); ?></div>
                 <div class="col-md-3"><strong>GST:</strong> <?= e(format_currency((float) ($viewPurchase['gst_amount'] ?? 0))); ?></div>
-                <div class="col-md-3"><strong>Grand Total:</strong> <?= e(format_currency((float) ($viewPurchase['grand_total'] ?? 0))); ?></div>
+                <div class="col-md-3">
+                  <strong>Grand Total:</strong> <?= e(format_currency((float) ($viewDiscountMeta['net'] ?? 0))); ?>
+                  <?php if ((float) ($viewDiscountMeta['amount'] ?? 0) > 0.009): ?>
+                    <div class="small text-muted">Gross: <?= e(format_currency((float) ($viewDiscountMeta['gross'] ?? 0))); ?></div>
+                    <div class="small text-muted">Discount: <?= e(format_currency((float) ($viewDiscountMeta['amount'] ?? 0))); ?></div>
+                  <?php endif; ?>
+                </div>
                 <?php if ($purchasePaymentsReady): ?>
                   <div class="col-md-3"><strong>Paid / Outstanding:</strong> <?= e(format_currency((float) ($viewPurchase['total_paid'] ?? 0))); ?> / <?= e(format_currency((float) ($viewPurchase['outstanding_total'] ?? 0))); ?></div>
                 <?php else: ?>
@@ -3289,8 +3632,18 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                       <th colspan="7" class="text-end">Totals</th>
                       <th class="text-end"><?= e(number_format((float) ($viewPurchase['taxable_amount'] ?? 0), 2)); ?></th>
                       <th class="text-end"><?= e(number_format((float) ($viewPurchase['gst_amount'] ?? 0), 2)); ?></th>
-                      <th class="text-end"><?= e(number_format((float) ($viewPurchase['grand_total'] ?? 0), 2)); ?></th>
+                      <th class="text-end"><?= e(number_format((float) ($viewDiscountMeta['gross'] ?? 0), 2)); ?></th>
                     </tr>
+                    <?php if ((float) ($viewDiscountMeta['amount'] ?? 0) > 0.009): ?>
+                      <tr>
+                        <th colspan="9" class="text-end">Discount</th>
+                        <th class="text-end">-<?= e(number_format((float) ($viewDiscountMeta['amount'] ?? 0), 2)); ?></th>
+                      </tr>
+                      <tr>
+                        <th colspan="9" class="text-end">Net Grand Total</th>
+                        <th class="text-end"><?= e(number_format((float) ($viewDiscountMeta['net'] ?? 0), 2)); ?></th>
+                      </tr>
+                    <?php endif; ?>
                   </tfoot>
                 </table>
               </div>
@@ -3999,6 +4352,56 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       return value.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
     }
 
+    function calculateDiscountForSummary(summaryEl, grossTotal) {
+      var form = summaryEl ? summaryEl.closest('form') : null;
+      var discountTypeInput = form ? form.querySelector('.js-discount-type') : null;
+      var discountValueInput = form ? form.querySelector('.js-discount-value') : null;
+      var discountType = discountTypeInput ? String(discountTypeInput.value || 'AMOUNT').toUpperCase() : 'AMOUNT';
+      if (discountType !== 'PERCENT') {
+        discountType = 'AMOUNT';
+      }
+
+      var discountValue = Math.max(0, readNumber(discountValueInput ? discountValueInput.value : 0));
+      if (discountType === 'PERCENT') {
+        discountValue = Math.min(discountValue, 100);
+      }
+
+      var discountAmount = discountType === 'PERCENT'
+        ? roundTwo((grossTotal * discountValue) / 100)
+        : roundTwo(discountValue);
+      discountAmount = roundTwo(Math.min(Math.max(0, discountAmount), grossTotal));
+
+      return {
+        type: discountType,
+        value: roundTwo(discountValue),
+        amount: discountAmount,
+        net: roundTwo(Math.max(0, grossTotal - discountAmount))
+      };
+    }
+
+    function syncDiscountInputConstraints(form) {
+      if (!form) {
+        return;
+      }
+
+      var discountTypeInput = form.querySelector('.js-discount-type');
+      var discountValueInput = form.querySelector('.js-discount-value');
+      if (!discountTypeInput || !discountValueInput) {
+        return;
+      }
+
+      var discountType = String(discountTypeInput.value || 'AMOUNT').toUpperCase();
+      if (discountType === 'PERCENT') {
+        discountValueInput.setAttribute('max', '100');
+        if (readNumber(discountValueInput.value) > 100) {
+          discountValueInput.value = '100.00';
+        }
+        return;
+      }
+
+      discountValueInput.removeAttribute('max');
+    }
+
     function updateSummary(summaryEl, totals) {
       if (!summaryEl) {
         return;
@@ -4007,7 +4410,10 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       var qtyEl = summaryEl.querySelector('.js-live-total-qty');
       var taxableEl = summaryEl.querySelector('.js-live-total-taxable');
       var gstEl = summaryEl.querySelector('.js-live-total-gst');
+      var grossEl = summaryEl.querySelector('.js-live-total-gross');
+      var discountAmountEl = summaryEl.querySelector('.js-live-discount-amount');
       var grandEl = summaryEl.querySelector('.js-live-total-grand');
+      var discountMeta = calculateDiscountForSummary(summaryEl, totals.grand);
 
       if (qtyEl) {
         qtyEl.textContent = formatMoney(totals.qty);
@@ -4018,8 +4424,14 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       if (gstEl) {
         gstEl.textContent = formatMoney(totals.gst);
       }
+      if (grossEl) {
+        grossEl.textContent = formatMoney(totals.grand);
+      }
+      if (discountAmountEl) {
+        discountAmountEl.textContent = formatMoney(discountMeta.amount);
+      }
       if (grandEl) {
-        grandEl.textContent = formatMoney(totals.grand);
+        grandEl.textContent = formatMoney(discountMeta.net);
       }
     }
 
@@ -4169,6 +4581,22 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       var recalculateAndRender = function () {
         updateSummary(summaryEl, calculateTableTotals(table));
       };
+
+      var ownerForm = table.closest('form') || (summaryEl ? summaryEl.closest('form') : null);
+      if (ownerForm) {
+        syncDiscountInputConstraints(ownerForm);
+
+        ownerForm.querySelectorAll('.js-discount-type').forEach(function (input) {
+          input.addEventListener('change', function () {
+            syncDiscountInputConstraints(ownerForm);
+            recalculateAndRender();
+          });
+        });
+        ownerForm.querySelectorAll('.js-discount-value').forEach(function (input) {
+          input.addEventListener('input', recalculateAndRender);
+          input.addEventListener('change', recalculateAndRender);
+        });
+      }
 
       table.querySelectorAll('tbody tr').forEach(function (row) {
         wireRowEvents(row, recalculateAndRender);

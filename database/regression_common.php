@@ -1473,11 +1473,14 @@ final class RegressionHarness
         }
 
         if ($this->tableExists('purchases') && $this->tableExists('purchase_items')) {
+            $purchaseGrossExpr = $this->hasColumn('purchases', 'gross_total')
+                ? 'COALESCE(p.gross_total, p.grand_total)'
+                : 'p.grand_total';
             $rows = $this->qa(
                 'SELECT p.id,
                         ROUND(p.taxable_amount,2) AS header_taxable,
                         ROUND(p.gst_amount,2) AS header_tax,
-                        ROUND(p.grand_total,2) AS header_total,
+                        ROUND(' . $purchaseGrossExpr . ',2) AS header_total,
                         ROUND(COALESCE(SUM(pi.taxable_amount),0),2) AS line_taxable,
                         ROUND(COALESCE(SUM(pi.gst_amount),0),2) AS line_tax,
                         ROUND(COALESCE(SUM(pi.total_amount),0),2) AS line_total
@@ -1485,7 +1488,7 @@ final class RegressionHarness
                  LEFT JOIN purchase_items pi ON pi.purchase_id = p.id
                  WHERE p.company_id = :c
                    AND COALESCE(p.status_code,"ACTIVE") <> "DELETED"
-                 GROUP BY p.id, p.taxable_amount, p.gst_amount, p.grand_total
+                 GROUP BY p.id, p.taxable_amount, p.gst_amount, ' . $purchaseGrossExpr . '
                  HAVING ABS(header_taxable-line_taxable) > 0.01
                      OR ABS(header_tax-line_tax) > 0.01
                      OR ABS(header_total-line_total) > 0.01

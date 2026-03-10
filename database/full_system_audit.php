@@ -111,7 +111,10 @@ if (te($pdo, 'garage_inventory') && te($pdo, 'inventory_movements')) {
 }
 
 if (te($pdo, 'purchases') && te($pdo, 'purchase_items')) {
-    $ptm = (int) (qv($pdo, 'SELECT COUNT(*) FROM (SELECT p.id FROM purchases p JOIN purchase_items pi ON pi.purchase_id=p.id WHERE COALESCE(p.status_code,"ACTIVE")<>"DELETED" GROUP BY p.id,p.taxable_amount,p.gst_amount,p.grand_total HAVING ABS(COALESCE(SUM(pi.taxable_amount),0)-p.taxable_amount)>0.05 OR ABS(COALESCE(SUM(pi.gst_amount),0)-p.gst_amount)>0.05 OR ABS(COALESCE(SUM(pi.total_amount),0)-p.grand_total)>0.05) x') ?? 0);
+    $purchaseGrossExpr = in_array('gross_total', table_columns('purchases'), true)
+        ? 'COALESCE(p.gross_total, p.grand_total)'
+        : 'p.grand_total';
+    $ptm = (int) (qv($pdo, 'SELECT COUNT(*) FROM (SELECT p.id, ' . $purchaseGrossExpr . ' AS header_gross FROM purchases p JOIN purchase_items pi ON pi.purchase_id=p.id WHERE COALESCE(p.status_code,"ACTIVE")<>"DELETED" GROUP BY p.id,p.taxable_amount,p.gst_amount,header_gross HAVING ABS(COALESCE(SUM(pi.taxable_amount),0)-p.taxable_amount)>0.05 OR ABS(COALESCE(SUM(pi.gst_amount),0)-p.gst_amount)>0.05 OR ABS(COALESCE(SUM(pi.total_amount),0)-header_gross)>0.05) x') ?? 0);
     ck($ic, 'purchase_totals', 'Purchase header totals mismatch vs purchase_items', $ptm === 0 ? 'PASS' : 'FAIL', $ptm);
 }
 
