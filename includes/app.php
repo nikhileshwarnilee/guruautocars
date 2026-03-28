@@ -45,3 +45,5 @@ if (is_logged_in() && ($_POST['_action'] ?? '') === 'switch_garage') {
     $redirectTo = $_POST['_redirect'] ?? 'dashboard.php';
     redirect((string) $redirectTo);
 }
+
+app_enforce_request_setup_requirements();

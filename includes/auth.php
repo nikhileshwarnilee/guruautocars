@@ -68,13 +68,13 @@ function current_user(bool $refresh = false): ?array
                 c.name AS company_name
          FROM users u
          INNER JOIN roles r ON r.id = u.role_id
-         INNER JOIN companies c ON c.id = u.company_id
+         LEFT JOIN companies c ON c.id = u.company_id
          LEFT JOIN garages g ON g.id = u.primary_garage_id
          WHERE u.id = :user_id
            AND u.is_active = 1
            AND u.status_code = "ACTIVE"
            AND (r.status_code IS NULL OR r.status_code = "ACTIVE")
-           AND (c.status_code IS NULL OR c.status_code = "ACTIVE")
+           AND (c.id IS NULL OR c.status_code IS NULL OR c.status_code = "ACTIVE")
          LIMIT 1'
     );
     $stmt->execute(['user_id' => (int) $_SESSION['user_id']]);
@@ -99,12 +99,25 @@ function current_user(bool $refresh = false): ?array
 
     $user['garages'] = $garages;
     $cachedUser = $user;
+    $garageIds = array_map(
+        static fn (array $garage): int => (int) ($garage['id'] ?? 0),
+        is_array($garages) ? $garages : []
+    );
 
-    if (empty($_SESSION['active_garage_id'])) {
-        if (!empty($user['primary_garage_id'])) {
-            $_SESSION['active_garage_id'] = (int) $user['primary_garage_id'];
+    $currentGarageId = (int) ($_SESSION['active_garage_id'] ?? 0);
+    if ($currentGarageId > 0 && !in_array($currentGarageId, $garageIds, true)) {
+        $currentGarageId = 0;
+        $_SESSION['active_garage_id'] = 0;
+    }
+
+    if ($currentGarageId <= 0) {
+        $primaryGarageId = (int) ($user['primary_garage_id'] ?? 0);
+        if ($primaryGarageId > 0 && in_array($primaryGarageId, $garageIds, true)) {
+            $_SESSION['active_garage_id'] = $primaryGarageId;
         } elseif (!empty($garages)) {
             $_SESSION['active_garage_id'] = (int) $garages[0]['id'];
+        } else {
+            $_SESSION['active_garage_id'] = 0;
         }
     }
 

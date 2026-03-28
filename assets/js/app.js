@@ -2414,12 +2414,12 @@ function initAjaxFormEngine() {
               window.location.assign(result.response.url);
             });
           }
-          showFormStatus(form, 'Unexpected server response. Please refresh and retry.', 'danger');
+          showFormStatus(form, extractServerMessage(null, result.rawText, 'Unexpected server response. Please refresh and retry.'), 'danger');
           return;
         }
 
         if (payload.ok === false && flashMessages.length === 0 && (!payload.message || String(payload.message).trim() === '')) {
-          showFormStatus(form, 'Request failed. Please retry.', 'danger');
+          showFormStatus(form, extractServerMessage(payload, result.rawText, 'Request failed. Please retry.'), 'danger');
           return;
         }
 
@@ -2427,8 +2427,8 @@ function initAjaxFormEngine() {
           showFormStatus(form, 'Saved successfully.', 'success');
         }
       })
-      .catch(function () {
-        showFormStatus(form, 'Network error. Please retry.', 'danger');
+      .catch(function (error) {
+        showFormStatus(form, error && error.message ? error.message : 'Network error. Please retry.', 'danger');
       })
       .then(function () {
         form.removeAttribute('data-gac-submitting');
@@ -2916,9 +2916,126 @@ function replaceAppWrapperFromHtml(html) {
     document.title = parsedDocument.title.trim();
   }
   syncBodyDataAttributes(parsedDocument);
+  rebindDynamicLayoutControls(currentWrapper);
 
   executeScriptsInContainer(currentWrapper);
   return true;
+}
+
+function rebindDynamicLayoutControls(container) {
+  if (!container || !container.querySelectorAll) {
+    return;
+  }
+
+  bindDynamicSidebarToggleButtons(container);
+  bindDynamicSidebarTreeviews(container);
+}
+
+function bindDynamicSidebarToggleButtons(container) {
+  var toggles = container.querySelectorAll('[data-lte-toggle="sidebar"]');
+  for (var index = 0; index < toggles.length; index++) {
+    var toggle = toggles[index];
+    if (!toggle || toggle.getAttribute('data-gac-sidebar-toggle-bound') === '1') {
+      continue;
+    }
+
+    toggle.setAttribute('data-gac-sidebar-toggle-bound', '1');
+    toggle.addEventListener('click', function (event) {
+      event.preventDefault();
+      toggleSidebarVisibility();
+    });
+  }
+}
+
+function toggleSidebarVisibility() {
+  if (!document.body) {
+    return;
+  }
+
+  var isDesktop = window.matchMedia ? window.matchMedia('(min-width: 992px)').matches : window.innerWidth >= 992;
+  if (isDesktop) {
+    var shouldExpand = document.body.classList.contains('sidebar-collapse');
+    document.body.classList.toggle('sidebar-collapse', !shouldExpand);
+    document.body.classList.remove('sidebar-open');
+    return;
+  }
+
+  var shouldOpen = document.body.classList.contains('sidebar-collapse') || !document.body.classList.contains('sidebar-open');
+  document.body.classList.toggle('sidebar-open', shouldOpen);
+  document.body.classList.toggle('sidebar-collapse', !shouldOpen);
+}
+
+function bindDynamicSidebarTreeviews(container) {
+  var sidebarMenus = container.querySelectorAll('.app-sidebar .sidebar-menu[data-lte-toggle="treeview"]');
+  for (var index = 0; index < sidebarMenus.length; index++) {
+    var sidebarMenu = sidebarMenus[index];
+    if (!sidebarMenu || sidebarMenu.getAttribute('data-gac-dynamic-treeview-bound') === '1') {
+      continue;
+    }
+
+    sidebarMenu.setAttribute('data-gac-dynamic-treeview-bound', '1');
+    syncDynamicSidebarTreeviewDisplay(sidebarMenu);
+
+    sidebarMenu.addEventListener('click', function (event) {
+      var target = event.target;
+      if (!target || typeof target.closest !== 'function') {
+        return;
+      }
+
+      var clickedLink = target.closest('.nav-link');
+      if (!clickedLink || !this.contains(clickedLink)) {
+        return;
+      }
+
+      var navItem = clickedLink.parentElement;
+      if (!navItem || navItem.parentElement !== this) {
+        return;
+      }
+
+      var treeview = sidebarDirectTreeview(navItem);
+      if (!treeview) {
+        return;
+      }
+
+      var href = String(clickedLink.getAttribute('href') || '').trim();
+      if (href !== '' && href !== '#') {
+        return;
+      }
+
+      event.preventDefault();
+      var willOpen = !navItem.classList.contains('menu-open');
+      if (willOpen) {
+        collapseSidebarSiblingGroups(this, navItem);
+      }
+
+      navItem.classList.toggle('menu-open', willOpen);
+      treeview.style.removeProperty('height');
+      treeview.style.display = willOpen ? 'block' : 'none';
+    });
+  }
+}
+
+function syncDynamicSidebarTreeviewDisplay(sidebarMenu) {
+  if (!sidebarMenu || !sidebarMenu.children) {
+    return;
+  }
+
+  for (var index = 0; index < sidebarMenu.children.length; index++) {
+    var navItem = sidebarMenu.children[index];
+    if (!navItem || !navItem.classList || !navItem.classList.contains('nav-item')) {
+      continue;
+    }
+
+    var treeview = sidebarDirectTreeview(navItem);
+    if (!treeview) {
+      continue;
+    }
+
+    var shouldBeOpen = navItem.classList.contains('menu-open') || sidebarHasActiveChild(navItem);
+    navItem.classList.toggle('menu-open', shouldBeOpen);
+    treeview.style.removeProperty('height');
+    treeview.style.display = shouldBeOpen ? 'block' : 'none';
+  }
 }
 
 function syncBodyDataAttributes(parsedDocument) {
@@ -2928,6 +3045,7 @@ function syncBodyDataAttributes(parsedDocument) {
 
   var attributeNames = [
     'data-inline-customer-form-url',
+    'data-inline-vehicle-form-url',
     'data-active-menu',
     'data-page-title',
     'data-dashboard-url'
@@ -2975,6 +3093,54 @@ function safeParseJson(text) {
     payload = null;
   }
   return payload;
+}
+
+function compactServerText(value, maxLength) {
+  var normalized = String(value || '').replace(/\s+/g, ' ').trim();
+  var limit = parseInt(maxLength || '240', 10);
+  if (!isFinite(limit) || limit <= 0) {
+    limit = 240;
+  }
+  if (normalized.length > limit) {
+    normalized = normalized.substring(0, Math.max(1, limit - 3)).trim() + '...';
+  }
+  return normalized;
+}
+
+function extractServerTextMessage(rawText) {
+  var markup = String(rawText || '').trim();
+  if (markup === '') {
+    return '';
+  }
+
+  if (markup.charAt(0) !== '<') {
+    return compactServerText(markup, 260);
+  }
+
+  try {
+    var parsed = new DOMParser().parseFromString(markup, 'text/html');
+    var alertNode = parsed.querySelector('.alert');
+    if (alertNode) {
+      return compactServerText(alertNode.textContent || '', 260);
+    }
+
+    return parsed.body ? compactServerText(parsed.body.textContent || '', 260) : '';
+  } catch (error) {
+    return '';
+  }
+}
+
+function extractServerMessage(payload, rawText, fallbackMessage) {
+  if (payload && typeof payload.message === 'string' && payload.message.trim() !== '') {
+    return payload.message.trim();
+  }
+
+  var extracted = extractServerTextMessage(rawText);
+  if (extracted !== '') {
+    return extracted;
+  }
+
+  return fallbackMessage || 'Request failed.';
 }
 
 function isSameDestinationUrl(left, right) {
@@ -3194,7 +3360,8 @@ function initGlobalVehicleSearch() {
             }
             return {
               ok: response.ok,
-              payload: payload
+              payload: payload,
+              rawText: text
             };
           });
         })
@@ -3205,7 +3372,7 @@ function initGlobalVehicleSearch() {
 
           if (!result.ok || !result.payload || !result.payload.ok) {
             state.items = [];
-            renderMessage('Unable to search right now.');
+            renderMessage(extractServerMessage(result.payload, result.rawText, 'Unable to search right now.'));
             return;
           }
 
@@ -3214,12 +3381,12 @@ function initGlobalVehicleSearch() {
           state.activeIndex = -1;
           renderItems();
         })
-        .catch(function () {
+        .catch(function (error) {
           if (requestSequence !== state.requestSequence) {
             return;
           }
           state.items = [];
-          renderMessage('Unable to search right now.');
+          renderMessage(error && error.message ? error.message : 'Unable to search right now.');
         });
     }
 
@@ -3507,7 +3674,10 @@ function initSearchableSelects() {
         method: 'POST',
         credentials: 'same-origin',
         body: new FormData(form),
-        headers: { 'X-Requested-With': 'XMLHttpRequest' }
+        headers: {
+          'X-Requested-With': 'XMLHttpRequest',
+          'Accept': 'application/json'
+        }
       })
         .then(function (response) {
           return response.text().then(function (text) {
@@ -3517,13 +3687,13 @@ function initSearchableSelects() {
             } catch (error) {
               payload = null;
             }
-            return { ok: response.ok, payload: payload };
+            return { ok: response.ok, payload: payload, rawText: text };
           });
         })
         .then(function (result) {
           var payload = result.payload || {};
           if (!result.ok || !payload.ok) {
-            renderInlineFormError(form, payload.message || context.submitError, context.errorAttribute);
+            renderInlineFormError(form, extractServerMessage(payload, result.rawText, context.submitError), context.errorAttribute);
             return;
           }
 
@@ -3544,8 +3714,8 @@ function initSearchableSelects() {
             context.modalInstance.hide();
           }
         })
-        .catch(function () {
-          renderInlineFormError(form, context.networkError, context.errorAttribute);
+        .catch(function (error) {
+          renderInlineFormError(form, error && error.message ? error.message : context.networkError, context.errorAttribute);
         })
         .then(function () {
           if (submitButton) {

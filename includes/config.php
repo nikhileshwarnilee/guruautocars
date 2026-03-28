@@ -66,6 +66,9 @@ if (!defined('APP_NAME')) {
 if (!defined('APP_SHORT_NAME')) {
     define('APP_SHORT_NAME', $env('APP_SHORT_NAME', 'Guru Auto Cars'));
 }
+if (!defined('APP_VERSION_NAME')) {
+    define('APP_VERSION_NAME', $env('APP_VERSION_NAME', 'v1.0.0'));
+}
 if (!defined('DB_HOST')) {
     define('DB_HOST', $env('DB_HOST', 'localhost'));
 }

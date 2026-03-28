@@ -1,5 +1,5 @@
 ---
 deployment:
   tasks:
-    - export DEPLOYPATH=/home3/fkwxcbmy/public_html/contysi.com/website/guruautocars
+    - export DEPLOYPATH=/home3/fkwxcbmy/public_html/shreeguruautocars/files
     - /bin/cp -R * $DEPLOYPATH

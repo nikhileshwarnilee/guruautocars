@@ -218,6 +218,249 @@ function post_int(string $key, int $default = 0): int
     return filter_var($value, FILTER_VALIDATE_INT) !== false ? (int) $value : $default;
 }
 
+function current_request_relative_path(): string
+{
+    $scriptPath = str_replace('\\', '/', (string) ($_SERVER['SCRIPT_NAME'] ?? ($_SERVER['PHP_SELF'] ?? '')));
+    $scriptPath = ltrim($scriptPath, '/');
+
+    $basePath = trim(str_replace('\\', '/', APP_BASE_URL), '/');
+    if ($basePath !== '' && str_starts_with($scriptPath, $basePath . '/')) {
+        $scriptPath = substr($scriptPath, strlen($basePath) + 1);
+    }
+
+    return ltrim($scriptPath, '/');
+}
+
+function current_request_relative_uri(): string
+{
+    $requestUri = str_replace('\\', '/', (string) ($_SERVER['REQUEST_URI'] ?? ''));
+    $requestUri = ltrim($requestUri, '/');
+
+    $basePath = trim(str_replace('\\', '/', APP_BASE_URL), '/');
+    if ($basePath !== '' && str_starts_with($requestUri, $basePath . '/')) {
+        $requestUri = substr($requestUri, strlen($basePath) + 1);
+    }
+
+    if ($requestUri !== '') {
+        return ltrim($requestUri, '/');
+    }
+
+    return current_request_relative_path();
+}
+
+function current_company_record_exists(): bool
+{
+    static $cache = [];
+
+    if (!function_exists('active_company_id')) {
+        return false;
+    }
+
+    $companyId = active_company_id();
+    if ($companyId <= 0) {
+        return false;
+    }
+
+    if (array_key_exists($companyId, $cache)) {
+        return $cache[$companyId];
+    }
+
+    try {
+        $stmt = db()->prepare(
+            'SELECT COUNT(*)
+             FROM companies
+             WHERE id = :id
+               AND (status_code IS NULL OR status_code = "ACTIVE")
+             LIMIT 1'
+        );
+        $stmt->execute(['id' => $companyId]);
+        $cache[$companyId] = ((int) $stmt->fetchColumn()) > 0;
+    } catch (Throwable $exception) {
+        $cache[$companyId] = false;
+    }
+
+    return $cache[$companyId];
+}
+
+function current_garage_record_exists(?int $garageId = null): bool
+{
+    static $cache = [];
+
+    if (!function_exists('active_garage_id')) {
+        return false;
+    }
+
+    $resolvedGarageId = $garageId !== null && $garageId > 0 ? $garageId : active_garage_id();
+    if ($resolvedGarageId <= 0) {
+        return false;
+    }
+
+    if (array_key_exists($resolvedGarageId, $cache)) {
+        return $cache[$resolvedGarageId];
+    }
+
+    try {
+        $stmt = db()->prepare(
+            'SELECT COUNT(*)
+             FROM garages
+             WHERE id = :id
+               AND (status = "active" OR status IS NULL)
+               AND (status_code IS NULL OR status_code = "ACTIVE")
+             LIMIT 1'
+        );
+        $stmt->execute(['id' => $resolvedGarageId]);
+        $cache[$resolvedGarageId] = ((int) $stmt->fetchColumn()) > 0;
+    } catch (Throwable $exception) {
+        $cache[$resolvedGarageId] = false;
+    }
+
+    return $cache[$resolvedGarageId];
+}
+
+function app_setup_requirement_message(string $areaLabel, bool $requireCompany = true, bool $requireGarage = false): ?string
+{
+    $missingCompany = $requireCompany && !current_company_record_exists();
+    $missingGarage = $requireGarage && !current_garage_record_exists();
+
+    if (!$missingCompany && !$missingGarage) {
+        return null;
+    }
+
+    $label = trim($areaLabel) !== '' ? trim($areaLabel) : 'this action';
+
+    if ($missingCompany && $missingGarage) {
+        return 'You can\'t continue with ' . $label . ' because no business company or garage is configured. '
+            . 'Add a company in Administration > Companies and then add a garage in Administration > Garages.';
+    }
+
+    if ($missingCompany) {
+        return 'You can\'t continue with ' . $label . ' because no business company is configured. '
+            . 'Add a company in Administration > Companies first.';
+    }
+
+    return 'You can\'t continue with ' . $label . ' because no garage is configured. '
+        . 'Add a garage in Administration > Garages first.';
+}
+
+function app_setup_guard_rule_for_request(?string $path = null, ?string $method = null): ?array
+{
+    $pathKey = strtolower(trim((string) ($path ?? current_request_relative_path()), '/'));
+    $requestMethod = strtoupper(trim((string) ($method ?? ($_SERVER['REQUEST_METHOD'] ?? 'GET'))));
+
+    if ($pathKey === '') {
+        return null;
+    }
+
+    if ($pathKey === 'modules/customers/inline_form.php') {
+        return ['label' => 'customer creation', 'require_company' => true, 'require_garage' => false, 'response' => 'html'];
+    }
+
+    if (in_array($pathKey, [
+        'modules/customers/ajax_create.php',
+        'modules/customers/master_insights_api.php',
+        'modules/customers/customer_360_api.php',
+    ], true)) {
+        return ['label' => 'customer operations', 'require_company' => true, 'require_garage' => false, 'response' => 'json'];
+    }
+
+    if ($pathKey === 'modules/vehicles/inline_form.php') {
+        return ['label' => 'vehicle creation', 'require_company' => true, 'require_garage' => false, 'response' => 'html'];
+    }
+
+    if ($pathKey === 'modules/vehicles/ajax_create.php') {
+        return ['label' => 'vehicle creation', 'require_company' => true, 'require_garage' => false, 'response' => 'json'];
+    }
+
+    if ($pathKey === 'modules/vehicles/search_api.php') {
+        return ['label' => 'vehicle search', 'require_company' => true, 'require_garage' => false, 'response' => 'json'];
+    }
+
+    if ($pathKey === 'modules/jobs/queue_board_api.php') {
+        return ['label' => 'job card operations', 'require_company' => true, 'require_garage' => true, 'response' => 'json'];
+    }
+
+    if ($pathKey === 'modules/returns/items_api.php') {
+        return ['label' => 'return operations', 'require_company' => true, 'require_garage' => true, 'response' => 'json'];
+    }
+
+    if ($requestMethod !== 'POST') {
+        return null;
+    }
+
+    return match ($pathKey) {
+        'modules/customers/index.php',
+        'modules/customers/view.php' => ['label' => 'customer operations', 'require_company' => true, 'require_garage' => false, 'response' => 'auto'],
+        'modules/vehicles/index.php' => ['label' => 'vehicle operations', 'require_company' => true, 'require_garage' => false, 'response' => 'auto'],
+        'modules/jobs/index.php',
+        'modules/jobs/view.php' => ['label' => 'job card operations', 'require_company' => true, 'require_garage' => true, 'response' => 'auto'],
+        'modules/estimates/index.php',
+        'modules/estimates/view.php' => ['label' => 'estimate operations', 'require_company' => true, 'require_garage' => true, 'response' => 'auto'],
+        'modules/billing/index.php' => ['label' => 'billing operations', 'require_company' => true, 'require_garage' => true, 'response' => 'auto'],
+        'modules/purchases/index.php' => ['label' => 'purchase operations', 'require_company' => true, 'require_garage' => true, 'response' => 'auto'],
+        'modules/returns/index.php' => ['label' => 'return operations', 'require_company' => true, 'require_garage' => true, 'response' => 'auto'],
+        'modules/expenses/index.php' => ['label' => 'expense operations', 'require_company' => true, 'require_garage' => true, 'response' => 'auto'],
+        'modules/vendors/index.php' => ['label' => 'vendor operations', 'require_company' => true, 'require_garage' => false, 'response' => 'auto'],
+        'modules/outsourced/index.php' => ['label' => 'outsourced work operations', 'require_company' => true, 'require_garage' => true, 'response' => 'auto'],
+        'modules/payroll/index.php',
+        'modules/payroll/master_forms.php' => ['label' => 'payroll operations', 'require_company' => true, 'require_garage' => true, 'response' => 'auto'],
+        default => null,
+    };
+}
+
+function app_render_setup_html_alert(string $message, int $statusCode = 409): never
+{
+    if (!headers_sent()) {
+        http_response_code($statusCode);
+        header('Content-Type: text/html; charset=utf-8');
+        header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+        header('Pragma: no-cache');
+    }
+
+    echo '<div class="alert alert-danger mb-0">' . e($message) . '</div>';
+    exit;
+}
+
+function app_enforce_request_setup_requirements(): void
+{
+    if (!is_logged_in()) {
+        return;
+    }
+
+    $rule = app_setup_guard_rule_for_request();
+    if (!is_array($rule)) {
+        return;
+    }
+
+    $message = app_setup_requirement_message(
+        (string) ($rule['label'] ?? 'this action'),
+        !empty($rule['require_company']),
+        !empty($rule['require_garage'])
+    );
+    if ($message === null) {
+        return;
+    }
+
+    $responseMode = strtolower(trim((string) ($rule['response'] ?? 'auto')));
+    if ($responseMode === 'html') {
+        app_render_setup_html_alert($message, 409);
+    }
+
+    if ($responseMode === 'json' || ($responseMode === 'auto' && is_ajax_request())) {
+        ajax_json([
+            'ok' => false,
+            'message' => $message,
+            'code' => 'SETUP_REQUIRED',
+        ], 409);
+    }
+
+    flash_set('app_setup_error', $message, 'danger');
+    $redirectTarget = current_request_relative_uri();
+    if ($redirectTarget === '') {
+        $redirectTarget = 'dashboard.php';
+    }
+    redirect($redirectTarget);
+}
+
 function format_currency(float $amount): string
 {
     return 'INR ' . number_format($amount, 2);
@@ -900,17 +1143,25 @@ function date_filter_resolve_request(array $config): array
     $sessionKey = 'gac_date_filter_mode_' . $companyId . '_' . strtolower($sessionNamespace);
     $sessionFromKey = $sessionKey . '_from';
     $sessionToKey = $sessionKey . '_to';
+    $sessionDefaultKey = $sessionKey . '_default';
     $ignoreSession = !empty($config['ignore_session']);
     if ($ignoreSession) {
-        unset($_SESSION[$sessionKey], $_SESSION[$sessionFromKey], $_SESSION[$sessionToKey]);
+        unset($_SESSION[$sessionKey], $_SESSION[$sessionFromKey], $_SESSION[$sessionToKey], $_SESSION[$sessionDefaultKey]);
     }
 
     $requestedModeRaw = isset($config['request_mode']) ? trim((string) $config['request_mode']) : '';
     $hasRequestedMode = $requestedModeRaw !== '';
     $requestedMode = date_filter_normalize_mode($requestedModeRaw, $systemDefaultMode);
+    $storedSessionDefault = !$ignoreSession && isset($_SESSION[$sessionDefaultKey])
+        ? date_filter_normalize_mode((string) $_SESSION[$sessionDefaultKey], $systemDefaultMode)
+        : '';
     $sessionMode = !$ignoreSession && isset($_SESSION[$sessionKey])
         ? date_filter_normalize_mode((string) $_SESSION[$sessionKey], $systemDefaultMode)
         : '';
+    if (!$ignoreSession && $sessionMode !== '' && ($storedSessionDefault === '' || $storedSessionDefault !== $systemDefaultMode)) {
+        unset($_SESSION[$sessionKey], $_SESSION[$sessionFromKey], $_SESSION[$sessionToKey]);
+        $sessionMode = '';
+    }
     $resolvedMode = $hasRequestedMode
         ? $requestedMode
         : ($sessionMode !== '' ? $sessionMode : $systemDefaultMode);
@@ -954,6 +1205,7 @@ function date_filter_resolve_request(array $config): array
         $resolvedMode = 'custom';
     }
     $_SESSION[$sessionKey] = $resolvedMode;
+    $_SESSION[$sessionDefaultKey] = $systemDefaultMode;
     if ($resolvedMode === 'custom') {
         $_SESSION[$sessionFromKey] = $fromDate;
         $_SESSION[$sessionToKey] = $toDate;

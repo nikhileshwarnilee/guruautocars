@@ -49,10 +49,13 @@ $canViewAdministration = has_permission('company.manage')
     || has_permission('export.data')
     || has_permission('backup.manage');
 $sidebarUser = current_user();
+$sidebarCompanyName = trim((string) ($sidebarUser['company_name'] ?? ''));
 $sidebarCompanyId = (int) ($sidebarUser['company_id'] ?? active_company_id());
-$sidebarCompanyLogo = $sidebarCompanyId > 0 ? company_logo_url($sidebarCompanyId, active_garage_id()) : null;
+$sidebarCompanyLogo = ($sidebarCompanyName !== '' && $sidebarCompanyId > 0)
+    ? company_logo_url($sidebarCompanyId, active_garage_id())
+    : null;
 $sidebarBrandLogo = $sidebarCompanyLogo !== null ? $sidebarCompanyLogo : url('assets/images/AdminLTELogo.png');
-$sidebarBrandName = trim((string) ($sidebarUser['company_name'] ?? APP_SHORT_NAME));
+$sidebarBrandName = $sidebarCompanyName !== '' ? $sidebarCompanyName : APP_SHORT_NAME;
 if ($sidebarBrandName === '') {
     $sidebarBrandName = APP_SHORT_NAME;
 }

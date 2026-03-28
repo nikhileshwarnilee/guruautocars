@@ -10,7 +10,9 @@ if ($appJsVersion === '') {
 ?>
       <footer class="app-footer">
         <div class="float-end d-none d-sm-inline">India GST Ready</div>
-        <strong><?= e(APP_SHORT_NAME); ?></strong> &copy; <?= date('Y'); ?>
+        <strong><?= e(APP_SHORT_NAME); ?></strong> &copy; <?= date('Y'); ?> |
+        Developed by <a href="https://contysi.com" target="_blank" rel="noopener noreferrer">ContySi</a> |
+        Version <?= e(APP_VERSION_NAME); ?>
       </footer>
     </div>
 

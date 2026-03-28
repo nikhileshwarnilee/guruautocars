@@ -24,7 +24,7 @@ $profileStmt = db()->prepare(
             g.name AS primary_garage_name
      FROM users u
      INNER JOIN roles r ON r.id = u.role_id
-     INNER JOIN companies c ON c.id = u.company_id
+     LEFT JOIN companies c ON c.id = u.company_id
      LEFT JOIN garages g ON g.id = u.primary_garage_id
      WHERE u.id = :user_id
        AND u.company_id = :company_id

@@ -20,9 +20,9 @@ if ($requestPathForRedirect === '') {
 $flashMessages = flash_pull_all();
 $globalVehicleSearchEnabled = $user !== null && has_permission('vehicle.view');
 $globalVehicleSearchApiUrl = $globalVehicleSearchEnabled ? url('modules/vehicles/search_api.php') : '';
+$headerCompanyName = trim((string) ($user['company_name'] ?? ''));
 $headerCompanyId = (int) ($user['company_id'] ?? active_company_id());
-$headerCompanyLogoUrl = $headerCompanyId > 0 ? company_logo_url($headerCompanyId, active_garage_id()) : null;
-$showTxnCleanupTestButton = $user !== null && strtolower(trim((string) ($user['role_key'] ?? ''))) === 'super_admin';
+$headerCompanyLogoUrl = ($headerCompanyName !== '' && $headerCompanyId > 0) ? company_logo_url($headerCompanyId, active_garage_id()) : null;
 $quickAccessLinks = [];
 if (has_permission('job.view')) {
     $quickAccessLinks[] = [
@@ -157,21 +157,7 @@ if ($appCssVersion === '') {
           <?php endif; ?>
           <ul class="navbar-nav ms-auto align-items-center">
             <?php if ($user !== null): ?>
-              <?php if ($showTxnCleanupTestButton): ?>
-                <li class="nav-item me-2">
-                  <form
-                    method="post"
-                    action="<?= e(url('database/cleanup_transactional_data_keep_masters.php')); ?>"
-                    target="_blank"
-                    class="d-flex align-items-center"
-                    onsubmit="return window.confirm('Run transactional cleanup and zero inventory quantities? This is destructive and intended only for test data reset.');"
-                  >
-                    <?= csrf_field(); ?>
-                    <input type="hidden" name="run_cleanup" value="1" />
-                    <button type="submit" class="btn btn-sm btn-outline-danger">Test Cleanup</button>
-                  </form>
-                </li>
-              <?php endif; ?>
+              <?php if ($headerCompanyLogoUrl !== null || $headerCompanyName !== ''): ?>
               <li class="nav-item me-2 d-none d-md-block">
                 <span class="d-inline-flex align-items-center gap-2">
                   <?php if ($headerCompanyLogoUrl !== null): ?>
@@ -182,11 +168,14 @@ if ($appCssVersion === '') {
                       style="height: 26px; width: auto;"
                     />
                   <?php endif; ?>
-                  <span class="badge text-bg-light border">
-                    <?= e((string) ($user['company_name'] ?? '')); ?>
-                  </span>
+                  <?php if ($headerCompanyName !== ''): ?>
+                    <span class="badge text-bg-light border">
+                      <?= e($headerCompanyName); ?>
+                    </span>
+                  <?php endif; ?>
                 </span>
               </li>
+              <?php endif; ?>
               <?php if (count($garages) > 1): ?>
                 <li class="nav-item me-2">
                   <form method="post" class="d-flex align-items-center gap-2">
