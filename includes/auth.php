@@ -85,6 +85,8 @@ function current_user(bool $refresh = false): ?array
         return null;
     }
 
+    $_SESSION['company_id'] = (int) ($user['company_id'] ?? 0);
+
     $garageStmt = db()->prepare(
         'SELECT g.id, g.name, g.code
          FROM user_garages ug

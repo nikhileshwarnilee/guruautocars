@@ -11,15 +11,77 @@ $canManage = has_permission('garage.manage');
 $isSuperAdmin = (string) ($_SESSION['role_key'] ?? '') === 'super_admin';
 $activeCompanyId = active_company_id();
 
+function garage_company_exists(PDO $pdo, int $companyId): bool
+{
+    if ($companyId <= 0) {
+        return false;
+    }
+
+    $stmt = $pdo->prepare(
+        'SELECT id
+         FROM companies
+         WHERE id = :id
+           AND status_code <> "DELETED"
+         LIMIT 1'
+    );
+    $stmt->execute(['id' => $companyId]);
+
+    return (bool) $stmt->fetchColumn();
+}
+
+function garage_save_error_message(Throwable $exception, string $operation): string
+{
+    $defaultMessage = $operation === 'update'
+        ? 'Unable to update garage right now. Please try again.'
+        : 'Unable to create garage right now. Please try again.';
+
+    $driverCode = 0;
+    if ($exception instanceof PDOException && isset($exception->errorInfo[1])) {
+        $driverCode = (int) $exception->errorInfo[1];
+    }
+
+    if (
+        $driverCode === 1062
+        || stripos($exception->getMessage(), 'duplicate') !== false
+        || stripos($exception->getMessage(), 'unique') !== false
+    ) {
+        return $operation === 'update'
+            ? 'Unable to update garage. Code must be unique per company.'
+            : 'Unable to create garage. Code must be unique per company.';
+    }
+
+    if (
+        $driverCode === 1452
+        || stripos($exception->getMessage(), 'fk_garages_company') !== false
+        || stripos($exception->getMessage(), 'foreign key constraint fails') !== false
+    ) {
+        return $operation === 'update'
+            ? 'Unable to update garage. The selected company was not found.'
+            : 'Unable to create garage. Create or select a valid company first.';
+    }
+
+    return $defaultMessage;
+}
+
+function garage_log_save_error(string $operation, Throwable $exception, int $companyId, string $code): void
+{
+    error_log(sprintf(
+        'Garage %s failed. company_id=%d code=%s error=%s',
+        $operation,
+        $companyId,
+        $code,
+        $exception->getMessage()
+    ));
+}
+
 $companyOptions = [];
 if ($isSuperAdmin) {
     $companyOptions = db()->query('SELECT id, name FROM companies WHERE status_code <> "DELETED" ORDER BY name ASC')->fetchAll();
 }
 
-$selectedCompanyId = $isSuperAdmin ? get_int('company_id', $activeCompanyId) : $activeCompanyId;
-if ($selectedCompanyId <= 0) {
-    $selectedCompanyId = $activeCompanyId;
-}
+$selectedCompanyId = $isSuperAdmin ? get_int('company_id', 0) : $activeCompanyId;
+$selectedCompanyExists = garage_company_exists(db(), $selectedCompanyId);
+$showCompanySelectionPrompt = $isSuperAdmin && $selectedCompanyId <= 0;
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     require_csrf();
@@ -57,6 +119,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $legacyStatus = $statusCode === 'ACTIVE' ? 'active' : 'inactive';
 
         $pdo = db();
+        if (!garage_company_exists($pdo, $companyId)) {
+            flash_set('garage_error', 'Select a valid company first, then add the garage.', 'danger');
+            redirect('modules/organization/garages.php?company_id=' . $selectedCompanyId);
+        }
+
         $pdo->beginTransaction();
 
         try {
@@ -106,8 +173,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             ]);
             flash_set('garage_success', 'Garage created successfully.', 'success');
         } catch (Throwable $exception) {
-            $pdo->rollBack();
-            flash_set('garage_error', 'Unable to create garage. Code must be unique per company.', 'danger');
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+
+            garage_log_save_error('create', $exception, $companyId, $code);
+            flash_set('garage_error', garage_save_error_message($exception, 'create'), 'danger');
         }
 
         redirect('modules/organization/garages.php?company_id=' . $companyId);
@@ -143,7 +214,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
 
         $legacyStatus = $statusCode === 'ACTIVE' ? 'active' : 'inactive';
-        $beforeStmt = db()->prepare(
+        $pdo = db();
+        if (!garage_company_exists($pdo, $companyId)) {
+            flash_set('garage_error', 'The selected company was not found.', 'danger');
+            redirect('modules/organization/garages.php?company_id=' . $selectedCompanyId);
+        }
+
+        $beforeStmt = $pdo->prepare(
             'SELECT id, name, code, status, status_code
              FROM garages
              WHERE id = :id
@@ -155,9 +232,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'company_id' => $companyId,
         ]);
         $beforeGarage = $beforeStmt->fetch() ?: null;
+        if (!is_array($beforeGarage)) {
+            flash_set('garage_error', 'The selected garage was not found.', 'danger');
+            redirect('modules/organization/garages.php?company_id=' . $companyId);
+        }
 
         try {
-            $stmt = db()->prepare(
+            $stmt = $pdo->prepare(
                 'UPDATE garages
                  SET name = :name,
                      code = :code,
@@ -210,7 +291,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             ]);
             flash_set('garage_success', 'Garage updated successfully.', 'success');
         } catch (Throwable $exception) {
-            flash_set('garage_error', 'Unable to update garage. Code must be unique per company.', 'danger');
+            garage_log_save_error('update', $exception, $companyId, $code);
+            flash_set('garage_error', garage_save_error_message($exception, 'update'), 'danger');
         }
 
         redirect('modules/organization/garages.php?company_id=' . $companyId);
@@ -301,7 +383,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
 $editId = get_int('edit_id');
 $editGarage = null;
-if ($editId > 0) {
+if ($editId > 0 && $selectedCompanyId > 0) {
     $editStmt = db()->prepare(
         'SELECT *
          FROM garages
@@ -316,15 +398,26 @@ if ($editId > 0) {
     $editGarage = $editStmt->fetch() ?: null;
 }
 
-$garageListStmt = db()->prepare(
-    'SELECT g.*, c.name AS company_name
-     FROM garages g
-     INNER JOIN companies c ON c.id = g.company_id
-     WHERE g.company_id = :company_id
-     ORDER BY g.id DESC'
-);
-$garageListStmt->execute(['company_id' => $selectedCompanyId]);
-$garages = $garageListStmt->fetchAll();
+$garageRows = [];
+if ($isSuperAdmin && $selectedCompanyId <= 0) {
+    $garageListStmt = db()->query(
+        'SELECT g.*, c.name AS company_name
+         FROM garages g
+         INNER JOIN companies c ON c.id = g.company_id
+         ORDER BY g.id DESC'
+    );
+    $garageRows = $garageListStmt->fetchAll();
+} elseif ($selectedCompanyId > 0) {
+    $garageListStmt = db()->prepare(
+        'SELECT g.*, c.name AS company_name
+         FROM garages g
+         INNER JOIN companies c ON c.id = g.company_id
+         WHERE g.company_id = :company_id
+         ORDER BY g.id DESC'
+    );
+    $garageListStmt->execute(['company_id' => $selectedCompanyId]);
+    $garageRows = $garageListStmt->fetchAll();
+}
 
 $statusChoices = ['ACTIVE', 'INACTIVE', 'DELETED'];
 if (!$isSuperAdmin) {
@@ -359,6 +452,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
               <div class="col-md-4">
                 <label class="form-label">Company Scope</label>
                 <select name="company_id" class="form-select" onchange="if (this.form && typeof this.form.requestSubmit === 'function') { this.form.requestSubmit(); } else if (this.form) { this.form.submit(); }">
+                  <option value="0" <?= $selectedCompanyId <= 0 ? 'selected' : ''; ?>>Select Company</option>
                   <?php foreach ($companyOptions as $company): ?>
                     <option value="<?= (int) $company['id']; ?>" <?= ((int) $company['id'] === $selectedCompanyId) ? 'selected' : ''; ?>>
                       <?= e((string) $company['name']); ?>
@@ -371,7 +465,17 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         </div>
       <?php endif; ?>
 
-      <?php if ($canManage): ?>
+      <?php if ($showCompanySelectionPrompt): ?>
+        <div class="alert alert-info">
+          Showing garages for all companies. Select a company from Company Scope to create or edit within one company.
+        </div>
+      <?php elseif (!$selectedCompanyExists): ?>
+        <div class="alert alert-warning">
+          Create or select a valid company in Company Master before adding garages or branches.
+        </div>
+      <?php endif; ?>
+
+      <?php if ($canManage && $selectedCompanyExists): ?>
         <div class="card card-primary">
           <div class="card-header"><h3 class="card-title"><?= $editGarage ? 'Edit Garage / Branch' : 'Add Garage / Branch'; ?></h3></div>
           <form method="post">
@@ -458,11 +562,12 @@ require_once __DIR__ . '/../../includes/sidebar.php';
               </tr>
             </thead>
             <tbody>
-              <?php if (empty($garages)): ?>
+              <?php if (empty($garageRows)): ?>
                 <tr><td colspan="7" class="text-center text-muted py-4">No garages found.</td></tr>
               <?php else: ?>
-                <?php foreach ($garages as $garage): ?>
+                <?php foreach ($garageRows as $garage): ?>
                   <?php
+                    $garageCompanyId = (int) ($garage['company_id'] ?? 0);
                     $garageCode = trim((string) ($garage['code'] ?? ''));
                     $city = trim((string) ($garage['city'] ?? ''));
                     $state = trim((string) ($garage['state'] ?? ''));
@@ -494,12 +599,12 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                     <td class="text-nowrap">
                       <?php if ($canManage): ?>
                         <div class="d-flex flex-wrap gap-1 justify-content-end">
-                          <a class="btn btn-sm btn-outline-primary" href="<?= e(url('modules/organization/garages.php?company_id=' . $selectedCompanyId . '&edit_id=' . (int) $garage['id'])); ?>">Edit</a>
+                          <a class="btn btn-sm btn-outline-primary" href="<?= e(url('modules/organization/garages.php?company_id=' . $garageCompanyId . '&edit_id=' . (int) $garage['id'])); ?>">Edit</a>
                           <?php if ($garageStatusCode !== 'DELETED'): ?>
                             <form method="post" class="d-inline" data-confirm="Change garage status?">
                               <?= csrf_field(); ?>
                               <input type="hidden" name="_action" value="change_status" />
-                              <input type="hidden" name="company_id" value="<?= (int) $selectedCompanyId; ?>" />
+                              <input type="hidden" name="company_id" value="<?= $garageCompanyId; ?>" />
                               <input type="hidden" name="garage_id" value="<?= (int) $garage['id']; ?>" />
                               <input type="hidden" name="next_status" value="<?= e($garageStatusCode === 'ACTIVE' ? 'INACTIVE' : 'ACTIVE'); ?>" />
                               <button type="submit" class="btn btn-sm btn-outline-secondary"><?= $garageStatusCode === 'ACTIVE' ? 'Inactivate' : 'Activate'; ?></button>
@@ -512,10 +617,10 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                                   data-safe-delete-entity="org_garage"
                                   data-safe-delete-record-field="garage_id"
                                   data-safe-delete-operation="delete"
-                                  data-safe-delete-reason-field="deletion_reason">
+                              data-safe-delete-reason-field="deletion_reason">
                               <?= csrf_field(); ?>
                               <input type="hidden" name="_action" value="change_status" />
-                              <input type="hidden" name="company_id" value="<?= (int) $selectedCompanyId; ?>" />
+                              <input type="hidden" name="company_id" value="<?= $garageCompanyId; ?>" />
                               <input type="hidden" name="garage_id" value="<?= (int) $garage['id']; ?>" />
                               <input type="hidden" name="next_status" value="DELETED" />
                               <button type="submit" class="btn btn-sm btn-outline-danger">Soft Delete</button>

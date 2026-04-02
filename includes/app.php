@@ -27,6 +27,10 @@ require_once __DIR__ . '/analytics.php';
 require_once __DIR__ . '/reversal.php';
 require_once __DIR__ . '/safe_delete.php';
 
+if (is_logged_in()) {
+    current_user();
+}
+
 if (function_exists('ledger_bootstrap_ready')) {
     ledger_bootstrap_ready();
 }
