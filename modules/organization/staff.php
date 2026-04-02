@@ -476,7 +476,7 @@ $garagesStmt = db()->prepare(
      ORDER BY name ASC'
 );
 $garagesStmt->execute(['company_id' => $selectedCompanyId]);
-$garages = $garagesStmt->fetchAll();
+$garageOptions = $garagesStmt->fetchAll();
 
 $editId = get_int('edit_id');
 $editUser = null;
@@ -616,7 +616,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                 <label class="form-label">Primary Garage</label>
                 <select name="primary_garage_id" class="form-select" required>
                   <option value="">Select Garage</option>
-                  <?php foreach ($garages as $garage): ?>
+                  <?php foreach ($garageOptions as $garage): ?>
                     <option value="<?= (int) $garage['id']; ?>" <?= ((int) ($editUser['primary_garage_id'] ?? 0) === (int) $garage['id']) ? 'selected' : ''; ?>>
                       <?= e((string) $garage['name']); ?> (<?= e((string) $garage['code']); ?>)
                     </option>
@@ -630,7 +630,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
               <div class="col-md-3">
                 <label class="form-label">Garage Access</label>
                 <select name="garage_ids[]" class="form-select" multiple size="4">
-                  <?php foreach ($garages as $garage): ?>
+                  <?php foreach ($garageOptions as $garage): ?>
                     <option value="<?= (int) $garage['id']; ?>" <?= in_array((int) $garage['id'], $editUserGarageIds, true) ? 'selected' : ''; ?>>
                       <?= e((string) $garage['name']); ?> (<?= e((string) $garage['code']); ?>)
                     </option>

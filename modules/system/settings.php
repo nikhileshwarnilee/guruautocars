@@ -31,7 +31,7 @@ $garagesStmt = db()->prepare(
      ORDER BY name ASC'
 );
 $garagesStmt->execute(['company_id' => $companyId]);
-$garages = $garagesStmt->fetchAll();
+$garageOptions = $garagesStmt->fetchAll();
 
 function job_type_sort_rows(array $rows): array
 {
@@ -630,7 +630,7 @@ $invoicePrintSettings = settings_invoice_print_settings($companyId, $garageId);
 $jobCardPrintSettings = settings_job_card_print_settings($companyId, $garageId);
 
 $activeGarageName = 'Garage #' . $garageId;
-foreach ($garages as $garage) {
+foreach ($garageOptions as $garage) {
     if ((int) ($garage['id'] ?? 0) === $garageId) {
         $activeGarageName = (string) ($garage['name'] ?? $activeGarageName);
         break;
@@ -826,7 +826,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                 <label class="form-label">Scope</label>
                 <select name="garage_id" class="form-select">
                   <option value="0">Company</option>
-                  <?php foreach ($garages as $garage): ?>
+                  <?php foreach ($garageOptions as $garage): ?>
                     <option value="<?= (int) $garage['id']; ?>" <?= ((int) ($editSetting['garage_id'] ?? 0) === (int) $garage['id']) ? 'selected' : ''; ?>>
                       <?= e((string) $garage['name']); ?>
                     </option>
