@@ -310,6 +310,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $odometerKm = null;
         $priority = strtoupper(post_string('priority', 10));
         $jobTypeId = $jobTypeEnabled ? post_int('job_type_id') : 0;
+        $openedAtRaw = post_string('opened_at', 25);
         $promisedAt = post_string('promised_at', 25);
         $assignedUserIds = $canAssign ? parse_ids($_POST['assigned_user_ids'] ?? []) : [];
         $intakeFuelLevel = job_vehicle_intake_normalize_fuel_level((string) ($_POST['intake_fuel_level'] ?? 'LOW'));
@@ -385,6 +386,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
         if (!in_array($priority, ['LOW', 'MEDIUM', 'HIGH', 'URGENT'], true)) {
             $priority = 'MEDIUM';
+        }
+        $openedAt = job_normalize_datetime_input($openedAtRaw);
+        if ($openedAtRaw !== '' && $openedAt === null) {
+            flash_set('job_error', 'Opened date/time is invalid.', 'danger');
+            redirect('modules/jobs/index.php');
+        }
+        $openedAt = $openedAt ?? date('Y-m-d H:i:s');
+        if (strtotime($openedAt) > time()) {
+            flash_set('job_error', 'Opened date/time cannot be in the future.', 'danger');
+            redirect('modules/jobs/index.php');
+        }
+        $promisedAtValue = job_normalize_datetime_input($promisedAt);
+        if ($promisedAt !== '' && $promisedAtValue === null) {
+            flash_set('job_error', 'Promised date/time is invalid.', 'danger');
+            redirect('modules/jobs/index.php');
         }
         if ($jobTypeEnabled) {
             if ($jobTypeId <= 0) {
@@ -475,16 +491,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             if ($jobOdometerEnabled) {
                 $stmt = $pdo->prepare(
                     'INSERT INTO job_cards
-                      (company_id, garage_id, job_number, customer_id, vehicle_id, odometer_km, assigned_to, service_advisor_id, complaint, diagnosis' . $recommendationColumnSql . $insuranceColumnSql . ', status, priority' . $jobTypeColumnSql . ', promised_at, status_code, created_by, updated_by)
+                      (company_id, garage_id, job_number, customer_id, vehicle_id, odometer_km, assigned_to, service_advisor_id, complaint, diagnosis' . $recommendationColumnSql . $insuranceColumnSql . ', status, priority' . $jobTypeColumnSql . ', opened_at, promised_at, status_code, created_by, updated_by)
                      VALUES
-                      (:company_id, :garage_id, :job_number, :customer_id, :vehicle_id, :odometer_km, NULL, :service_advisor_id, :complaint, :diagnosis' . $recommendationValueSql . $insuranceValueSql . ', "OPEN", :priority' . $jobTypeValueSql . ', :promised_at, "ACTIVE", :created_by, :updated_by)'
+                      (:company_id, :garage_id, :job_number, :customer_id, :vehicle_id, :odometer_km, NULL, :service_advisor_id, :complaint, :diagnosis' . $recommendationValueSql . $insuranceValueSql . ', "OPEN", :priority' . $jobTypeValueSql . ', :opened_at, :promised_at, "ACTIVE", :created_by, :updated_by)'
                 );
             } else {
                 $stmt = $pdo->prepare(
                     'INSERT INTO job_cards
-                      (company_id, garage_id, job_number, customer_id, vehicle_id, assigned_to, service_advisor_id, complaint, diagnosis' . $recommendationColumnSql . $insuranceColumnSql . ', status, priority' . $jobTypeColumnSql . ', promised_at, status_code, created_by, updated_by)
+                      (company_id, garage_id, job_number, customer_id, vehicle_id, assigned_to, service_advisor_id, complaint, diagnosis' . $recommendationColumnSql . $insuranceColumnSql . ', status, priority' . $jobTypeColumnSql . ', opened_at, promised_at, status_code, created_by, updated_by)
                      VALUES
-                      (:company_id, :garage_id, :job_number, :customer_id, :vehicle_id, NULL, :service_advisor_id, :complaint, :diagnosis' . $recommendationValueSql . $insuranceValueSql . ', "OPEN", :priority' . $jobTypeValueSql . ', :promised_at, "ACTIVE", :created_by, :updated_by)'
+                      (:company_id, :garage_id, :job_number, :customer_id, :vehicle_id, NULL, :service_advisor_id, :complaint, :diagnosis' . $recommendationValueSql . $insuranceValueSql . ', "OPEN", :priority' . $jobTypeValueSql . ', :opened_at, :promised_at, "ACTIVE", :created_by, :updated_by)'
                 );
             }
 
@@ -498,7 +514,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'complaint' => $complaint,
                 'diagnosis' => $diagnosis !== '' ? $diagnosis : null,
                 'priority' => $priority,
-                'promised_at' => $promisedAt !== '' ? str_replace('T', ' ', $promisedAt) : null,
+                'opened_at' => $openedAt,
+                'promised_at' => $promisedAtValue,
                 'created_by' => $userId,
                 'updated_by' => $userId,
             ];
@@ -567,6 +584,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'mechanical_condition_notes' => $intakeMechanicalNotes,
                     'remarks' => $intakeRemarks,
                     'customer_acknowledged' => $intakeCustomerAcknowledged ? 1 : 0,
+                    'created_at' => $openedAt,
                 ];
                 $intakeResult = job_vehicle_intake_save_for_job(
                     $companyId,
@@ -588,7 +606,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
             }
 
-            $createHistoryPayload = ['job_number' => $jobNumber];
+            $createHistoryPayload = [
+                'job_number' => $jobNumber,
+                'opened_at' => $openedAt,
+            ];
+            if ($promisedAtValue !== null) {
+                $createHistoryPayload['promised_at'] = $promisedAtValue;
+            }
             if ($jobOdometerEnabled && $odometerKm !== null) {
                 $createHistoryPayload['odometer_km'] = $odometerKm;
             }
@@ -608,6 +632,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'status' => 'OPEN',
                     'status_code' => 'ACTIVE',
                     'priority' => $priority,
+                    'opened_at' => $openedAt,
+                    'promised_at' => $promisedAtValue,
                     'job_type_id' => $jobTypeEnabled ? ($jobTypeId > 0 ? $jobTypeId : null) : null,
                     'customer_id' => $customerId,
                     'vehicle_id' => $vehicleId,
@@ -702,6 +728,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         if (!in_array($priority, ['LOW', 'MEDIUM', 'HIGH', 'URGENT'], true)) {
             $priority = 'MEDIUM';
         }
+        $promisedAtValue = job_normalize_datetime_input($promisedAt);
+        if ($promisedAt !== '' && $promisedAtValue === null) {
+            flash_set('job_error', 'Promised date/time is invalid.', 'danger');
+            redirect('modules/jobs/index.php?edit_id=' . $jobId);
+        }
         if ($jobTypeEnabled) {
             if ($jobTypeId > 0 && !isset($jobTypeCatalogRows[$jobTypeId])) {
                 flash_set('job_error', 'Selected job type is invalid or deleted.', 'danger');
@@ -744,7 +775,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'complaint' => $complaint,
             'diagnosis' => $diagnosis !== '' ? $diagnosis : null,
             'priority' => $priority,
-            'promised_at' => $promisedAt !== '' ? str_replace('T', ' ', $promisedAt) : null,
+            'promised_at' => $promisedAtValue,
             'updated_by' => $userId,
             'id' => $jobId,
             'company_id' => $companyId,
@@ -926,6 +957,7 @@ if (!$editJob && $jobTypeEnabled) {
     }
 }
 $selectedJobTypeForForm = $editJob ? $editJobTypeId : $prefillJobTypeId;
+$createOpenedAtDefault = date('Y-m-d\TH:i');
 
 $statusFilterRaw = strtoupper(trim((string) ($_GET['status'] ?? '')));
 $statusGroupFilter = strtoupper(trim((string) ($_GET['status_group'] ?? '')));
@@ -1223,6 +1255,13 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             <?php if (!$editJob && $jobTypeFormOptions === []): ?>
               <div class="form-hint text-danger mt-1">Add at least one active job type from Job Settings or Administration > Settings.</div>
             <?php endif; ?>
+          </div>
+        <?php endif; ?>
+        <?php if (!$editJob): ?>
+          <div class="col-md-2">
+            <label class="form-label">Opened At</label>
+            <input type="datetime-local" name="opened_at" class="form-control" value="<?= e($createOpenedAtDefault); ?>">
+            <div class="form-hint text-muted mt-1">Set a past date/time for backdated job cards.</div>
           </div>
         <?php endif; ?>
         <div class="col-md-2"><label class="form-label">Promised</label><input type="datetime-local" name="promised_at" class="form-control" value="<?= e((string) (!empty($editJob['promised_at']) ? str_replace(' ', 'T', substr((string) $editJob['promised_at'], 0, 16)) : '')); ?>"></div>

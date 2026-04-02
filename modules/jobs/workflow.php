@@ -61,6 +61,27 @@ function job_generate_number(PDO $pdo, int $garageId): string
     return sprintf('%s-%s-%04d', (string) $counter['prefix'], date('ym'), $nextNumber);
 }
 
+function job_normalize_datetime_input(?string $value): ?string
+{
+    $rawValue = trim((string) $value);
+    if ($rawValue === '') {
+        return null;
+    }
+
+    $normalizedValue = str_replace('T', ' ', $rawValue);
+    foreach (['Y-m-d H:i:s', 'Y-m-d H:i'] as $format) {
+        $date = DateTimeImmutable::createFromFormat($format, $normalizedValue);
+        $errors = DateTimeImmutable::getLastErrors();
+        $hasErrors = is_array($errors)
+            && (((int) ($errors['warning_count'] ?? 0)) > 0 || ((int) ($errors['error_count'] ?? 0)) > 0);
+        if ($date instanceof DateTimeImmutable && !$hasErrors) {
+            return $date->format('Y-m-d H:i:s');
+        }
+    }
+
+    return null;
+}
+
 function job_is_locked(array $job): bool
 {
     $status = job_normalize_status((string) ($job['status'] ?? 'OPEN'));
@@ -4793,6 +4814,7 @@ function job_vehicle_intake_save_for_job(
     $mechanicalNotes = mb_substr(trim((string) ($payload['mechanical_condition_notes'] ?? '')), 0, 5000);
     $remarks = mb_substr(trim((string) ($payload['remarks'] ?? '')), 0, 5000);
     $customerAcknowledged = !empty($payload['customer_acknowledged']) ? 1 : 0;
+    $createdAt = job_normalize_datetime_input((string) ($payload['created_at'] ?? '')) ?? date('Y-m-d H:i:s');
 
     $acknowledgedAt = $customerAcknowledged === 1 ? date('Y-m-d H:i:s') : null;
     if ($existingIntakeId > 0) {
@@ -4841,7 +4863,7 @@ function job_vehicle_intake_save_for_job(
             'INSERT INTO job_vehicle_intake
               (company_id, garage_id, job_card_id, fuel_level, odometer_reading, exterior_condition_notes, interior_condition_notes, mechanical_condition_notes, remarks, customer_acknowledged, acknowledged_at, created_by, created_at, status_code, deleted_at)
              VALUES
-              (:company_id, :garage_id, :job_card_id, :fuel_level, :odometer_reading, :exterior_condition_notes, :interior_condition_notes, :mechanical_condition_notes, :remarks, :customer_acknowledged, :acknowledged_at, :created_by, NOW(), "ACTIVE", NULL)'
+              (:company_id, :garage_id, :job_card_id, :fuel_level, :odometer_reading, :exterior_condition_notes, :interior_condition_notes, :mechanical_condition_notes, :remarks, :customer_acknowledged, :acknowledged_at, :created_by, :created_at, "ACTIVE", NULL)'
         );
         $insertStmt->execute([
             'company_id' => $companyId,
@@ -4856,6 +4878,7 @@ function job_vehicle_intake_save_for_job(
             'customer_acknowledged' => $customerAcknowledged,
             'acknowledged_at' => $acknowledgedAt,
             'created_by' => $actorUserId > 0 ? $actorUserId : null,
+            'created_at' => $createdAt,
         ]);
         $intakeId = (int) db()->lastInsertId();
     }
