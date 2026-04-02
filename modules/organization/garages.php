@@ -29,6 +29,117 @@ function garage_company_exists(PDO $pdo, int $companyId): bool
     return (bool) $stmt->fetchColumn();
 }
 
+function garage_normalize_name(string $name): string
+{
+    $collapsed = preg_replace('/\s+/', ' ', trim($name));
+
+    return strtoupper((string) ($collapsed ?? ''));
+}
+
+function garage_name_exists(PDO $pdo, int $companyId, string $name, int $excludeGarageId = 0): bool
+{
+    if ($companyId <= 0 || trim($name) === '') {
+        return false;
+    }
+
+    $sql = 'SELECT id, name
+            FROM garages
+            WHERE company_id = :company_id';
+    $params = ['company_id' => $companyId];
+
+    if ($excludeGarageId > 0) {
+        $sql .= ' AND id <> :exclude_id';
+        $params['exclude_id'] = $excludeGarageId;
+    }
+
+    $stmt = $pdo->prepare($sql);
+    $stmt->execute($params);
+    $normalizedName = garage_normalize_name($name);
+
+    foreach ($stmt->fetchAll() as $row) {
+        if ($normalizedName === garage_normalize_name((string) ($row['name'] ?? ''))) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+function garage_build_code_base(string $name): string
+{
+    $normalized = strtoupper((string) preg_replace('/[^A-Za-z0-9]+/', ' ', $name));
+    $words = array_values(array_filter(explode(' ', trim($normalized)), static fn (string $value): bool => $value !== ''));
+    $base = '';
+
+    foreach ($words as $word) {
+        $remaining = 8 - strlen($base);
+        if ($remaining <= 0) {
+            break;
+        }
+
+        $base .= substr($word, 0, min(3, $remaining));
+    }
+
+    if ($base === '') {
+        $compact = strtoupper((string) preg_replace('/[^A-Za-z0-9]+/', '', $name));
+        $base = substr($compact !== '' ? $compact : 'GARAGE', 0, 8);
+    }
+
+    if (strlen($base) < 3) {
+        $compact = strtoupper((string) preg_replace('/[^A-Za-z0-9]+/', '', $name));
+        $base = substr(str_pad($compact !== '' ? $compact : 'GARAGE', 3, 'G'), 0, 8);
+    }
+
+    return $base;
+}
+
+function garage_code_exists(PDO $pdo, int $companyId, string $code, int $excludeGarageId = 0): bool
+{
+    if ($companyId <= 0 || trim($code) === '') {
+        return false;
+    }
+
+    $sql = 'SELECT id
+            FROM garages
+            WHERE company_id = :company_id
+              AND code = :code';
+    $params = [
+        'company_id' => $companyId,
+        'code' => $code,
+    ];
+
+    if ($excludeGarageId > 0) {
+        $sql .= ' AND id <> :exclude_id';
+        $params['exclude_id'] = $excludeGarageId;
+    }
+
+    $sql .= ' LIMIT 1';
+    $stmt = $pdo->prepare($sql);
+    $stmt->execute($params);
+
+    return (bool) $stmt->fetchColumn();
+}
+
+function garage_generate_unique_code(PDO $pdo, int $companyId, string $name, int $excludeGarageId = 0): string
+{
+    $base = garage_build_code_base($name);
+
+    for ($index = 0; $index < 1000; $index++) {
+        $suffix = $index === 0 ? '' : (string) ($index + 1);
+        $candidate = substr($base, 0, 30 - strlen($suffix)) . $suffix;
+        if (!garage_code_exists($pdo, $companyId, $candidate, $excludeGarageId)) {
+            return $candidate;
+        }
+    }
+
+    $fallback = substr($base, 0, 24) . date('His');
+    if (!garage_code_exists($pdo, $companyId, $fallback, $excludeGarageId)) {
+        return $fallback;
+    }
+
+    return substr($base, 0, 22) . date('His') . mt_rand(10, 99);
+}
+
 function garage_save_error_message(Throwable $exception, string $operation): string
 {
     $defaultMessage = $operation === 'update'
@@ -45,9 +156,7 @@ function garage_save_error_message(Throwable $exception, string $operation): str
         || stripos($exception->getMessage(), 'duplicate') !== false
         || stripos($exception->getMessage(), 'unique') !== false
     ) {
-        return $operation === 'update'
-            ? 'Unable to update garage. Code must be unique per company.'
-            : 'Unable to create garage. Code must be unique per company.';
+        return $defaultMessage;
     }
 
     if (
@@ -81,7 +190,8 @@ if ($isSuperAdmin) {
 
 $selectedCompanyId = $isSuperAdmin ? get_int('company_id', 0) : $activeCompanyId;
 $selectedCompanyExists = garage_company_exists(db(), $selectedCompanyId);
-$showCompanySelectionPrompt = $isSuperAdmin && $selectedCompanyId <= 0;
+$currentUser = current_user();
+$activeCompanyName = trim((string) ($currentUser['company_name'] ?? ''));
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     require_csrf();
@@ -95,8 +205,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $companyId = $isSuperAdmin ? post_int('company_id', $activeCompanyId) : $activeCompanyId;
 
     if ($action === 'create') {
-        $name = post_string('name', 140);
-        $code = strtoupper(post_string('code', 30));
+        $name = trim((string) preg_replace('/\s+/', ' ', post_string('name', 140)));
         $phone = post_string('phone', 20);
         $email = strtolower(post_string('email', 120));
         $gstin = strtoupper(post_string('gstin', 15));
@@ -107,9 +216,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $pincode = post_string('pincode', 10);
         $statusCode = normalize_status_code((string) ($_POST['status_code'] ?? 'ACTIVE'));
 
-        if ($companyId <= 0 || $name === '' || $code === '') {
-            flash_set('garage_error', 'Company, garage name and code are required.', 'danger');
-            redirect('modules/organization/garages.php?company_id=' . $selectedCompanyId);
+        if ($companyId <= 0 || $name === '') {
+            flash_set('garage_error', 'Company and garage name are required.', 'danger');
+            redirect('modules/organization/garages.php?company_id=' . ($companyId > 0 ? $companyId : $selectedCompanyId));
         }
 
         if ($statusCode === 'DELETED') {
@@ -121,9 +230,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $pdo = db();
         if (!garage_company_exists($pdo, $companyId)) {
             flash_set('garage_error', 'Select a valid company first, then add the garage.', 'danger');
-            redirect('modules/organization/garages.php?company_id=' . $selectedCompanyId);
+            redirect('modules/organization/garages.php?company_id=' . ($companyId > 0 ? $companyId : $selectedCompanyId));
         }
 
+        if (garage_name_exists($pdo, $companyId, $name)) {
+            flash_set('garage_error', 'Garage name must be unique per company.', 'danger');
+            redirect('modules/organization/garages.php?company_id=' . $companyId);
+        }
+
+        $code = garage_generate_unique_code($pdo, $companyId, $name);
         $pdo->beginTransaction();
 
         try {
@@ -171,7 +286,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'status_code' => $statusCode,
                 ],
             ]);
-            flash_set('garage_success', 'Garage created successfully.', 'success');
+            flash_set('garage_success', 'Garage created successfully. Code ' . $code . ' was generated automatically.', 'success');
         } catch (Throwable $exception) {
             if ($pdo->inTransaction()) {
                 $pdo->rollBack();
@@ -186,8 +301,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     if ($action === 'update') {
         $garageId = post_int('garage_id');
-        $name = post_string('name', 140);
-        $code = strtoupper(post_string('code', 30));
+        $name = trim((string) preg_replace('/\s+/', ' ', post_string('name', 140)));
         $phone = post_string('phone', 20);
         $email = strtolower(post_string('email', 120));
         $gstin = strtoupper(post_string('gstin', 15));
@@ -198,9 +312,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $pincode = post_string('pincode', 10);
         $statusCode = normalize_status_code((string) ($_POST['status_code'] ?? 'ACTIVE'));
 
-        if ($garageId <= 0 || $companyId <= 0 || $name === '' || $code === '') {
+        if ($garageId <= 0 || $companyId <= 0 || $name === '') {
             flash_set('garage_error', 'Invalid garage payload.', 'danger');
-            redirect('modules/organization/garages.php?company_id=' . $selectedCompanyId);
+            redirect('modules/organization/garages.php?company_id=' . ($companyId > 0 ? $companyId : $selectedCompanyId));
         }
 
         if (!$isSuperAdmin && $companyId !== $activeCompanyId) {
@@ -235,6 +349,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         if (!is_array($beforeGarage)) {
             flash_set('garage_error', 'The selected garage was not found.', 'danger');
             redirect('modules/organization/garages.php?company_id=' . $companyId);
+        }
+
+        $beforeNormalizedName = garage_normalize_name((string) ($beforeGarage['name'] ?? ''));
+        $afterNormalizedName = garage_normalize_name($name);
+        if ($afterNormalizedName !== $beforeNormalizedName && garage_name_exists($pdo, $companyId, $name, $garageId)) {
+            flash_set('garage_error', 'Garage name must be unique per company.', 'danger');
+            redirect('modules/organization/garages.php?company_id=' . $companyId . '&edit_id=' . $garageId);
+        }
+
+        $code = trim((string) ($beforeGarage['code'] ?? ''));
+        if ($code === '') {
+            $code = garage_generate_unique_code($pdo, $companyId, $name, $garageId);
         }
 
         try {
@@ -399,7 +525,7 @@ if ($editId > 0 && $selectedCompanyId > 0) {
 }
 
 $garageRows = [];
-if ($isSuperAdmin && $selectedCompanyId <= 0) {
+if ($isSuperAdmin) {
     $garageListStmt = db()->query(
         'SELECT g.*, c.name AS company_name
          FROM garages g
@@ -424,6 +550,18 @@ if (!$isSuperAdmin) {
     $statusChoices = ['ACTIVE', 'INACTIVE'];
 }
 
+$companyNamesById = [];
+foreach ($companyOptions as $companyOption) {
+    $companyNamesById[(int) ($companyOption['id'] ?? 0)] = (string) ($companyOption['name'] ?? '');
+}
+
+$formCompanyId = $editGarage
+    ? (int) ($editGarage['company_id'] ?? 0)
+    : ($isSuperAdmin ? ($selectedCompanyExists ? $selectedCompanyId : 0) : $activeCompanyId);
+$canRenderGarageForm = $canManage && ($isSuperAdmin ? !empty($companyOptions) : $selectedCompanyExists);
+$showMissingCompanySetup = $isSuperAdmin && empty($companyOptions);
+$showInvalidSelectedCompany = $selectedCompanyId > 0 && !$selectedCompanyExists;
+
 require_once __DIR__ . '/../../includes/header.php';
 require_once __DIR__ . '/../../includes/sidebar.php';
 ?>
@@ -445,37 +583,21 @@ require_once __DIR__ . '/../../includes/sidebar.php';
 
   <div class="app-content">
     <div class="container-fluid">
-      <?php if ($isSuperAdmin): ?>
-        <div class="card card-outline card-primary">
-          <div class="card-body">
-            <form method="get" class="row g-2 align-items-end">
-              <div class="col-md-4">
-                <label class="form-label">Company Scope</label>
-                <select name="company_id" class="form-select" onchange="if (this.form && typeof this.form.requestSubmit === 'function') { this.form.requestSubmit(); } else if (this.form) { this.form.submit(); }">
-                  <option value="0" <?= $selectedCompanyId <= 0 ? 'selected' : ''; ?>>Select Company</option>
-                  <?php foreach ($companyOptions as $company): ?>
-                    <option value="<?= (int) $company['id']; ?>" <?= ((int) $company['id'] === $selectedCompanyId) ? 'selected' : ''; ?>>
-                      <?= e((string) $company['name']); ?>
-                    </option>
-                  <?php endforeach; ?>
-                </select>
-              </div>
-            </form>
-          </div>
-        </div>
-      <?php endif; ?>
-
-      <?php if ($showCompanySelectionPrompt): ?>
-        <div class="alert alert-info">
-          Showing garages for all companies. Select a company from Company Scope to create or edit within one company.
-        </div>
-      <?php elseif (!$selectedCompanyExists): ?>
+      <?php if ($showMissingCompanySetup): ?>
         <div class="alert alert-warning">
-          Create or select a valid company in Company Master before adding garages or branches.
+          Create a company in Company Master before adding garages or branches.
+        </div>
+      <?php elseif ($showInvalidSelectedCompany): ?>
+        <div class="alert alert-warning">
+          The selected company was not found. Choose a valid company in the garage form below.
+        </div>
+      <?php elseif (!$isSuperAdmin && !$selectedCompanyExists): ?>
+        <div class="alert alert-warning">
+          Your account does not have a valid company assigned. Contact an administrator before creating garages.
         </div>
       <?php endif; ?>
 
-      <?php if ($canManage && $selectedCompanyExists): ?>
+      <?php if ($canRenderGarageForm): ?>
         <div class="card card-primary">
           <div class="card-header"><h3 class="card-title"><?= $editGarage ? 'Edit Garage / Branch' : 'Add Garage / Branch'; ?></h3></div>
           <form method="post">
@@ -483,15 +605,38 @@ require_once __DIR__ . '/../../includes/sidebar.php';
               <?= csrf_field(); ?>
               <input type="hidden" name="_action" value="<?= $editGarage ? 'update' : 'create'; ?>" />
               <input type="hidden" name="garage_id" value="<?= (int) ($editGarage['id'] ?? 0); ?>" />
-              <input type="hidden" name="company_id" value="<?= (int) $selectedCompanyId; ?>" />
+
+              <?php if ($isSuperAdmin): ?>
+                <?php if ($editGarage): ?>
+                  <input type="hidden" name="company_id" value="<?= $formCompanyId; ?>" />
+                  <div class="col-md-4">
+                    <label class="form-label">Company</label>
+                    <input type="text" class="form-control" value="<?= e((string) ($companyNamesById[$formCompanyId] ?? ('Company #' . $formCompanyId))); ?>" readonly />
+                  </div>
+                <?php else: ?>
+                  <div class="col-md-4">
+                    <label class="form-label">Company</label>
+                    <select name="company_id" class="form-select" required>
+                      <option value="0" <?= $formCompanyId <= 0 ? 'selected' : ''; ?>>Select Company</option>
+                      <?php foreach ($companyOptions as $company): ?>
+                        <option value="<?= (int) $company['id']; ?>" <?= ((int) $company['id'] === $formCompanyId) ? 'selected' : ''; ?>>
+                          <?= e((string) $company['name']); ?>
+                        </option>
+                      <?php endforeach; ?>
+                    </select>
+                  </div>
+                <?php endif; ?>
+              <?php else: ?>
+                <input type="hidden" name="company_id" value="<?= (int) $activeCompanyId; ?>" />
+                <div class="col-md-4">
+                  <label class="form-label">Company</label>
+                  <input type="text" class="form-control" value="<?= e($activeCompanyName !== '' ? $activeCompanyName : ('Company #' . $activeCompanyId)); ?>" readonly />
+                </div>
+              <?php endif; ?>
 
               <div class="col-md-4">
                 <label class="form-label">Garage Name</label>
-                <input type="text" name="name" class="form-control" required value="<?= e((string) ($editGarage['name'] ?? '')); ?>" />
-              </div>
-              <div class="col-md-2">
-                <label class="form-label">Code</label>
-                <input type="text" name="code" class="form-control" required value="<?= e((string) ($editGarage['code'] ?? '')); ?>" />
+                <input type="text" name="name" class="form-control" required value="<?= e((string) ($editGarage['name'] ?? '')); ?>" placeholder="Use a unique garage / branch name" />
               </div>
               <div class="col-md-2">
                 <label class="form-label">Phone</label>
@@ -534,6 +679,14 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                     <?php endif; ?>
                   <?php endforeach; ?>
                 </select>
+              </div>
+              <div class="col-12">
+                <div class="alert alert-light border mb-0 py-2">
+                  Use a unique garage / branch name within the company. Garage code is generated automatically in the background.
+                  <?php if ($editGarage && trim((string) ($editGarage['code'] ?? '')) !== ''): ?>
+                    Current code: <span class="font-monospace fw-semibold"><?= e((string) $editGarage['code']); ?></span>
+                  <?php endif; ?>
+                </div>
               </div>
             </div>
             <div class="card-footer d-flex gap-2">
