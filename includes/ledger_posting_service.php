@@ -231,6 +231,7 @@ function ledger_default_coa_blueprint(): array
         ['code' => '4000', 'name' => 'Revenue', 'type' => 'REVENUE', 'parent_code' => null],
         ['code' => '4100', 'name' => 'Sales Revenue', 'type' => 'REVENUE', 'parent_code' => '4000'],
         ['code' => '4200', 'name' => 'Purchase Return Recovery', 'type' => 'REVENUE', 'parent_code' => '4000'],
+        ['code' => '4210', 'name' => 'Purchase Discount Received', 'type' => 'REVENUE', 'parent_code' => '4000'],
         ['code' => '4300', 'name' => 'Other Income', 'type' => 'REVENUE', 'parent_code' => '4000'],
 
         ['code' => '5000', 'name' => 'Expenses', 'type' => 'EXPENSE', 'parent_code' => null],
@@ -384,6 +385,15 @@ function ledger_payment_mode_account_code(?string $paymentMode): string
 
     // UPI/CARD/BANK_TRANSFER/CHEQUE/MIXED/ADJUSTMENT default to bank.
     return '1110';
+}
+
+function ledger_purchase_discount_amount(array $purchase): float
+{
+    $taxable = ledger_round((float) ($purchase['taxable_amount'] ?? 0));
+    $gst = ledger_round((float) ($purchase['gst_amount'] ?? 0));
+    $grand = ledger_round((float) ($purchase['grand_total'] ?? 0));
+
+    return ledger_round(max(0.0, ($taxable + $gst) - $grand));
 }
 
 function ledger_create_journal(PDO $pdo, array $journal, array $lines): int
@@ -836,6 +846,7 @@ function ledger_post_purchase_finalized(PDO $pdo, array $purchase, ?int $created
     $taxable = ledger_round((float) ($purchase['taxable_amount'] ?? 0));
     $gst = ledger_round((float) ($purchase['gst_amount'] ?? 0));
     $grand = ledger_round((float) ($purchase['grand_total'] ?? 0));
+    $discount = ledger_purchase_discount_amount($purchase);
     $invoiceNumber = trim((string) ($purchase['invoice_number'] ?? ''));
 
     if ($purchaseId <= 0 || $companyId <= 0 || $garageId <= 0 || $grand <= 0.0) {
@@ -874,6 +885,14 @@ function ledger_post_purchase_finalized(PDO $pdo, array $purchase, ?int $created
         'party_type' => $vendorId > 0 ? 'VENDOR' : null,
         'party_id' => $vendorId > 0 ? $vendorId : null,
     ];
+    if ($discount > 0.0) {
+        $lines[] = [
+            'account_code' => '4210',
+            'debit_amount' => 0.0,
+            'credit_amount' => $discount,
+            'garage_id' => $garageId,
+        ];
+    }
 
     return ledger_create_journal($pdo, [
         'company_id' => $companyId,

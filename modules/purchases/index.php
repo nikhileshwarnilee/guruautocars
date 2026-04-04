@@ -53,31 +53,81 @@ function pur_is_valid_date(?string $value): bool
     return checkdate($month, $day, $year);
 }
 
-function pur_issue_action_token(string $action): string
+function pur_action_token_bucket(string $action): array
 {
     if (!isset($_SESSION['_purchase_action_tokens']) || !is_array($_SESSION['_purchase_action_tokens'])) {
         $_SESSION['_purchase_action_tokens'] = [];
     }
 
+    $bucket = $_SESSION['_purchase_action_tokens'][$action] ?? [];
+    if (!is_array($bucket)) {
+        $legacyToken = trim((string) $bucket);
+        $bucket = [];
+        if ($legacyToken !== '') {
+            $bucket[$legacyToken] = time();
+        }
+    }
+
+    $expiresBefore = time() - (4 * 3600);
+    foreach ($bucket as $candidate => $issuedAt) {
+        if (!is_string($candidate) || $candidate === '' || (int) $issuedAt < $expiresBefore) {
+            unset($bucket[$candidate]);
+        }
+    }
+
+    return $bucket;
+}
+
+function pur_issue_action_token(string $action): string
+{
+    $bucket = pur_action_token_bucket($action);
     $token = bin2hex(random_bytes(16));
-    $_SESSION['_purchase_action_tokens'][$action] = $token;
+    $bucket[$token] = time();
+
+    if (count($bucket) > 256) {
+        asort($bucket, SORT_NUMERIC);
+        $bucket = array_slice($bucket, -256, null, true);
+    }
+
+    $_SESSION['_purchase_action_tokens'][$action] = $bucket;
 
     return $token;
 }
 
 function pur_consume_action_token(string $action, string $token): bool
 {
+    if ($token === '') {
+        return false;
+    }
+
     $tokens = $_SESSION['_purchase_action_tokens'] ?? [];
     if (!is_array($tokens) || !isset($tokens[$action])) {
         return false;
     }
 
-    $valid = hash_equals((string) $tokens[$action], $token);
-    if ($valid) {
-        unset($_SESSION['_purchase_action_tokens'][$action]);
+    $bucket = pur_action_token_bucket($action);
+    foreach (array_keys($bucket) as $candidate) {
+        if (!is_string($candidate) || !hash_equals($candidate, $token)) {
+            continue;
+        }
+
+        unset($bucket[$candidate]);
+        if ($bucket === []) {
+            unset($_SESSION['_purchase_action_tokens'][$action]);
+        } else {
+            $_SESSION['_purchase_action_tokens'][$action] = $bucket;
+        }
+
+        return true;
     }
 
-    return $valid;
+    if ($bucket === []) {
+        unset($_SESSION['_purchase_action_tokens'][$action]);
+    } else {
+        $_SESSION['_purchase_action_tokens'][$action] = $bucket;
+    }
+
+    return false;
 }
 
 function pur_lock_inventory_row(PDO $pdo, int $garageId, int $partId): float
@@ -2913,7 +2963,6 @@ if ($purchasesReady && $canManage && $editPurchaseId > 0) {
 
 $createToken = pur_issue_action_token('create_purchase');
 $assignToken = pur_issue_action_token('assign_unassigned');
-$finalizeToken = pur_issue_action_token('finalize_purchase');
 $paymentModes = pur_payment_modes();
 
 require_once __DIR__ . '/../../includes/header.php';
@@ -4206,10 +4255,11 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                           <a class="btn btn-sm btn-outline-secondary" href="<?= e(url('modules/purchases/index.php?edit_purchase_id=' . $purchaseId)); ?>">Edit</a>
                         <?php endif; ?>
                         <?php if (!$isUnassigned && $isDraft && $canFinalize): ?>
+                          <?php $rowFinalizeToken = pur_issue_action_token('finalize_purchase'); ?>
                           <form method="post" class="d-inline" data-confirm="Finalize this purchase?">
                             <?= csrf_field(); ?>
                             <input type="hidden" name="_action" value="finalize_purchase">
-                            <input type="hidden" name="action_token" value="<?= e($finalizeToken); ?>">
+                            <input type="hidden" name="action_token" value="<?= e($rowFinalizeToken); ?>">
                             <input type="hidden" name="purchase_id" value="<?= (int) $purchaseId; ?>">
                             <button type="submit" class="btn btn-sm btn-outline-success">Finalize</button>
                           </form>
