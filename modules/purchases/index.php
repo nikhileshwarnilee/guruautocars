@@ -234,6 +234,22 @@ function pur_supports_discount_columns(): bool
   return $supports;
 }
 
+function pur_supports_charge_columns(): bool
+{
+  static $supports = null;
+  if ($supports !== null) {
+    return $supports;
+  }
+
+  $columns = table_columns('purchases');
+  $supports =
+    $columns !== []
+    && in_array('courier_charges', $columns, true)
+    && in_array('other_charges', $columns, true);
+
+  return $supports;
+}
+
 function pur_apply_purchase_discount(float $grossTotal, string $discountType, float $discountValue): array
 {
   $grossTotal = round(max(0.0, $grossTotal), 2);
@@ -255,6 +271,26 @@ function pur_apply_purchase_discount(float $grossTotal, string $discountType, fl
   ];
 }
 
+function pur_apply_purchase_adjustments(float $grossTotal, string $discountType, float $discountValue, float $courierCharges = 0.0, float $otherCharges = 0.0): array
+{
+  $discountMeta = pur_apply_purchase_discount($grossTotal, $discountType, $discountValue);
+  $courierCharges = round(max(0.0, $courierCharges), 2);
+  $otherCharges = round(max(0.0, $otherCharges), 2);
+  $chargeTotal = round($courierCharges + $otherCharges, 2);
+  $netTotal = round(max(0.0, (float) ($discountMeta['net'] ?? 0) + $chargeTotal), 2);
+
+  return [
+    'type' => (string) ($discountMeta['type'] ?? 'AMOUNT'),
+    'value' => (float) ($discountMeta['value'] ?? 0),
+    'amount' => (float) ($discountMeta['amount'] ?? 0),
+    'gross' => (float) ($discountMeta['gross'] ?? round(max(0.0, $grossTotal), 2)),
+    'courier_charges' => $courierCharges,
+    'other_charges' => $otherCharges,
+    'charge_total' => $chargeTotal,
+    'net' => $netTotal,
+  ];
+}
+
 function pur_purchase_discount_meta_from_row(array $purchase, ?float $fallbackGrossTotal = null): array
 {
   $netTotal = round(max(0.0, (float) ($purchase['grand_total'] ?? 0)), 2);
@@ -262,23 +298,26 @@ function pur_purchase_discount_meta_from_row(array $purchase, ?float $fallbackGr
   $discountType = 'AMOUNT';
   $discountValue = 0.0;
   $discountAmount = 0.0;
+  $courierCharges = pur_supports_charge_columns() ? round(max(0.0, (float) ($purchase['courier_charges'] ?? 0)), 2) : 0.0;
+  $otherCharges = pur_supports_charge_columns() ? round(max(0.0, (float) ($purchase['other_charges'] ?? 0)), 2) : 0.0;
+  $chargeTotal = round($courierCharges + $otherCharges, 2);
 
   if (pur_supports_discount_columns()) {
     $discountType = pur_normalize_discount_type((string) ($purchase['discount_type'] ?? 'AMOUNT'));
     $discountValue = round(max(0.0, (float) ($purchase['discount_value'] ?? 0)), 2);
     $discountAmount = round(max(0.0, (float) ($purchase['discount_amount'] ?? 0)), 2);
-    $grossTotal = round(max(0.0, (float) ($purchase['gross_total'] ?? ($netTotal + $discountAmount))), 2);
-  } elseif ($fallbackGrossTotal !== null && $fallbackGrossTotal > $netTotal + 0.009) {
+    $grossTotal = round(max(0.0, (float) ($purchase['gross_total'] ?? ($netTotal + $discountAmount - $chargeTotal))), 2);
+  } elseif ($fallbackGrossTotal !== null && $fallbackGrossTotal > $netTotal + $discountAmount - $chargeTotal + 0.009) {
     $grossTotal = round(max(0.0, $fallbackGrossTotal), 2);
-    $discountAmount = round(max(0.0, $grossTotal - $netTotal), 2);
+    $discountAmount = round(max(0.0, $grossTotal + $chargeTotal - $netTotal), 2);
     $discountValue = $discountAmount;
   }
 
   if ($discountAmount > $grossTotal) {
     $discountAmount = $grossTotal;
   }
-  if ($grossTotal < $netTotal) {
-    $grossTotal = $netTotal;
+  if ($grossTotal + $chargeTotal < $netTotal) {
+    $grossTotal = round(max(0.0, $netTotal - $chargeTotal), 2);
   }
 
   return [
@@ -286,6 +325,9 @@ function pur_purchase_discount_meta_from_row(array $purchase, ?float $fallbackGr
     'value' => $discountValue,
     'amount' => $discountAmount,
     'gross' => $grossTotal,
+    'courier_charges' => $courierCharges,
+    'other_charges' => $otherCharges,
+    'charge_total' => $chargeTotal,
     'net' => $netTotal,
   ];
 }
@@ -402,6 +444,7 @@ function pur_csv_download(string $filename, array $headers, array $rows, array $
 $purchasesReady = table_columns('purchases') !== [] && table_columns('purchase_items') !== [];
 $purchasePaymentsReady = table_columns('purchase_payments') !== [];
 $purchaseDiscountColumnsReady = pur_supports_discount_columns();
+$purchaseChargeColumnsReady = pur_supports_charge_columns();
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     require_csrf();
@@ -431,6 +474,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $paymentStatus = strtoupper(trim((string) ($_POST['payment_status'] ?? 'UNPAID')));
         $discountType = pur_normalize_discount_type((string) ($_POST['discount_type'] ?? 'AMOUNT'));
         $discountValue = round(max(0.0, pur_decimal($_POST['discount_value'] ?? 0.0, 0.0)), 2);
+        $courierCharges = $purchaseChargeColumnsReady ? round(max(0.0, pur_decimal($_POST['courier_charges'] ?? 0.0, 0.0)), 2) : 0.0;
+        $otherCharges = $purchaseChargeColumnsReady ? round(max(0.0, pur_decimal($_POST['other_charges'] ?? 0.0, 0.0)), 2) : 0.0;
         $notes = post_string('notes', 255);
         $targetStatus = strtoupper(trim((string) ($_POST['target_status'] ?? 'DRAFT')));
 
@@ -586,17 +631,49 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'gst' => round($totals['gst'], 2),
             'grand' => round($totals['grand'], 2),
         ];
-        $discountMeta = pur_apply_purchase_discount((float) $totals['grand'], $discountType, $discountValue);
+        $discountMeta = pur_apply_purchase_adjustments((float) $totals['grand'], $discountType, $discountValue, $courierCharges, $otherCharges);
         $totals['discount_type'] = (string) ($discountMeta['type'] ?? 'AMOUNT');
         $totals['discount_value'] = (float) ($discountMeta['value'] ?? 0);
         $totals['discount_amount'] = (float) ($discountMeta['amount'] ?? 0);
+        $totals['courier_charges'] = (float) ($discountMeta['courier_charges'] ?? 0);
+        $totals['other_charges'] = (float) ($discountMeta['other_charges'] ?? 0);
+        $totals['charge_total'] = (float) ($discountMeta['charge_total'] ?? 0);
         $totals['gross'] = (float) ($discountMeta['gross'] ?? $totals['grand']);
         $totals['grand'] = (float) ($discountMeta['net'] ?? $totals['grand']);
 
         $pdo = db();
         $pdo->beginTransaction();
         try {
-            if ($purchaseDiscountColumnsReady) {
+            if ($purchaseDiscountColumnsReady && $purchaseChargeColumnsReady) {
+                $purchaseInsert = $pdo->prepare(
+                    'INSERT INTO purchases
+                      (company_id, garage_id, vendor_id, invoice_number, purchase_date, purchase_source, assignment_status, purchase_status, payment_status, taxable_amount, gst_amount, gross_total, discount_type, discount_value, discount_amount, courier_charges, other_charges, grand_total, notes, created_by, finalized_by, finalized_at)
+                     VALUES
+                      (:company_id, :garage_id, :vendor_id, :invoice_number, :purchase_date, "VENDOR_ENTRY", "ASSIGNED", :purchase_status, :payment_status, :taxable_amount, :gst_amount, :gross_total, :discount_type, :discount_value, :discount_amount, :courier_charges, :other_charges, :grand_total, :notes, :created_by, :finalized_by, :finalized_at)'
+                );
+                $purchaseInsert->execute([
+                    'company_id' => $companyId,
+                    'garage_id' => $activeGarageId,
+                    'vendor_id' => $vendorId,
+                    'invoice_number' => $invoiceNumber !== '' ? $invoiceNumber : null,
+                    'purchase_date' => $purchaseDate,
+                    'purchase_status' => $targetStatus,
+                    'payment_status' => $paymentStatus,
+                    'taxable_amount' => $totals['taxable'],
+                    'gst_amount' => $totals['gst'],
+                    'gross_total' => $totals['gross'],
+                    'discount_type' => $totals['discount_type'],
+                    'discount_value' => $totals['discount_value'],
+                    'discount_amount' => $totals['discount_amount'],
+                    'courier_charges' => $totals['courier_charges'],
+                    'other_charges' => $totals['other_charges'],
+                    'grand_total' => $totals['grand'],
+                    'notes' => $notes !== '' ? $notes : null,
+                    'created_by' => $userId,
+                    'finalized_by' => $targetStatus === 'FINALIZED' ? $userId : null,
+                    'finalized_at' => $targetStatus === 'FINALIZED' ? date('Y-m-d H:i:s') : null,
+                ]);
+            } elseif ($purchaseDiscountColumnsReady) {
                 $purchaseInsert = $pdo->prepare(
                     'INSERT INTO purchases
                       (company_id, garage_id, vendor_id, invoice_number, purchase_date, purchase_source, assignment_status, purchase_status, payment_status, taxable_amount, gst_amount, gross_total, discount_type, discount_value, discount_amount, grand_total, notes, created_by, finalized_by, finalized_at)
@@ -732,6 +809,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'purchase_date' => $purchaseDate,
                     'taxable_amount' => $totals['taxable'],
                     'gst_amount' => $totals['gst'],
+                    'gross_total' => $totals['gross'],
+                    'discount_amount' => $totals['discount_amount'],
+                    'courier_charges' => $totals['courier_charges'],
+                    'other_charges' => $totals['other_charges'],
                     'grand_total' => $totals['grand'],
                 ], $userId > 0 ? $userId : null);
             }
@@ -772,6 +853,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         'discount_type' => (string) ($totals['discount_type'] ?? 'AMOUNT'),
                         'discount_value' => (float) ($totals['discount_value'] ?? 0),
                         'discount_amount' => (float) ($totals['discount_amount'] ?? 0),
+                        'courier_charges' => (float) ($totals['courier_charges'] ?? 0),
+                        'other_charges' => (float) ($totals['other_charges'] ?? 0),
                         'grand_total' => $totals['grand'],
                     ],
                     'metadata' => [
@@ -808,6 +891,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $paymentStatus = strtoupper(trim((string) ($_POST['payment_status'] ?? 'UNPAID')));
         $discountType = pur_normalize_discount_type((string) ($_POST['discount_type'] ?? 'AMOUNT'));
         $discountValue = round(max(0.0, pur_decimal($_POST['discount_value'] ?? 0.0, 0.0)), 2);
+        $courierCharges = $purchaseChargeColumnsReady ? round(max(0.0, pur_decimal($_POST['courier_charges'] ?? 0.0, 0.0)), 2) : 0.0;
+        $otherCharges = $purchaseChargeColumnsReady ? round(max(0.0, pur_decimal($_POST['other_charges'] ?? 0.0, 0.0)), 2) : 0.0;
         $notes = post_string('notes', 255);
         $finalizeRequested = post_int('finalize_purchase') === 1;
 
@@ -1037,17 +1122,63 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $updatedTotals['gst'] = round((float) ($itemTotalsRow['gst_total'] ?? 0), 2);
             $updatedTotals['gross'] = round((float) ($itemTotalsRow['gross_total'] ?? 0), 2);
 
-            $discountMeta = pur_apply_purchase_discount((float) $updatedTotals['gross'], $discountType, $discountValue);
+            $discountMeta = pur_apply_purchase_adjustments((float) $updatedTotals['gross'], $discountType, $discountValue, $courierCharges, $otherCharges);
             $updatedTotals['discount_type'] = (string) ($discountMeta['type'] ?? 'AMOUNT');
             $updatedTotals['discount_value'] = (float) ($discountMeta['value'] ?? 0);
             $updatedTotals['discount_amount'] = (float) ($discountMeta['amount'] ?? 0);
+            $updatedTotals['courier_charges'] = (float) ($discountMeta['courier_charges'] ?? 0);
+            $updatedTotals['other_charges'] = (float) ($discountMeta['other_charges'] ?? 0);
+            $updatedTotals['charge_total'] = (float) ($discountMeta['charge_total'] ?? 0);
             $updatedTotals['grand'] = (float) ($discountMeta['net'] ?? $updatedTotals['gross']);
 
             $finalizedAt = $finalizeRequested ? date('Y-m-d H:i:s') : null;
             $finalizedBy = $finalizeRequested ? $userId : null;
             $nextStatus = $finalizeRequested ? 'FINALIZED' : 'DRAFT';
 
-            if ($purchaseDiscountColumnsReady) {
+            if ($purchaseDiscountColumnsReady && $purchaseChargeColumnsReady) {
+                $updateStmt = $pdo->prepare(
+                    'UPDATE purchases
+                     SET vendor_id = :vendor_id,
+                         invoice_number = :invoice_number,
+                         purchase_date = :purchase_date,
+                         assignment_status = "ASSIGNED",
+                         purchase_status = :purchase_status,
+                         payment_status = :payment_status,
+                         taxable_amount = :taxable_amount,
+                         gst_amount = :gst_amount,
+                         gross_total = :gross_total,
+                         discount_type = :discount_type,
+                         discount_value = :discount_value,
+                         discount_amount = :discount_amount,
+                         courier_charges = :courier_charges,
+                         other_charges = :other_charges,
+                         grand_total = :grand_total,
+                         notes = :notes,
+                         finalized_by = :finalized_by,
+                         finalized_at = :finalized_at
+                     WHERE id = :id'
+                );
+                $updateStmt->execute([
+                    'vendor_id' => $vendorId,
+                    'invoice_number' => $invoiceNumber,
+                    'purchase_date' => $purchaseDate,
+                    'purchase_status' => $nextStatus,
+                    'payment_status' => $paymentStatus,
+                    'taxable_amount' => (float) $updatedTotals['taxable'],
+                    'gst_amount' => (float) $updatedTotals['gst'],
+                    'gross_total' => (float) $updatedTotals['gross'],
+                    'discount_type' => (string) ($updatedTotals['discount_type'] ?? 'AMOUNT'),
+                    'discount_value' => (float) ($updatedTotals['discount_value'] ?? 0),
+                    'discount_amount' => (float) ($updatedTotals['discount_amount'] ?? 0),
+                    'courier_charges' => (float) ($updatedTotals['courier_charges'] ?? 0),
+                    'other_charges' => (float) ($updatedTotals['other_charges'] ?? 0),
+                    'grand_total' => (float) $updatedTotals['grand'],
+                    'notes' => $notes !== '' ? $notes : ((string) ($purchase['notes'] ?? '') !== '' ? (string) $purchase['notes'] : null),
+                    'finalized_by' => $finalizedBy,
+                    'finalized_at' => $finalizedAt,
+                    'id' => $purchaseId,
+                ]);
+            } elseif ($purchaseDiscountColumnsReady) {
                 $updateStmt = $pdo->prepare(
                     'UPDATE purchases
                      SET vendor_id = :vendor_id,
@@ -1153,6 +1284,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'purchase_date' => $purchaseDate,
                     'taxable_amount' => (float) $updatedTotals['taxable'],
                     'gst_amount' => (float) $updatedTotals['gst'],
+                    'gross_total' => (float) ($updatedTotals['gross'] ?? $updatedTotals['grand']),
+                    'discount_amount' => (float) ($updatedTotals['discount_amount'] ?? 0),
+                    'courier_charges' => (float) ($updatedTotals['courier_charges'] ?? 0),
+                    'other_charges' => (float) ($updatedTotals['other_charges'] ?? 0),
                     'grand_total' => (float) $updatedTotals['grand'],
                 ], $userId > 0 ? $userId : null);
             }
@@ -1194,6 +1329,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         'discount_type' => (string) ($updatedTotals['discount_type'] ?? 'AMOUNT'),
                         'discount_value' => (float) ($updatedTotals['discount_value'] ?? 0),
                         'discount_amount' => (float) ($updatedTotals['discount_amount'] ?? 0),
+                        'courier_charges' => (float) ($updatedTotals['courier_charges'] ?? 0),
+                        'other_charges' => (float) ($updatedTotals['other_charges'] ?? 0),
                         'grand_total' => (float) $updatedTotals['grand'],
                     ],
                 ]
@@ -1314,6 +1451,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $purchaseDate = trim((string) ($_POST['purchase_date'] ?? date('Y-m-d')));
         $discountType = pur_normalize_discount_type((string) ($_POST['discount_type'] ?? 'AMOUNT'));
         $discountValue = round(max(0.0, pur_decimal($_POST['discount_value'] ?? 0.0, 0.0)), 2);
+        $courierCharges = $purchaseChargeColumnsReady ? round(max(0.0, pur_decimal($_POST['courier_charges'] ?? 0.0, 0.0)), 2) : 0.0;
+        $otherCharges = $purchaseChargeColumnsReady ? round(max(0.0, pur_decimal($_POST['other_charges'] ?? 0.0, 0.0)), 2) : 0.0;
         $notes = post_string('notes', 255);
         $editReason = post_string('edit_reason', 255);
 
@@ -1432,10 +1571,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'gross' => round($totals['gross'], 2),
             'grand' => round($totals['gross'], 2),
         ];
-        $discountMeta = pur_apply_purchase_discount((float) $totals['gross'], $discountType, $discountValue);
+        $discountMeta = pur_apply_purchase_adjustments((float) $totals['gross'], $discountType, $discountValue, $courierCharges, $otherCharges);
         $totals['discount_type'] = (string) ($discountMeta['type'] ?? 'AMOUNT');
         $totals['discount_value'] = (float) ($discountMeta['value'] ?? 0);
         $totals['discount_amount'] = (float) ($discountMeta['amount'] ?? 0);
+        $totals['courier_charges'] = (float) ($discountMeta['courier_charges'] ?? 0);
+        $totals['other_charges'] = (float) ($discountMeta['other_charges'] ?? 0);
+        $totals['charge_total'] = (float) ($discountMeta['charge_total'] ?? 0);
         $totals['grand'] = (float) ($discountMeta['net'] ?? $totals['gross']);
 
         $pdo = db();
@@ -1592,7 +1734,47 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $effectivePaid = max(0.0, round((float) ($purchase['total_paid'] ?? 0), 2));
             $nextPaymentStatus = pur_payment_status_from_amounts((float) $totals['grand'], $effectivePaid);
 
-            if ($purchaseDiscountColumnsReady) {
+            if ($purchaseDiscountColumnsReady && $purchaseChargeColumnsReady) {
+                $purchaseUpdateStmt = $pdo->prepare(
+                    'UPDATE purchases
+                     SET vendor_id = :vendor_id,
+                         invoice_number = :invoice_number,
+                         purchase_date = :purchase_date,
+                         payment_status = :payment_status,
+                         taxable_amount = :taxable_amount,
+                         gst_amount = :gst_amount,
+                         gross_total = :gross_total,
+                         discount_type = :discount_type,
+                         discount_value = :discount_value,
+                         discount_amount = :discount_amount,
+                         courier_charges = :courier_charges,
+                         other_charges = :other_charges,
+                         grand_total = :grand_total,
+                         notes = :notes
+                     WHERE id = :id
+                       AND company_id = :company_id
+                       AND garage_id = :garage_id'
+                );
+                $purchaseUpdateStmt->execute([
+                    'vendor_id' => $vendorId > 0 ? $vendorId : null,
+                    'invoice_number' => $invoiceNumber !== '' ? $invoiceNumber : null,
+                    'purchase_date' => $purchaseDate,
+                    'payment_status' => $nextPaymentStatus,
+                    'taxable_amount' => (float) $totals['taxable'],
+                    'gst_amount' => (float) $totals['gst'],
+                    'gross_total' => (float) ($totals['gross'] ?? $totals['grand']),
+                    'discount_type' => (string) ($totals['discount_type'] ?? 'AMOUNT'),
+                    'discount_value' => (float) ($totals['discount_value'] ?? 0),
+                    'discount_amount' => (float) ($totals['discount_amount'] ?? 0),
+                    'courier_charges' => (float) ($totals['courier_charges'] ?? 0),
+                    'other_charges' => (float) ($totals['other_charges'] ?? 0),
+                    'grand_total' => (float) $totals['grand'],
+                    'notes' => $notes !== '' ? $notes : null,
+                    'id' => $purchaseId,
+                    'company_id' => $companyId,
+                    'garage_id' => $activeGarageId,
+                ]);
+            } elseif ($purchaseDiscountColumnsReady) {
                 $purchaseUpdateStmt = $pdo->prepare(
                     'UPDATE purchases
                      SET vendor_id = :vendor_id,
@@ -1674,6 +1856,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'discount_type' => (string) ($beforeDiscountMeta['type'] ?? 'AMOUNT'),
                     'discount_value' => (float) ($beforeDiscountMeta['value'] ?? 0),
                     'discount_amount' => (float) ($beforeDiscountMeta['amount'] ?? 0),
+                    'courier_charges' => (float) ($beforeDiscountMeta['courier_charges'] ?? 0),
+                    'other_charges' => (float) ($beforeDiscountMeta['other_charges'] ?? 0),
                     'grand_total' => (float) ($purchase['grand_total'] ?? 0),
                 ],
                 'after' => [
@@ -1687,6 +1871,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'discount_type' => (string) ($totals['discount_type'] ?? 'AMOUNT'),
                     'discount_value' => (float) ($totals['discount_value'] ?? 0),
                     'discount_amount' => (float) ($totals['discount_amount'] ?? 0),
+                    'courier_charges' => (float) ($totals['courier_charges'] ?? 0),
+                    'other_charges' => (float) ($totals['other_charges'] ?? 0),
                     'grand_total' => (float) $totals['grand'],
                 ],
                 'metadata' => [
@@ -2753,6 +2939,8 @@ if ($purchasesReady) {
           $exportDiscountExpr = $purchaseDiscountColumnsReady
             ? 'COALESCE(p.discount_amount, 0)'
             : 'GREATEST((' . $exportGrossExpr . ') - p.grand_total, 0)';
+          $exportCourierExpr = $purchaseChargeColumnsReady ? 'COALESCE(p.courier_charges, 0)' : '0';
+          $exportOtherChargesExpr = $purchaseChargeColumnsReady ? 'COALESCE(p.other_charges, 0)' : '0';
           $exportStmt = db()->prepare(
             'SELECT p.id AS purchase_id, p.purchase_date, p.purchase_source, p.assignment_status, p.purchase_status, p.payment_status,
                 COALESCE(v.vendor_name, "UNASSIGNED") AS vendor_name,
@@ -2763,6 +2951,8 @@ if ($purchasesReady) {
                 p.gst_amount AS purchase_gst_amount,
                 ' . $exportGrossExpr . ' AS purchase_gross_total,
                 ' . $exportDiscountExpr . ' AS purchase_discount_amount,
+                ' . $exportCourierExpr . ' AS purchase_courier_charges,
+                ' . $exportOtherChargesExpr . ' AS purchase_other_charges,
                 p.grand_total AS purchase_grand_total,
                 u.name AS created_by_name
              FROM purchases p
@@ -2798,6 +2988,8 @@ if ($purchasesReady) {
             'Purchase GST',
             'Purchase Gross Total',
             'Purchase Discount',
+            'Courier Charges',
+            'Other Charges',
             'Purchase Grand Total',
             'Created By',
           ];
@@ -2824,6 +3016,8 @@ if ($purchasesReady) {
               number_format((float) ($row['purchase_gst_amount'] ?? 0), 2, '.', ''),
               number_format((float) ($row['purchase_gross_total'] ?? 0), 2, '.', ''),
               number_format((float) ($row['purchase_discount_amount'] ?? 0), 2, '.', ''),
+              number_format((float) ($row['purchase_courier_charges'] ?? 0), 2, '.', ''),
+              number_format((float) ($row['purchase_other_charges'] ?? 0), 2, '.', ''),
               number_format((float) ($row['purchase_grand_total'] ?? 0), 2, '.', ''),
               (string) ($row['created_by_name'] ?? ''),
             ];
@@ -3054,6 +3248,14 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                         <label class="form-label">Discount Value</label>
                         <input type="number" name="discount_value" class="form-control js-discount-value" min="0" step="0.01" value="0.00">
                       </div>
+                      <div class="col-md-3">
+                        <label class="form-label">Courier Charges</label>
+                        <input type="number" name="courier_charges" class="form-control js-charge-input" min="0" step="0.01" value="0.00">
+                      </div>
+                      <div class="col-md-3">
+                        <label class="form-label">Other Charges</label>
+                        <input type="number" name="other_charges" class="form-control js-charge-input" min="0" step="0.01" value="0.00">
+                      </div>
                     </div>
 
                     <div class="table-responsive">
@@ -3132,6 +3334,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                           <div class="fw-semibold js-live-total-grand">0.00</div>
                           <div class="small text-muted">Gross: <span class="js-live-total-gross">0.00</span></div>
                           <div class="small text-muted">Discount: <span class="js-live-discount-amount">0.00</span></div>
+                          <div class="small text-muted">Charges: <span class="js-live-charge-amount">0.00</span></div>
                         </div>
                       </div>
                     </div>
@@ -3179,6 +3382,8 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                           : ['type' => 'AMOUNT', 'value' => 0.0, 'amount' => 0.0, 'gross' => 0.0, 'net' => 0.0];
                         $assignDiscountTypeValue = (string) ($assignDiscountMeta['type'] ?? 'AMOUNT');
                         $assignDiscountValue = number_format((float) ($assignDiscountMeta['value'] ?? 0), 2, '.', '');
+                        $assignCourierChargesValue = number_format((float) ($assignDiscountMeta['courier_charges'] ?? 0), 2, '.', '');
+                        $assignOtherChargesValue = number_format((float) ($assignDiscountMeta['other_charges'] ?? 0), 2, '.', '');
                       ?>
 
                       <div class="mb-2">
@@ -3230,6 +3435,14 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                         <div class="col-6">
                           <label class="form-label">Discount Value</label>
                           <input type="number" name="discount_value" class="form-control js-discount-value" min="0" step="0.01" value="<?= e($assignDiscountValue); ?>">
+                        </div>
+                        <div class="col-6">
+                          <label class="form-label">Courier Charges</label>
+                          <input type="number" name="courier_charges" class="form-control js-charge-input" min="0" step="0.01" value="<?= e($assignCourierChargesValue); ?>">
+                        </div>
+                        <div class="col-6">
+                          <label class="form-label">Other Charges</label>
+                          <input type="number" name="other_charges" class="form-control js-charge-input" min="0" step="0.01" value="<?= e($assignOtherChargesValue); ?>">
                         </div>
                       </div>
                       <div class="mb-2">
@@ -3316,6 +3529,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                               <div class="fw-semibold js-live-total-grand"><?= e(number_format((float) ($assignDiscountMeta['net'] ?? 0), 2)); ?></div>
                               <div class="small text-muted">Gross: <span class="js-live-total-gross"><?= e(number_format((float) ($assignDiscountMeta['gross'] ?? 0), 2)); ?></span></div>
                               <div class="small text-muted">Discount: <span class="js-live-discount-amount"><?= e(number_format((float) ($assignDiscountMeta['amount'] ?? 0), 2)); ?></span></div>
+                              <div class="small text-muted">Charges: <span class="js-live-charge-amount"><?= e(number_format((float) ($assignDiscountMeta['charge_total'] ?? 0), 2)); ?></span></div>
                             </div>
                           </div>
                         </div>
@@ -3355,6 +3569,8 @@ require_once __DIR__ . '/../../includes/sidebar.php';
             $editDiscountMeta = pur_purchase_discount_meta_from_row($editPurchase, $editLineGrossTotal > 0.009 ? round($editLineGrossTotal, 2) : null);
             $editDiscountTypeValue = (string) ($editDiscountMeta['type'] ?? 'AMOUNT');
             $editDiscountValue = number_format((float) ($editDiscountMeta['value'] ?? 0), 2, '.', '');
+            $editCourierChargesValue = number_format((float) ($editDiscountMeta['courier_charges'] ?? 0), 2, '.', '');
+            $editOtherChargesValue = number_format((float) ($editDiscountMeta['other_charges'] ?? 0), 2, '.', '');
           ?>
           <div class="card card-warning mb-3" id="purchase-edit-section">
             <div class="card-header d-flex justify-content-between align-items-center">
@@ -3417,6 +3633,14 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                   <div class="col-md-3">
                     <label class="form-label">Discount Value</label>
                     <input type="number" name="discount_value" class="form-control js-discount-value" min="0" step="0.01" value="<?= e($editDiscountValue); ?>">
+                  </div>
+                  <div class="col-md-3">
+                    <label class="form-label">Courier Charges</label>
+                    <input type="number" name="courier_charges" class="form-control js-charge-input" min="0" step="0.01" value="<?= e($editCourierChargesValue); ?>">
+                  </div>
+                  <div class="col-md-3">
+                    <label class="form-label">Other Charges</label>
+                    <input type="number" name="other_charges" class="form-control js-charge-input" min="0" step="0.01" value="<?= e($editOtherChargesValue); ?>">
                   </div>
                 </div>
 
@@ -3539,6 +3763,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                       <div class="fw-semibold js-live-total-grand"><?= e(number_format((float) ($editDiscountMeta['net'] ?? 0), 2)); ?></div>
                       <div class="small text-muted">Gross: <span class="js-live-total-gross"><?= e(number_format((float) ($editDiscountMeta['gross'] ?? 0), 2)); ?></span></div>
                       <div class="small text-muted">Discount: <span class="js-live-discount-amount"><?= e(number_format((float) ($editDiscountMeta['amount'] ?? 0), 2)); ?></span></div>
+                      <div class="small text-muted">Charges: <span class="js-live-charge-amount"><?= e(number_format((float) ($editDiscountMeta['charge_total'] ?? 0), 2)); ?></span></div>
                     </div>
                   </div>
                 </div>
@@ -3622,9 +3847,17 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                 <div class="col-md-3"><strong>GST:</strong> <?= e(format_currency((float) ($viewPurchase['gst_amount'] ?? 0))); ?></div>
                 <div class="col-md-3">
                   <strong>Grand Total:</strong> <?= e(format_currency((float) ($viewDiscountMeta['net'] ?? 0))); ?>
-                  <?php if ((float) ($viewDiscountMeta['amount'] ?? 0) > 0.009): ?>
+                  <?php if ((float) ($viewDiscountMeta['amount'] ?? 0) > 0.009 || (float) ($viewDiscountMeta['charge_total'] ?? 0) > 0.009): ?>
                     <div class="small text-muted">Gross: <?= e(format_currency((float) ($viewDiscountMeta['gross'] ?? 0))); ?></div>
-                    <div class="small text-muted">Discount: <?= e(format_currency((float) ($viewDiscountMeta['amount'] ?? 0))); ?></div>
+                    <?php if ((float) ($viewDiscountMeta['amount'] ?? 0) > 0.009): ?>
+                      <div class="small text-muted">Discount: <?= e(format_currency((float) ($viewDiscountMeta['amount'] ?? 0))); ?></div>
+                    <?php endif; ?>
+                    <?php if ((float) ($viewDiscountMeta['courier_charges'] ?? 0) > 0.009): ?>
+                      <div class="small text-muted">Courier: <?= e(format_currency((float) ($viewDiscountMeta['courier_charges'] ?? 0))); ?></div>
+                    <?php endif; ?>
+                    <?php if ((float) ($viewDiscountMeta['other_charges'] ?? 0) > 0.009): ?>
+                      <div class="small text-muted">Other Charges: <?= e(format_currency((float) ($viewDiscountMeta['other_charges'] ?? 0))); ?></div>
+                    <?php endif; ?>
                   <?php endif; ?>
                 </div>
                 <?php if ($purchasePaymentsReady): ?>
@@ -3688,6 +3921,20 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                         <th colspan="9" class="text-end">Discount</th>
                         <th class="text-end">-<?= e(number_format((float) ($viewDiscountMeta['amount'] ?? 0), 2)); ?></th>
                       </tr>
+                    <?php endif; ?>
+                    <?php if ((float) ($viewDiscountMeta['courier_charges'] ?? 0) > 0.009): ?>
+                      <tr>
+                        <th colspan="9" class="text-end">Courier Charges</th>
+                        <th class="text-end"><?= e(number_format((float) ($viewDiscountMeta['courier_charges'] ?? 0), 2)); ?></th>
+                      </tr>
+                    <?php endif; ?>
+                    <?php if ((float) ($viewDiscountMeta['other_charges'] ?? 0) > 0.009): ?>
+                      <tr>
+                        <th colspan="9" class="text-end">Other Charges</th>
+                        <th class="text-end"><?= e(number_format((float) ($viewDiscountMeta['other_charges'] ?? 0), 2)); ?></th>
+                      </tr>
+                    <?php endif; ?>
+                    <?php if ((float) ($viewDiscountMeta['amount'] ?? 0) > 0.009 || (float) ($viewDiscountMeta['charge_total'] ?? 0) > 0.009): ?>
                       <tr>
                         <th colspan="9" class="text-end">Net Grand Total</th>
                         <th class="text-end"><?= e(number_format((float) ($viewDiscountMeta['net'] ?? 0), 2)); ?></th>
@@ -4406,6 +4653,8 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       var form = summaryEl ? summaryEl.closest('form') : null;
       var discountTypeInput = form ? form.querySelector('.js-discount-type') : null;
       var discountValueInput = form ? form.querySelector('.js-discount-value') : null;
+      var courierChargesInput = form ? form.querySelector('input[name="courier_charges"]') : null;
+      var otherChargesInput = form ? form.querySelector('input[name="other_charges"]') : null;
       var discountType = discountTypeInput ? String(discountTypeInput.value || 'AMOUNT').toUpperCase() : 'AMOUNT';
       if (discountType !== 'PERCENT') {
         discountType = 'AMOUNT';
@@ -4420,12 +4669,18 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         ? roundTwo((grossTotal * discountValue) / 100)
         : roundTwo(discountValue);
       discountAmount = roundTwo(Math.min(Math.max(0, discountAmount), grossTotal));
+      var courierCharges = roundTwo(Math.max(0, readNumber(courierChargesInput ? courierChargesInput.value : 0)));
+      var otherCharges = roundTwo(Math.max(0, readNumber(otherChargesInput ? otherChargesInput.value : 0)));
+      var chargeTotal = roundTwo(courierCharges + otherCharges);
 
       return {
         type: discountType,
         value: roundTwo(discountValue),
         amount: discountAmount,
-        net: roundTwo(Math.max(0, grossTotal - discountAmount))
+        courierCharges: courierCharges,
+        otherCharges: otherCharges,
+        chargeTotal: chargeTotal,
+        net: roundTwo(Math.max(0, grossTotal - discountAmount + chargeTotal))
       };
     }
 
@@ -4462,6 +4717,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       var gstEl = summaryEl.querySelector('.js-live-total-gst');
       var grossEl = summaryEl.querySelector('.js-live-total-gross');
       var discountAmountEl = summaryEl.querySelector('.js-live-discount-amount');
+      var chargeAmountEl = summaryEl.querySelector('.js-live-charge-amount');
       var grandEl = summaryEl.querySelector('.js-live-total-grand');
       var discountMeta = calculateDiscountForSummary(summaryEl, totals.grand);
 
@@ -4479,6 +4735,9 @@ require_once __DIR__ . '/../../includes/sidebar.php';
       }
       if (discountAmountEl) {
         discountAmountEl.textContent = formatMoney(discountMeta.amount);
+      }
+      if (chargeAmountEl) {
+        chargeAmountEl.textContent = formatMoney(discountMeta.chargeTotal);
       }
       if (grandEl) {
         grandEl.textContent = formatMoney(discountMeta.net);
@@ -4643,6 +4902,10 @@ require_once __DIR__ . '/../../includes/sidebar.php';
           });
         });
         ownerForm.querySelectorAll('.js-discount-value').forEach(function (input) {
+          input.addEventListener('input', recalculateAndRender);
+          input.addEventListener('change', recalculateAndRender);
+        });
+        ownerForm.querySelectorAll('.js-charge-input').forEach(function (input) {
           input.addEventListener('input', recalculateAndRender);
           input.addEventListener('change', recalculateAndRender);
         });

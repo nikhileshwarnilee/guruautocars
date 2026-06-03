@@ -242,6 +242,29 @@ function finance_record_expense_for_outsourced_payment(int $paymentId, int $work
         return null;
     }
 
+    $paidTo = '';
+    if ($workId > 0) {
+        $pdo = db();
+        $workStmt = $pdo->prepare(
+            'SELECT COALESCE(v.vendor_name, ow.partner_name) AS paid_to
+             FROM outsourced_works ow
+             LEFT JOIN vendors v ON v.id = ow.vendor_id
+             WHERE ow.id = :work_id
+               AND ow.company_id = :company_id
+               AND ow.garage_id = :garage_id
+             LIMIT 1'
+        );
+        $workStmt->execute([
+            'work_id' => $workId,
+            'company_id' => $companyId,
+            'garage_id' => $garageId,
+        ]);
+        $workRow = $workStmt->fetch();
+        if ($workRow && trim((string) ($workRow['paid_to'] ?? '')) !== '') {
+            $paidTo = trim((string) $workRow['paid_to']);
+        }
+    }
+
     $signedAmount = $isReversal ? -abs($amount) : abs($amount);
     $entryType = $isReversal ? 'REVERSAL' : 'EXPENSE';
 
@@ -252,7 +275,7 @@ function finance_record_expense_for_outsourced_payment(int $paymentId, int $work
         'expense_date' => $paymentDate,
         'amount' => $signedAmount,
         'payment_mode' => $paymentMode,
-        'paid_to' => '',
+        'paid_to' => $paidTo,
         'notes' => $notes,
         'source_type' => $isReversal ? 'OUTSOURCED_PAYMENT_REV' : 'OUTSOURCED_PAYMENT',
         'source_id' => $paymentId,

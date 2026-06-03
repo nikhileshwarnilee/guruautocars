@@ -230,15 +230,19 @@ function ledger_default_coa_blueprint(): array
 
         ['code' => '4000', 'name' => 'Revenue', 'type' => 'REVENUE', 'parent_code' => null],
         ['code' => '4100', 'name' => 'Sales Revenue', 'type' => 'REVENUE', 'parent_code' => '4000'],
+        ['code' => '4110', 'name' => 'Sales Discount', 'type' => 'REVENUE', 'parent_code' => '4000'],
         ['code' => '4200', 'name' => 'Purchase Return Recovery', 'type' => 'REVENUE', 'parent_code' => '4000'],
         ['code' => '4210', 'name' => 'Purchase Discount Received', 'type' => 'REVENUE', 'parent_code' => '4000'],
         ['code' => '4300', 'name' => 'Other Income', 'type' => 'REVENUE', 'parent_code' => '4000'],
+        ['code' => '4310', 'name' => 'Round Off Income', 'type' => 'REVENUE', 'parent_code' => '4000'],
 
         ['code' => '5000', 'name' => 'Expenses', 'type' => 'EXPENSE', 'parent_code' => null],
         ['code' => '5100', 'name' => 'Operating Expense', 'type' => 'EXPENSE', 'parent_code' => '5000'],
         ['code' => '5110', 'name' => 'Salary Expense', 'type' => 'EXPENSE', 'parent_code' => '5000'],
         ['code' => '5120', 'name' => 'Outsourced Work Expense', 'type' => 'EXPENSE', 'parent_code' => '5000'],
         ['code' => '5130', 'name' => 'Sales Return', 'type' => 'EXPENSE', 'parent_code' => '5000'],
+        ['code' => '5140', 'name' => 'Round Off Expense', 'type' => 'EXPENSE', 'parent_code' => '5000'],
+        ['code' => '5150', 'name' => 'Purchase Charges', 'type' => 'EXPENSE', 'parent_code' => '5000'],
     ];
 }
 
@@ -389,11 +393,51 @@ function ledger_payment_mode_account_code(?string $paymentMode): string
 
 function ledger_purchase_discount_amount(array $purchase): float
 {
-    $taxable = ledger_round((float) ($purchase['taxable_amount'] ?? 0));
-    $gst = ledger_round((float) ($purchase['gst_amount'] ?? 0));
+    $gross = ledger_round((float) ($purchase['gross_total'] ?? 0));
+    if ($gross <= 0.0) {
+        $taxable = ledger_round((float) ($purchase['taxable_amount'] ?? 0));
+        $gst = ledger_round((float) ($purchase['gst_amount'] ?? 0));
+        $gross = ledger_round($taxable + $gst);
+    }
+    $charges = ledger_purchase_additional_charges($purchase);
     $grand = ledger_round((float) ($purchase['grand_total'] ?? 0));
+    $computedDiscount = ledger_round($gross + $charges - $grand);
+    if ($computedDiscount > 0.009) {
+        return $computedDiscount;
+    }
 
-    return ledger_round(max(0.0, ($taxable + $gst) - $grand));
+    return ledger_round(max(0.0, (float) ($purchase['discount_amount'] ?? 0)));
+}
+
+function ledger_purchase_additional_charges(array $purchase): float
+{
+    $courier = ledger_round(max(0.0, (float) ($purchase['courier_charges'] ?? 0)));
+    $other = ledger_round(max(0.0, (float) ($purchase['other_charges'] ?? 0)));
+    return ledger_round($courier + $other);
+}
+
+function ledger_invoice_discount_amount(array $invoice): float
+{
+    $gross = ledger_round((float) ($invoice['gross_total'] ?? 0));
+    if ($gross <= 0.0) {
+        $taxable = ledger_round((float) ($invoice['taxable_amount'] ?? 0));
+        $tax = ledger_round((float) ($invoice['total_tax_amount'] ?? 0));
+        $gross = ledger_round($taxable + $tax);
+    }
+
+    $roundOff = ledger_round((float) ($invoice['round_off'] ?? 0));
+    $grand = ledger_round((float) ($invoice['grand_total'] ?? 0));
+    $computedDiscount = ledger_round($gross + $roundOff - $grand);
+    if ($computedDiscount > 0.009) {
+        return $computedDiscount;
+    }
+
+    $snapshot = json_decode((string) ($invoice['snapshot_json'] ?? ''), true);
+    if (is_array($snapshot) && is_array($snapshot['billing'] ?? null)) {
+        return ledger_round(max(0.0, (float) ($snapshot['billing']['discount_amount'] ?? 0)));
+    }
+
+    return 0.0;
 }
 
 function ledger_create_journal(PDO $pdo, array $journal, array $lines): int
@@ -847,6 +891,7 @@ function ledger_post_purchase_finalized(PDO $pdo, array $purchase, ?int $created
     $gst = ledger_round((float) ($purchase['gst_amount'] ?? 0));
     $grand = ledger_round((float) ($purchase['grand_total'] ?? 0));
     $discount = ledger_purchase_discount_amount($purchase);
+    $charges = ledger_purchase_additional_charges($purchase);
     $invoiceNumber = trim((string) ($purchase['invoice_number'] ?? ''));
 
     if ($purchaseId <= 0 || $companyId <= 0 || $garageId <= 0 || $grand <= 0.0) {
@@ -871,6 +916,16 @@ function ledger_post_purchase_finalized(PDO $pdo, array $purchase, ?int $created
         $lines[] = [
             'account_code' => '1215',
             'debit_amount' => $gst,
+            'credit_amount' => 0.0,
+            'garage_id' => $garageId,
+            'party_type' => $vendorId > 0 ? 'VENDOR' : null,
+            'party_id' => $vendorId > 0 ? $vendorId : null,
+        ];
+    }
+    if ($charges > 0.0) {
+        $lines[] = [
+            'account_code' => '5150',
+            'debit_amount' => $charges,
             'credit_amount' => 0.0,
             'garage_id' => $garageId,
             'party_type' => $vendorId > 0 ? 'VENDOR' : null,
@@ -915,6 +970,8 @@ function ledger_post_invoice_finalized(PDO $pdo, array $invoice, ?int $createdBy
     $invoiceNumber = trim((string) ($invoice['invoice_number'] ?? ''));
     $taxable = ledger_round((float) ($invoice['taxable_amount'] ?? 0));
     $grand = ledger_round((float) ($invoice['grand_total'] ?? 0));
+    $discount = ledger_invoice_discount_amount($invoice);
+    $roundOff = ledger_round((float) ($invoice['round_off'] ?? 0));
 
     if ($invoiceId <= 0 || $companyId <= 0 || $garageId <= 0 || $grand <= 0.0) {
         return null;
@@ -934,6 +991,25 @@ function ledger_post_invoice_finalized(PDO $pdo, array $invoice, ?int $createdBy
         'party_id' => $customerId > 0 ? $customerId : null,
     ]];
 
+    if ($discount > 0.0) {
+        $lines[] = [
+            'account_code' => '4110',
+            'debit_amount' => $discount,
+            'credit_amount' => 0.0,
+            'garage_id' => $garageId,
+            'party_type' => $customerId > 0 ? 'CUSTOMER' : null,
+            'party_id' => $customerId > 0 ? $customerId : null,
+        ];
+    }
+    if ($roundOff < -0.009) {
+        $lines[] = [
+            'account_code' => '5140',
+            'debit_amount' => abs($roundOff),
+            'credit_amount' => 0.0,
+            'garage_id' => $garageId,
+        ];
+    }
+
     if ($taxable > 0.0) {
         $lines[] = [
             'account_code' => '4100',
@@ -946,6 +1022,14 @@ function ledger_post_invoice_finalized(PDO $pdo, array $invoice, ?int $createdBy
     }
 
     $lines = array_merge($lines, ledger_invoice_output_gst_lines($invoice, $garageId, $customerId));
+    if ($roundOff > 0.009) {
+        $lines[] = [
+            'account_code' => '4310',
+            'debit_amount' => 0.0,
+            'credit_amount' => $roundOff,
+            'garage_id' => $garageId,
+        ];
+    }
 
     return ledger_create_journal($pdo, [
         'company_id' => $companyId,

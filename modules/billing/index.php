@@ -55,6 +55,48 @@ function billing_parse_date(?string $date): ?string
     return $date;
 }
 
+function billing_invoice_unpaid_guard(PDO $pdo, array $invoice, bool $financialExtensionsReady): array
+{
+    $invoiceId = (int) ($invoice['id'] ?? 0);
+    $paymentStatus = strtoupper(trim((string) ($invoice['payment_status'] ?? 'UNPAID')));
+    $paymentSummary = reversal_invoice_payment_summary($pdo, $invoiceId);
+    $netPaid = round((float) ($paymentSummary['net_paid_amount'] ?? 0), 2);
+    $unreversedPayments = (int) ($paymentSummary['unreversed_count'] ?? 0);
+    $advanceAdjusted = ($financialExtensionsReady && function_exists('billing_invoice_advance_adjusted_total'))
+        ? round((float) billing_invoice_advance_adjusted_total($pdo, $invoiceId), 2)
+        : 0.0;
+
+    $blockers = [];
+    if ($paymentStatus !== 'UNPAID') {
+        $blockers[] = 'payment status is ' . $paymentStatus;
+    }
+    if ($unreversedPayments > 0 || abs($netPaid) > 0.009) {
+        $blockers[] = 'payment entries exist';
+    }
+    if ($advanceAdjusted > 0.009) {
+        $blockers[] = 'advance adjustments exist';
+    }
+
+    return [
+        'allowed' => $blockers === [],
+        'blockers' => $blockers,
+        'payment_status' => $paymentStatus,
+        'net_paid_amount' => $netPaid,
+        'unreversed_payments' => $unreversedPayments,
+        'advance_adjusted' => $advanceAdjusted,
+    ];
+}
+
+function billing_unpaid_required_message(string $actionLabel, array $guard): string
+{
+    $blockers = array_values(array_filter(array_map('trim', (array) ($guard['blockers'] ?? []))));
+    $message = 'Only UNPAID invoices can be ' . $actionLabel . '.';
+    if ($blockers !== []) {
+        $message .= ' Current blocker: ' . implode(', ', $blockers) . '.';
+    }
+    return $message . ' First delete or reverse the payment/settlement, then proceed when the invoice is UNPAID.';
+}
+
 function billing_snapshot_value(array $snapshot, string $section, string $key): string
 {
     $value = $snapshot[$section][$key] ?? null;
@@ -1198,6 +1240,132 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         redirect('modules/billing/index.php');
     }
 
+    if ($action === 'unfinalize_invoice' && ($canFinalize || $canCancel)) {
+        $invoiceId = post_int('invoice_id');
+
+        if ($invoiceId <= 0) {
+            flash_set('billing_error', 'Invoice is required.', 'danger');
+            redirect('modules/billing/index.php');
+        }
+
+        $pdo = db();
+        $pdo->beginTransaction();
+
+        try {
+            $invoiceStmt = $pdo->prepare(
+                'SELECT *
+                 FROM invoices
+                 WHERE id = :invoice_id
+                   AND company_id = :company_id
+                   AND garage_id = :garage_id
+                 LIMIT 1
+                 FOR UPDATE'
+            );
+            $invoiceStmt->execute([
+                'invoice_id' => $invoiceId,
+                'company_id' => $companyId,
+                'garage_id' => $garageId,
+            ]);
+            $invoice = $invoiceStmt->fetch() ?: null;
+            if (!is_array($invoice)) {
+                throw new RuntimeException('Invoice not found.');
+            }
+
+            $currentStatus = strtoupper((string) ($invoice['invoice_status'] ?? ''));
+            if ($currentStatus !== 'FINALIZED') {
+                throw new RuntimeException('Only finalized invoices can be moved back to draft.');
+            }
+
+            $unpaidGuard = billing_invoice_unpaid_guard($pdo, $invoice, $financialExtensionsReady);
+            if (!($unpaidGuard['allowed'] ?? false)) {
+                throw new RuntimeException(billing_unpaid_required_message('moved back to draft', $unpaidGuard));
+            }
+
+            if (function_exists('ledger_reverse_reference')) {
+                ledger_reverse_reference(
+                    $pdo,
+                    $companyId,
+                    'INVOICE_FINALIZE',
+                    $invoiceId,
+                    'INVOICE_UNFINALIZE_REVERSAL',
+                    $invoiceId,
+                    date('Y-m-d'),
+                    'Invoice moved back to draft #' . $invoiceId,
+                    $userId > 0 ? $userId : null,
+                    true
+                );
+            }
+
+            if ($financialExtensionsReady) {
+                billing_record_customer_ledger_entry(
+                    $pdo,
+                    $companyId,
+                    $garageId,
+                    (int) ($invoice['customer_id'] ?? 0),
+                    date('Y-m-d'),
+                    'INVOICE',
+                    'INVOICE',
+                    $invoiceId,
+                    0.0,
+                    0.0,
+                    $userId > 0 ? $userId : null,
+                    'Invoice moved back to draft ' . (string) ($invoice['invoice_number'] ?? '')
+                );
+            }
+
+            $draftStmt = $pdo->prepare(
+                'UPDATE invoices
+                 SET invoice_status = "DRAFT",
+                     payment_status = "UNPAID",
+                     payment_mode = NULL,
+                     finalized_at = NULL,
+                     finalized_by = NULL
+                 WHERE id = :invoice_id'
+            );
+            $draftStmt->execute(['invoice_id' => $invoiceId]);
+
+            billing_record_status_history(
+                $pdo,
+                $invoiceId,
+                'FINALIZED',
+                'DRAFT',
+                'UNFINALIZE',
+                'Finalized invoice moved back to draft.',
+                $userId > 0 ? $userId : null,
+                [
+                    'net_paid_amount' => (float) ($unpaidGuard['net_paid_amount'] ?? 0),
+                    'advance_adjusted' => (float) ($unpaidGuard['advance_adjusted'] ?? 0),
+                ]
+            );
+
+            log_audit('billing', 'unfinalize', $invoiceId, 'Moved invoice back to draft ' . (string) ($invoice['invoice_number'] ?? ''), [
+                'entity' => 'invoice',
+                'source' => 'UI',
+                'before' => [
+                    'invoice_status' => $currentStatus,
+                    'payment_status' => (string) ($invoice['payment_status'] ?? 'UNPAID'),
+                    'grand_total' => (float) ($invoice['grand_total'] ?? 0),
+                ],
+                'after' => [
+                    'invoice_status' => 'DRAFT',
+                    'payment_status' => 'UNPAID',
+                    'payment_mode' => null,
+                ],
+                'metadata' => [
+                    'invoice_number' => (string) ($invoice['invoice_number'] ?? ''),
+                ],
+            ]);
+
+            $pdo->commit();
+            flash_set('billing_success', 'Invoice moved back to draft. You can now cancel it if needed.', 'success');
+        } catch (Throwable $exception) {
+            $pdo->rollBack();
+            flash_set('billing_error', $exception->getMessage(), 'danger');
+        }
+
+        redirect('modules/billing/index.php');
+    }
+
     if ($action === 'cancel_invoice' && $canCancel) {
         $invoiceId = post_int('invoice_id');
         $cancelReason = post_string('cancel_reason', 255);
@@ -1225,6 +1393,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $currentStatus = strtoupper((string) ($invoice['invoice_status'] ?? ''));
             if ($currentStatus === 'CANCELLED') {
                 throw new RuntimeException('Invoice is already cancelled.');
+            }
+            if ($currentStatus === 'FINALIZED') {
+                throw new RuntimeException('Move the finalized invoice back to draft before cancelling it.');
+            }
+            if ($currentStatus !== 'DRAFT') {
+                throw new RuntimeException('Only draft invoices can be cancelled.');
+            }
+
+            $unpaidGuard = billing_invoice_unpaid_guard($pdo, $invoice, $financialExtensionsReady);
+            if (!($unpaidGuard['allowed'] ?? false)) {
+                throw new RuntimeException(billing_unpaid_required_message('cancelled', $unpaidGuard));
             }
 
             $canCancelInvoice = (bool) ($dependencyReport['can_cancel'] ?? false);
@@ -2130,6 +2309,7 @@ $invoicesStmt = db()->prepare(
      LEFT JOIN job_cards jc ON jc.id = i.job_card_id
      WHERE i.company_id = :company_id
        AND i.garage_id = :garage_id
+       AND i.invoice_status <> "CANCELLED"
      ORDER BY i.id DESC'
 );
 $invoicesStmt->execute([
@@ -2775,7 +2955,15 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                           <button type="submit" class="btn btn-sm btn-success">Finalize</button>
                         </form>
                       <?php endif; ?>
-                      <?php if ($canCancel && $invoiceStatus !== 'CANCELLED'): ?>
+                      <?php if (($canFinalize || $canCancel) && $invoiceStatus === 'FINALIZED'): ?>
+                        <form method="post" class="d-inline" data-confirm="Move this finalized invoice back to draft? This is allowed only while the invoice is unpaid.">
+                          <?= csrf_field(); ?>
+                          <input type="hidden" name="_action" value="unfinalize_invoice" />
+                          <input type="hidden" name="invoice_id" value="<?= (int) $invoice['id']; ?>" />
+                          <button type="submit" class="btn btn-sm btn-outline-warning">Move to Draft</button>
+                        </form>
+                      <?php endif; ?>
+                      <?php if ($canCancel && $invoiceStatus === 'DRAFT'): ?>
                         <button
                           type="button"
                           class="btn btn-sm btn-outline-danger js-cancel-invoice-btn"
@@ -3148,7 +3336,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
     <div class="modal-content">
       <form method="post" data-safe-delete data-safe-delete-entity="invoice" data-safe-delete-record-field="invoice_id" data-safe-delete-operation="cancel" data-safe-delete-reason-field="cancel_reason">
         <div class="modal-header bg-danger-subtle">
-          <h5 class="modal-title">Cancel Invoice</h5>
+          <h5 class="modal-title">Cancel Draft Invoice</h5>
           <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
         </div>
         <div class="modal-body">
@@ -3162,12 +3350,12 @@ require_once __DIR__ . '/../../includes/sidebar.php';
           <div class="mb-0">
             <label class="form-label">Cancellation Reason</label>
             <textarea name="cancel_reason" id="cancel-invoice-reason" class="form-control" rows="3" maxlength="255" required></textarea>
-            <small class="text-muted">Cancellation is blocked until all dependency reversals are completed.</small>
+            <small class="text-muted">Only unpaid draft invoices can be cancelled.</small>
           </div>
         </div>
         <div class="modal-footer">
           <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Close</button>
-          <button type="submit" class="btn btn-danger">Confirm Cancel</button>
+          <button type="submit" class="btn btn-danger">Cancel Draft</button>
         </div>
       </form>
     </div>

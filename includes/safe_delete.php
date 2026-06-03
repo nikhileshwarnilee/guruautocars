@@ -1570,25 +1570,36 @@ function safe_delete_analyze_purchase(PDO $pdo, int $purchaseId, array $scope, a
     $paymentImpact = 0.0;
     if (safe_delete_table_exists('purchase_payments')) {
         $ppCols = table_columns('purchase_payments');
+        $hasPaymentEntryType = in_array('entry_type', $ppCols, true);
+        $hasPaymentReversedId = in_array('reversed_payment_id', $ppCols, true);
         $select = ['pp.id', 'pp.amount'];
         foreach (['payment_date', 'entry_type', 'reference_no', 'payment_mode', 'reversed_payment_id'] as $col) {
             if (in_array($col, $ppCols, true)) {
                 $select[] = 'pp.' . $col;
             }
         }
+        $paymentJoinSql = '';
+        if ($hasPaymentReversedId) {
+            $select[] = 'rev.id AS reversal_row_id';
+            $paymentJoinSql = ' LEFT JOIN purchase_payments rev ON rev.reversed_payment_id = pp.id';
+            if ($hasPaymentEntryType) {
+                $paymentJoinSql .= ' AND (rev.entry_type = "REVERSAL" OR rev.entry_type IS NULL)';
+            }
+        }
         foreach (safe_delete_fetch_rows(
             $pdo,
-            'SELECT ' . implode(', ', $select) . ' FROM purchase_payments pp WHERE pp.purchase_id = :purchase_id ORDER BY pp.id DESC',
+            'SELECT ' . implode(', ', $select) . ' FROM purchase_payments pp' . $paymentJoinSql . ' WHERE pp.purchase_id = :purchase_id ORDER BY pp.id DESC',
             ['purchase_id' => $purchaseId]
         ) as $row) {
             $amount = round((float) ($row['amount'] ?? 0), 2);
             $entryType = strtoupper(trim((string) ($row['entry_type'] ?? ($amount < 0 ? 'REVERSAL' : 'PAYMENT'))));
-            if ($entryType === 'PAYMENT' && $amount > 0) {
+            $alreadyReversed = (int) ($row['reversal_row_id'] ?? 0) > 0;
+            if ($entryType === 'PAYMENT' && $amount > 0 && !$alreadyReversed) {
                 $paymentImpact += $amount;
             }
-            $canReverseRow = $entryType === 'PAYMENT' && $amount > 0;
-            $rowActions = $canReverseRow
-                ? [safe_delete_make_dependency_action(
+            $canReverseRow = $entryType === 'PAYMENT' && $amount > 0 && !$alreadyReversed;
+            if ($canReverseRow) {
+                $rowActions = [safe_delete_make_dependency_action(
                     'Reverse',
                     'purchase_payment',
                     (int) ($row['id'] ?? 0),
@@ -1598,11 +1609,13 @@ function safe_delete_analyze_purchase(PDO $pdo, int $purchaseId, array $scope, a
                     'outline-danger',
                     true,
                     'Create reversal entry for this purchase payment before deleting the purchase.'
-                )]
-                : [safe_delete_make_dependency_action_unavailable(
-                    $entryType === 'REVERSAL' ? 'Already Reversal' : 'No Direct Action',
-                    $entryType === 'REVERSAL' ? 'This row is already a reversal entry.' : ''
                 )];
+            } else {
+                $rowActions = [safe_delete_make_dependency_action_unavailable(
+                    $alreadyReversed ? 'Already Reversed' : ($entryType === 'REVERSAL' ? 'Already Reversal' : 'No Direct Action'),
+                    $alreadyReversed ? 'This payment already has a reversal entry.' : ($entryType === 'REVERSAL' ? 'This row is already a reversal entry.' : '')
+                )];
+            }
             $paymentRows[] = safe_delete_make_item(
                 safe_delete_row_reference($row, ['reference_no'], 'PPAY'),
                 safe_delete_pick_date($row, ['payment_date']),

@@ -13,7 +13,7 @@ $garageId = active_garage_id();
 $userId = (int) ($_SESSION['user_id'] ?? 0);
 
 $canManage = has_permission('outsourced.manage');
-$canPay = has_permission('outsourced.pay') || $canManage;
+$canPay = has_permission('outsourced.pay') || has_permission('purchase.payments') || $canManage;
 $canExport = has_permission('export.data') || $canManage;
 
 function ow_decimal(mixed $raw, float $default = 0.0): float
@@ -304,6 +304,7 @@ $toDate = (string) ($outsourceDateFilter['to_date'] ?? $outsourceRangeEnd);
 
 $searchQuery = trim((string) ($_GET['q'] ?? ''));
 $vendorFilter = get_int('vendor_id', 0);
+$payWorkId = get_int('pay_work_id', 0);
 $statusFilter = ow_normalize_status((string) ($_GET['status'] ?? ''));
 if (!isset($_GET['status']) || trim((string) $_GET['status']) === '') {
     $statusFilter = '';
@@ -633,9 +634,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
 
             $currentStatus = ow_normalize_status((string) ($work['current_status'] ?? 'SENT'));
-            if (ow_status_rank($currentStatus) < ow_status_rank('PAYABLE')) {
-                throw new RuntimeException('Move lifecycle to PAYABLE before recording payments.');
-            }
 
             $agreedCost = round((float) ($work['agreed_cost'] ?? 0), 2);
             $paidAmount = round((float) ($work['paid_amount'] ?? 0), 2);
@@ -670,12 +668,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $newPaidAmount = round($paidAmount + $amount, 2);
             $nextStatus = ($agreedCost > 0 && $newPaidAmount + 0.009 >= $agreedCost) ? 'PAID' : 'PAYABLE';
             $now = date('Y-m-d H:i:s');
+            $sentAt = !empty($work['sent_at']) ? (string) $work['sent_at'] : $now;
+            $receivedAt = !empty($work['received_at']) ? (string) $work['received_at'] : $now;
+            $verifiedAt = !empty($work['verified_at']) ? (string) $work['verified_at'] : $now;
             $payableAt = !empty($work['payable_at']) ? (string) $work['payable_at'] : $now;
             $paidAt = $nextStatus === 'PAID' ? $now : null;
 
             $updateStmt = $pdo->prepare(
                 'UPDATE outsourced_works
                  SET current_status = :current_status,
+                     sent_at = :sent_at,
+                     received_at = :received_at,
+                     verified_at = :verified_at,
                      payable_at = :payable_at,
                      paid_at = :paid_at,
                      updated_by = :updated_by
@@ -685,6 +689,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             );
             $updateStmt->execute([
                 'current_status' => $nextStatus,
+                'sent_at' => $sentAt,
+                'received_at' => $receivedAt,
+                'verified_at' => $verifiedAt,
                 'payable_at' => $payableAt,
                 'paid_at' => $paidAt,
                 'updated_by' => $userId > 0 ? $userId : null,
@@ -918,6 +925,7 @@ $profitabilityRows = [];
 $paymentHistory = [];
 $reversiblePayments = [];
 $payableWorks = [];
+$selectedPayWork = null;
 $editWork = null;
 
 $totalAgreed = 0.0;
@@ -1204,7 +1212,7 @@ if ($outsourcedReady) {
     $reversiblePayments = $reversibleStmt->fetchAll();
 
     $payableWorksStmt = db()->prepare(
-        'SELECT ow.id, jc.job_number, COALESCE(vn.vendor_name, ow.partner_name) AS vendor_label,
+        'SELECT ow.id, ow.current_status, jc.job_number, COALESCE(vn.vendor_name, ow.partner_name) AS vendor_label,
                 ow.agreed_cost,
                 COALESCE(pay.total_paid, 0) AS paid_amount,
                 GREATEST(ow.agreed_cost - COALESCE(pay.total_paid, 0), 0) AS outstanding_amount
@@ -1220,9 +1228,18 @@ if ($outsourcedReady) {
            AND ow.garage_id = :garage_id
            AND ow.status_code = "ACTIVE"
            AND jc.status_code <> "DELETED"
-           AND ow.current_status IN ("PAYABLE", "PAID")
            AND GREATEST(ow.agreed_cost - COALESCE(pay.total_paid, 0), 0) > 0.01
-         ORDER BY outstanding_amount DESC, ow.id DESC
+         ORDER BY
+            CASE ow.current_status
+                WHEN "PAYABLE" THEN 1
+                WHEN "VERIFIED" THEN 2
+                WHEN "RECEIVED" THEN 3
+                WHEN "SENT" THEN 4
+                WHEN "PAID" THEN 5
+                ELSE 6
+            END,
+            outstanding_amount DESC,
+            ow.id DESC
          LIMIT 250'
     );
     $payableWorksStmt->execute([
@@ -1230,6 +1247,13 @@ if ($outsourcedReady) {
         'garage_id' => $garageId,
     ]);
     $payableWorks = $payableWorksStmt->fetchAll();
+    $selectedPayWork = null;
+    foreach ($payableWorks as $work) {
+        if ((int) ($work['id'] ?? 0) === $payWorkId) {
+            $selectedPayWork = $work;
+            break;
+        }
+    }
 
     $editId = get_int('edit_id', 0);
     if ($editId > 0) {
@@ -1571,8 +1595,8 @@ require_once __DIR__ . '/../../includes/sidebar.php';
         <?php if ($canPay): ?>
           <div class="row g-3 mb-3">
             <div class="col-lg-7">
-              <div class="card card-success h-100">
-                <div class="card-header"><h3 class="card-title">Record Outsourced Payment</h3></div>
+              <div class="card card-success h-100" id="outsourced-payment-form">
+                <div class="card-header"><h3 class="card-title">Record Vendor Payment</h3></div>
                 <form method="post">
                   <div class="card-body row g-2">
                     <?= csrf_field(); ?>
@@ -1580,10 +1604,11 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                     <div class="col-md-6">
                       <label class="form-label">Work</label>
                       <select name="work_id" class="form-select" required>
-                        <option value="">Select payable work</option>
+                        <option value="">Select outstanding work</option>
                         <?php foreach ($payableWorks as $work): ?>
-                          <option value="<?= (int) $work['id']; ?>">
-                            #<?= (int) $work['id']; ?> | <?= e((string) ($work['job_number'] ?? '')); ?> | <?= e((string) ($work['vendor_label'] ?? '')); ?> | O/S <?= e(format_currency((float) ($work['outstanding_amount'] ?? 0))); ?>
+                          <?php $optionStatus = ow_normalize_status((string) ($work['current_status'] ?? 'SENT')); ?>
+                          <option value="<?= (int) $work['id']; ?>" <?= $payWorkId === (int) $work['id'] ? 'selected' : ''; ?>>
+                            #<?= (int) $work['id']; ?> | <?= e($optionStatus); ?> | <?= e((string) ($work['job_number'] ?? '')); ?> | <?= e((string) ($work['vendor_label'] ?? '')); ?> | O/S <?= e(format_currency((float) ($work['outstanding_amount'] ?? 0))); ?>
                           </option>
                         <?php endforeach; ?>
                       </select>
@@ -1594,7 +1619,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                     </div>
                     <div class="col-md-2">
                       <label class="form-label">Amount</label>
-                      <input type="number" step="0.01" min="0.01" name="amount" class="form-control" required />
+                      <input type="number" step="0.01" min="0.01" name="amount" class="form-control" value="<?= $selectedPayWork !== null ? e((string) round((float) ($selectedPayWork['outstanding_amount'] ?? 0), 2)) : ''; ?>" required />
                     </div>
                     <div class="col-md-2">
                       <label class="form-label">Mode</label>
@@ -1709,6 +1734,9 @@ require_once __DIR__ . '/../../includes/sidebar.php';
                       <td><?= e(format_currency($paidAmount)); ?><br><small class="text-muted"><?= (int) ($work['payment_count'] ?? 0); ?> entries</small></td>
                       <td><?= e(format_currency($outstanding)); ?></td>
                       <td class="text-nowrap">
+                        <?php if ($canPay && $outstanding > 0.009): ?>
+                          <a href="<?= e(url('modules/outsourced/index.php?' . ($baseQuery !== '' ? $baseQuery . '&' : '') . 'pay_work_id=' . (int) $work['id'] . '#outsourced-payment-form')); ?>" class="btn btn-sm btn-success">Pay</a>
+                        <?php endif; ?>
                         <?php if ($canManage): ?>
                           <a href="<?= e(url('modules/outsourced/index.php?' . ($baseQuery !== '' ? $baseQuery . '&' : '') . 'edit_id=' . (int) $work['id'])); ?>" class="btn btn-sm btn-outline-primary">Edit</a>
                           <?php if ($nextStatus !== null): ?>
