@@ -133,6 +133,7 @@ function billing_store_customer_state_resolution_context(int $companyId, int $ga
         'customer_city' => mb_substr(trim((string) ($payload['customer_city'] ?? '')), 0, 80),
         'customer_state' => mb_substr(trim((string) ($payload['customer_state'] ?? '')), 0, 80),
         'customer_pincode' => mb_substr(trim((string) ($payload['customer_pincode'] ?? '')), 0, 10),
+        'invoice_date' => billing_parse_date((string) ($payload['invoice_date'] ?? '')) ?? date('Y-m-d'),
         'due_date' => billing_parse_date((string) ($payload['due_date'] ?? '')) ?? '',
         'discount_type' => billing_normalize_discount_type((string) ($payload['discount_type'] ?? 'AMOUNT')),
         'discount_value' => max(0.0, billing_round((float) ($payload['discount_value'] ?? 0))),
@@ -253,6 +254,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $customerPincode = post_string('customer_pincode', 10);
 
         $dueDate = billing_parse_date((string) ($_POST['due_date'] ?? ''));
+        $invoiceDate = billing_parse_date((string) ($_POST['invoice_date'] ?? '')) ?? date('Y-m-d');
         $discountType = billing_normalize_discount_type((string) ($_POST['discount_type'] ?? 'AMOUNT'));
         $discountValue = max(0.0, billing_round((float) ($_POST['discount_value'] ?? 0)));
         $notes = post_string('notes', 1000);
@@ -269,6 +271,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'customer_city' => $customerCity,
             'customer_state' => $customerState,
             'customer_pincode' => $customerPincode,
+            'invoice_date' => $invoiceDate,
             'due_date' => $dueDate ?? '',
             'discount_type' => $discountType,
             'discount_value' => $discountValue,
@@ -377,6 +380,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $customerUpdatedForDraftInvoice = true;
 
             $_POST['job_card_id'] = (string) $jobCardId;
+            $_POST['invoice_date'] = $invoiceDate;
             $_POST['due_date'] = $dueDate ?? '';
             $_POST['discount_type'] = $discountType;
             $_POST['discount_value'] = number_format($discountValue, 2, '.', '');
@@ -397,6 +401,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
 
         $jobCardId = post_int('job_card_id');
+        $invoiceDate = billing_parse_date((string) ($_POST['invoice_date'] ?? '')) ?? date('Y-m-d');
         $dueDate = billing_parse_date((string) ($_POST['due_date'] ?? ''));
         $discountType = billing_normalize_discount_type((string) ($_POST['discount_type'] ?? 'AMOUNT'));
         $discountValue = max(0.0, billing_round((float) ($_POST['discount_value'] ?? 0)));
@@ -563,7 +568,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 throw new RuntimeException('Invoice total must be greater than zero.');
             }
 
-            $invoiceDate = date('Y-m-d');
             $numberMeta = billing_generate_invoice_number($pdo, $companyId, $garageId, $invoiceDate);
             $invoiceNumber = (string) $numberMeta['invoice_number'];
 
@@ -885,6 +889,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'customer_city' => (string) ($jobRow['customer_city'] ?? ''),
                     'customer_state' => (string) ($jobRow['customer_state'] ?? ''),
                     'customer_pincode' => (string) ($jobRow['customer_pincode'] ?? ''),
+                    'invoice_date' => $invoiceDate,
                     'due_date' => $dueDate ?? '',
                     'discount_type' => $discountType,
                     'discount_value' => $discountValue,
@@ -2710,7 +2715,13 @@ require_once __DIR__ . '/../../includes/sidebar.php';
               </div>
               <div class="col-md-2">
                 <label class="form-label">Invoice Date</label>
-                <input type="text" class="form-control" value="<?= e($draftFormInvoiceDate); ?>" readonly />
+                <input
+                  type="date"
+                  name="invoice_date"
+                  class="form-control"
+                  value="<?= e($draftFormInvoiceDate); ?>"
+                  <?= $isDraftFormEditMode ? 'readonly' : 'required'; ?>
+                />
               </div>
               <div class="col-md-1">
                 <label class="form-label">Discount Type</label>
@@ -3277,6 +3288,7 @@ require_once __DIR__ . '/../../includes/sidebar.php';
           <input type="hidden" name="customer_id" value="<?= (int) ($customerStateResolutionContext['customer_id'] ?? 0); ?>" />
           <input type="hidden" name="customer_name" value="<?= e((string) ($customerStateResolutionContext['customer_name'] ?? '')); ?>" />
           <input type="hidden" name="customer_phone" value="<?= e((string) ($customerStateResolutionContext['customer_phone'] ?? '')); ?>" />
+          <input type="hidden" name="invoice_date" value="<?= e((string) ($customerStateResolutionContext['invoice_date'] ?? date('Y-m-d'))); ?>" />
           <input type="hidden" name="due_date" value="<?= e((string) ($customerStateResolutionContext['due_date'] ?? '')); ?>" />
           <input type="hidden" name="discount_type" value="<?= e((string) ($customerStateResolutionContext['discount_type'] ?? 'AMOUNT')); ?>" />
           <input type="hidden" name="discount_value" value="<?= e(number_format((float) ($customerStateResolutionContext['discount_value'] ?? 0), 2, '.', '')); ?>" />
